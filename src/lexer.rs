@@ -75,6 +75,10 @@ pub enum Tok {
     LArrow,
     /// `=>` — a `case` arm / function-literal arrow.
     FatArrow,
+    /// `->` — the tuple-pair sugar (`k -> v`).
+    RArrow,
+    /// `::` — list cons.
+    ColonColon,
     // operators
     Assign,
     PlusAssign,
@@ -386,6 +390,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         let (kind, adv) = match two {
             "<-" => (Tok::LArrow, 2),
             "=>" => (Tok::FatArrow, 2),
+            "->" => (Tok::RArrow, 2),
+            "::" => (Tok::ColonColon, 2),
             "+=" => (Tok::PlusAssign, 2),
             "-=" => (Tok::MinusAssign, 2),
             "*=" => (Tok::StarAssign, 2),

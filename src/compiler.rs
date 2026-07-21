@@ -15,10 +15,14 @@
 
 use crate::ast::*;
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// The desugar target a `rust { ... }` block lowers to (see [`crate::rust_ffi`]).
 const RUST_COMPILE: &str = "__rust_compile";
+
+/// The synthetic call name `desugar_for` emits for a range generator inside a
+/// collection comprehension (materialized to a `List` via [`crate::host::RANGE_LIST`]).
+const RANGE_LIST_CALL: &str = "$range_list";
 
 struct Compiler {
     b: ChunkBuilder,
@@ -75,6 +79,26 @@ struct Compiler {
     current_object: Option<String>,
     /// Distinguishes synthetic method-dispatch / constructor-pattern temporaries.
     obj_counter: u32,
+    /// Lambda bodies discovered while lowering, awaiting emission as subroutine
+    /// regions (drained after `main` + the class/object/function subs; draining a
+    /// closure may enqueue further nested closures).
+    pending_closures: VecDeque<PendingClosure>,
+    /// Monotonic id for synthetic closure body names (`$closure_0`, …).
+    closures_seen: u32,
+}
+
+/// A lambda body queued for emission as a subroutine region. `captures` are the
+/// enclosing-frame locals it reads as upvalues (bound to slots after the
+/// parameters); the enclosing class/object context is carried so a lambda that
+/// reads a field or calls a sibling method lowers it the same way the method body
+/// would.
+struct PendingClosure {
+    name_idx: u16,
+    params: Vec<String>,
+    captures: Vec<String>,
+    body: Expr,
+    current_class: Option<(String, HashSet<String>)>,
+    current_object: Option<String>,
 }
 
 /// Compile-time class shape.
@@ -205,6 +229,8 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         current_class: None,
         current_object: None,
         obj_counter: 0,
+        pending_closures: VecDeque::new(),
+        closures_seen: 0,
     };
 
     // Singleton-object `val`s initialize once before `main` (into `Name.val`
@@ -221,11 +247,14 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
 
     // Every subroutine (free `def`s, class constructors + methods, object
-    // methods) lives after `main`, jumped over on the fall-through; each is
-    // reached only through its `Op::Call` sub_entry.
+    // methods, and lambda bodies) lives after `main`, jumped over on the
+    // fall-through; each is reached only through its `Op::Call`/`find_sub` entry.
+    // Lambdas discovered while lowering `main` mean the subs region is needed even
+    // with no `def`/`class`.
     let has_subs = !prog.functions.is_empty()
         || !classes.is_empty()
-        || objects.iter().any(|o| !o.methods.is_empty());
+        || objects.iter().any(|o| !o.methods.is_empty())
+        || !c.pending_closures.is_empty();
     if has_subs {
         let skip = c.b.emit(Op::Jump(0), 0);
         for func in &prog.functions {
@@ -241,6 +270,10 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             for m in &od.methods {
                 c.object_method(od, m)?;
             }
+        }
+        // Drain lambda bodies last; emitting one may enqueue further nested ones.
+        while let Some(pc) = c.pending_closures.pop_front() {
+            c.emit_closure(pc)?;
         }
         let end = c.b.current_pos();
         c.b.patch_jump(skip, end);
@@ -464,6 +497,11 @@ impl Compiler {
             return Ok(());
         }
         match &enums[idx] {
+            // Collection generators are desugared to `.map`/`.flatMap` before
+            // `lower_for` (the counted-loop path handles integer ranges only).
+            ForEnum::GenColl { .. } => {
+                unreachable!("collection generators are desugared before lower_for")
+            }
             ForEnum::Guard(cond) => {
                 self.expr(cond)?;
                 let jf = self.b.emit(Op::JumpIfFalse(0), 0);
@@ -594,24 +632,163 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(crate::host::SFORMAT, 2), *line);
             }
             Expr::ForYield { enums, body } => {
-                // result = empty Vector; len = 0
-                self.b.emit(Op::MakeArray(0), 0);
-                self.yield_counter += 1;
-                let arr = self.declare_place(&format!(" yield_{}", self.yield_counter));
-                self.emit_store(arr);
-                let len = self.declare_place(&format!(" yield_len_{}", self.yield_counter));
-                self.b.emit(Op::LoadInt(0), 0);
-                self.emit_store(len);
-                self.lower_for(enums, 0, body, Some((arr, len)))?;
-                // The comprehension's value is the accumulated Vector.
-                self.emit_load(arr);
+                // A collection generator (`x <- List(…)`) desugars to a
+                // `.map`/`.flatMap`/`.withFilter` chain; a pure integer-range
+                // comprehension keeps the counted-loop lowering (JIT-friendly).
+                if enums.iter().any(is_coll_gen) {
+                    let d = desugar_for(enums, body, true);
+                    self.expr(&d)?;
+                } else {
+                    // result = empty Vector; len = 0
+                    self.b.emit(Op::MakeArray(0), 0);
+                    self.yield_counter += 1;
+                    let arr = self.declare_place(&format!(" yield_{}", self.yield_counter));
+                    self.emit_store(arr);
+                    let len = self.declare_place(&format!(" yield_len_{}", self.yield_counter));
+                    self.b.emit(Op::LoadInt(0), 0);
+                    self.emit_store(len);
+                    self.lower_for(enums, 0, body, Some((arr, len)))?;
+                    // The comprehension's value is the accumulated Vector.
+                    self.emit_load(arr);
+                }
             }
             Expr::ForEach { enums, body } => {
-                self.lower_for(enums, 0, body, None)?;
-                // `foreach` yields `Unit`.
-                self.b.emit(Op::LoadUndef, 0);
+                if enums.iter().any(is_coll_gen) {
+                    let d = desugar_for(enums, body, false);
+                    self.expr(&d)?;
+                } else {
+                    self.lower_for(enums, 0, body, None)?;
+                    // `foreach` yields `Unit`.
+                    self.b.emit(Op::LoadUndef, 0);
+                }
+            }
+            Expr::Lambda { params, body } => self.lambda(params, body)?,
+            Expr::Placeholder => {
+                return Err("scalars: `_` placeholder outside an argument".to_string())
+            }
+            Expr::Tuple(elems) => {
+                for el in elems {
+                    self.expr(el)?;
+                }
+                self.b.emit(
+                    Op::CallBuiltin(crate::host::MAKE_TUPLE, elems.len() as u8),
+                    0,
+                );
+            }
+            Expr::Collection { ctor, elems } => self.collection(ctor, elems)?,
+        }
+        Ok(())
+    }
+
+    /// Lower a `List(...)` / `Map(...)` literal to its host constructor builtin.
+    fn collection(&mut self, ctor: &str, elems: &[Expr]) -> Result<(), String> {
+        for el in elems {
+            self.expr(el)?;
+        }
+        let id = match ctor {
+            "List" => crate::host::MAKE_LIST,
+            "Map" => crate::host::MAKE_MAP,
+            _ => return Err(format!("scalars: unknown collection constructor `{ctor}`")),
+        };
+        self.b.emit(Op::CallBuiltin(id, elems.len() as u8), 0);
+        Ok(())
+    }
+
+    /// Lower a lambda literal: queue its body for emission as a subroutine region
+    /// and, at the literal site, build the runtime closure handle. Free names that
+    /// resolve to an enclosing frame slot are captured by value (upvalues); free
+    /// names that are globals/`def`s stay unbound and resolve at call time.
+    fn lambda(&mut self, params: &[String], body: &Expr) -> Result<(), String> {
+        // Upvalues: free names bound to an enclosing frame slot. At top level
+        // (`scope` is `None`) a lambda captures nothing — its free names are the
+        // program-global bindings, read live when the closure runs.
+        let mut captures: Vec<String> = match self.scope.as_ref() {
+            Some(scope) => free_vars(params, body)
+                .into_iter()
+                .filter(|n| scope.slots.contains_key(n))
+                .collect(),
+            None => Vec::new(),
+        };
+        // A lambda inside a class method that reads a field or calls a sibling
+        // method needs the enclosing `this` (slot 0) as an upvalue.
+        if let Some((cname, fields)) = self.current_class.clone() {
+            let uses_this = free_vars(params, body)
+                .iter()
+                .any(|n| fields.contains(n) || self.class_defines_method(&cname, n));
+            if uses_this
+                && self
+                    .scope
+                    .as_ref()
+                    .is_some_and(|s| s.slots.contains_key("this"))
+                && !captures.iter().any(|c| c == "this")
+            {
+                captures.push("this".to_string());
             }
         }
+
+        // Push name index, param count, then each captured value (read from the
+        // enclosing frame) so MAKE_CLOSURE stores them in the handle.
+        let id = self.closures_seen;
+        self.closures_seen += 1;
+        let name_idx = self.b.add_name(&format!("$closure_{id}"));
+        self.b.emit(Op::LoadInt(name_idx as i64), 0);
+        self.b.emit(Op::LoadInt(params.len() as i64), 0);
+        for cap in &captures {
+            let place = self.resolve_place(cap);
+            self.emit_load(place);
+        }
+        self.b.emit(
+            Op::CallBuiltin(crate::host::MAKE_CLOSURE, captures.len() as u8 + 2),
+            0,
+        );
+        self.pending_closures.push_back(PendingClosure {
+            name_idx,
+            params: params.to_vec(),
+            captures,
+            body: body.clone(),
+            current_class: self.current_class.clone(),
+            current_object: self.current_object.clone(),
+        });
+        Ok(())
+    }
+
+    /// Emit a queued lambda body as a subroutine region: bind parameters then
+    /// captured upvalues into frame slots, lower the body as the (single-value)
+    /// result, and end with a `ReturnValue`.
+    fn emit_closure(&mut self, pc: PendingClosure) -> Result<(), String> {
+        let ip = self.b.current_pos();
+        self.b.add_sub_entry(pc.name_idx, ip);
+
+        let mut slots = HashMap::new();
+        for (i, p) in pc.params.iter().enumerate() {
+            slots.insert(p.clone(), i as u16);
+        }
+        for (j, cap) in pc.captures.iter().enumerate() {
+            slots.insert(cap.clone(), (pc.params.len() + j) as u16);
+        }
+        let total = pc.params.len() + pc.captures.len();
+        let saved_scope = self.scope.replace(Scope {
+            slots,
+            next_slot: total as u16,
+        });
+        let saved_vals = std::mem::take(&mut self.vals);
+        for p in &pc.params {
+            self.vals.insert(p.clone(), true);
+        }
+        let saved_class = std::mem::replace(&mut self.current_class, pc.current_class);
+        let saved_object = std::mem::replace(&mut self.current_object, pc.current_object);
+
+        // Prologue: pop the pushed params + captures (top-down) into their slots.
+        for i in (0..total).rev() {
+            self.b.emit(Op::SetSlot(i as u16), 0);
+        }
+        self.expr(&pc.body)?;
+        self.b.emit(Op::ReturnValue, 0);
+
+        self.scope = saved_scope;
+        self.vals = saved_vals;
+        self.current_class = saved_class;
+        self.current_object = saved_object;
         Ok(())
     }
 
@@ -838,15 +1015,31 @@ impl Compiler {
                 }
             }
         }
+        // `Nil` — the empty `List`.
+        if name == "Nil" {
+            self.b.emit(Op::CallBuiltin(crate::host::MAKE_LIST, 0), 0);
+            return Ok(());
+        }
         // A bare reference to a singleton object (e.g. `None`) materializes it.
         if self.objects.contains_key(name) {
             return self.materialize_object(name);
         }
-        // A bare reference to a zero-parameter `def` is a paren-less call.
-        if self.func_arity.get(name) == Some(&0) {
-            let nidx = self.b.add_name(name);
-            self.b.emit(Op::Call(nidx, 0), 0);
-            return Ok(());
+        // A bare reference to a `def`. A zero-parameter `def` is a paren-less
+        // call; a `def` with parameters used as a value is eta-expanded to a
+        // closure (`fib` ⇒ `x => fib(x)`), so `List(…).map(fib)` works.
+        if let Some(&arity) = self.func_arity.get(name) {
+            if arity == 0 {
+                let nidx = self.b.add_name(name);
+                self.b.emit(Op::Call(nidx, 0), 0);
+                return Ok(());
+            }
+            let params: Vec<String> = (0..arity).map(|i| format!("$eta{i}")).collect();
+            let call = Expr::Call {
+                name: name.to_string(),
+                args: params.iter().map(|p| Expr::Var(p.clone())).collect(),
+                line: 0,
+            };
+            return self.lambda(&params, &call);
         }
         let place = self.resolve_place(name);
         self.emit_load(place);
@@ -1251,6 +1444,16 @@ impl Compiler {
     ///   dispatch by name through the FFI-call builtin. Without any FFI block, an
     ///   unknown call is a compile-time error, preserving the normal diagnostic.
     fn call(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        // A synthetic range-materialization call emitted by `desugar_for` for a
+        // range generator appearing in a collection comprehension.
+        if name == RANGE_LIST_CALL {
+            for a in args {
+                self.expr(a)?;
+            }
+            self.b
+                .emit(Op::CallBuiltin(crate::host::RANGE_LIST, 3), line);
+            return Ok(());
+        }
         if name == RUST_COMPILE {
             // Only the base64 body (first arg) is needed; the line arg is dropped.
             if let Some(body) = args.first() {
@@ -1305,6 +1508,24 @@ impl Compiler {
             }
             let nidx = self.b.add_name(name);
             self.b.emit(Op::Call(nidx, args.len() as u8), line);
+            return Ok(());
+        }
+        // A call on a bound name that is not a `def` is an `apply`: the value is a
+        // function (`f(x)`), a `List`/`Tuple` (`xs(i)` indexing), or a `Map`
+        // (`m(k)` lookup). Load the value, push the args, and dispatch via APPLY.
+        let is_bound = self.vals.contains_key(name)
+            || self
+                .scope
+                .as_ref()
+                .is_some_and(|s| s.slots.contains_key(name));
+        if is_bound {
+            let place = self.resolve_place(name);
+            self.emit_load(place);
+            for a in args {
+                self.expr(a)?;
+            }
+            self.b
+                .emit(Op::CallBuiltin(crate::host::APPLY, args.len() as u8), line);
             return Ok(());
         }
         if !self.has_ffi {
@@ -1489,11 +1710,18 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0);
             return Ok(());
         }
+        // `::` (cons) prepends the left operand to the right `List` via the host
+        // constructor builtin.
+        if let BinOp::Cons = op {
+            self.b.emit(Op::CallBuiltin(crate::host::LIST_CONS, 2), 0);
+            return Ok(());
+        }
         let vop = match op {
             BinOp::Add => Op::Add,
             BinOp::Sub => Op::Sub,
             BinOp::Mul => Op::Mul,
             BinOp::Div => unreachable!("division routed through the SDIV builtin above"),
+            BinOp::Cons => unreachable!("cons routed through the LIST_CONS builtin above"),
             BinOp::Mod => Op::Mod,
             BinOp::Eq => Op::NumEq,
             BinOp::Ne => Op::NumNe,
@@ -1550,11 +1778,14 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
             enums.iter().any(enum_has_ffi) || expr_has_ffi(body)
         }
+        Expr::Lambda { body, .. } => expr_has_ffi(body),
+        Expr::Tuple(elems) | Expr::Collection { elems, .. } => elems.iter().any(expr_has_ffi),
         Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::Null
+        | Expr::Placeholder
         | Expr::Var(_) => false,
     }
 }
@@ -1563,7 +1794,266 @@ fn expr_has_ffi(e: &Expr) -> bool {
 fn enum_has_ffi(e: &ForEnum) -> bool {
     match e {
         ForEnum::Gen { start, end, .. } => expr_has_ffi(start) || expr_has_ffi(end),
+        ForEnum::GenColl { coll, .. } => expr_has_ffi(coll),
         ForEnum::Guard(c) => expr_has_ffi(c),
+    }
+}
+
+// ── for-comprehension desugaring (collection generators) ────────────────────
+
+/// Whether an enumerator is a collection generator (`x <- List(…)`).
+fn is_coll_gen(e: &ForEnum) -> bool {
+    matches!(e, ForEnum::GenColl { .. })
+}
+
+/// Desugar a `for` comprehension containing a collection generator into a
+/// `.map`/`.flatMap`/`.withFilter`/`.foreach` chain (Scala's translation):
+///
+/// * `for (x <- e) yield b`            → `e.map(x => b)`
+/// * `for (x <- e) b`      (foreach)   → `e.foreach(x => b)`
+/// * `for (x <- e if g; …) …`          → `e.withFilter(x => g)` then continue
+/// * `for (x <- e; rest…) yield b`     → `e.flatMap(x => <for rest yield b>)`
+///
+/// A range generator (`i <- a to b`) is materialized to a `List` first.
+fn desugar_for(enums: &[ForEnum], body: &Expr, is_yield: bool) -> Expr {
+    let (name, mut src) = gen_source(&enums[0]);
+    // Guards immediately after the generator become `withFilter` on its source.
+    let mut i = 1;
+    while let Some(ForEnum::Guard(g)) = enums.get(i) {
+        src = method(src, "withFilter", vec![lambda1(&name, g.clone())]);
+        i += 1;
+    }
+    let rest = &enums[i..];
+    if rest.is_empty() {
+        let m = if is_yield { "map" } else { "foreach" };
+        method(src, m, vec![lambda1(&name, body.clone())])
+    } else {
+        let inner = desugar_for(rest, body, is_yield);
+        // Nested yield collects via `flatMap`; nested foreach nests `foreach`.
+        let m = if is_yield { "flatMap" } else { "foreach" };
+        method(src, m, vec![lambda1(&name, inner)])
+    }
+}
+
+/// The `(bound name, source-collection expr)` of a generator enumerator. A range
+/// generator is wrapped in the `$range_list` materialization call.
+fn gen_source(e: &ForEnum) -> (String, Expr) {
+    match e {
+        ForEnum::GenColl { name, coll } => (name.clone(), coll.clone()),
+        ForEnum::Gen {
+            name,
+            start,
+            end,
+            inclusive,
+        } => (
+            name.clone(),
+            Expr::Call {
+                name: RANGE_LIST_CALL.to_string(),
+                args: vec![start.clone(), end.clone(), Expr::Bool(*inclusive)],
+                line: 0,
+            },
+        ),
+        ForEnum::Guard(_) => unreachable!("a comprehension does not begin with a guard"),
+    }
+}
+
+/// Build a single-parameter lambda `name => body`.
+fn lambda1(name: &str, body: Expr) -> Expr {
+    Expr::Lambda {
+        params: vec![name.to_string()],
+        body: Box::new(body),
+    }
+}
+
+/// Build a method call `recv.name(args)`.
+fn method(recv: Expr, name: &str, args: Vec<Expr>) -> Expr {
+    Expr::Method {
+        recv: Box::new(recv),
+        name: name.to_string(),
+        args,
+        line: 0,
+    }
+}
+
+// ── free-variable analysis (lambda upvalue capture) ─────────────────────────
+
+/// The names referenced free in a lambda `body` given its `params` — the
+/// candidates for upvalue capture (the compiler keeps only those bound to an
+/// enclosing frame slot). Over-reporting is harmless: a reported name that is not
+/// an enclosing slot is filtered out at the capture site.
+fn free_vars(params: &[String], body: &Expr) -> Vec<String> {
+    let bound: HashSet<String> = params.iter().cloned().collect();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    fv_expr(body, &bound, &mut out, &mut seen);
+    out
+}
+
+/// Record `name` as free if it is neither bound in this scope nor already seen.
+fn fv_note(name: &str, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    if !bound.contains(name) && seen.insert(name.to_string()) {
+        out.push(name.to_string());
+    }
+}
+
+/// Free-variable scan of a statement block (a fresh nested scope: `val`/`var`
+/// declarations bind for the remainder of the block).
+fn fv_block(
+    stmts: &[Stmt],
+    bound: &HashSet<String>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let mut b = bound.clone();
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Local { name, init, .. } => {
+                if let Some(e) = init {
+                    fv_expr(e, &b, out, seen);
+                }
+                b.insert(name.clone());
+            }
+            StmtKind::Assign { name, value, .. } => {
+                fv_note(name, &b, out, seen);
+                fv_expr(value, &b, out, seen);
+            }
+            StmtKind::Expr(e) => fv_expr(e, &b, out, seen),
+            StmtKind::If { cond, then, els } => {
+                fv_expr(cond, &b, out, seen);
+                fv_block(then, &b, out, seen);
+                fv_block(els, &b, out, seen);
+            }
+            StmtKind::While { cond, body } => {
+                fv_expr(cond, &b, out, seen);
+                fv_block(body, &b, out, seen);
+            }
+            StmtKind::Return(opt) => {
+                if let Some(e) = opt {
+                    fv_expr(e, &b, out, seen);
+                }
+            }
+        }
+    }
+}
+
+/// Free-variable scan of an expression. Nested lambdas / match arms /
+/// comprehension generators introduce their own bound names.
+fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    match e {
+        Expr::Var(name) => fv_note(name, bound, out, seen),
+        Expr::Unary { rhs, .. } => fv_expr(rhs, bound, out, seen),
+        Expr::Binary { lhs, rhs, .. } => {
+            fv_expr(lhs, bound, out, seen);
+            fv_expr(rhs, bound, out, seen);
+        }
+        Expr::Println { arg, .. } => {
+            if let Some(a) = arg {
+                fv_expr(a, bound, out, seen);
+            }
+        }
+        Expr::Call { name, args, .. } => {
+            // The callee may be a captured function value (`f(x)` where `f` is an
+            // enclosing binding). Noting a real `def`/builtin name too is harmless
+            // — it is filtered out unless it is an enclosing frame slot.
+            fv_note(name, bound, out, seen);
+            for a in args {
+                fv_expr(a, bound, out, seen);
+            }
+        }
+        Expr::Method { recv, args, .. } => {
+            fv_expr(recv, bound, out, seen);
+            for a in args {
+                fv_expr(a, bound, out, seen);
+            }
+        }
+        Expr::New { args, .. } => {
+            for a in args {
+                fv_expr(a, bound, out, seen);
+            }
+        }
+        Expr::Copy { recv, updates, .. } => {
+            fv_expr(recv, bound, out, seen);
+            for (_, val) in updates {
+                fv_expr(val, bound, out, seen);
+            }
+        }
+        Expr::If { cond, then, els } => {
+            fv_expr(cond, bound, out, seen);
+            fv_expr(then, bound, out, seen);
+            if let Some(e) = els {
+                fv_expr(e, bound, out, seen);
+            }
+        }
+        Expr::Block(stmts) => fv_block(stmts, bound, out, seen),
+        Expr::Match { scrut, arms } => {
+            fv_expr(scrut, bound, out, seen);
+            for arm in arms {
+                let mut b = bound.clone();
+                pattern_binds(&arm.pat, &mut b);
+                if let Some(g) = &arm.guard {
+                    fv_expr(g, &b, out, seen);
+                }
+                fv_block(&arm.body, &b, out, seen);
+            }
+        }
+        Expr::Format { value, .. } => fv_expr(value, bound, out, seen),
+        Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
+            let mut b = bound.clone();
+            for en in enums {
+                match en {
+                    ForEnum::Gen {
+                        name, start, end, ..
+                    } => {
+                        fv_expr(start, &b, out, seen);
+                        fv_expr(end, &b, out, seen);
+                        b.insert(name.clone());
+                    }
+                    ForEnum::GenColl { name, coll } => {
+                        fv_expr(coll, &b, out, seen);
+                        b.insert(name.clone());
+                    }
+                    ForEnum::Guard(g) => fv_expr(g, &b, out, seen),
+                }
+            }
+            fv_expr(body, &b, out, seen);
+        }
+        Expr::Lambda { params, body } => {
+            let mut b = bound.clone();
+            for p in params {
+                b.insert(p.clone());
+            }
+            fv_expr(body, &b, out, seen);
+        }
+        Expr::Tuple(elems) | Expr::Collection { elems, .. } => {
+            for el in elems {
+                fv_expr(el, bound, out, seen);
+            }
+        }
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Placeholder => {}
+    }
+}
+
+/// Add the names a pattern binds to `bound` (recursing into constructor
+/// sub-patterns) so a lambda inside a `match` arm does not capture them.
+fn pattern_binds(p: &Pattern, bound: &mut HashSet<String>) {
+    match p {
+        Pattern::Bind(n) => {
+            bound.insert(n.clone());
+        }
+        Pattern::Typed { name, .. } if name != "_" => {
+            bound.insert(name.clone());
+        }
+        Pattern::Constructor { elems, .. } => {
+            for e in elems {
+                pattern_binds(e, bound);
+            }
+        }
+        _ => {}
     }
 }
 

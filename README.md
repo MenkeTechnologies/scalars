@@ -82,9 +82,13 @@ native call frames, and postfix `.` dispatch wires a core `String`/`Int`/`Double
 method slice. A host-side object model (`class`/`object`/`case class`, `new`,
 fields, `this`, method dispatch, structural `equals`/`hashCode`/`toString`,
 `copy`, `apply`/`unapply`, constructor patterns, built-in `Option`) rides
-fusevm's `Value::Obj` handle. Collections and the wider standard library are the
-next waves (see [`BUGS.md`](BUGS.md)). Nothing is faked — an unsupported
-construct is a parse error or an honest runtime throw, not a silent mis-run.
+fusevm's `Value::Obj` handle. First-class functions (`x => …`, `(a, b) => …`,
+block bodies, `_` placeholders, capture of the enclosing frame) and the immutable
+`List`/`Map` collections (`.map`/`.filter`/`.flatMap`/`.foldLeft`/…, `::`,
+indexing, `k -> v`, collection `for … yield` comprehensions) are modeled host-side
+too. The wider standard library is the next wave (see [`BUGS.md`](BUGS.md)).
+Nothing is faked — an unsupported construct is a parse error or an honest runtime
+throw, not a silent mis-run.
 
 ---
 
@@ -189,15 +193,31 @@ Implemented and checked against the reference `scala`:
   `copy(field = …)`, companion `apply` (no `new`) and `unapply`. Built-in
   `Option` (`Some(v)` / `None`). All of it rides a host-side object heap behind
   fusevm's `Value::Obj` handle (`src/host.rs`) — no fusevm changes, no JVM.
+- **First-class functions** — lambdas (`x => e`, `(a, b) => e`, block bodies
+  `x => { … }`, `Int => Int` function-type annotations) and the `_`-placeholder
+  form (`_ + 1`, `_ * 2`, `_ + _`). A lambda captures its enclosing frame, so it
+  can be stored in a `val`, passed as an argument, returned, and invoked (`f(x)` /
+  `f.apply(x)`) — curried closures (`def adder(n: Int): Int => Int = x => x + n`)
+  see their upvalues after the defining frame returns. Modeled as a host-heap
+  closure re-entering the VM to run its body — no fusevm changes.
+- **Collections** — immutable `List` (`List(1,2,3)`, `Nil`, `::` cons,
+  `.head`/`.tail`/`.length`/`.isEmpty`/`.reverse`/`.contains`/indexing `xs(i)`,
+  and higher-order `.map`/`.filter`/`.flatMap`/`.foreach`/`.foldLeft`/`.foldRight`/
+  `.reduce`/`.sum`/`.mkString`/`.exists`/`.forall`/`.count`) and immutable `Map`
+  (`Map(k -> v)`, `.apply`/`.get`/`.contains`/`.keys`/`.values`/`.size`/`getOrElse`,
+  `+`), plus `a -> b` tuple pairs. Insertion-ordered, byte-faithful `toString`
+  (`List(1, 2, 3)`, `Map(a -> 1, b -> 2)`).
 - **Method dispatch** — postfix `.` on core values: `String` (`length`,
   `toUpperCase`/`toLowerCase`, `trim`, `reverse`, `substring`, `charAt`,
   `contains`/`startsWith`/`endsWith`, `toInt`/`toDouble`, …), `Int`/`Double`
   (`abs`, `min`/`max`, `round`, `toDouble`/`toInt`, …), and `toString` on any
   value; chains left-to-right (`s.trim.length`).
 - **Control flow** — `if` / `else if` / `else` (statement *and* expression
-  position), `while`, and Scala range `for` comprehensions: side-effecting
-  `for (i <- a until b) …` and `for (i <- a to b) yield …` (collecting a
-  `Vector`), with multiple `;`-separated generators and `if` guards.
+  position), `while`, and `for` comprehensions over both integer ranges
+  (`for (i <- a until b) …`, `for (i <- a to b) yield …` collecting a `Vector`)
+  and collections (`for (x <- List(1,2,3)) yield x*2`, desugared to
+  `.map`/`.flatMap`/`.withFilter`), with multiple `;`-separated generators and
+  `if` guards.
 - **Statement separators** — inferred line breaks *or* explicit `;` (the lexer
   applies Scala's can-end / can-begin newline rule, so no semicolons are needed).
 - **Output** — `println(x)` / `print(x)` with Scala value formatting.
@@ -277,12 +297,10 @@ fixes; 32,000+ probes now run clean.
 
 Next waves, in priority order:
 
-1. **Lambdas / function values** (`x => …`) — the gating substrate for
-   collections. `.map`/`.flatMap`/`withFilter` and collection `for` generators
-   (`for (x <- List(1,2,3))`) all take a function value, so they wait on this.
-2. **Collections** — `List`/`Array`/`Map` as first-class values on the object
-   heap built for the class model, with `map`/`flatMap`/`filter` once lambdas
-   land, and traits / inheritance / generics for the wider type system.
+1. **More collections** — `Array`/`Seq`/`Vector`/`Set` literals and mutable
+   collections, on the same host heap the immutable `List`/`Map` already ride.
+2. **Traits / inheritance / generics** for the wider type system, and the
+   broader standard library (`math`, `scala.io`, `scala.collection.*`).
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

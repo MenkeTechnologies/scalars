@@ -597,7 +597,20 @@ impl Parser {
 
     /// Consume a type reference after `:` (`Int`, `Array[String]`, `a.b.C`) and
     /// return it as a string for diagnostics. Types do not gate execution.
+    /// A type reference that may include a function-type arrow (`Int => Int`).
+    /// Used everywhere a `=>` after the type is unambiguously part of the type
+    /// (`val`/`def`/parameter/lambda-parameter annotations).
     fn type_ref(&mut self) -> Result<String, String> {
+        self.type_ref_inner(true)
+    }
+
+    /// A type reference in a context where a following `=>` is NOT part of the
+    /// type (a `case name: Type =>` pattern, where `=>` is the arm separator).
+    fn type_ref_no_arrow(&mut self) -> Result<String, String> {
+        self.type_ref_inner(false)
+    }
+
+    fn type_ref_inner(&mut self, allow_arrow: bool) -> Result<String, String> {
         let mut s = String::new();
         loop {
             match self.peek().clone() {
@@ -626,6 +639,33 @@ impl Parser {
                     }
                     s.push_str("[]");
                 }
+                // A function type: `Int => Int`, `(Int, Int) => Int`. The `=>`
+                // and its result type are consumed so the following `= <init>`
+                // parses (the type is diagnostic-only). Suppressed in a pattern,
+                // where `=>` is the arm separator.
+                Tok::FatArrow if allow_arrow => {
+                    s.push_str("=>");
+                    self.advance();
+                }
+                // A parenthesized parameter-type tuple in a function type. Balance
+                // the group (it is not a lambda — this is a type position).
+                Tok::LParen => {
+                    let mut depth = 0;
+                    loop {
+                        match self.advance() {
+                            Tok::LParen => depth += 1,
+                            Tok::RParen => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            Tok::Eof => break,
+                            _ => {}
+                        }
+                    }
+                    s.push_str("()");
+                }
                 _ => break,
             }
         }
@@ -636,6 +676,16 @@ impl Parser {
             ));
         }
         Ok(s)
+    }
+
+    /// Whether the cursor is at an assignment target (`ident <assign-op>`), used
+    /// to route a lambda body like `x => acc += x` through statement parsing.
+    fn assignment_ahead(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(_))
+            && self
+                .toks
+                .get(self.pos + 1)
+                .is_some_and(|t| assign_op(&t.kind).is_some())
     }
 
     /// Assignment (`x = e`, `x += e`) or a bare expression statement.
@@ -725,6 +775,8 @@ impl Parser {
             let name = self.ident()?;
             self.eat(&Tok::LArrow)?;
             let start = self.expression()?;
+            // `a until b` / `a to b` is a range generator; anything else is a
+            // collection generator (`x <- List(…)`), desugared to `.map`/`.flatMap`.
             let inclusive = match self.peek().clone() {
                 Tok::Ident(w) if w == "until" => {
                     self.advance();
@@ -734,11 +786,21 @@ impl Parser {
                     self.advance();
                     true
                 }
-                other => {
-                    return Err(format!(
-                        "scalars: only `<- a until b` / `<- a to b` ranges are supported in `for` (found {other}) on line {}",
-                        self.line()
-                    ))
+                _ => {
+                    out.push(ForEnum::GenColl { name, coll: start });
+                    // Trailing `if` guards bind to the generator just parsed.
+                    while self.is(&Tok::If) {
+                        self.advance();
+                        out.push(ForEnum::Guard(self.expression()?));
+                    }
+                    if self.is(&Tok::Semi) {
+                        self.skip_seps();
+                        if self.is(&Tok::RParen) {
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
                 }
             };
             let end = self.expression()?;
@@ -775,13 +837,105 @@ impl Parser {
     // ── expressions (precedence climbing) ─────────────────────────────────
 
     fn expression(&mut self) -> Result<Expr, String> {
+        // A function literal (`x => e`, `(a, b) => e`) is a complete expression.
+        if self.at_lambda_start() {
+            return self.lambda();
+        }
         // `match` binds looser than every binary operator (`a + b match { … }`
         // matches on the sum), so it wraps the fully-parsed binary expression.
         let mut e = self.binary(0)?;
+        // `a -> b` — the tuple-pair sugar (binds looser than every binary op).
+        if self.is(&Tok::RArrow) {
+            self.advance();
+            let rhs = if self.at_lambda_start() {
+                self.lambda()?
+            } else {
+                self.binary(0)?
+            };
+            e = Expr::Tuple(vec![e, rhs]);
+        }
         while self.is(&Tok::Match) {
             e = self.match_expr(e)?;
         }
         Ok(e)
+    }
+
+    /// Whether the cursor begins a lambda: `ident =>` or a `( … ) =>` parameter
+    /// list. Scans a balanced paren group to find the token after `)`.
+    fn at_lambda_start(&self) -> bool {
+        match self.peek() {
+            Tok::Ident(_) => matches!(
+                self.toks.get(self.pos + 1).map(|t| &t.kind),
+                Some(Tok::FatArrow)
+            ),
+            Tok::LParen => {
+                let mut depth = 0;
+                let mut i = self.pos;
+                while i < self.toks.len() {
+                    match &self.toks[i].kind {
+                        Tok::LParen => depth += 1,
+                        Tok::RParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return matches!(
+                                    self.toks.get(i + 1).map(|t| &t.kind),
+                                    Some(Tok::FatArrow)
+                                );
+                            }
+                        }
+                        Tok::Eof => return false,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Parse a function literal `params => body`. `params` is a single bare
+    /// identifier or a parenthesized (optionally typed) list; `body` is a single
+    /// expression or a `{ … }` block.
+    fn lambda(&mut self) -> Result<Expr, String> {
+        let mut params = Vec::new();
+        if self.is(&Tok::LParen) {
+            self.advance();
+            self.skip_seps();
+            while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
+                let name = self.ident()?;
+                if self.is(&Tok::Colon) {
+                    self.advance();
+                    self.type_ref()?;
+                }
+                params.push(name);
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                    self.skip_seps();
+                } else {
+                    break;
+                }
+            }
+            self.eat(&Tok::RParen)?;
+        } else {
+            params.push(self.ident()?);
+        }
+        self.eat(&Tok::FatArrow)?;
+        self.skip_seps();
+        let body = if self.is(&Tok::LBrace) {
+            self.advance();
+            Expr::Block(self.block()?)
+        } else if self.assignment_ahead() {
+            // A lambda whose body is an assignment (`x => acc += x`) is a `Unit`
+            // statement, not an expression — wrap it in a single-statement block.
+            Expr::Block(vec![self.statement()?])
+        } else {
+            self.expression()?
+        };
+        Ok(Expr::Lambda {
+            params,
+            body: Box::new(body),
+        })
     }
 
     fn binary(&mut self, min_bp: u8) -> Result<Expr, String> {
@@ -791,7 +945,12 @@ impl Parser {
                 break;
             }
             self.advance();
-            let rhs = self.binary(bp + 1)?;
+            // `::` (cons) is right-associative: `1 :: 2 :: Nil` == `1 :: (2 :: Nil)`.
+            let rhs = if op == BinOp::Cons {
+                self.binary(bp)?
+            } else {
+                self.binary(bp + 1)?
+            };
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -842,14 +1001,31 @@ impl Parser {
                 };
                 continue;
             }
-            let args = if self.is(&Tok::LParen) {
-                self.arg_list()?
-            } else {
-                Vec::new()
-            };
+            // Optional `[T]` type arguments on a method (`xs.map[Int](f)`).
+            if self.is(&Tok::LBracket) {
+                self.skip_bracket_group();
+            }
+            // A method may be curried (`foldLeft(z)(op)`); flatten every trailing
+            // argument list into the one call.
+            let mut args = Vec::new();
+            while self.is(&Tok::LParen) {
+                args.extend(self.arg_list()?);
+            }
             e = Expr::Method {
                 recv: Box::new(e),
                 name,
+                args,
+                line,
+            };
+        }
+        // A trailing application on a value expression (`f(x)`, `xs(i)`) when the
+        // receiver is not a `.method` chain — e.g. `getFn()(arg)`. `apply`.
+        while self.is(&Tok::LParen) {
+            let line = self.line();
+            let args = self.arg_list()?;
+            e = Expr::Method {
+                recv: Box::new(e),
+                name: "apply".to_string(),
                 args,
                 line,
             };
@@ -934,23 +1110,60 @@ impl Parser {
                 self.advance();
                 self.build_interp(raw, is_f, &parts, &exprs, &fmts)
             }
+            // `( e )` grouping, or a tuple literal `(a, b, …)`. A `( … ) =>`
+            // lambda is caught earlier in `expression`.
             Tok::LParen => {
                 self.advance();
-                let e = self.expression()?;
+                self.skip_seps();
+                let mut elems = vec![self.expression()?];
+                while self.is(&Tok::Comma) {
+                    self.advance();
+                    self.skip_seps();
+                    elems.push(self.expression()?);
+                }
                 self.eat(&Tok::RParen)?;
-                Ok(e)
+                if elems.len() == 1 {
+                    Ok(elems.pop().unwrap())
+                } else {
+                    Ok(Expr::Tuple(elems))
+                }
             }
             Tok::Ident(name) => {
-                // `println(...)` / `print(...)`, a named call `name(args)`, or a
-                // var read. Postfix `.member` dispatch is layered on in `postfix`.
-                if (name == "println" || name == "print")
-                    && matches!(self.toks[self.pos + 1].kind, Tok::LParen)
-                {
-                    return self.print_call(name == "println");
+                let next = self.toks.get(self.pos + 1).map(|t| &t.kind);
+                // A bare `_` is an argument placeholder (rewritten to a lambda by
+                // `wrap_placeholders` at the enclosing argument boundary).
+                if name == "_" && !matches!(next, Some(Tok::LParen)) {
+                    self.advance();
+                    return Ok(Expr::Placeholder);
+                }
+                // `println(...)` / `print(...)`, or bare `println` as a function
+                // value (eta-expansion to `x => println(x)`, for `xs.foreach(println)`).
+                if name == "println" || name == "print" {
+                    let newline = name == "println";
+                    if matches!(next, Some(Tok::LParen)) {
+                        return self.print_call(newline);
+                    }
+                    self.advance();
+                    return Ok(Expr::Lambda {
+                        params: vec!["$eta".to_string()],
+                        body: Box::new(Expr::Println {
+                            newline,
+                            arg: Some(Box::new(Expr::Var("$eta".to_string()))),
+                        }),
+                    });
                 }
                 let line = self.line();
                 self.advance();
+                // Optional generic type arguments (`List[Int](…)`, `foo[T](…)`).
+                if self.is(&Tok::LBracket) {
+                    self.skip_bracket_group();
+                }
                 if self.is(&Tok::LParen) {
+                    // `List(...)` / `Map(...)` collection literals.
+                    if name == "List" || name == "Map" {
+                        let elems = self.arg_list()?;
+                        return Ok(Expr::Collection { ctor: name, elems });
+                    }
                     return self.call(name, line);
                 }
                 Ok(Expr::Var(name))
@@ -970,7 +1183,7 @@ impl Parser {
         let mut args = Vec::new();
         if !self.is(&Tok::RParen) {
             loop {
-                args.push(self.expression()?);
+                args.push(wrap_placeholders(self.expression()?));
                 if self.is(&Tok::Comma) {
                     self.advance();
                     self.skip_seps();
@@ -1008,7 +1221,8 @@ impl Parser {
         let mut args = Vec::new();
         if !self.is(&Tok::RParen) {
             loop {
-                args.push(self.expression()?);
+                let a = wrap_placeholders(self.expression()?);
+                args.push(a);
                 if self.is(&Tok::Comma) {
                     self.advance();
                     self.skip_seps();
@@ -1182,7 +1396,7 @@ impl Parser {
                 }
                 if self.is(&Tok::Colon) {
                     self.advance();
-                    let ty = self.type_ref()?;
+                    let ty = self.type_ref_no_arrow()?;
                     Ok(Pattern::Typed { name, ty })
                 } else if name == "_" {
                     Ok(Pattern::Wildcard)
@@ -1266,6 +1480,71 @@ fn parse_fragment(src: &str) -> Result<Expr, String> {
     p.expression()
 }
 
+/// If `e` contains underscore placeholders, rewrite it into a [`Expr::Lambda`]
+/// whose synthetic parameters (`$ph0`, `$ph1`, …) replace the placeholders
+/// left-to-right — Scala's `_ + 1` ⇒ `x => x + 1`, `_ + _` ⇒ `(a, b) => a + b`.
+/// A placeholder inside an already-wrapped nested lambda is left untouched (the
+/// walk does not descend into a `Lambda`).
+fn wrap_placeholders(e: Expr) -> Expr {
+    let mut n = 0usize;
+    let mut body = e;
+    replace_placeholders(&mut body, &mut n);
+    if n == 0 {
+        return body;
+    }
+    let params = (0..n).map(|i| format!("$ph{i}")).collect();
+    Expr::Lambda {
+        params,
+        body: Box::new(body),
+    }
+}
+
+/// Replace each [`Expr::Placeholder`] with `Var($ph{n})`, bumping `n`. Does not
+/// recurse into a nested `Lambda` (its placeholders already belong to it).
+fn replace_placeholders(e: &mut Expr, n: &mut usize) {
+    match e {
+        Expr::Placeholder => {
+            *e = Expr::Var(format!("$ph{n}"));
+            *n += 1;
+        }
+        Expr::Lambda { .. } => {}
+        Expr::Unary { rhs, .. } => replace_placeholders(rhs, n),
+        Expr::Binary { lhs, rhs, .. } => {
+            replace_placeholders(lhs, n);
+            replace_placeholders(rhs, n);
+        }
+        Expr::Method { recv, args, .. } => {
+            replace_placeholders(recv, n);
+            for a in args {
+                replace_placeholders(a, n);
+            }
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                replace_placeholders(a, n);
+            }
+        }
+        Expr::New { args, .. } | Expr::Tuple(args) | Expr::Collection { elems: args, .. } => {
+            for a in args {
+                replace_placeholders(a, n);
+            }
+        }
+        Expr::Println { arg: Some(a), .. } => replace_placeholders(a, n),
+        Expr::Format { value, .. } => replace_placeholders(value, n),
+        Expr::If { cond, then, els } => {
+            replace_placeholders(cond, n);
+            replace_placeholders(then, n);
+            if let Some(e) = els {
+                replace_placeholders(e, n);
+            }
+        }
+        // Placeholders do not reach across a block/match/comprehension boundary
+        // (Scala's placeholder scope is the enclosing expression), and the other
+        // arms carry no sub-expressions.
+        _ => {}
+    }
+}
+
 /// Map a token to a compound-assignment operator, if it is one.
 fn assign_op(t: &Tok) -> Option<AssignOp> {
     Some(match t {
@@ -1290,11 +1569,14 @@ fn binop(t: &Tok) -> Option<(BinOp, u8)> {
         Tok::Gt => (BinOp::Gt, 4),
         Tok::Le => (BinOp::Le, 4),
         Tok::Ge => (BinOp::Ge, 4),
-        Tok::Plus => (BinOp::Add, 5),
-        Tok::Minus => (BinOp::Sub, 5),
-        Tok::Star => (BinOp::Mul, 6),
-        Tok::Slash => (BinOp::Div, 6),
-        Tok::Percent => (BinOp::Mod, 6),
+        // `::` (cons) — Scala's `:`-family precedence sits just below `+`/`-`
+        // and is right-associative (handled in `binary`).
+        Tok::ColonColon => (BinOp::Cons, 5),
+        Tok::Plus => (BinOp::Add, 6),
+        Tok::Minus => (BinOp::Sub, 6),
+        Tok::Star => (BinOp::Mul, 7),
+        Tok::Slash => (BinOp::Div, 7),
+        Tok::Percent => (BinOp::Mod, 7),
         _ => return None,
     })
 }

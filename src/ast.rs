@@ -131,6 +131,9 @@ pub enum ForEnum {
         end: Expr,
         inclusive: bool,
     },
+    /// `name <- collExpr` — a collection generator (a `List`/`Map`/etc. source),
+    /// desugared to `.map`/`.flatMap`/`.withFilter` (see [`crate::compiler`]).
+    GenColl { name: String, coll: Expr },
     /// `if cond` — a filter that skips the remaining (inner) enumerators when the
     /// condition is false, desugaring to `withFilter`.
     Guard(Expr),
@@ -253,6 +256,27 @@ pub enum Expr {
         enums: Vec<ForEnum>,
         body: Box<Expr>,
     },
+    /// A first-class function value: `x => e`, `(a, b) => e`, `x => { … }`. The
+    /// parameter names bind in `body`; free names are captured from the enclosing
+    /// frame (see [`crate::compiler`]). Lowered to a host-heap closure.
+    Lambda {
+        params: Vec<String>,
+        body: Box<Expr>,
+    },
+    /// An underscore placeholder (`_`) in an argument expression. The enclosing
+    /// argument is rewritten into a [`Expr::Lambda`] whose synthetic parameters
+    /// replace the placeholders left-to-right (see [`crate::parser`]); a
+    /// `Placeholder` never survives into the compiler.
+    Placeholder,
+    /// A tuple literal: `(a, b)`, or the `a -> b` pair sugar. Lowered to a
+    /// host-heap tuple; a 2-tuple is `Tuple2` (as `Map` pairs use).
+    Tuple(Vec<Expr>),
+    /// `List(...)` / `Nil` / `Map(...)` collection literal. `ctor` is the
+    /// constructor name (`List`, `Map`, `Nil`); `elems` the element/pair exprs.
+    Collection {
+        ctor: String,
+        elems: Vec<Expr>,
+    },
 }
 
 /// One arm of a [`Expr::Match`]: `case pat [if guard] => body`.
@@ -314,4 +338,6 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    /// `::` — list cons (right-associative; prepends the left operand).
+    Cons,
 }

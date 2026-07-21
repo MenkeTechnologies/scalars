@@ -805,3 +805,222 @@ fn some_pattern_binds_none_pattern_matches() {
     assert!(ok);
     assert_eq!(out, "14\n0\n");
 }
+
+// ── Lambdas / first-class functions (byte-verified vs scala 3.8.4) ───────────
+
+#[test]
+fn lambda_single_and_multi_param() {
+    let (out, ok) = run(&wrap(
+        "val inc = (x: Int) => x + 1\nval mul = (a: Int, b: Int) => a * b\nprintln(inc(41))\nprintln(mul(6, 7))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "42\n42\n");
+}
+
+#[test]
+fn lambda_function_type_annotation() {
+    // `val sq: Int => Int = x => x * x` — a function-type-annotated binding whose
+    // literal has an unparenthesized single parameter.
+    let (out, ok) = run(&wrap("val sq: Int => Int = x => x * x\nprintln(sq(9))"));
+    assert!(ok);
+    assert_eq!(out, "81\n");
+}
+
+#[test]
+fn lambda_block_body() {
+    let (out, ok) = run(&wrap(
+        "val blk = (x: Int) => { val y = x * 2; y + 1 }\nprintln(blk(20))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "41\n");
+}
+
+#[test]
+fn lambda_passed_as_argument() {
+    let (out, ok) = run(&wrap(
+        "def applyTo(f: Int => Int, v: Int): Int = f(v)\nval inc = (x: Int) => x + 1\nprintln(applyTo(inc, 100))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "101\n");
+}
+
+#[test]
+fn lambda_returned_and_captures_enclosing_param() {
+    // A returned closure over the enclosing `def`'s parameter (`n`) — the upvalue
+    // must survive after `adder` has returned.
+    let (out, ok) = run(&wrap(
+        "def adder(n: Int): Int => Int = (x: Int) => x + n\nval add10 = adder(10)\nprintln(add10(5))\nprintln(adder(100)(1))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "15\n101\n");
+}
+
+#[test]
+fn lambda_composition_captures_two_params() {
+    let (out, ok) = run(&wrap(
+        "def compose(f: Int => Int, g: Int => Int): Int => Int = (x: Int) => f(g(x))\nval inc = (x: Int) => x + 1\nval dbl = (x: Int) => x * 2\nprintln(compose(inc, dbl)(10))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "21\n");
+}
+
+#[test]
+fn underscore_placeholder_forms() {
+    // `_ * 2` (one placeholder), `_ + _` (two placeholders → two-param lambda).
+    let (out, ok) = run(&wrap(
+        "println(List(1,2,3,4).map(_ * 2))\nprintln(List(1,2,3,4).filter(_ % 2 == 0))\nprintln(List(1,2,3,4).foldLeft(0)(_ + _))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(2, 4, 6, 8)\nList(2, 4)\n10\n");
+}
+
+// ── List (byte-verified vs scala 3.8.4) ──────────────────────────────────────
+
+#[test]
+fn list_literal_nil_and_basic_accessors() {
+    let (out, ok) = run(&wrap(
+        "val xs = List(10, 20, 30)\nprintln(xs)\nprintln(Nil)\nprintln(List())\nprintln(xs.head)\nprintln(xs.tail)\nprintln(xs.length)\nprintln(xs.isEmpty)\nprintln(xs.reverse)\nprintln(xs.contains(20))\nprintln(xs(2))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(10, 20, 30)\nList()\nList()\n10\nList(20, 30)\n3\nfalse\nList(30, 20, 10)\ntrue\n30\n"
+    );
+}
+
+#[test]
+fn list_cons_is_right_associative() {
+    let (out, ok) = run(&wrap(
+        "val xs = List(10, 20)\nprintln(0 :: xs)\nprintln(1 :: 2 :: 3 :: Nil)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(0, 10, 20)\nList(1, 2, 3)\n");
+}
+
+#[test]
+fn list_map_filter_foldleft_chain() {
+    let (out, ok) = run(&wrap(
+        "println(List(1,2,3).map(x => x + 10))\nprintln(List(1,2,3,4,5).filter(_ > 2).map(_ * 10).sum)\nprintln(List(\"a\",\"b\",\"c\").foldLeft(\"\")((acc, s) => acc + s))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(11, 12, 13)\n120\nabc\n");
+}
+
+#[test]
+fn list_foreach_side_effects_in_order() {
+    // `foreach` runs for effect (its `Unit` result is discarded, not printed).
+    let (out, ok) = run(&wrap("List(1,2,3).foreach(x => print(x + \" \"))"));
+    assert!(ok);
+    assert_eq!(out, "1 2 3 ");
+}
+
+#[test]
+fn list_flatmap_flattens() {
+    let (out, ok) = run(&wrap(
+        "println(List(1,2,3).flatMap(x => List(x, x * 10)))\nprintln(List(List(1,2), List(3,4)).flatMap(x => x))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(1, 10, 2, 20, 3, 30)\nList(1, 2, 3, 4)\n");
+}
+
+// ── Map (byte-verified vs scala 3.8.4) ───────────────────────────────────────
+
+#[test]
+fn map_literal_and_lookups() {
+    let (out, ok) = run(&wrap(
+        "val m = Map(\"a\" -> 1, \"b\" -> 2, \"c\" -> 3)\nprintln(m)\nprintln(m(\"b\"))\nprintln(m.get(\"a\"))\nprintln(m.get(\"z\"))\nprintln(m.contains(\"c\"))\nprintln(m.size)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Map(a -> 1, b -> 2, c -> 3)\n2\nSome(1)\nNone\ntrue\n3\n"
+    );
+}
+
+#[test]
+fn map_keys_values_and_plus() {
+    let (out, ok) = run(&wrap(
+        "val m = Map(\"a\" -> 1, \"b\" -> 2)\nprintln(m.keys)\nprintln(m.values)\nprintln(m + (\"c\" -> 3))\nprintln(Map[String,Int]())",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Set(a, b)\nIterable(1, 2)\nMap(a -> 1, b -> 2, c -> 3)\nMap()\n"
+    );
+}
+
+#[test]
+fn arrow_builds_a_tuple() {
+    let (out, ok) = run(&wrap("println(\"k\" -> 99)\nprintln((1, 2, 3))"));
+    assert!(ok);
+    assert_eq!(out, "(k,99)\n(1,2,3)\n");
+}
+
+// ── for-comprehensions over collections (byte-verified vs scala 3.8.4) ────────
+
+#[test]
+fn for_yield_over_list_maps() {
+    let (out, ok) = run(&wrap(
+        "println(for (x <- List(1,2,3)) yield x * 2)\nprintln(for (x <- List(1,2,3,4) if x % 2 == 0) yield x)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(2, 4, 6)\nList(2, 4)\n");
+}
+
+#[test]
+fn for_yield_multi_generator_flatmaps() {
+    let (out, ok) = run(&wrap(
+        "println(for (x <- List(1,2); y <- List(10,20)) yield x + y)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(11, 21, 12, 22)\n");
+}
+
+#[test]
+fn for_foreach_over_collection_runs_for_effect() {
+    let (out, ok) = run(&wrap(
+        "var s = 0\nfor (x <- List(5,10,15)) s += x\nprintln(s)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "30\n");
+}
+
+#[test]
+fn def_reference_eta_expands_to_a_function_value() {
+    // A bare `def` used as an argument is eta-expanded (`sq` ⇒ `x => sq(x)`).
+    let (out, ok) = run(&wrap(
+        "def sq(x: Int): Int = x * x\nprintln(List(1,2,3,4).map(sq))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(1, 4, 9, 16)\n");
+}
+
+#[test]
+fn lambda_body_may_be_an_assignment_statement() {
+    let (out, ok) = run(&wrap(
+        "var total = 0\nList(1,2,3,4,5).foreach(x => total += x)\nprintln(total)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "15\n");
+}
+
+#[test]
+fn range_yield_result_supports_collection_methods() {
+    // A range `for … yield` (a `Vector`) can be chained through `.toList`/`.map`.
+    let (out, ok) = run(&wrap(
+        "println((for (i <- 1 to 5) yield i).toList.map(_ * 10))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(10, 20, 30, 40, 50)\n");
+}
+
+#[test]
+fn for_yield_range_led_generator_is_a_vector() {
+    // A range-led comprehension mixing a collection generator yields a `Vector`
+    // (Scala's `Range.flatMap` result type), not a `List`.
+    let (out, ok) = run(&wrap(
+        "println(for (i <- 1 to 3; c <- List(\"a\",\"b\")) yield i + c)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "Vector(1a, 1b, 2a, 2b, 3a, 3b)\n");
+}

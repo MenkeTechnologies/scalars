@@ -38,24 +38,23 @@ never silently mis-run.
   (parsed and ignored), type parameters (parsed and ignored), abstract members.
   A class's `val`/private access modifiers are parsed but not enforced (every
   field is reachable — a documented simplification).
-- **Collections and arrays.** `Array`, `List`, `Seq`, `Map`, indexing,
-  higher-order `.map`/`.filter`. These are blocked on **lambdas** (`x => …`),
-  which scalars does not have yet: `.map`/`.filter` and collection `for`
-  generators (`x <- list`) all take a function value. A host-side `List`/`Map`
-  `Obj` is straightforward on the object heap built here, but is deferred until
-  lambdas land so the collection API can be modeled faithfully rather than
-  stubbed. The `args` parameter of `main` is parsed and ignored.
+- **Mutable / other collections.** `Array`, `Seq`/`Vector`/`Set` literals,
+  `mutable.*`, and the many collection methods beyond the wired subset. The
+  immutable `List` and `Map` are modeled host-side (`List(…)`, `Nil`, `::`,
+  `.head`/`.tail`/`.length`/`.isEmpty`/`.reverse`/`.contains`/indexing,
+  `.map`/`.filter`/`.flatMap`/`.foreach`/`.foldLeft`/`.foldRight`/`.reduce`/
+  `.sum`/`.mkString`/`.exists`/`.forall`/`.count`; `Map(k -> v)`, `.apply`/`.get`/
+  `.contains`/`.keys`/`.values`/`.size`/`getOrElse`/`+`); a range-led
+  comprehension yields a `Vector`. The `args` parameter of `main` is parsed and
+  ignored.
 - **The wider standard library.** `math`, `scala.io`, `scala.collection.*`, and
   the many `String`/numeric methods beyond the wired subset above.
 - **`if`/`else` as an expression in operand position.** `val r = if (c) a else b`
   is rejected; a tail `if`/`else` as a whole `def` body is supported.
-- **String interpolation.** `s"$name"`, `f"$x%.2f"`, `raw"..."`.
-- **`for … yield` comprehensions and the `by` step** — only side-effecting
-  `for (i <- a until|to b)` ranges with step 1 run today.
-- **`match`/`case`, pattern matching, `do/while`, `try`/`catch`/`finally`,
-  `throw` (user-raised).**
-- **Functions as values, lambdas (`=>`), by-name params, `given`/`using`,
-  generics, `@main` (Scala 3 annotation entry).**
+- **`by` step in ranges** — `for (i <- a until|to b)` runs with step 1 only.
+- **`do/while`, `try`/`catch`/`finally`, `throw` (user-raised).**
+- **By-name params, `given`/`using`, generics, `@main` (Scala 3 annotation
+  entry).**
 
 ## Modeled with a documented simplification
 

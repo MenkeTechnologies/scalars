@@ -15,7 +15,7 @@
 //!    with a non-numeric operand to [`numeric_hook`], where `+` concatenates via
 //!    the same [`scala_str`].
 
-use fusevm::{NumOp, Value, VM};
+use fusevm::{Frame, NumOp, VMResult, Value, VM};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -80,6 +80,34 @@ pub const OBJ_COPY: u16 = 712;
 /// assignment inside a method). The stack holds the receiver (deepest), the
 /// field-name `Str`, and the new value on top; `argc` is 3. Returns `Unit`.
 pub const OBJ_SET: u16 = 713;
+/// Builtin id for building a first-class function value (a lambda). The stack
+/// holds the closure body's name-pool index and its parameter count (two
+/// integers), then the captured upvalue values (deepest first); `argc` is
+/// capture-count + 2. Registers a heap `Closure` and returns its `Value::Obj`
+/// handle (invoked later via `invoke_closure`).
+pub const MAKE_CLOSURE: u16 = 714;
+/// Builtin id for `apply` on a heap value — the universal `receiver(args)`
+/// dispatch. The stack holds the receiver (deepest) and the `argc` args on top.
+/// A closure is invoked; a `List` is indexed; a `Map` is keyed; a `Tuple` is
+/// indexed (`t(0)`). Faults for a non-applyable receiver.
+pub const APPLY: u16 = 715;
+/// Builtin id for a `List(...)` literal. The stack holds the `argc` element
+/// values (deepest first); returns a host-heap `List` handle.
+pub const MAKE_LIST: u16 = 716;
+/// Builtin id for a `Map(...)` literal. The stack holds the `argc` `Tuple2`
+/// key/value pair values (deepest first); returns an insertion-ordered host-heap
+/// `Map` handle (a duplicate key keeps its first position with the last value).
+pub const MAKE_MAP: u16 = 717;
+/// Builtin id for a tuple literal (`(a, b)`, `a -> b`). The stack holds the
+/// `argc` element values (deepest first); returns a host-heap `Tuple` handle.
+pub const MAKE_TUPLE: u16 = 718;
+/// Builtin id for `::` cons. The stack holds the head value (deepest) and the
+/// tail `List` on top; `argc` is 2. Returns a new `List` with `head` prepended.
+pub const LIST_CONS: u16 = 719;
+/// Builtin id for materializing an integer range as a `List` (a range generator
+/// inside a desugared collection for-comprehension). The stack holds `start`,
+/// `end`, and an `inclusive` `Bool` (top); `argc` is 3. Step is 1.
+pub const RANGE_LIST: u16 = 720;
 
 thread_local! {
     /// Set by a runtime fault raised inside a builtin (an FFI compile/dispatch
@@ -117,6 +145,13 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(OBJ_CLASS, b_obj_class);
     vm.register_builtin(OBJ_COPY, b_obj_copy);
     vm.register_builtin(OBJ_SET, b_obj_set);
+    vm.register_builtin(MAKE_CLOSURE, b_make_closure);
+    vm.register_builtin(APPLY, b_apply);
+    vm.register_builtin(MAKE_LIST, b_make_list);
+    vm.register_builtin(MAKE_MAP, b_make_map);
+    vm.register_builtin(MAKE_TUPLE, b_make_tuple);
+    vm.register_builtin(LIST_CONS, b_list_cons);
+    vm.register_builtin(RANGE_LIST, b_range_list);
 }
 
 // ── Host-side object heap ───────────────────────────────────────────────────
@@ -130,7 +165,58 @@ pub fn install(vm: &mut VM) {
 // reset per run (see [`reset_heap`]); every construction site bakes the class
 // name + field names into the bytecode, so no runtime class registry is needed.
 
-/// A live Scala object behind a [`Value::Obj`] handle.
+/// A live Scala object behind a [`Value::Obj`] handle: a class/case instance, a
+/// collection, a tuple, or a first-class function value.
+#[derive(Clone)]
+enum HeapVal {
+    /// A `class`/`case class`/`object` instance (an ordered, type-tagged record).
+    Record(ScalaObj),
+    /// A sequence collection. `kind` selects the `toString` prefix (`List(…)`,
+    /// `Set(…)`, `Iterable(…)`) so `.keys`/`.values` render as Scala does.
+    Seq(SeqKind, Vec<Value>),
+    /// An insertion-ordered map (matches `Map1`..`Map4`'s stable order and
+    /// `m + (k -> v)` mutation semantics — a new key appends, an existing key
+    /// keeps its position with the new value).
+    Map(Vec<(Value, Value)>),
+    /// A tuple (`(a, b)`, `a -> b`).
+    Tuple(Vec<Value>),
+    /// A first-class function value (lambda) — see [`Closure`].
+    Closure(Closure),
+}
+
+/// The rendered prefix of a [`HeapVal::Seq`].
+#[derive(Clone, Copy, PartialEq)]
+enum SeqKind {
+    List,
+    Vector,
+    Set,
+    Iterable,
+}
+
+impl SeqKind {
+    fn label(self) -> &'static str {
+        match self {
+            SeqKind::List => "List",
+            SeqKind::Vector => "Vector",
+            SeqKind::Set => "Set",
+            SeqKind::Iterable => "Iterable",
+        }
+    }
+}
+
+/// A first-class function value. `name_idx` is the closure body's name-pool index
+/// (resolved to a subroutine entry via `Chunk::find_sub` at call time), `params`
+/// its declared parameter count, and `captures` the values read from the enclosing
+/// frame at creation time (its upvalues, stored by value so a returned closure
+/// still sees them after the defining frame has popped).
+#[derive(Clone)]
+struct Closure {
+    name_idx: u16,
+    params: u8,
+    captures: Vec<Value>,
+}
+
+/// A live Scala class instance behind a [`HeapVal::Record`].
 #[derive(Clone)]
 struct ScalaObj {
     /// The declaring class/object name (`Point`, `Some`, `None`, …).
@@ -150,7 +236,7 @@ thread_local! {
     /// The per-run object arena. Handles index into it; cleared by [`reset_heap`]
     /// before each program so runs in one process (the library `run_str` path)
     /// do not share instances.
-    static HEAP: RefCell<Vec<ScalaObj>> = const { RefCell::new(Vec::new()) };
+    static HEAP: RefCell<Vec<HeapVal>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Clear the object arena. Called by the runner before each program run.
@@ -159,7 +245,7 @@ pub fn reset_heap() {
 }
 
 /// Allocate `o` in the arena and return its `Value::Obj` handle.
-fn heap_alloc(o: ScalaObj) -> Value {
+fn heap_push(o: HeapVal) -> Value {
     HEAP.with(|h| {
         let mut h = h.borrow_mut();
         h.push(o);
@@ -167,12 +253,68 @@ fn heap_alloc(o: ScalaObj) -> Value {
     })
 }
 
-/// Run `f` against the object `v` points to, or `None` if `v` is not a live
-/// handle. Multiple concurrent shared borrows are fine (nested `Obj` fields
-/// re-borrow through [`scala_str`]); only a `borrow_mut` would conflict.
+/// Allocate a class/case record and return its handle.
+fn heap_alloc(o: ScalaObj) -> Value {
+    heap_push(HeapVal::Record(o))
+}
+
+/// Run `f` against the record `v` points to, or `None` if `v` is not a live
+/// record handle (a collection/tuple/closure returns `None`).
 fn with_obj<R>(v: &Value, f: impl FnOnce(&ScalaObj) -> R) -> Option<R> {
     if let Value::Obj(id) = v {
-        HEAP.with(|h| h.borrow().get(*id as usize).map(f))
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Record(o)) => Some(f(o)),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Clone the elements of a `Seq`/`Tuple` handle (both are element sequences), if
+/// `v` is one. Used by the pure (`vm`-free) helpers.
+fn as_seq(v: &Value) -> Option<Vec<Value>> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Seq(_, items)) => Some(items.clone()),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Clone a `Seq` handle's kind and elements, if `v` is one.
+fn seq_kind_items(v: &Value) -> Option<(SeqKind, Vec<Value>)> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Seq(k, items)) => Some((*k, items.clone())),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Clone the entries of a `Map` handle, if `v` is one.
+fn as_map(v: &Value) -> Option<Vec<(Value, Value)>> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Map(m)) => Some(m.clone()),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Clone a closure handle's metadata, if `v` is a closure value.
+fn as_closure(v: &Value) -> Option<Closure> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Closure(c)) => Some(c.clone()),
+            _ => None,
+        })
     } else {
         None
     }
@@ -266,14 +408,244 @@ fn b_obj_set(vm: &mut VM, _argc: u8) -> Value {
     let recv = vm.pop();
     if let Value::Obj(id) = recv {
         HEAP.with(|h| {
-            if let Some(o) = h.borrow_mut().get_mut(id as usize) {
-                if let Some(f) = o.fields.iter_mut().find(|f| &*f.0 == name) {
+            if let Some(HeapVal::Record(o)) = h.borrow_mut().get_mut(id as usize) {
+                if let Some(f) = o.fields.iter_mut().find(|f| f.0.as_ref() == name.as_str()) {
                     f.1 = val;
                 }
             }
         });
     }
     Value::Undef
+}
+
+// ── Closures, collections, tuples ──────────────────────────────────────────
+
+/// `MAKE_CLOSURE` builtin — pop the capture count (`argc - 2`), then the
+/// parameter count and body name index, then the captured upvalue values
+/// (deepest first). Registers a heap [`Closure`] and returns its handle.
+fn b_make_closure(vm: &mut VM, argc: u8) -> Value {
+    let ncap = (argc as usize).saturating_sub(2);
+    let mut captures = Vec::with_capacity(ncap);
+    for _ in 0..ncap {
+        captures.push(vm.pop());
+    }
+    captures.reverse();
+    let params = vm.pop().to_int() as u8;
+    let name_idx = vm.pop().to_int() as u16;
+    heap_push(HeapVal::Closure(Closure {
+        name_idx,
+        params,
+        captures,
+    }))
+}
+
+/// `MAKE_LIST` builtin — pop `argc` element values (deepest first) into a `List`.
+fn b_make_list(vm: &mut VM, argc: u8) -> Value {
+    let mut items = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        items.push(vm.pop());
+    }
+    items.reverse();
+    heap_push(HeapVal::Seq(SeqKind::List, items))
+}
+
+/// `MAKE_TUPLE` builtin — pop `argc` element values (deepest first) into a tuple.
+fn b_make_tuple(vm: &mut VM, argc: u8) -> Value {
+    let mut items = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        items.push(vm.pop());
+    }
+    items.reverse();
+    heap_push(HeapVal::Tuple(items))
+}
+
+/// `MAKE_MAP` builtin — pop `argc` `Tuple2` pair values (deepest first) into an
+/// insertion-ordered map. A duplicate key keeps its first position with the last
+/// value (Scala's `Map(a -> 1, a -> 2)` == `Map(a -> 2)`).
+fn b_make_map(vm: &mut VM, argc: u8) -> Value {
+    let mut pairs = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        pairs.push(vm.pop());
+    }
+    pairs.reverse();
+    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
+    for p in &pairs {
+        let (k, v) = match as_seq_or_tuple(p) {
+            Some(t) if t.len() == 2 => (t[0].clone(), t[1].clone()),
+            _ => return fault(vm, "scalars: Map(...) expects `key -> value` pairs"),
+        };
+        map_put(&mut entries, k, v);
+    }
+    heap_push(HeapVal::Map(entries))
+}
+
+/// `LIST_CONS` builtin (`head :: tail`) — pop the tail `List` and the head, and
+/// return a new `List` with `head` prepended.
+fn b_list_cons(vm: &mut VM, _argc: u8) -> Value {
+    let tail = vm.pop();
+    let head = vm.pop();
+    let mut items = match as_seq(&tail) {
+        Some(t) => t,
+        None => return fault(vm, "scalars: `::` right operand is not a List"),
+    };
+    items.insert(0, head);
+    heap_push(HeapVal::Seq(SeqKind::List, items))
+}
+
+/// `RANGE_LIST` builtin — materialize `[start .. end]` (inclusive when the top
+/// `Bool` is `true`) as a step-1 `List`.
+fn b_range_list(vm: &mut VM, _argc: u8) -> Value {
+    let inclusive = matches!(vm.pop(), Value::Bool(true));
+    let end = vm.pop().to_int();
+    let start = vm.pop().to_int();
+    let last = if inclusive { end } else { end - 1 };
+    let items = (start..=last).map(Value::int).collect();
+    // A `Range`'s `map`/`flatMap` yields an `IndexedSeq` (`Vector`); model the
+    // materialized range as a `Vector` so a range-led comprehension renders as
+    // Scala's `Vector(...)`, not `List(...)`.
+    heap_push(HeapVal::Seq(SeqKind::Vector, items))
+}
+
+/// Read a tuple/seq's elements (a `Tuple2` is a 2-element sequence).
+fn as_seq_or_tuple(v: &Value) -> Option<Vec<Value>> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Tuple(t)) | Some(HeapVal::Seq(_, t)) => Some(t.clone()),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Insert/update `(k, v)` in an ordered entry list: update in place if `k` is
+/// already present (keeping its position), else append.
+fn map_put(entries: &mut Vec<(Value, Value)>, k: Value, v: Value) {
+    match entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
+        Some(slot) => slot.1 = v,
+        None => entries.push((k, v)),
+    }
+}
+
+/// `APPLY` builtin — the universal `receiver(args)` dispatch (Scala `apply`).
+/// The stack holds the receiver (deepest) then the `argc` args. A closure is
+/// invoked; a `List`/`Tuple` is indexed; a `Map` is keyed.
+fn b_apply(vm: &mut VM, argc: u8) -> Value {
+    let k = argc as usize;
+    let mut args = Vec::with_capacity(k);
+    for _ in 0..k {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let recv = vm.pop();
+    match apply_value(vm, &recv, &args) {
+        Ok(v) => v,
+        Err(e) => fault(vm, e),
+    }
+}
+
+/// Dispatch `recv(args)`: closure invocation, list/tuple indexing, or map lookup.
+fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, String> {
+    if as_closure(recv).is_some() {
+        return invoke_closure(vm, recv, args);
+    }
+    if let Value::Obj(id) = recv {
+        let kind = HEAP.with(|h| {
+            h.borrow().get(*id as usize).map(|o| match o {
+                HeapVal::Seq(..) => 0u8,
+                HeapVal::Tuple(_) => 1,
+                HeapVal::Map(_) => 2,
+                _ => 3,
+            })
+        });
+        match kind {
+            Some(0) | Some(1) => {
+                let items = as_seq_or_tuple(recv).unwrap_or_default();
+                let i = args.first().map(|a| a.to_int()).unwrap_or(0);
+                return list_index(&items, i);
+            }
+            Some(2) => {
+                let m = as_map(recv).unwrap_or_default();
+                let key = args.first().cloned().unwrap_or(Value::Undef);
+                return map_get(&m, &key)
+                    .ok_or_else(|| format!("scalars: key not found: {}", scala_str(&key)));
+            }
+            _ => {}
+        }
+    }
+    Err(format!(
+        "scalars: value {} cannot be applied to arguments",
+        scala_str(recv)
+    ))
+}
+
+/// Read element `i` of a list/tuple, or an out-of-bounds error.
+fn list_index(items: &[Value], i: i64) -> Result<Value, String> {
+    if i < 0 || i as usize >= items.len() {
+        Err(format!(
+            "scalars: java.lang.IndexOutOfBoundsException: {i} (length {})",
+            items.len()
+        ))
+    } else {
+        Ok(items[i as usize].clone())
+    }
+}
+
+/// Look up `key` in an ordered map's entries (structural key equality).
+fn map_get(entries: &[(Value, Value)], key: &Value) -> Option<Value> {
+    entries
+        .iter()
+        .find(|(k, _)| value_eq(k, key))
+        .map(|(_, v)| v.clone())
+}
+
+// ── Re-entrant closure/subroutine invocation ────────────────────────────────
+//
+// A collection op (`map`/`filter`/`foldLeft`/…) must run a closure body mid-op.
+// This drives a *nested* `VM::run`: push a call frame whose `return_ip` is past
+// the chunk end so the nested run halts exactly when the body's `ReturnValue`
+// pops that frame, then save/restore the interpreter IP so the enclosing dispatch
+// loop resumes cleanly. This is the same host-side first-class-closure pattern
+// groovyrs uses — no fusevm change, closures live entirely in the frontend heap.
+
+/// Run a subroutine body whose prologue values are already pushed above
+/// `stack_base`, returning its result value.
+fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String> {
+    let return_ip = vm.chunk.ops.len();
+    vm.frames.push(Frame {
+        return_ip,
+        stack_base,
+        slots: Vec::new(),
+    });
+    let saved_ip = vm.ip;
+    vm.ip = entry;
+    let result = vm.run();
+    vm.ip = saved_ip;
+    match result {
+        VMResult::Ok(v) => Ok(v),
+        VMResult::Halted => Ok(vm.stack.pop().unwrap_or(Value::Undef)),
+        VMResult::Error(e) => Err(e),
+    }
+}
+
+/// Invoke closure `clo` with `args`: push exactly `params` arguments (padding
+/// with `null`, dropping extras), then the captured upvalues in declaration
+/// order, and run the body. The prologue pops params+captures into slots.
+fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Result<Value, String> {
+    let meta = as_closure(clo).ok_or_else(|| "scalars: value is not a function".to_string())?;
+    let entry = vm
+        .chunk
+        .find_sub(meta.name_idx)
+        .ok_or_else(|| "scalars: closure body not found".to_string())?;
+    let want = meta.params as usize;
+    let stack_base = vm.stack.len();
+    for i in 0..want {
+        vm.stack.push(args.get(i).cloned().unwrap_or(Value::Undef));
+    }
+    for cap in &meta.captures {
+        vm.stack.push(cap.clone());
+    }
+    run_sub(vm, entry, stack_base)
 }
 
 /// Resolve a method/field access on a heap object (the `Value::Obj` arm of
@@ -301,29 +673,52 @@ fn no_such_obj_member(class: &str, name: &str) -> String {
     format!("scalars: value {name} is not a member of {class}")
 }
 
-/// Render a heap object as Scala would: a `case` instance is `Class(f0,f1,…)`
-/// (fields in declared order via `toString`, comma-joined with no space, exactly
-/// as Scala's synthesized `case` `toString`); a plain instance is `Class@<hex>`
-/// (identity hash — the handle stands in for the JVM identity hash).
+/// Render a heap object as Scala would. A `case` instance is `Class(f0,f1,…)`
+/// (fields in declared order via `toString`, comma-joined with no space); a
+/// plain instance is `Class@<hex>` (the handle stands in for the JVM identity
+/// hash). A collection renders `List(e0, e1)` / `Set(…)` / `Iterable(…)`; a map
+/// `Map(k -> v, …)`; a tuple `(a,b)`; a function `<functionN>`.
 fn obj_to_string(v: &Value) -> String {
-    with_obj(v, |o| {
-        if o.is_case && o.is_object {
-            // A `case object` prints as its bare name (`None`), not `None()`.
-            o.class.to_string()
-        } else if o.is_case {
-            let inner = o
-                .fields
-                .iter()
-                .map(|(_, val)| scala_str(val))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{}({})", o.class, inner)
-        } else {
-            let id = if let Value::Obj(i) = v { *i } else { 0 };
-            format!("{}@{:x}", o.class, id)
+    let id = if let Value::Obj(i) = v { *i } else { 0 };
+    HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(id as usize) {
+            Some(HeapVal::Record(o)) => {
+                if o.is_case && o.is_object {
+                    // A `case object` prints as its bare name (`None`), not `None()`.
+                    o.class.to_string()
+                } else if o.is_case {
+                    let inner = o
+                        .fields
+                        .iter()
+                        .map(|(_, val)| scala_str(val))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{}({})", o.class, inner)
+                } else {
+                    format!("{}@{:x}", o.class, id)
+                }
+            }
+            Some(HeapVal::Seq(kind, items)) => {
+                let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(", ");
+                format!("{}({inner})", kind.label())
+            }
+            Some(HeapVal::Map(entries)) => {
+                let inner = entries
+                    .iter()
+                    .map(|(k, val)| format!("{} -> {}", scala_str(k), scala_str(val)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Map({inner})")
+            }
+            Some(HeapVal::Tuple(items)) => {
+                let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(",");
+                format!("({inner})")
+            }
+            Some(HeapVal::Closure(c)) => format!("<function{}>", c.params),
+            None => "null".to_string(),
         }
     })
-    .unwrap_or_else(|| "null".to_string())
 }
 
 /// A `case` instance's structural hash (equal instances hash equal). A plain
@@ -369,8 +764,15 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
             if ia == ib {
                 return true; // same instance (also the plain-class identity case)
             }
-            match (with_obj(a, |o| o.clone()), with_obj(b, |o| o.clone())) {
-                (Some(oa), Some(ob)) => {
+            let (oa, ob) = match HEAP.with(|h| {
+                let h = h.borrow();
+                Some((h.get(*ia as usize)?.clone(), h.get(*ib as usize)?.clone()))
+            }) {
+                Some(p) => p,
+                None => return false,
+            };
+            match (oa, ob) {
+                (HeapVal::Record(oa), HeapVal::Record(ob)) => {
                     // Plain classes already failed the identity check above.
                     oa.is_case
                         && ob.is_case
@@ -381,6 +783,19 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
                             .iter()
                             .zip(&ob.fields)
                             .all(|((_, x), (_, y))| value_eq(x, y))
+                }
+                // Two sequences/tuples are equal element-by-element (a `List`
+                // equals a `Set` only if both order and elements match — good
+                // enough for the collections this frontend builds).
+                (HeapVal::Seq(_, xa), HeapVal::Seq(_, xb))
+                | (HeapVal::Tuple(xa), HeapVal::Tuple(xb)) => {
+                    xa.len() == xb.len() && xa.iter().zip(&xb).all(|(x, y)| value_eq(x, y))
+                }
+                (HeapVal::Map(ma), HeapVal::Map(mb)) => {
+                    ma.len() == mb.len()
+                        && ma
+                            .iter()
+                            .all(|(k, v)| map_get(&mb, k).is_some_and(|w| value_eq(v, &w)))
                 }
                 _ => false,
             }
@@ -630,11 +1045,314 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
     }
     args.reverse();
     let recv = vm.pop();
+    // A range `for … yield` result is a fusevm `Value::Array` (rendered as
+    // `Vector`); promote it to a heap `Vector` seq so the collection methods
+    // (`map`, `toList`, …) apply uniformly.
+    let recv = match &recv {
+        Value::Array(items) => heap_push(HeapVal::Seq(SeqKind::Vector, items.clone())),
+        _ => recv,
+    };
 
+    // A heap collection/tuple/closure may need to run a closure body mid-method
+    // (`map`, `filter`, `foldLeft`, …), so those dispatch through the vm-aware
+    // path; everything else stays on the pure dispatcher.
+    if is_heap_collection(&recv) {
+        return match heap_method(vm, &recv, &name, &args) {
+            Ok(v) => v,
+            Err(e) => fault(vm, e),
+        };
+    }
     match dispatch_method(&recv, &name, &args) {
         Ok(v) => v,
         Err(e) => fault(vm, e),
     }
+}
+
+/// Whether `v` is a heap `Seq`/`Map`/`Tuple`/`Closure` (dispatched vm-aware).
+fn is_heap_collection(v: &Value) -> bool {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| {
+            matches!(
+                h.borrow().get(*id as usize),
+                Some(HeapVal::Seq(..) | HeapVal::Map(_) | HeapVal::Tuple(_) | HeapVal::Closure(_))
+            )
+        })
+    } else {
+        false
+    }
+}
+
+/// The heap kind of `v`, for method routing.
+fn heap_kind(v: &Value) -> Option<u8> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| {
+            h.borrow().get(*id as usize).map(|o| match o {
+                HeapVal::Seq(..) => 0u8,
+                HeapVal::Map(_) => 1,
+                HeapVal::Tuple(_) => 2,
+                HeapVal::Closure(_) => 3,
+                HeapVal::Record(_) => 4,
+            })
+        })
+    } else {
+        None
+    }
+}
+
+/// Dispatch a method on a heap collection/tuple/closure. The closure-consuming
+/// operations re-enter the VM (via [`invoke_closure`]) to run their function arg.
+fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if name == "toString" && args.is_empty() {
+        return Ok(Value::str(scala_str(recv)));
+    }
+    if (name == "equals" || name == "==") && args.len() == 1 {
+        return Ok(Value::bool(obj_eq(recv, &args[0])));
+    }
+    match heap_kind(recv) {
+        Some(0) => seq_method(vm, recv, name, args),
+        Some(1) => map_method(vm, recv, name, args),
+        Some(2) => tuple_method(recv, name, args),
+        Some(3) => closure_method(vm, recv, name, args),
+        _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// `Seq` (`List`/`Set`/`Iterable`) methods — a faithful subset. Closure-taking
+/// ops run their function argument through [`invoke_closure`].
+fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
+    // A transforming op keeps the receiver's collection kind (`List.map` → `List`,
+    // a range-derived `Vector.map` → `Vector`).
+    let same = |v: Vec<Value>| new_seq(kind, v);
+    match (name, args.len()) {
+        ("length" | "size", 0) => Ok(Value::int(items.len() as i64)),
+        ("isEmpty", 0) => Ok(Value::bool(items.is_empty())),
+        ("nonEmpty", 0) => Ok(Value::bool(!items.is_empty())),
+        ("head", 0) => items
+            .first()
+            .cloned()
+            .ok_or_else(|| "scalars: java.util.NoSuchElementException: head of empty list".into()),
+        ("last", 0) => items
+            .last()
+            .cloned()
+            .ok_or_else(|| "scalars: java.util.NoSuchElementException: last of empty list".into()),
+        ("tail", 0) => {
+            if items.is_empty() {
+                Err("scalars: java.lang.UnsupportedOperationException: tail of empty list".into())
+            } else {
+                Ok(same(items[1..].to_vec()))
+            }
+        }
+        ("reverse", 0) => Ok(same(items.iter().rev().cloned().collect())),
+        ("sum", 0) => Ok(seq_sum(&items)),
+        ("mkString", 0) => Ok(Value::str(
+            items.iter().map(scala_str).collect::<Vec<_>>().join(""),
+        )),
+        ("mkString", 1) => {
+            let sep = args[0].as_str_cow().into_owned();
+            Ok(Value::str(
+                items.iter().map(scala_str).collect::<Vec<_>>().join(&sep),
+            ))
+        }
+        ("contains", 1) => Ok(Value::bool(items.iter().any(|x| value_eq(x, &args[0])))),
+        ("apply", 1) => list_index(&items, args[0].to_int()),
+        ("toList", 0) => Ok(new_list(items)),
+        ("map", 1) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in &items {
+                out.push(invoke_closure(vm, &args[0], std::slice::from_ref(it))?);
+            }
+            Ok(same(out))
+        }
+        ("flatMap", 1) => {
+            let mut out = Vec::new();
+            for it in &items {
+                let r = invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
+                match as_seq(&r) {
+                    Some(inner) => out.extend(inner),
+                    None => return Err("scalars: flatMap function must return a collection".into()),
+                }
+            }
+            Ok(same(out))
+        }
+        ("filter" | "filterNot" | "withFilter", 1) => {
+            let keep_if = name != "filterNot";
+            let mut out = Vec::new();
+            for it in &items {
+                let r = invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
+                if truthy(&r) == keep_if {
+                    out.push(it.clone());
+                }
+            }
+            Ok(same(out))
+        }
+        ("foreach", 1) => {
+            for it in &items {
+                invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
+            }
+            Ok(Value::Undef)
+        }
+        ("exists", 1) => {
+            for it in &items {
+                if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(it))?) {
+                    return Ok(Value::bool(true));
+                }
+            }
+            Ok(Value::bool(false))
+        }
+        ("forall", 1) => {
+            for it in &items {
+                if !truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(it))?) {
+                    return Ok(Value::bool(false));
+                }
+            }
+            Ok(Value::bool(true))
+        }
+        ("count", 1) => {
+            let mut n = 0i64;
+            for it in &items {
+                if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(it))?) {
+                    n += 1;
+                }
+            }
+            Ok(Value::int(n))
+        }
+        ("foldLeft", 2) => {
+            let mut acc = args[0].clone();
+            for it in &items {
+                acc = invoke_closure(vm, &args[1], &[acc, it.clone()])?;
+            }
+            Ok(acc)
+        }
+        ("foldRight", 2) => {
+            let mut acc = args[0].clone();
+            for it in items.iter().rev() {
+                acc = invoke_closure(vm, &args[1], &[it.clone(), acc])?;
+            }
+            Ok(acc)
+        }
+        ("reduce" | "reduceLeft", 1) => {
+            if items.is_empty() {
+                return Err(
+                    "scalars: java.lang.UnsupportedOperationException: empty.reduceLeft".into(),
+                );
+            }
+            let mut acc = items[0].clone();
+            for it in &items[1..] {
+                acc = invoke_closure(vm, &args[0], &[acc, it.clone()])?;
+            }
+            Ok(acc)
+        }
+        _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// `Map` methods — a faithful subset.
+fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let entries = as_map(recv).unwrap_or_default();
+    match (name, args.len()) {
+        ("size", 0) => Ok(Value::int(entries.len() as i64)),
+        ("isEmpty", 0) => Ok(Value::bool(entries.is_empty())),
+        ("nonEmpty", 0) => Ok(Value::bool(!entries.is_empty())),
+        ("contains", 1) => Ok(Value::bool(map_get(&entries, &args[0]).is_some())),
+        ("apply", 1) => map_get(&entries, &args[0])
+            .ok_or_else(|| format!("scalars: key not found: {}", scala_str(&args[0]))),
+        ("get", 1) => Ok(match map_get(&entries, &args[0]) {
+            Some(v) => make_some(v),
+            None => make_none(),
+        }),
+        ("getOrElse", 2) => Ok(map_get(&entries, &args[0]).unwrap_or_else(|| args[1].clone())),
+        ("keys" | "keySet", 0) => Ok(new_seq(
+            SeqKind::Set,
+            entries.iter().map(|(k, _)| k.clone()).collect(),
+        )),
+        ("values", 0) => Ok(new_seq(
+            SeqKind::Iterable,
+            entries.iter().map(|(_, v)| v.clone()).collect(),
+        )),
+        ("toList", 0) => Ok(new_list(
+            entries
+                .iter()
+                .map(|(k, v)| heap_push(HeapVal::Tuple(vec![k.clone(), v.clone()])))
+                .collect(),
+        )),
+        ("foreach", 1) => {
+            for (k, v) in &entries {
+                let pair = heap_push(HeapVal::Tuple(vec![k.clone(), v.clone()]));
+                invoke_closure(vm, &args[0], std::slice::from_ref(&pair))?;
+            }
+            Ok(Value::Undef)
+        }
+        _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// `Tuple` methods — element accessors `_1`/`_2`/… and indexing.
+fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let items = as_seq_or_tuple(recv).unwrap_or_default();
+    if args.is_empty() {
+        if let Some(n) = name.strip_prefix('_').and_then(|d| d.parse::<usize>().ok()) {
+            if n >= 1 && n <= items.len() {
+                return Ok(items[n - 1].clone());
+            }
+        }
+    }
+    if name == "apply" && args.len() == 1 {
+        return list_index(&items, args[0].to_int());
+    }
+    Err(no_such_method(recv, name))
+}
+
+/// Closure methods — `apply`/`call`.
+fn closure_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "apply" | "call" => invoke_closure(vm, recv, args),
+        _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// Scala truthiness of a closure result used as a predicate (`Boolean`).
+fn truthy(v: &Value) -> bool {
+    matches!(v, Value::Bool(true))
+}
+
+/// Sum a numeric sequence (`Int` result when all `Int`, else `Double`).
+fn seq_sum(items: &[Value]) -> Value {
+    if items.iter().all(|v| matches!(v, Value::Int(_))) {
+        Value::int(items.iter().map(|v| v.to_int()).sum())
+    } else {
+        Value::float(items.iter().map(|v| v.to_float()).sum())
+    }
+}
+
+/// Build a `List` heap value.
+fn new_list(items: Vec<Value>) -> Value {
+    heap_push(HeapVal::Seq(SeqKind::List, items))
+}
+
+/// Build a labelled `Seq` heap value.
+fn new_seq(kind: SeqKind, items: Vec<Value>) -> Value {
+    heap_push(HeapVal::Seq(kind, items))
+}
+
+/// Build a built-in `Some(v)` case-class record.
+fn make_some(v: Value) -> Value {
+    heap_alloc(ScalaObj {
+        class: Arc::from("Some"),
+        is_case: true,
+        is_object: false,
+        fields: vec![(Arc::from("value"), v)],
+    })
+}
+
+/// Build the built-in `None` case-object record.
+fn make_none() -> Value {
+    heap_alloc(ScalaObj {
+        class: Arc::from("None"),
+        is_case: true,
+        is_object: true,
+        fields: Vec::new(),
+    })
 }
 
 /// Resolve `recv.name(args)` against the wired stdlib, or return the Scala-style
@@ -954,6 +1672,17 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             Value::Str(_) => Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b)))),
             Value::Int(_) | Value::Float(_) if matches!(b, Value::Str(_)) => {
                 Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b))))
+            }
+            // `map + (k -> v)` — a new map with the pair added (`Map`'s `+`).
+            Value::Obj(_) if as_map(a).is_some() => {
+                let mut entries = as_map(a).unwrap();
+                match as_seq_or_tuple(b) {
+                    Some(t) if t.len() == 2 => {
+                        map_put(&mut entries, t[0].clone(), t[1].clone());
+                        Ok(heap_push(HeapVal::Map(entries)))
+                    }
+                    _ => Err("scalars: Map `+` expects a `key -> value` pair".to_string()),
+                }
             }
             _ => Err(format!(
                 "scalars: `+` is not defined between `{}` and `{}`",
