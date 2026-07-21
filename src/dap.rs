@@ -387,7 +387,13 @@ fn handle_stopped(vm: &VM, msg: &J) -> bool {
                 .into_iter()
                 .find(|(n, _)| *n == expr)
                 .map(|(_, v)| v)
-                .unwrap_or_else(|| if expr.is_empty() { String::new() } else { format!("<cannot evaluate `{expr}`>") });
+                .unwrap_or_else(|| {
+                    if expr.is_empty() {
+                        String::new()
+                    } else {
+                        format!("<cannot evaluate `{expr}`>")
+                    }
+                });
             respond(
                 req_seq,
                 command,

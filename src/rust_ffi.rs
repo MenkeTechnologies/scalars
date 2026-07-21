@@ -48,12 +48,16 @@ mod tests {
         let out = super::desugar(src);
         assert!(out.contains("__rust_compile("), "no builtin call: {out}");
         assert!(!out.contains("pub extern"), "Rust body leaked: {out}");
-        assert!(out.contains("println(add(2, 3))"), "trailing code lost: {out}");
+        assert!(
+            out.contains("println(add(2, 3))"),
+            "trailing code lost: {out}"
+        );
     }
 
     #[test]
     fn leaves_ordinary_scala_untouched() {
-        let src = "object M {\n  def main(args: Array[String]): Unit = {\n    println(41 + 1)\n  }\n}\n";
+        let src =
+            "object M {\n  def main(args: Array[String]): Unit = {\n    println(41 + 1)\n  }\n}\n";
         assert_eq!(super::desugar(src), src);
     }
 }

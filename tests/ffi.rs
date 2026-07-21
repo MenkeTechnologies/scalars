@@ -76,7 +76,8 @@ fn ffi_works_in_app_body() {
 fn unknown_call_without_ffi_block_is_a_compile_error() {
     // Without a `rust { ... }` block the program has no FFI, so an unknown call
     // keeps the normal "not found" diagnostic rather than a runtime dispatch.
-    let src = "object M {\n  def main(args: Array[String]): Unit = {\n    println(nope(1))\n  }\n}\n";
+    let src =
+        "object M {\n  def main(args: Array[String]): Unit = {\n    println(nope(1))\n  }\n}\n";
     let (_out, err, ok) = run_all(src);
     assert!(!ok, "expected failure but run succeeded");
     assert!(err.contains("not found: nope"), "unexpected error: {err}");

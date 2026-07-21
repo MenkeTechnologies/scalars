@@ -287,7 +287,8 @@ impl Compiler {
             // Only the base64 body (first arg) is needed; the line arg is dropped.
             if let Some(body) = args.first() {
                 self.expr(body)?;
-                self.b.emit(Op::CallBuiltin(crate::host::FFI_COMPILE, 1), line);
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::FFI_COMPILE, 1), line);
             } else {
                 self.b.emit(Op::LoadUndef, line);
             }
@@ -302,8 +303,10 @@ impl Compiler {
         let c = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(c), line);
         // argc is the arg count plus one (the name) — see `host::b_ffi_call`.
-        self.b
-            .emit(Op::CallBuiltin(crate::host::FFI_CALL, args.len() as u8 + 1), line);
+        self.b.emit(
+            Op::CallBuiltin(crate::host::FFI_CALL, args.len() as u8 + 1),
+            line,
+        );
         Ok(())
     }
 
@@ -378,13 +381,15 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
 
 fn expr_has_ffi(e: &Expr) -> bool {
     match e {
-        Expr::Call { name, args, .. } => {
-            name == RUST_COMPILE || args.iter().any(expr_has_ffi)
-        }
+        Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
         Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
         Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
         Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
-        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
         | Expr::Var(_) => false,
     }
 }
