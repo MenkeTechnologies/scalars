@@ -73,15 +73,18 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
   against a live `scala` across ten generators (32,000+ probes clean).
 
-This is an early slice: single-object programs whose entry point (`def main`, or
-an `extends App` body) uses `val`/`var` bindings (with `val` immutability
-enforced), arithmetic, `if`/`while`, the Scala range `for`, and `println`/`print`.
-User-defined `def`s — parameters, recursion, mutual recursion, `return`, and a
-tail `if`/`else` result — compile to fusevm's native call frames, and postfix
-`.` dispatch wires a core `String`/`Int`/`Double` method slice. Classes,
-collections, and the wider standard library are the next waves (see
-[`BUGS.md`](BUGS.md)). Nothing is faked — an unsupported construct is a parse
-error or an honest runtime throw, not a silent mis-run.
+This is an early slice: programs with an entry point (`def main`, or an
+`extends App` body) plus sibling `class`/`object` declarations, using `val`/`var`
+bindings (with `val` immutability enforced), arithmetic, `if`/`while`, the Scala
+range `for`, and `println`/`print`. User-defined `def`s — parameters, recursion,
+mutual recursion, `return`, and a tail `if`/`else` result — compile to fusevm's
+native call frames, and postfix `.` dispatch wires a core `String`/`Int`/`Double`
+method slice. A host-side object model (`class`/`object`/`case class`, `new`,
+fields, `this`, method dispatch, structural `equals`/`hashCode`/`toString`,
+`copy`, `apply`/`unapply`, constructor patterns, built-in `Option`) rides
+fusevm's `Value::Obj` handle. Collections and the wider standard library are the
+next waves (see [`BUGS.md`](BUGS.md)). Nothing is faked — an unsupported
+construct is a parse error or an honest runtime throw, not a silent mis-run.
 
 ---
 
@@ -175,9 +178,17 @@ Implemented and checked against the reference `scala`:
   with Java-`Formatter` specs (`%d`, `%.2f`, `%-5s`, `%05d`, `%x`, `%b`, …), and
   `raw"…"` (escapes stay literal).
 - **Pattern matching** — `expr match { case … }` over literal, `_` wildcard,
-  variable-binding, typed (`case s: String`), and guarded (`case x if x > 0`)
-  patterns; a non-exhaustive match throws `scala.MatchError`. Constructor /
-  case-class patterns are not modeled (fusevm-blocked — see [`BUGS.md`](BUGS.md)).
+  variable-binding, typed (`case s: String`), guarded (`case x if x > 0`), and
+  constructor / case-class patterns (`case Point(x, y)`, `case Some(v)`,
+  `case None`) — nested and guarded; a non-exhaustive match throws
+  `scala.MatchError`.
+- **Object model** — `class C(x: Int) { def m = … }` with `new C(…)`, fields,
+  `this`, in-place `var`-field mutation, and instance-method dispatch; `object`
+  singletons (static `def`s, `Name.val` members); and `case class` with an
+  ordered-field `toString` (`Point(1,2)`), structural `equals`/`hashCode`,
+  `copy(field = …)`, companion `apply` (no `new`) and `unapply`. Built-in
+  `Option` (`Some(v)` / `None`). All of it rides a host-side object heap behind
+  fusevm's `Value::Obj` handle (`src/host.rs`) — no fusevm changes, no JVM.
 - **Method dispatch** — postfix `.` on core values: `String` (`length`,
   `toUpperCase`/`toLowerCase`, `trim`, `reverse`, `substring`, `charAt`,
   `contains`/`startsWith`/`endsWith`, `toInt`/`toDouble`, …), `Int`/`Double`
@@ -245,8 +256,11 @@ slice 1: user-defined `def`s (parameters, recursion, mutual recursion, `return`,
 tail `if`/`else` result) over fusevm's native `Op::Call` frame ABI; postfix `.`
 dispatch wiring a core `String`/`Int`/`Double` method slice; `s`/`f`/`raw` string
 interpolation; `if`/`else` in expression position; `match`/`case` over
-literal / wildcard / variable / typed / guarded patterns; and `for … yield`
-range comprehensions (multi-generator + `if` guards) collecting a `Vector`.
+literal / wildcard / variable / typed / guarded / **constructor** patterns; a
+`for … yield` range comprehension (multi-generator + `if` guards) collecting a
+`Vector`; and a **host-side object model** — `class`/`object`/`case class`,
+`new`, fields, `this`, method dispatch, structural `equals`/`hashCode`,
+`toString`, `copy`, companion `apply`/`unapply`, and built-in `Option`.
 
 ### Differential parity fuzzer
 
@@ -263,15 +277,12 @@ fixes; 32,000+ probes now run clean.
 
 Next waves, in priority order:
 
-1. **Reference types** — the wider `String`/numeric method surface, collections
-   (`List`, `Array`, `Map`) as first-class values with `map`/`flatMap`/`filter`,
-   and a class/`case class`/trait object model. The last is blocked on an
-   ordered, type-tagged record value (fusevm's `Value` has only an unordered
-   `Hash` and an opaque `Obj` handle) — see [`BUGS.md`](BUGS.md). Collection
-   generators in `for` (`for (x <- List(1,2,3))`) and constructor patterns in
-   `match` (`case Some(x)`) unlock with it.
-2. **Scala idioms** — lambdas / function values (needed for real
-   `map`/`flatMap`/`withFilter` desugaring), tuples, and `Option`.
+1. **Lambdas / function values** (`x => …`) — the gating substrate for
+   collections. `.map`/`.flatMap`/`withFilter` and collection `for` generators
+   (`for (x <- List(1,2,3))`) all take a function value, so they wait on this.
+2. **Collections** — `List`/`Array`/`Map` as first-class values on the object
+   heap built for the class model, with `map`/`flatMap`/`filter` once lambdas
+   land, and traits / inheritance / generics for the wider type system.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

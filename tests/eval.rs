@@ -594,13 +594,22 @@ fn match_without_matching_arm_throws() {
 }
 
 #[test]
-fn match_constructor_pattern_is_rejected() {
-    // Constructor/case-class patterns are not modeled (fusevm-blocked); the
-    // parser rejects them rather than mis-lowering.
-    let (_out, ok) = run(&wrap(
-        r#"val x = 5; println(x match { case Some(y) => y; case _ => 0 })"#,
-    ));
-    assert!(!ok, "constructor patterns must be rejected");
+fn match_option_constructor_pattern_binds() {
+    // Constructor patterns on the built-in `Option` — `Some(v)` binds the value,
+    // `None` is a stable-identifier pattern. Verified against `scala`.
+    let src = "object T extends App {\n  val o: Option[Int] = Some(7)\n  val r = o match { case Some(v) => v * 2; case None => -1 }\n  println(r)\n  val e: Option[Int] = None\n  println(e match { case Some(v) => v; case None => 0 })\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "14\n0\n");
+}
+
+#[test]
+fn match_case_class_constructor_pattern_binds_fields() {
+    // `case Point(x, y)` binds each field in declared order.
+    let src = "case class Point(x: Int, y: Int)\nobject T extends App {\n  val p = Point(3, 4)\n  p match { case Point(a, b) => println(a + b) }\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "7\n");
 }
 
 // ── `for … yield` comprehensions ──────────────────────────────────────────
@@ -663,4 +672,136 @@ fn for_side_effecting_with_assignment_body() {
     ));
     assert!(ok);
     assert_eq!(out, "10\n");
+}
+
+// ── classes, objects, case classes (host-side object model) ───────────────
+// Every expected output below was diffed byte-for-byte against `scala` 1.15.0
+// (Scala 3.8.4) during authoring, then frozen.
+
+#[test]
+fn class_new_field_access_and_method() {
+    let src = "class Rect(val w: Int, val h: Int) {\n  def area = w * h\n  def scaled(k: Int) = new Rect(w * k, h * k)\n}\nobject T extends App {\n  val r = new Rect(3, 4)\n  println(r.w)\n  println(r.area)\n  println(r.scaled(2).area)\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "3\n12\n48\n");
+}
+
+#[test]
+fn class_body_var_field_mutates_in_place() {
+    // A `var` field declared in the class body is initialized by the constructor
+    // and mutated in place by a method (`n += 1`), persisting across calls.
+    let src = "class Counter { var n = 0; def bump = { n += 1; n } }\nobject T extends App {\n  val c = new Counter\n  var i = 0\n  while (i < 3) { c.bump; i += 1 }\n  println(c.n)\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn class_method_calls_sibling_method() {
+    // An unqualified call to a sibling method resolves to `this.m(...)`.
+    let src = "class Adder(val base: Int) {\n  def add(n: Int) = base + n\n  def twice(n: Int) = add(add(n))\n}\nobject T extends App {\n  println(new Adder(10).twice(1))\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "21\n");
+}
+
+#[test]
+fn object_singleton_val_and_def_dispatch() {
+    let src = "object Registry {\n  val name = \"reg\"\n  def greet(who: String) = \"hi \" + who\n  def total(a: Int, b: Int) = a + b\n}\nobject T extends App {\n  println(Registry.name)\n  println(Registry.greet(\"bob\"))\n  println(Registry.total(3, 4))\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "reg\nhi bob\n7\n");
+}
+
+#[test]
+fn object_var_member_accumulates_across_calls() {
+    let src = "object State { var total = 0; def addTo(k: Int) = { total += k; total } }\nobject T extends App {\n  println(State.addTo(5))\n  println(State.addTo(3))\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "5\n8\n");
+}
+
+#[test]
+fn case_class_tostring_is_ordered_fields_no_space() {
+    // Scala's synthesized `case` `toString` joins fields with a bare comma.
+    let src = "case class Money(cents: Int, currency: String)\nobject T extends App {\n  println(Money(500, \"USD\"))\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "Money(500,USD)\n");
+}
+
+#[test]
+fn case_class_equals_is_structural() {
+    let src = "case class Point(x: Int, y: Int)\nobject T extends App {\n  println(Point(1, 2) == Point(1, 2))\n  println(Point(1, 2) == Point(3, 4))\n  println(Point(1, 2).equals(Point(1, 2)))\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "true\nfalse\ntrue\n");
+}
+
+#[test]
+fn case_class_hashcode_agrees_with_equals() {
+    // Equal instances hash equal; unequal instances (almost always) differ.
+    let src = "case class Point(x: Int, y: Int)\nobject T extends App {\n  println(Point(1, 2).hashCode == Point(1, 2).hashCode)\n  println(Point(1, 2).hashCode == Point(2, 1).hashCode)\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "true\nfalse\n");
+}
+
+#[test]
+fn plain_class_equality_is_reference_identity() {
+    // A non-`case` class uses reference identity: two distinct instances with the
+    // same field are unequal; an instance equals itself.
+    let src = "class Foo(val a: Int)\nobject T extends App {\n  val f = new Foo(1)\n  println(f == new Foo(1))\n  println(f == f)\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "false\ntrue\n");
+}
+
+#[test]
+fn case_class_copy_named_and_positional() {
+    let src = "case class Money(cents: Int, currency: String)\nobject T extends App {\n  val m = Money(500, \"USD\")\n  println(m.copy(cents = 750))\n  println(m.copy(currency = \"EUR\"))\n  println(m.copy(1, \"GBP\"))\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "Money(750,USD)\nMoney(500,EUR)\nMoney(1,GBP)\n");
+}
+
+#[test]
+fn case_class_apply_constructs_without_new() {
+    let src = "case class Point(x: Int, y: Int)\nobject T extends App {\n  val p = Point(1, 2)\n  println(p.x + p.y)\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn option_some_and_none_tostring() {
+    // `Some(v)` renders with parens; the `None` case object renders bare.
+    let src = "object T extends App {\n  println(Some(42))\n  println(None)\n  val o: Option[Int] = Some(1)\n  println(o.toString)\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "Some(42)\nNone\nSome(1)\n");
+}
+
+#[test]
+fn nested_constructor_pattern_binds_deeply() {
+    let src = "case class Point(x: Int, y: Int)\ncase class Line(a: Point, b: Point)\nobject T extends App {\n  val ln = Line(Point(1, 2), Point(3, 4))\n  ln match {\n    case Line(Point(a, _), Point(_, d)) => println(a + d)\n  }\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn constructor_pattern_with_guard() {
+    let src = "case class Box(n: Int)\nobject T extends App {\n  val b = Box(10)\n  val r = b match {\n    case Box(v) if v > 5 => \"big\"\n    case Box(_) => \"small\"\n  }\n  println(r)\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "big\n");
+}
+
+#[test]
+fn some_pattern_binds_none_pattern_matches() {
+    let src = "object T extends App {\n  val o: Option[Int] = Some(7)\n  println(o match { case Some(v) => v * 2; case None => -1 })\n  val e: Option[Int] = None\n  println(e match { case Some(v) => v; case None => 0 })\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "14\n0\n");
 }

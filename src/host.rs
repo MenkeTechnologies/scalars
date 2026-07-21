@@ -17,6 +17,9 @@
 
 use fusevm::{NumOp, Value, VM};
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// Builtin id for Predef `println` (one Scala-formatted arg + newline).
 pub const SPRINTLN: u16 = 700;
@@ -54,6 +57,29 @@ pub const SISTYPE: u16 = 708;
 /// Builtin id for a non-exhaustive `match` fall-through. Pops the unmatched
 /// scrutinee and faults with `scala.MatchError`, matching an uncaught throw.
 pub const SMATCHERR: u16 = 709;
+/// Builtin id for constructing a host-heap object (a `class`/`case class`
+/// instance, `object` singleton, or the built-in `Some`/`None`). The stack holds
+/// the ordered constructor-argument values (deepest first), then the class-name
+/// `Str`, the comma-separated field-name list `Str` (empty for a no-field
+/// object), an `is_case` `Bool`, and an `is_object` `Bool` on top; `argc` is
+/// field-count + 4. Returns a `Value::Obj` handle into the frontend heap (see
+/// [`ScalaObj`]). `is_object` selects singleton `toString` (`None`, not `None()`).
+pub const OBJ_NEW: u16 = 710;
+/// Builtin id for reading a heap object's class name (for runtime method
+/// dispatch and constructor-pattern class tests). Pops one value; returns its
+/// class name `Str`, or `""` for a non-object (so the dispatch fallthrough can
+/// route non-`Obj` receivers to [`SMETHOD`]).
+pub const OBJ_CLASS: u16 = 711;
+/// Builtin id for `case class` `copy(...)`. The stack holds the receiver
+/// (deepest), the comma-separated update spec `Str` (each token is a field name,
+/// or `#<index>` for a positional update), then the update values; `argc` is
+/// update-count + 2. Clones the receiver's ordered record with the named/indexed
+/// fields overwritten and returns a fresh `Value::Obj`.
+pub const OBJ_COPY: u16 = 712;
+/// Builtin id for mutating a heap object's field in place (a `var` field
+/// assignment inside a method). The stack holds the receiver (deepest), the
+/// field-name `Str`, and the new value on top; `argc` is 3. Returns `Unit`.
+pub const OBJ_SET: u16 = 713;
 
 thread_local! {
     /// Set by a runtime fault raised inside a builtin (an FFI compile/dispatch
@@ -87,6 +113,299 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SFORMAT, b_format);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
+    vm.register_builtin(OBJ_NEW, b_obj_new);
+    vm.register_builtin(OBJ_CLASS, b_obj_class);
+    vm.register_builtin(OBJ_COPY, b_obj_copy);
+    vm.register_builtin(OBJ_SET, b_obj_set);
+}
+
+// ── Host-side object heap ───────────────────────────────────────────────────
+//
+// fusevm's `Value::Obj(u32)` is an opaque handle into a *frontend-owned* object
+// heap; fusevm carries the handle but the pointed-to object lives here. A Scala
+// instance is an ordered, type-tagged record: the class name, whether it is a
+// `case` type (structural `equals`/`hashCode`/`toString` vs. a plain class's
+// reference identity), and its fields in *declared order* (so `toString` renders
+// `Point(1,2)`). The handle is an index into the thread-local arena, which is
+// reset per run (see [`reset_heap`]); every construction site bakes the class
+// name + field names into the bytecode, so no runtime class registry is needed.
+
+/// A live Scala object behind a [`Value::Obj`] handle.
+#[derive(Clone)]
+struct ScalaObj {
+    /// The declaring class/object name (`Point`, `Some`, `None`, …).
+    class: Arc<str>,
+    /// `true` for a `case class`/`case object` — selects structural
+    /// `equals`/`hashCode`/`toString`. A plain `class` uses reference identity.
+    is_case: bool,
+    /// `true` for a singleton `object`/`case object` — a `case` singleton renders
+    /// as its bare name (`None`), not `None()`.
+    is_object: bool,
+    /// Fields in declared order: `(name, value)`. Order is load-bearing for
+    /// `toString` and positional constructor-pattern binding.
+    fields: Vec<(Arc<str>, Value)>,
+}
+
+thread_local! {
+    /// The per-run object arena. Handles index into it; cleared by [`reset_heap`]
+    /// before each program so runs in one process (the library `run_str` path)
+    /// do not share instances.
+    static HEAP: RefCell<Vec<ScalaObj>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Clear the object arena. Called by the runner before each program run.
+pub fn reset_heap() {
+    HEAP.with(|h| h.borrow_mut().clear());
+}
+
+/// Allocate `o` in the arena and return its `Value::Obj` handle.
+fn heap_alloc(o: ScalaObj) -> Value {
+    HEAP.with(|h| {
+        let mut h = h.borrow_mut();
+        h.push(o);
+        Value::Obj((h.len() - 1) as u32)
+    })
+}
+
+/// Run `f` against the object `v` points to, or `None` if `v` is not a live
+/// handle. Multiple concurrent shared borrows are fine (nested `Obj` fields
+/// re-borrow through [`scala_str`]); only a `borrow_mut` would conflict.
+fn with_obj<R>(v: &Value, f: impl FnOnce(&ScalaObj) -> R) -> Option<R> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| h.borrow().get(*id as usize).map(f))
+    } else {
+        None
+    }
+}
+
+/// `OBJ_NEW` builtin — see [`OBJ_NEW`]. Pops `is_case`, the field-name CSV, the
+/// class name, then the field values (deepest first), and allocates the record.
+fn b_obj_new(vm: &mut VM, _argc: u8) -> Value {
+    let is_object = matches!(vm.pop(), Value::Bool(true));
+    let is_case = matches!(vm.pop(), Value::Bool(true));
+    let csv = vm.pop().as_str_cow().into_owned();
+    let class = vm.pop().as_str_cow().into_owned();
+    let names: Vec<&str> = if csv.is_empty() {
+        Vec::new()
+    } else {
+        csv.split(',').collect()
+    };
+    let mut vals = Vec::with_capacity(names.len());
+    for _ in 0..names.len() {
+        vals.push(vm.pop());
+    }
+    vals.reverse();
+    let fields = names
+        .into_iter()
+        .zip(vals)
+        .map(|(nm, v)| (Arc::from(nm), v))
+        .collect();
+    heap_alloc(ScalaObj {
+        class: Arc::from(class.as_str()),
+        is_case,
+        is_object,
+        fields,
+    })
+}
+
+/// `OBJ_CLASS` builtin — pop one value; push its class name (or `""` for a
+/// non-object, so the method-dispatch fallthrough routes it to [`SMETHOD`]).
+fn b_obj_class(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    match with_obj(&v, |o| o.class.to_string()) {
+        Some(c) => Value::str(c),
+        None => Value::str(""),
+    }
+}
+
+/// `OBJ_COPY` builtin — see [`OBJ_COPY`]. Clones the receiver's record with the
+/// named (`field`) or positional (`#index`) updates applied.
+fn b_obj_copy(vm: &mut VM, argc: u8) -> Value {
+    let k = (argc as usize).saturating_sub(2);
+    let mut vals = Vec::with_capacity(k);
+    for _ in 0..k {
+        vals.push(vm.pop());
+    }
+    vals.reverse();
+    let spec = vm.pop().as_str_cow().into_owned();
+    let recv = vm.pop();
+    let base = match with_obj(&recv, |o| o.clone()) {
+        Some(o) => o,
+        None => return fault(vm, "scalars: copy is not a member of a non-object"),
+    };
+    let specs: Vec<&str> = if spec.is_empty() {
+        Vec::new()
+    } else {
+        spec.split(',').collect()
+    };
+    let mut fields = base.fields.clone();
+    for (s, val) in specs.into_iter().zip(vals) {
+        if let Some(idx) = s.strip_prefix('#') {
+            if let Ok(i) = idx.parse::<usize>() {
+                if let Some(f) = fields.get_mut(i) {
+                    f.1 = val;
+                }
+            }
+        } else if let Some(f) = fields.iter_mut().find(|f| &*f.0 == s) {
+            f.1 = val;
+        }
+    }
+    heap_alloc(ScalaObj {
+        class: base.class,
+        is_case: base.is_case,
+        is_object: base.is_object,
+        fields,
+    })
+}
+
+/// `OBJ_SET` builtin — see [`OBJ_SET`]. Pop the new value, the field name, and
+/// the receiver; overwrite that field in place. Returns `Unit`.
+fn b_obj_set(vm: &mut VM, _argc: u8) -> Value {
+    let val = vm.pop();
+    let name = vm.pop().as_str_cow().into_owned();
+    let recv = vm.pop();
+    if let Value::Obj(id) = recv {
+        HEAP.with(|h| {
+            if let Some(o) = h.borrow_mut().get_mut(id as usize) {
+                if let Some(f) = o.fields.iter_mut().find(|f| &*f.0 == name) {
+                    f.1 = val;
+                }
+            }
+        });
+    }
+    Value::Undef
+}
+
+/// Resolve a method/field access on a heap object (the `Value::Obj` arm of
+/// [`dispatch_method`]). Handles `hashCode`/`equals` and paren-less field reads;
+/// `toString` is handled generically by the caller via [`scala_str`].
+fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let (class, is_case, fields) =
+        with_obj(recv, |o| (o.class.to_string(), o.is_case, o.fields.clone()))
+            .ok_or_else(|| "scalars: dangling object handle".to_string())?;
+    match (name, args.len()) {
+        ("hashCode", 0) => Ok(Value::int(obj_hash(&class, is_case, &fields, recv))),
+        ("equals", 1) => Ok(Value::bool(obj_eq(recv, &args[0]))),
+        // A paren-less access naming a field reads that field.
+        (_, 0) => match fields.iter().find(|(fname, _)| &**fname == name) {
+            Some((_, v)) => Ok(v.clone()),
+            None => Err(no_such_obj_member(&class, name)),
+        },
+        _ => Err(no_such_obj_member(&class, name)),
+    }
+}
+
+/// The Scala "value … is not a member of …" message for an unresolved access on
+/// an instance of `class`.
+fn no_such_obj_member(class: &str, name: &str) -> String {
+    format!("scalars: value {name} is not a member of {class}")
+}
+
+/// Render a heap object as Scala would: a `case` instance is `Class(f0,f1,…)`
+/// (fields in declared order via `toString`, comma-joined with no space, exactly
+/// as Scala's synthesized `case` `toString`); a plain instance is `Class@<hex>`
+/// (identity hash — the handle stands in for the JVM identity hash).
+fn obj_to_string(v: &Value) -> String {
+    with_obj(v, |o| {
+        if o.is_case && o.is_object {
+            // A `case object` prints as its bare name (`None`), not `None()`.
+            o.class.to_string()
+        } else if o.is_case {
+            let inner = o
+                .fields
+                .iter()
+                .map(|(_, val)| scala_str(val))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{}({})", o.class, inner)
+        } else {
+            let id = if let Value::Obj(i) = v { *i } else { 0 };
+            format!("{}@{:x}", o.class, id)
+        }
+    })
+    .unwrap_or_else(|| "null".to_string())
+}
+
+/// A `case` instance's structural hash (equal instances hash equal). A plain
+/// instance hashes by handle identity. Masked to a non-negative 31-bit value so
+/// it reads like a JVM `hashCode` (the exact bits are not observable-equal to the
+/// JVM's MurmurHash, only the equal-implies-equal contract is).
+fn obj_hash(class: &str, is_case: bool, fields: &[(Arc<str>, Value)], v: &Value) -> i64 {
+    let mut h = DefaultHasher::new();
+    if is_case {
+        class.hash(&mut h);
+        for (_, val) in fields {
+            hash_value(val, &mut h);
+        }
+    } else if let Value::Obj(id) = v {
+        id.hash(&mut h);
+    }
+    (h.finish() & 0x7fff_ffff) as i64
+}
+
+/// Hash a field value structurally (recursing into nested `case` objects) so two
+/// equal records hash identically.
+fn hash_value(v: &Value, h: &mut DefaultHasher) {
+    match v {
+        Value::Obj(_) => {
+            with_obj(v, |o| {
+                o.class.hash(h);
+                for (_, val) in &o.fields {
+                    hash_value(val, h);
+                }
+            });
+        }
+        _ => scala_str(v).hash(h),
+    }
+}
+
+/// Scala `==`/`equals` between two values, with object semantics: a `case`
+/// instance compares structurally (class + field-by-field); a plain instance
+/// compares by reference identity (the handle). An object vs. a non-object, or
+/// two different classes, are unequal.
+fn obj_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Obj(ia), Value::Obj(ib)) => {
+            if ia == ib {
+                return true; // same instance (also the plain-class identity case)
+            }
+            match (with_obj(a, |o| o.clone()), with_obj(b, |o| o.clone())) {
+                (Some(oa), Some(ob)) => {
+                    // Plain classes already failed the identity check above.
+                    oa.is_case
+                        && ob.is_case
+                        && oa.class == ob.class
+                        && oa.fields.len() == ob.fields.len()
+                        && oa
+                            .fields
+                            .iter()
+                            .zip(&ob.fields)
+                            .all(|((_, x), (_, y))| value_eq(x, y))
+                }
+                _ => false,
+            }
+        }
+        _ => false, // object vs. non-object
+    }
+}
+
+/// Structural equality of two field values (recurses into nested objects).
+fn value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Obj(_), Value::Obj(_)) => obj_eq(a, b),
+        _ => a == b,
+    }
+}
+
+/// Scala `==` for the [`numeric_hook`] `Eq`/`Ne` arms: object operands compare
+/// with [`obj_eq`]; everything else keeps the existing structural
+/// (`scala_str`-based) comparison.
+fn scala_eq(a: &Value, b: &Value) -> bool {
+    if matches!(a, Value::Obj(_)) || matches!(b, Value::Obj(_)) {
+        obj_eq(a, b)
+    } else {
+        scala_str(a) == scala_str(b)
+    }
 }
 
 /// `SFORMAT` builtin: pop the format spec (top) and the value, and format the
@@ -330,6 +649,7 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         Value::Str(s) => string_method(s, name, args),
         Value::Int(n) => int_method(*n, name, args),
         Value::Float(f) => double_method(*f, name, args),
+        Value::Obj(_) => obj_method(recv, name, args),
         _ => Err(no_such_method(recv, name)),
     }
 }
@@ -553,6 +873,9 @@ pub fn scala_str(v: &Value) -> String {
             let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(", ");
             format!("Vector({inner})")
         }
+        // A host-heap instance: `Class(f0,f1)` for a `case` type, `Class@hex`
+        // for a plain class (see [`obj_to_string`]).
+        Value::Obj(_) => obj_to_string(v),
         other => other.as_str_cow().into_owned(),
     }
 }
@@ -638,10 +961,12 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
                 scala_str(b)
             )),
         },
-        // Value equality/ordering against a string operand (Scala's `==` is
-        // structural `equals`, so string `==` compares by content).
-        NumOp::Eq => Ok(Value::bool(scala_str(a) == scala_str(b))),
-        NumOp::Ne => Ok(Value::bool(scala_str(a) != scala_str(b))),
+        // Value equality against a non-numeric operand. Scala's `==` is
+        // structural `equals`: string `==` compares by content, and an object
+        // operand compares by [`obj_eq`] (structural for a `case` instance,
+        // reference identity for a plain class).
+        NumOp::Eq => Ok(Value::bool(scala_eq(a, b))),
+        NumOp::Ne => Ok(Value::bool(!scala_eq(a, b))),
         NumOp::Lt => Ok(Value::bool(scala_str(a) < scala_str(b))),
         NumOp::Gt => Ok(Value::bool(scala_str(a) > scala_str(b))),
         NumOp::Le => Ok(Value::bool(scala_str(a) <= scala_str(b))),

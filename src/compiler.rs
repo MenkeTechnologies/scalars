@@ -15,7 +15,7 @@
 
 use crate::ast::*;
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The desugar target a `rust { ... }` block lowers to (see [`crate::rust_ffi`]).
 const RUST_COMPILE: &str = "__rust_compile";
@@ -56,6 +56,46 @@ struct Compiler {
     /// the top-level (`main`) scope, where every binding is a global addressed
     /// by `GetVar`/`SetVar`.
     scope: Option<Scope>,
+    /// Class metadata (`name → (ordered field names, is_case)`), for
+    /// construction, `copy`, method dispatch, and constructor-pattern binding.
+    classes: HashMap<String, ClassMeta>,
+    /// Singleton `object` metadata (`name → members`), for static member
+    /// dispatch (`Registry.greet(x)` / `Registry.name`).
+    objects: HashMap<String, ObjMeta>,
+    /// Method name → the classes that define a `def` of that name, for the
+    /// runtime instance-method dispatch chain (`recv.m(...)`).
+    method_index: HashMap<String, Vec<String>>,
+    /// `Some((name, fields))` while compiling a class method: the enclosing
+    /// class's name and field-name set, so a bare identifier naming a field
+    /// resolves to `this.field` and a bare sibling-method call to `this.m(...)`.
+    current_class: Option<(String, HashSet<String>)>,
+    /// `Some(name)` while compiling an `object`'s method (or its `val` inits), so
+    /// a bare identifier naming one of the object's `val`s resolves to the
+    /// `Name.val` global and a bare method call to `Name$method`.
+    current_object: Option<String>,
+    /// Distinguishes synthetic method-dispatch / constructor-pattern temporaries.
+    obj_counter: u32,
+}
+
+/// Compile-time class shape.
+struct ClassMeta {
+    /// Instance fields in declared order (constructor params then body fields).
+    field_names: Vec<String>,
+    /// Primary-constructor arity (the `new`/`apply` argument count — the leading
+    /// prefix of `field_names`).
+    arity: usize,
+    /// `case class` → structural semantics + companion `apply`/`unapply`/`copy`.
+    is_case: bool,
+}
+
+/// Compile-time singleton-object shape.
+struct ObjMeta {
+    /// `val`/`var` member names (accessed as the `Name.val` global).
+    vals: HashSet<String>,
+    /// `def` member names (dispatched to the `Name$method` subroutine).
+    methods: HashSet<String>,
+    /// `case object` → structural semantics (so two `None`s compare equal).
+    is_case: bool,
 }
 
 /// A function body's local slot map (see [`Compiler::scope`]).
@@ -95,6 +135,60 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         .iter()
         .map(|f| (f.name.clone(), f.params.len()))
         .collect();
+
+    // Classes to emit constructors/methods for: the user's, plus the built-in
+    // `Option` support (`Some(value)`), unless the user redefined them.
+    let mut classes: Vec<ClassDecl> = prog.classes.clone();
+    if !classes.iter().any(|c| c.name == "Some") {
+        classes.push(builtin_some());
+    }
+    // Built-in `None` case object, unless redefined.
+    let mut objects: Vec<ObjectDecl> = prog.objects.clone();
+    if !objects.iter().any(|o| o.name == "None") {
+        objects.push(builtin_none());
+    }
+
+    // Index class shapes and the method → defining-classes map.
+    let mut class_meta = HashMap::new();
+    let mut method_index: HashMap<String, Vec<String>> = HashMap::new();
+    for cd in &classes {
+        class_meta.insert(
+            cd.name.clone(),
+            ClassMeta {
+                field_names: cd.field_names.clone(),
+                arity: cd.params.len(),
+                is_case: cd.is_case,
+            },
+        );
+        for m in &cd.methods {
+            method_index
+                .entry(m.name.clone())
+                .or_default()
+                .push(cd.name.clone());
+        }
+    }
+    // Index singleton objects.
+    let mut obj_meta = HashMap::new();
+    for od in &objects {
+        let vals = od
+            .body
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::Local { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let methods = od.methods.iter().map(|m| m.name.clone()).collect();
+        obj_meta.insert(
+            od.name.clone(),
+            ObjMeta {
+                vals,
+                methods,
+                is_case: od.is_case,
+            },
+        );
+    }
+
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         for_counter: 0,
@@ -105,24 +199,91 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         func_arity,
         vals: HashMap::new(),
         scope: None,
+        classes: class_meta,
+        objects: obj_meta,
+        method_index,
+        current_class: None,
+        current_object: None,
+        obj_counter: 0,
     };
-    // Main body runs first (the VM starts at ip 0 in frame 0), so the tracing
-    // JIT's `ip == 0` anchor still fires on real work.
+
+    // Singleton-object `val`s initialize once before `main` (into `Name.val`
+    // globals). Scala inits objects lazily; eager pre-init is a documented
+    // simplification that is observably identical for pure val bodies.
+    for od in &objects {
+        c.object_inits(od)?;
+    }
+
+    // Main body runs first after the object inits (the VM starts at ip 0), so the
+    // tracing JIT's early anchor still fires on real work.
     for stmt in &prog.main {
         c.stmt(stmt)?;
     }
-    // Function bodies live in the same chunk after main, jumped over on the
-    // fall-through so main never walks into one; each is reached only through
-    // its `Op::Call` sub_entry.
-    if !prog.functions.is_empty() {
+
+    // Every subroutine (free `def`s, class constructors + methods, object
+    // methods) lives after `main`, jumped over on the fall-through; each is
+    // reached only through its `Op::Call` sub_entry.
+    let has_subs = !prog.functions.is_empty()
+        || !classes.is_empty()
+        || objects.iter().any(|o| !o.methods.is_empty());
+    if has_subs {
         let skip = c.b.emit(Op::Jump(0), 0);
         for func in &prog.functions {
             c.function_body(func)?;
+        }
+        for cd in &classes {
+            c.class_constructor(cd)?;
+            for m in &cd.methods {
+                c.class_method(cd, m)?;
+            }
+        }
+        for od in &objects {
+            for m in &od.methods {
+                c.object_method(od, m)?;
+            }
         }
         let end = c.b.current_pos();
         c.b.patch_jump(skip, end);
     }
     Ok(c.b.build())
+}
+
+/// The built-in `Some(value)` case class (`Option`'s non-empty case).
+fn builtin_some() -> ClassDecl {
+    ClassDecl {
+        name: "Some".to_string(),
+        is_case: true,
+        params: vec!["value".to_string()],
+        body: Vec::new(),
+        field_names: vec!["value".to_string()],
+        methods: Vec::new(),
+    }
+}
+
+/// The built-in `None` case object (`Option`'s empty case) — a zero-field
+/// singleton so two `None`s compare structurally equal.
+fn builtin_none() -> ObjectDecl {
+    ObjectDecl {
+        name: "None".to_string(),
+        is_case: true,
+        body: Vec::new(),
+        methods: Vec::new(),
+    }
+}
+
+/// The synthetic name of a class constructor subroutine.
+fn ctor_name(class: &str) -> String {
+    format!("{class}$new")
+}
+
+/// The synthetic name of a `class`/`object` method subroutine.
+fn method_sub_name(owner: &str, method: &str) -> String {
+    format!("{owner}${method}")
+}
+
+/// The global-variable name backing an `object`'s `val` member.
+fn object_field_global(obj: &str, field: &str) -> String {
+    format!("{obj}.{field}")
 }
 
 impl Compiler {
@@ -154,6 +315,29 @@ impl Compiler {
                         "scalars: reassignment to val `{name}` (line {})",
                         s.line
                     ));
+                }
+                let is_local = self
+                    .scope
+                    .as_ref()
+                    .is_some_and(|s| s.slots.contains_key(name));
+                // A `var` field assignment inside a method mutates the heap record.
+                if !is_local {
+                    if let Some((_, fields)) = &self.current_class {
+                        if fields.contains(name) {
+                            return self.field_assign(name, *op, value, s.line);
+                        }
+                    }
+                    // A `var` reassignment inside an object method updates its
+                    // `Name.val` global.
+                    if let Some(obj) = self.current_object.clone() {
+                        if self
+                            .objects
+                            .get(&obj)
+                            .is_some_and(|m| m.vals.contains(name))
+                        {
+                            return self.object_val_assign(&obj, name, *op, value);
+                        }
+                    }
                 }
                 let place = self.resolve_place(name);
                 match op {
@@ -369,22 +553,7 @@ impl Compiler {
                 let c = self.b.add_constant(Value::Undef);
                 self.b.emit(Op::LoadConst(c), 0);
             }
-            Expr::Var(name) => {
-                // A function-local slot wins. Otherwise a bare reference to a
-                // zero-parameter `def` is a paren-less call; anything else is a
-                // global read.
-                let is_local = self
-                    .scope
-                    .as_ref()
-                    .is_some_and(|s| s.slots.contains_key(name));
-                if !is_local && self.func_arity.get(name) == Some(&0) {
-                    let nidx = self.b.add_name(name);
-                    self.b.emit(Op::Call(nidx, 0), 0);
-                } else {
-                    let place = self.resolve_place(name);
-                    self.emit_load(place);
-                }
-            }
+            Expr::Var(name) => self.var_ref(name)?,
             Expr::Unary { op, rhs } => {
                 self.expr(rhs)?;
                 match op {
@@ -409,6 +578,12 @@ impl Compiler {
                 args,
                 line,
             } => self.method(recv, name, args, *line)?,
+            Expr::New { name, args, line } => self.construct(name, args, *line)?,
+            Expr::Copy {
+                recv,
+                updates,
+                line,
+            } => self.copy_expr(recv, updates, *line)?,
             Expr::If { cond, then, els } => self.if_expr(cond, then, els.as_deref())?,
             Expr::Block(stmts) => self.block_expr(stmts)?,
             Expr::Match { scrut, arms } => self.match_expr(scrut, arms)?,
@@ -499,32 +674,7 @@ impl Compiler {
         let mut end_jumps = Vec::new();
         for arm in arms {
             let mut fail_jumps = Vec::new();
-            match &arm.pat {
-                Pattern::Wildcard => {}
-                Pattern::Bind(name) => {
-                    let p = self.declare_place(name);
-                    self.emit_load(splace);
-                    self.emit_store(p);
-                }
-                Pattern::Literal(lit) => {
-                    self.emit_load(splace);
-                    self.expr(lit)?;
-                    self.b.emit(Op::NumEq, 0);
-                    fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
-                }
-                Pattern::Typed { name, ty } => {
-                    self.emit_load(splace);
-                    let c = self.b.add_constant(Value::str(ty.clone()));
-                    self.b.emit(Op::LoadConst(c), 0);
-                    self.b.emit(Op::CallBuiltin(crate::host::SISTYPE, 2), 0);
-                    fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
-                    if name != "_" {
-                        let p = self.declare_place(name);
-                        self.emit_load(splace);
-                        self.emit_store(p);
-                    }
-                }
-            }
+            self.match_pattern(&arm.pat, splace, &mut fail_jumps)?;
             if let Some(g) = &arm.guard {
                 self.expr(g)?;
                 fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
@@ -547,22 +697,547 @@ impl Compiler {
         Ok(())
     }
 
-    /// Lower postfix `recv.name(args)` dispatch. The receiver is pushed first
-    /// (deepest), then the arguments, then the method-name string; the universal
-    /// method builtin (`SMETHOD`) pops the name, `argc-2` arguments, and the
-    /// receiver, and routes to the wired String/Int stdlib (see `crate::host`).
+    /// Match one pattern against the value in `vplace`, pushing a
+    /// `JumpIfFalse` onto `fail_jumps` at each point that must branch to the next
+    /// arm on mismatch. Recurses for constructor sub-patterns.
+    fn match_pattern(
+        &mut self,
+        pat: &Pattern,
+        vplace: Place,
+        fail_jumps: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        match pat {
+            Pattern::Wildcard => {}
+            Pattern::Bind(name) => {
+                let p = self.declare_place(name);
+                self.emit_load(vplace);
+                self.emit_store(p);
+            }
+            Pattern::Literal(lit) => {
+                self.emit_load(vplace);
+                self.expr(lit)?;
+                self.b.emit(Op::NumEq, 0);
+                fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+            }
+            Pattern::Typed { name, ty } => {
+                self.emit_load(vplace);
+                let c = self.b.add_constant(Value::str(ty.clone()));
+                self.b.emit(Op::LoadConst(c), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::SISTYPE, 2), 0);
+                fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+                if name != "_" {
+                    let p = self.declare_place(name);
+                    self.emit_load(vplace);
+                    self.emit_store(p);
+                }
+            }
+            Pattern::Stable(name) => {
+                // `case None =>` / a stable-identifier pattern: `scrut == <value>`.
+                self.emit_load(vplace);
+                self.materialize_object(name)?;
+                self.b.emit(Op::NumEq, 0);
+                fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+            }
+            Pattern::Constructor { name, elems } => {
+                let fields = match self.classes.get(name) {
+                    Some(meta) => meta.field_names.clone(),
+                    None => {
+                        return Err(format!("scalars: not found: constructor pattern `{name}`"))
+                    }
+                };
+                if elems.len() != fields.len() {
+                    return Err(format!(
+                        "scalars: wrong number of arguments for constructor pattern `{name}` (expected {}, found {})",
+                        fields.len(),
+                        elems.len()
+                    ));
+                }
+                // Class-tag test: `OBJ_CLASS(scrut) == name`.
+                self.emit_load(vplace);
+                self.b.emit(Op::CallBuiltin(crate::host::OBJ_CLASS, 1), 0);
+                let c = self.b.add_constant(Value::str(name.clone()));
+                self.b.emit(Op::LoadConst(c), 0);
+                self.b.emit(Op::NumEq, 0);
+                fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+                // Bind each field position against its sub-pattern.
+                for (elem, fname) in elems.iter().zip(&fields) {
+                    self.emit_load(vplace);
+                    let fc = self.b.add_constant(Value::str(fname.clone()));
+                    self.b.emit(Op::LoadConst(fc), 0);
+                    self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+                    self.obj_counter += 1;
+                    let fp = self.declare_place(&format!(" fld_{}", self.obj_counter));
+                    self.emit_store(fp);
+                    self.match_pattern(elem, fp, fail_jumps)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Push a singleton `object`/`case object` value (e.g. `None`) — a zero-field
+    /// host-heap record tagged with the object's name.
+    fn materialize_object(&mut self, name: &str) -> Result<(), String> {
+        let is_case = match self.objects.get(name) {
+            Some(meta) => meta.is_case,
+            None => return Err(format!("scalars: not found: value {name}")),
+        };
+        let cn = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(cn), 0);
+        let csv = self.b.add_constant(Value::str(String::new()));
+        self.b.emit(Op::LoadConst(csv), 0);
+        self.b
+            .emit(if is_case { Op::LoadTrue } else { Op::LoadFalse }, 0);
+        // A singleton object — render as its bare name.
+        self.b.emit(Op::LoadTrue, 0);
+        self.b.emit(Op::CallBuiltin(crate::host::OBJ_NEW, 4), 0);
+        Ok(())
+    }
+
+    /// Read a bare identifier. Resolution order: function-local slot, enclosing
+    /// class field (`this.field`) or sibling method, enclosing object `val`/method,
+    /// singleton object value, zero-arg `def` (paren-less call), then global.
+    fn var_ref(&mut self, name: &str) -> Result<(), String> {
+        let is_local = self
+            .scope
+            .as_ref()
+            .is_some_and(|s| s.slots.contains_key(name));
+        if is_local {
+            let place = self.resolve_place(name);
+            self.emit_load(place);
+            return Ok(());
+        }
+        // Inside a class method: a bare field is `this.field`; a bare sibling
+        // (zero-arg) method is `this.m`.
+        if let Some((cname, fields)) = self.current_class.clone() {
+            if fields.contains(name) {
+                self.emit_field_get_this(name);
+                return Ok(());
+            }
+            if self.class_defines_method(&cname, name) {
+                let this = self.resolve_place("this");
+                self.emit_load(this);
+                let nidx = self.b.add_name(&method_sub_name(&cname, name));
+                self.b.emit(Op::Call(nidx, 1), 0);
+                return Ok(());
+            }
+        }
+        // Inside an object method / val-init: a bare `val` is the `Name.val`
+        // global; a bare (zero-arg) method is `Name$method`.
+        if let Some(obj) = self.current_object.clone() {
+            if let Some(meta) = self.objects.get(&obj) {
+                if meta.vals.contains(name) {
+                    let g = self.b.add_name(&object_field_global(&obj, name));
+                    self.b.emit(Op::GetVar(g), 0);
+                    return Ok(());
+                }
+                if meta.methods.contains(name) {
+                    let nidx = self.b.add_name(&method_sub_name(&obj, name));
+                    self.b.emit(Op::Call(nidx, 0), 0);
+                    return Ok(());
+                }
+            }
+        }
+        // A bare reference to a singleton object (e.g. `None`) materializes it.
+        if self.objects.contains_key(name) {
+            return self.materialize_object(name);
+        }
+        // A bare reference to a zero-parameter `def` is a paren-less call.
+        if self.func_arity.get(name) == Some(&0) {
+            let nidx = self.b.add_name(name);
+            self.b.emit(Op::Call(nidx, 0), 0);
+            return Ok(());
+        }
+        let place = self.resolve_place(name);
+        self.emit_load(place);
+        Ok(())
+    }
+
+    /// Whether class `cname` declares a `def` named `method`.
+    fn class_defines_method(&self, cname: &str, method: &str) -> bool {
+        self.method_index
+            .get(method)
+            .is_some_and(|cs| cs.iter().any(|c| c == cname))
+    }
+
+    /// Emit a read of `this.field` (the receiver is the `this` slot).
+    fn emit_field_get_this(&mut self, field: &str) {
+        let this = self.resolve_place("this");
+        self.emit_load(this);
+        let c = self.b.add_constant(Value::str(field.to_string()));
+        self.b.emit(Op::LoadConst(c), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+    }
+
+    /// Lower a `var` field assignment inside a method (`field <op>= e`) to an
+    /// in-place [`OBJ_SET`] on `this` (a compound op reads the field first).
+    fn field_assign(
+        &mut self,
+        field: &str,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        // OBJ_SET pops `[this, name, value]`.
+        let this = self.resolve_place("this");
+        self.emit_load(this);
+        let c = self.b.add_constant(Value::str(field.to_string()));
+        self.b.emit(Op::LoadConst(c), line);
+        match op {
+            AssignOp::Assign => {
+                self.expr(value)?;
+            }
+            AssignOp::Div => {
+                self.emit_field_get_this(field);
+                self.expr(value)?;
+                self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0);
+            }
+            _ => {
+                self.emit_field_get_this(field);
+                self.expr(value)?;
+                self.b.emit(compound_op(op), 0);
+            }
+        }
+        self.b.emit(Op::CallBuiltin(crate::host::OBJ_SET, 3), line);
+        self.b.emit(Op::Pop, 0); // discard the `Unit` result
+        Ok(())
+    }
+
+    /// Lower a `var` reassignment inside an object method to a store into the
+    /// object's `Name.val` global.
+    fn object_val_assign(
+        &mut self,
+        obj: &str,
+        name: &str,
+        op: AssignOp,
+        value: &Expr,
+    ) -> Result<(), String> {
+        let g = self.b.add_name(&object_field_global(obj, name));
+        match op {
+            AssignOp::Assign => {
+                self.expr(value)?;
+            }
+            AssignOp::Div => {
+                self.b.emit(Op::GetVar(g), 0);
+                self.expr(value)?;
+                self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0);
+            }
+            _ => {
+                self.b.emit(Op::GetVar(g), 0);
+                self.expr(value)?;
+                self.b.emit(compound_op(op), 0);
+            }
+        }
+        self.b.emit(Op::SetVar(g), 0);
+        Ok(())
+    }
+
+    /// Lower `new Class(args)` / a `case class` companion `apply` — both invoke
+    /// the class's `Class$new` constructor subroutine, which builds the record.
+    fn construct(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        let arity = match self.classes.get(name) {
+            Some(meta) => meta.arity,
+            None => return Err(format!("scalars: not found: type {name} (line {line})")),
+        };
+        if args.len() != arity {
+            return Err(format!(
+                "scalars: {name} takes {arity} constructor argument(s), found {} (line {line})",
+                args.len()
+            ));
+        }
+        for a in args {
+            self.expr(a)?;
+        }
+        let nidx = self.b.add_name(&ctor_name(name));
+        self.b.emit(Op::Call(nidx, args.len() as u8), line);
+        Ok(())
+    }
+
+    /// Lower `recv.copy(updates)` — clone `recv`'s record with the named
+    /// (`field = e`) or positional updates applied, via the [`OBJ_COPY`] builtin.
+    fn copy_expr(
+        &mut self,
+        recv: &Expr,
+        updates: &[(Option<String>, Expr)],
+        line: u32,
+    ) -> Result<(), String> {
+        self.expr(recv)?;
+        // Spec CSV: a field name for a named update, `#index` for a positional one.
+        let spec = updates
+            .iter()
+            .enumerate()
+            .map(|(i, (named, _))| named.clone().unwrap_or_else(|| format!("#{i}")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sc = self.b.add_constant(Value::str(spec));
+        self.b.emit(Op::LoadConst(sc), line);
+        for (_, val) in updates {
+            self.expr(val)?;
+        }
+        self.b.emit(
+            Op::CallBuiltin(crate::host::OBJ_COPY, updates.len() as u8 + 2),
+            line,
+        );
+        Ok(())
+    }
+
+    /// Lower postfix `recv.name(args)`. Dispatch order:
+    ///
+    /// 1. **Static object member** — `Obj.method(...)` calls `Obj$method`;
+    ///    `Obj.val` reads the `Obj.val` global.
+    /// 2. **Instance method** — when some class declares `def name`, emit a
+    ///    runtime class-tag dispatch chain (with a [`SMETHOD`] fallback).
+    /// 3. **Fallback** — the universal `SMETHOD` builtin (String/Int/Double
+    ///    stdlib and host-heap field/`toString`/`hashCode`/`equals` access).
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        if let Expr::Var(obj) = recv {
+            let member = self
+                .objects
+                .get(obj)
+                .map(|m| (m.methods.contains(name), m.vals.contains(name)));
+            if let Some((is_method, is_val)) = member {
+                if is_method {
+                    for a in args {
+                        self.expr(a)?;
+                    }
+                    let nidx = self.b.add_name(&method_sub_name(obj, name));
+                    self.b.emit(Op::Call(nidx, args.len() as u8), line);
+                    return Ok(());
+                }
+                if is_val && args.is_empty() {
+                    let g = self.b.add_name(&object_field_global(obj, name));
+                    self.b.emit(Op::GetVar(g), line);
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(classes) = self.method_index.get(name).cloned() {
+            return self.dispatch_instance_method(recv, name, args, &classes, line);
+        }
+        self.emit_smethod(recv, name, args, line)
+    }
+
+    /// Emit the universal [`SMETHOD`] dispatch: receiver (deepest), args, then the
+    /// method-name string.
+    fn emit_smethod(
+        &mut self,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<(), String> {
         self.expr(recv)?;
         for a in args {
             self.expr(a)?;
         }
         let nc = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nc), line);
-        // argc = receiver (1) + arguments + method-name (1).
         self.b.emit(
             Op::CallBuiltin(crate::host::SMETHOD, args.len() as u8 + 2),
             line,
         );
+        Ok(())
+    }
+
+    /// Emit a runtime class-tag dispatch chain for `recv.name(args)`: evaluate the
+    /// receiver once, read its class, and for each class defining `name` compare
+    /// the tag and call `Class$name` with `this` + args. A receiver whose class
+    /// matches none falls back to [`SMETHOD`] (non-object receivers, field reads).
+    fn dispatch_instance_method(
+        &mut self,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        classes: &[String],
+        line: u32,
+    ) -> Result<(), String> {
+        self.expr(recv)?;
+        self.obj_counter += 1;
+        let n = self.obj_counter;
+        let t = self.declare_place(&format!(" recv_{n}"));
+        self.emit_store(t);
+        self.emit_load(t);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::OBJ_CLASS, 1), line);
+        let cls = self.declare_place(&format!(" cls_{n}"));
+        self.emit_store(cls);
+
+        let mut end_jumps = Vec::new();
+        for class in classes {
+            self.emit_load(cls);
+            let cc = self.b.add_constant(Value::str(class.clone()));
+            self.b.emit(Op::LoadConst(cc), line);
+            self.b.emit(Op::NumEq, line);
+            let jf = self.b.emit(Op::JumpIfFalse(0), line);
+            self.emit_load(t);
+            for a in args {
+                self.expr(a)?;
+            }
+            let nidx = self.b.add_name(&method_sub_name(class, name));
+            self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(jf, next);
+        }
+        // Fallback: universal dispatcher on the stored receiver.
+        self.emit_load(t);
+        for a in args {
+            self.expr(a)?;
+        }
+        let nc = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nc), line);
+        self.b.emit(
+            Op::CallBuiltin(crate::host::SMETHOD, args.len() as u8 + 2),
+            line,
+        );
+        let end = self.b.current_pos();
+        for je in end_jumps {
+            self.b.patch_jump(je, end);
+        }
+        Ok(())
+    }
+
+    // ── class / object subroutine emission ──────────────────────────────────
+
+    /// Emit `object`-`val` initialization (before `main`) into the `Name.val`
+    /// globals; run any side-effecting body statement for effect.
+    fn object_inits(&mut self, od: &ObjectDecl) -> Result<(), String> {
+        let saved = self.current_object.take();
+        self.current_object = Some(od.name.clone());
+        for s in &od.body {
+            match &s.kind {
+                StmtKind::Local { name, init, .. } => {
+                    if let Some(e) = init {
+                        self.expr(e)?;
+                        let g = self.b.add_name(&object_field_global(&od.name, name));
+                        self.b.emit(Op::SetVar(g), 0);
+                    }
+                }
+                _ => self.stmt(s)?,
+            }
+        }
+        self.current_object = saved;
+        Ok(())
+    }
+
+    /// Emit a class's `Class$new` constructor subroutine: bind the constructor
+    /// params to slots, run the body (evaluating `val`/`var` field initializers
+    /// into their slots), then assemble the ordered record via [`OBJ_NEW`].
+    fn class_constructor(&mut self, cd: &ClassDecl) -> Result<(), String> {
+        let nidx = self.b.add_name(&ctor_name(&cd.name));
+        let ip = self.b.current_pos();
+        self.b.add_sub_entry(nidx, ip);
+
+        let mut slots = HashMap::new();
+        let saved_vals = std::mem::take(&mut self.vals);
+        for (i, p) in cd.params.iter().enumerate() {
+            slots.insert(p.clone(), i as u16);
+            self.vals.insert(p.clone(), true);
+        }
+        self.scope = Some(Scope {
+            slots,
+            next_slot: cd.params.len() as u16,
+        });
+        for i in (0..cd.params.len()).rev() {
+            self.b.emit(Op::SetSlot(i as u16), 0);
+        }
+        for s in &cd.body {
+            self.stmt(s)?;
+        }
+        // Assemble the record: field values (in declared order), then the class
+        // name, the field-name CSV, and the `is_case` flag.
+        for f in &cd.field_names {
+            let place = self.resolve_place(f);
+            self.emit_load(place);
+        }
+        let cn = self.b.add_constant(Value::str(cd.name.clone()));
+        self.b.emit(Op::LoadConst(cn), 0);
+        let csv = self.b.add_constant(Value::str(cd.field_names.join(",")));
+        self.b.emit(Op::LoadConst(csv), 0);
+        self.b.emit(
+            if cd.is_case {
+                Op::LoadTrue
+            } else {
+                Op::LoadFalse
+            },
+            0,
+        );
+        // A `class`/`case class` is not a singleton object.
+        self.b.emit(Op::LoadFalse, 0);
+        self.b.emit(
+            Op::CallBuiltin(crate::host::OBJ_NEW, cd.field_names.len() as u8 + 4),
+            0,
+        );
+        self.b.emit(Op::ReturnValue, 0);
+
+        self.scope = None;
+        self.vals = saved_vals;
+        Ok(())
+    }
+
+    /// Emit a class method as the `Class$method` subroutine: an implicit leading
+    /// `this` slot, then the declared params; the body compiles with the class's
+    /// field set in scope (bare fields resolve to `this.field`).
+    fn class_method(&mut self, cd: &ClassDecl, m: &Func) -> Result<(), String> {
+        let nidx = self.b.add_name(&method_sub_name(&cd.name, &m.name));
+        let ip = self.b.current_pos();
+        self.b.add_sub_entry(nidx, ip);
+
+        let mut slots = HashMap::new();
+        slots.insert("this".to_string(), 0u16);
+        let saved_vals = std::mem::take(&mut self.vals);
+        self.vals.insert("this".to_string(), true);
+        for (i, p) in m.params.iter().enumerate() {
+            slots.insert(p.clone(), (i + 1) as u16);
+            self.vals.insert(p.clone(), true);
+        }
+        self.scope = Some(Scope {
+            slots,
+            next_slot: (m.params.len() + 1) as u16,
+        });
+        // Prologue: args arrive as `[this, p0, …]` (deepest = this); pop reverse.
+        for i in (0..=m.params.len()).rev() {
+            self.b.emit(Op::SetSlot(i as u16), 0);
+        }
+        let saved_class = self.current_class.take();
+        self.current_class = Some((cd.name.clone(), cd.field_names.iter().cloned().collect()));
+        self.tail(&m.body)?;
+        self.b.emit(Op::Return, 0);
+        self.current_class = saved_class;
+
+        self.scope = None;
+        self.vals = saved_vals;
+        Ok(())
+    }
+
+    /// Emit an object method as the `Name$method` subroutine (no `this`); the
+    /// body compiles with the object's `val`s reachable as `Name.val` globals.
+    fn object_method(&mut self, od: &ObjectDecl, m: &Func) -> Result<(), String> {
+        let nidx = self.b.add_name(&method_sub_name(&od.name, &m.name));
+        let ip = self.b.current_pos();
+        self.b.add_sub_entry(nidx, ip);
+
+        let mut slots = HashMap::new();
+        let saved_vals = std::mem::take(&mut self.vals);
+        for (i, p) in m.params.iter().enumerate() {
+            slots.insert(p.clone(), i as u16);
+            self.vals.insert(p.clone(), true);
+        }
+        self.scope = Some(Scope {
+            slots,
+            next_slot: m.params.len() as u16,
+        });
+        for i in (0..m.params.len()).rev() {
+            self.b.emit(Op::SetSlot(i as u16), 0);
+        }
+        let saved_obj = self.current_object.take();
+        self.current_object = Some(od.name.clone());
+        self.tail(&m.body)?;
+        self.b.emit(Op::Return, 0);
+        self.current_object = saved_obj;
+
+        self.scope = None;
+        self.vals = saved_vals;
         Ok(())
     }
 
@@ -586,6 +1261,40 @@ impl Compiler {
                 self.b.emit(Op::LoadUndef, line);
             }
             return Ok(());
+        }
+        // `Class(args)` — a `case class` companion `apply` (construct without
+        // `new`) / built-in `Some(v)`. A plain class has no companion `apply`, so
+        // it must be built with `new` (bare `PlainClass(args)` is not a call).
+        if self.classes.get(name).is_some_and(|m| m.is_case) {
+            return self.construct(name, args, line);
+        }
+        // An unqualified method call inside a class method (`m(x)` == `this.m(x)`).
+        if let Some((cname, _)) = self.current_class.clone() {
+            if self.class_defines_method(&cname, name) {
+                let this = self.resolve_place("this");
+                self.emit_load(this);
+                for a in args {
+                    self.expr(a)?;
+                }
+                let nidx = self.b.add_name(&method_sub_name(&cname, name));
+                self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
+                return Ok(());
+            }
+        }
+        // An unqualified method call inside an object method (`m(x)` == `Obj.m(x)`).
+        if let Some(obj) = self.current_object.clone() {
+            if self
+                .objects
+                .get(&obj)
+                .is_some_and(|meta| meta.methods.contains(name))
+            {
+                for a in args {
+                    self.expr(a)?;
+                }
+                let nidx = self.b.add_name(&method_sub_name(&obj, name));
+                self.b.emit(Op::Call(nidx, args.len() as u8), line);
+                return Ok(());
+            }
         }
         // A call to a user-defined `def`: push args (deepest first) and jump into
         // the function's `sub_entry` frame. The callee prologue pops these args
@@ -820,6 +1529,10 @@ fn expr_has_ffi(e: &Expr) -> bool {
     match e {
         Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
         Expr::Method { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
+        Expr::New { args, .. } => args.iter().any(expr_has_ffi),
+        Expr::Copy { recv, updates, .. } => {
+            expr_has_ffi(recv) || updates.iter().any(|(_, e)| expr_has_ffi(e))
+        }
         Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
         Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
         Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),

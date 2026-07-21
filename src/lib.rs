@@ -38,6 +38,7 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
     vm.enable_tracing_jit();
+    host::reset_heap(); // start each run with an empty object arena
     let _ = host::take_error(); // clear any stale FFI fault from a prior run
     let res = vm.run();
     // An FFI compile/dispatch fault halts the VM and parks its message; surface
@@ -79,6 +80,7 @@ fn run_chunk_debug(chunk: fusevm::Chunk) -> Result<Value, String> {
     host::install(&mut vm);
     vm.register_builtin(host::DBG_LINE, dbg_line_builtin);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
+    host::reset_heap(); // start each run with an empty object arena
     match vm.run() {
         VMResult::Ok(v) => Ok(v),
         VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),

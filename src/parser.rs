@@ -19,6 +19,8 @@ pub fn parse(src: &str) -> Result<Program, String> {
         toks: tokens,
         pos: 0,
         funcs: Vec::new(),
+        classes: Vec::new(),
+        objects: Vec::new(),
     };
     p.program()
 }
@@ -29,6 +31,20 @@ struct Parser {
     /// User-defined `def`s collected while parsing (both object members and
     /// `def`s hoisted out of a body block). Flattened into `Program::functions`.
     funcs: Vec<Func>,
+    /// Top-level `class`/`case class` declarations.
+    classes: Vec<ClassDecl>,
+    /// Top-level non-entry `object`/`case object` declarations.
+    objects: Vec<ObjectDecl>,
+}
+
+/// The outcome of parsing a top-level `object`: the program entry point, or a
+/// singleton object declaration.
+enum TopObject {
+    /// The entry object — `(object_name, entry-point body)`. Its helper `def`s
+    /// were hoisted into `self.funcs`.
+    Entry(String, Vec<Stmt>),
+    /// A non-entry singleton `object`/`case object`.
+    Singleton(ObjectDecl),
 }
 
 impl Parser {
@@ -72,8 +88,9 @@ impl Parser {
         }
     }
 
-    /// `[package/import lines] object Name [extends …] { members… }` — find the
-    /// entry object and its entry point.
+    /// A compilation unit: `[package/import] (class | object | case class | case
+    /// object)*`. Exactly one `object` is the entry point (it `extends App` or
+    /// declares `def main`); the rest are sibling `class`/`object` declarations.
     fn program(&mut self) -> Result<Program, String> {
         self.skip_seps();
         // Skip package/import prologue lines.
@@ -88,16 +105,85 @@ impl Parser {
                 _ => break,
             }
         }
-        // Object modifiers/annotations (`final`, `@main`, …) arrive as idents/
-        // punctuation; skip to the `object` keyword.
-        while !self.is(&Tok::Object) && !self.is(&Tok::Eof) {
-            self.advance();
-        }
-        self.eat(&Tok::Object)?;
-        let object_name = self.ident()?;
 
-        // `extends Parent with Trait …` — note whether `App` is a parent (its
-        // body then runs directly).
+        let mut entry: Option<(String, Vec<Stmt>)> = None;
+        loop {
+            self.skip_seps();
+            if self.is(&Tok::Eof) {
+                break;
+            }
+            // Leading modifiers/annotations (`final`, `sealed`, `abstract`, …)
+            // arrive as bare idents; skip to the declaration keyword. `case`,
+            // `object`, and the `class` ident all stop the skip.
+            while !self.is(&Tok::Eof)
+                && !self.is(&Tok::Object)
+                && !self.is(&Tok::Case)
+                && !matches!(self.peek(), Tok::Ident(w) if w == "class" || w == "trait")
+            {
+                self.advance();
+            }
+            if self.is(&Tok::Eof) {
+                break;
+            }
+            // `case` prefix → `case class` / `case object`.
+            let is_case = if self.is(&Tok::Case) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            if self.is(&Tok::Object) {
+                match self.object_decl(is_case)? {
+                    TopObject::Entry(name, body) => {
+                        if entry.is_some() {
+                            return Err(
+                                "scalars: multiple entry objects (`extends App` / `def main`)"
+                                    .to_string(),
+                            );
+                        }
+                        entry = Some((name, body));
+                    }
+                    TopObject::Singleton(obj) => self.objects.push(obj),
+                }
+            } else if matches!(self.peek(), Tok::Ident(w) if w == "class") {
+                let c = self.class_decl(is_case)?;
+                self.classes.push(c);
+            } else if matches!(self.peek(), Tok::Ident(w) if w == "trait") {
+                // Traits are not modeled yet; skip the declaration body.
+                self.advance();
+                let _ = self.ident();
+                self.skip_member()?;
+            } else if !self.is(&Tok::Eof) {
+                return Err(format!(
+                    "scalars: expected a top-level `object`/`class` declaration, found {} on line {}",
+                    self.peek(),
+                    self.line()
+                ));
+            }
+        }
+
+        match entry {
+            Some((object_name, main)) => Ok(Program {
+                object_name,
+                main,
+                functions: std::mem::take(&mut self.funcs),
+                classes: std::mem::take(&mut self.classes),
+                objects: std::mem::take(&mut self.objects),
+            }),
+            None => Err(
+                "scalars: no entry object (`extends App` or `def main(args: Array[String])`)"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Parse an `object`/`case object` declaration (cursor on `object`). Returns
+    /// the program entry if it `extends App` or declares `def main`, otherwise a
+    /// singleton declaration.
+    fn object_decl(&mut self, is_case: bool) -> Result<TopObject, String> {
+        self.eat(&Tok::Object)?;
+        let name = self.ident()?;
+        // `extends Parent with Trait …` — note whether `App` is a parent.
         let mut app_mode = false;
         if self.is(&Tok::Extends) {
             self.advance();
@@ -114,40 +200,144 @@ impl Parser {
             // The whole object body is the program; any `def` inside is hoisted
             // into `self.funcs` by `block`.
             let body = self.block()?;
-            return Ok(Program {
-                object_name,
-                main: body,
-                functions: std::mem::take(&mut self.funcs),
-            });
+            return Ok(TopObject::Entry(name, body));
         }
 
-        // Otherwise scan members: `def main` is the entry, other `def`s are
-        // functions, everything else (object fields, nested types) is skipped.
+        // Scan members into defs / body statements / an optional `main`.
+        let mut defs = Vec::new();
+        let mut body = Vec::new();
         let mut main = None;
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             if self.is(&Tok::Def) {
-                if let Some(body) = self.try_main()? {
-                    main = Some(body);
+                if let Some(m) = self.try_main()? {
+                    main = Some(m);
                 } else {
-                    let f = self.parse_def()?;
-                    self.funcs.push(f);
+                    defs.push(self.parse_def()?);
                 }
+            } else if self.is(&Tok::Val) || self.is(&Tok::Var) {
+                body.push(self.statement()?);
             } else {
                 self.skip_member()?;
             }
             self.skip_seps();
         }
+        self.eat(&Tok::RBrace)?;
 
-        match main {
-            Some(main) => Ok(Program {
-                object_name,
-                main,
-                functions: std::mem::take(&mut self.funcs),
-            }),
-            None => Err(format!(
-                "scalars: object `{object_name}` has no `def main(args: Array[String])` and does not `extend App`"
-            )),
+        if let Some(main) = main {
+            // Entry object via `def main`: its helper `def`s join the flat
+            // function namespace; object-level `val`s are ignored (as before).
+            self.funcs.extend(defs);
+            Ok(TopObject::Entry(name, main))
+        } else {
+            Ok(TopObject::Singleton(ObjectDecl {
+                name,
+                is_case,
+                body,
+                methods: defs,
+            }))
+        }
+    }
+
+    /// Parse a `class`/`case class` declaration (cursor on the `class` ident).
+    /// The primary constructor's parameters become instance fields; the class
+    /// body's `val`/`var` declarations become further fields (initialized by the
+    /// constructor) and its `def`s become methods.
+    fn class_decl(&mut self, is_case: bool) -> Result<ClassDecl, String> {
+        self.advance(); // `class`
+        let name = self.ident()?;
+        // Optional `[T, …]` type-parameter clause.
+        if self.is(&Tok::LBracket) {
+            self.skip_bracket_group();
+        }
+        // Primary-constructor parameters (all become fields).
+        let mut params = Vec::new();
+        if self.is(&Tok::LParen) {
+            self.advance();
+            self.skip_seps();
+            while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
+                // Optional `val`/`var`/modifier before the parameter name.
+                while self.is(&Tok::Val) || self.is(&Tok::Var) {
+                    self.advance();
+                }
+                let pname = self.ident()?;
+                if self.is(&Tok::Colon) {
+                    self.advance();
+                    self.type_ref()?;
+                }
+                // A default value (`x: Int = 0`) is parsed and ignored.
+                if self.is(&Tok::Assign) {
+                    self.advance();
+                    self.expression()?;
+                }
+                params.push(pname);
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                    self.skip_seps();
+                } else {
+                    break;
+                }
+            }
+            self.eat(&Tok::RParen)?;
+        }
+        // Optional `extends …` clause — consumed and ignored (no inheritance).
+        if self.is(&Tok::Extends) {
+            self.advance();
+            while !self.is(&Tok::LBrace)
+                && !self.is(&Tok::Newline)
+                && !self.is(&Tok::Semi)
+                && !self.is(&Tok::Eof)
+            {
+                self.advance();
+            }
+        }
+        // Class body (optional). `def`s → methods; `val`/`var` → fields + ctor
+        // statements; anything else → a constructor side-effect statement.
+        let mut body = Vec::new();
+        let mut methods = Vec::new();
+        let mut field_names = params.clone();
+        if self.is(&Tok::LBrace) {
+            self.advance();
+            self.skip_seps();
+            while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+                if self.is(&Tok::Def) {
+                    methods.push(self.parse_def()?);
+                } else {
+                    let st = self.statement()?;
+                    if let StmtKind::Local { name, .. } = &st.kind {
+                        field_names.push(name.clone());
+                    }
+                    body.push(st);
+                }
+                self.skip_seps();
+            }
+            self.eat(&Tok::RBrace)?;
+        }
+        Ok(ClassDecl {
+            name,
+            is_case,
+            params,
+            body,
+            field_names,
+            methods,
+        })
+    }
+
+    /// Consume a `[ … ]` group, balancing nested brackets. The cursor is on `[`.
+    fn skip_bracket_group(&mut self) {
+        let mut depth = 0;
+        loop {
+            match self.advance() {
+                Tok::LBracket => depth += 1,
+                Tok::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Eof => break,
+                _ => {}
+            }
         }
     }
 
@@ -640,22 +830,20 @@ impl Parser {
             self.advance(); // `.`
             let line = self.line();
             let name = self.ident()?;
+            // `.copy(field = e, …)` — a `case class` copy with named/positional
+            // updates. Named args (`field =`) are not general-purpose method args
+            // in this frontend, so `copy` is parsed specially.
+            if name == "copy" && self.is(&Tok::LParen) {
+                let updates = self.copy_updates()?;
+                e = Expr::Copy {
+                    recv: Box::new(e),
+                    updates,
+                    line,
+                };
+                continue;
+            }
             let args = if self.is(&Tok::LParen) {
-                self.advance();
-                let mut args = Vec::new();
-                if !self.is(&Tok::RParen) {
-                    loop {
-                        args.push(self.expression()?);
-                        if self.is(&Tok::Comma) {
-                            self.advance();
-                            self.skip_seps();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                self.eat(&Tok::RParen)?;
-                args
+                self.arg_list()?
             } else {
                 Vec::new()
             };
@@ -667,6 +855,39 @@ impl Parser {
             };
         }
         Ok(e)
+    }
+
+    /// Parse a `.copy(...)` update list (cursor on `(`): comma-separated
+    /// `field = expr` (named) or bare `expr` (positional) updates.
+    fn copy_updates(&mut self) -> Result<Vec<(Option<String>, Expr)>, String> {
+        self.eat(&Tok::LParen)?;
+        let mut updates = Vec::new();
+        if !self.is(&Tok::RParen) {
+            loop {
+                // A named update is `ident =` (a single `=`, not `==`).
+                let named = if let Tok::Ident(fname) = self.peek().clone() {
+                    if matches!(self.toks[self.pos + 1].kind, Tok::Assign) {
+                        self.advance(); // field
+                        self.advance(); // =
+                        Some(fname)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let value = self.expression()?;
+                updates.push((named, value));
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                    self.skip_seps();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        Ok(updates)
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
@@ -695,6 +916,8 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Null)
             }
+            // `new Class(args)` — construct a host-heap instance.
+            Tok::New => self.new_expr(),
             // `if` in expression position: `val r = if (c) a else b`.
             Tok::If => self.if_expr(),
             // `for (...) yield …` / `for (...) …` in expression position.
@@ -758,6 +981,44 @@ impl Parser {
         }
         self.eat(&Tok::RParen)?;
         Ok(Expr::Call { name, args, line })
+    }
+
+    /// `new Class[Types](args)` — construct a host-heap instance (the cursor is
+    /// on `new`). Type arguments are consumed and ignored; the argument list is
+    /// optional (`new Empty`).
+    fn new_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::New)?;
+        let line = self.line();
+        let name = self.ident()?;
+        if self.is(&Tok::LBracket) {
+            self.skip_bracket_group();
+        }
+        let args = if self.is(&Tok::LParen) {
+            self.arg_list()?
+        } else {
+            Vec::new()
+        };
+        Ok(Expr::New { name, args, line })
+    }
+
+    /// Parse a parenthesized, comma-separated positional argument list (cursor on
+    /// `(`); consumes the closing `)`.
+    fn arg_list(&mut self) -> Result<Vec<Expr>, String> {
+        self.eat(&Tok::LParen)?;
+        let mut args = Vec::new();
+        if !self.is(&Tok::RParen) {
+            loop {
+                args.push(self.expression()?);
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                    self.skip_seps();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        Ok(args)
     }
 
     /// Parse `println(arg)` / `print(arg)` (the cursor is on the ident).
@@ -900,12 +1161,24 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 self.advance();
-                // `Foo(...)` — a constructor/extractor pattern (fusevm-blocked).
+                // `Foo(sub, …)` — a constructor/extractor pattern.
                 if self.is(&Tok::LParen) {
-                    return Err(format!(
-                        "scalars: constructor patterns (`case {name}(…)`) are not supported (line {})",
-                        self.line()
-                    ));
+                    self.advance();
+                    self.skip_seps();
+                    let mut elems = Vec::new();
+                    if !self.is(&Tok::RParen) {
+                        loop {
+                            elems.push(self.pattern()?);
+                            if self.is(&Tok::Comma) {
+                                self.advance();
+                                self.skip_seps();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.eat(&Tok::RParen)?;
+                    return Ok(Pattern::Constructor { name, elems });
                 }
                 if self.is(&Tok::Colon) {
                     self.advance();
@@ -913,6 +1186,10 @@ impl Parser {
                     Ok(Pattern::Typed { name, ty })
                 } else if name == "_" {
                     Ok(Pattern::Wildcard)
+                } else if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    // A capitalized bare identifier is a stable-identifier
+                    // pattern (`case None =>`), matched by `==`, not a binding.
+                    Ok(Pattern::Stable(name))
                 } else {
                     Ok(Pattern::Bind(name))
                 }
@@ -982,6 +1259,8 @@ fn parse_fragment(src: &str) -> Result<Expr, String> {
         toks: tokens,
         pos: 0,
         funcs: Vec::new(),
+        classes: Vec::new(),
+        objects: Vec::new(),
     };
     p.skip_seps();
     p.expression()

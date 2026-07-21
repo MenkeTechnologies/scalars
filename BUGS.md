@@ -19,17 +19,32 @@ never silently mis-run.
   `.abs`/`.round`/`.isNaN`/`.toInt` on `Double`; and `.toString` on any value.
   Method chaining works (`s.trim.length`). Out-of-range/parse failures throw
   faithfully (`StringIndexOutOfBoundsException`, `NumberFormatException`).
+- **Classes, objects, `case class` (host-side object model).** `class C(x: Int)
+  { def m = … }` with `new C(…)`, constructor params + body `val`/`var` fields,
+  `this`, in-place `var`-field mutation, and instance-method dispatch (runtime
+  class-tag dispatch off a `Value::Obj` handle into the frontend heap in
+  `src/host.rs`). `object` singletons dispatch `def`s statically and expose
+  `val`s as `Name.val`. `case class` derives an ordered-field `toString`
+  (`Point(1,2)`), structural `equals`/`hashCode`, `copy(field = …)` (named and
+  positional), a companion `apply` (construct without `new`), and `unapply` —
+  wired into constructor patterns `case Point(x, y) =>`, nested and guarded.
+  Built-in `Option` (`Some(v)`, the `None` case object) rides the same model.
+  Plain (non-`case`) classes use reference-identity `equals`/`hashCode` and a
+  `Class@hex` `toString`, matching Scala.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **Classes, traits, `case class`, objects-as-values, `new`.** No instance
-  model, no fields, no constructors, no `this`, no auto-derived
-  `equals`/`hashCode`/`toString`/`apply`. `new` is lexed but has no semantics.
-  (This needs an ordered, type-tagged record value that fusevm's `Value` does
-  not yet provide — see the note at the bottom.)
+- **Traits, inheritance, generics.** `trait`, `extends`/`with` linearization
+  (parsed and ignored), type parameters (parsed and ignored), abstract members.
+  A class's `val`/private access modifiers are parsed but not enforced (every
+  field is reachable — a documented simplification).
 - **Collections and arrays.** `Array`, `List`, `Seq`, `Map`, indexing,
-  higher-order `.map`/`.filter`. The `args` parameter of `main` is parsed and
-  ignored.
+  higher-order `.map`/`.filter`. These are blocked on **lambdas** (`x => …`),
+  which scalars does not have yet: `.map`/`.filter` and collection `for`
+  generators (`x <- list`) all take a function value. A host-side `List`/`Map`
+  `Obj` is straightforward on the object heap built here, but is deferred until
+  lambdas land so the collection API can be modeled faithfully rather than
+  stubbed. The `args` parameter of `main` is parsed and ignored.
 - **The wider standard library.** `math`, `scala.io`, `scala.collection.*`, and
   the many `String`/numeric methods beyond the wired subset above.
 - **`if`/`else` as an expression in operand position.** `val r = if (c) a else b`
@@ -69,15 +84,18 @@ never silently mis-run.
   order and any `def` members are hoisted and callable; other member kinds
   (fields, nested types) are skipped.
 
-## Missing substrate (blocks `case class`)
+## Object model: how it works
 
-Faithful `case class` support is blocked on the value model, not the frontend.
-`case class Point(x, y)` needs an **ordered, type-tagged record** so that
-`toString` renders `Point(1, 2)` in declared field order and structural
-`equals`/`hashCode` compare field-by-field. fusevm's `Value` offers only an
-unordered `Hash(HashMap<String, Value>)` (loses field order) and an opaque
-`Obj(u32)` handle into a frontend-owned heap that scalars does not yet maintain.
-Until scalars either (a) grows a small object heap behind `Value::Obj` with a
-class registry (name → ordered field names, keyed so the host method dispatcher
-can resolve fields and derive `toString`), or (b) fusevm adds an ordered record
-value, `class`/`case class` stays a parse-level gap rather than a mis-run.
+`case class` needs an **ordered, type-tagged record** so `toString` renders
+`Point(1,2)` in declared field order and structural `equals`/`hashCode` compare
+field-by-field. fusevm's `Value::Obj(u32)` is an opaque handle into a
+*frontend-owned* object heap; scalars now owns that heap (`src/host.rs`): a
+`Value::Obj` indexes a per-run arena of records (`class name`, `is_case`,
+`is_object`, ordered `(field, value)` list). Construction, field access,
+`toString`/`equals`/`hashCode`, `copy`, and constructor-pattern binding are host
+extension builtins (`OBJ_NEW`/`OBJ_CLASS`/`OBJ_COPY`/`OBJ_SET`, plus the `Obj`
+arm of `SMETHOD` and the `==` numeric hook) — no fusevm changes. Every
+construction site bakes the class name + ordered field names into the bytecode,
+so no runtime class registry is needed; instance-method calls resolve by a
+runtime class-tag dispatch chain the compiler emits from compile-time class
+knowledge.

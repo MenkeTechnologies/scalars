@@ -20,6 +20,51 @@ pub struct Program {
     /// object-level namespace. Each is callable by name from `main`, from
     /// another `def`, or recursively (see [`crate::compiler`]).
     pub functions: Vec<Func>,
+    /// Top-level `class` / `case class` declarations (other than the entry
+    /// object). Each compiles to a host-heap record constructor plus its methods
+    /// (see [`crate::compiler`]).
+    pub classes: Vec<ClassDecl>,
+    /// Top-level `object` / `case object` declarations other than the entry
+    /// object — singletons whose `def`s dispatch statically and whose `val`s are
+    /// program-global.
+    pub objects: Vec<ObjectDecl>,
+}
+
+/// A `class` / `case class` declaration. The instance is a host-heap record (an
+/// ordered, type-tagged field list behind a `Value::Obj`); `is_case` selects
+/// structural `equals`/`hashCode`/`toString` and enables companion
+/// `apply`/`unapply`/`copy`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassDecl {
+    pub name: String,
+    pub is_case: bool,
+    /// Primary-constructor parameter names, in order. All are instance fields
+    /// (the runtime is dynamically typed, so the `val`/`var`/private distinction
+    /// is not enforced — a documented simplification).
+    pub params: Vec<String>,
+    /// The class body run as the constructor: `val`/`var` field declarations
+    /// (their initializers may reference constructor params and earlier fields)
+    /// and any side-effecting statements. `def`s are hoisted into `methods`.
+    pub body: Vec<Stmt>,
+    /// Every instance field in declared order: constructor `params` followed by
+    /// the `val`/`var` names declared in `body`. This is the record's shape (used
+    /// for `toString`, construction, and constructor-pattern binding).
+    pub field_names: Vec<String>,
+    /// Methods (`def`s) declared in the class body. Compiled as global
+    /// subroutines named `Class$method` with an implicit leading `this` param.
+    pub methods: Vec<Func>,
+}
+
+/// An `object` / `case object` singleton. Its `val`s become program globals
+/// (`Name.val`) initialized before `main`; its `def`s become subroutines
+/// (`Name$method`) dispatched statically off the object name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectDecl {
+    pub name: String,
+    pub is_case: bool,
+    /// `val`/`var` declarations (initialized once before `main`) and side effects.
+    pub body: Vec<Stmt>,
+    pub methods: Vec<Func>,
 }
 
 /// A user-defined method: `def name(p0: T0, p1: T1, …): R = body`. Parameter and
@@ -148,6 +193,22 @@ pub enum Expr {
         args: Vec<Expr>,
         line: u32,
     },
+    /// `new Class(args)` — construct a host-heap instance. Lowered to the class's
+    /// `Class$new` constructor subroutine (see [`crate::compiler`]).
+    New {
+        name: String,
+        args: Vec<Expr>,
+        line: u32,
+    },
+    /// `recv.copy(field = e, …)` on a `case class` — a new instance with the
+    /// named (or positional) fields overwritten and the rest copied from `recv`.
+    /// `updates` pairs an optional field name (`None` = positional) with its
+    /// value expression.
+    Copy {
+        recv: Box<Expr>,
+        updates: Vec<(Option<String>, Expr)>,
+        line: u32,
+    },
     /// `if (cond) then [else els]` in *expression* position — a value-producing
     /// conditional (`val r = if (c) a else b`). Distinct from [`StmtKind::If`]
     /// (statement position, run for effect). When `els` is `None` the false path
@@ -206,8 +267,7 @@ pub struct MatchArm {
 }
 
 /// A `match` pattern. Constructor/case-class/extractor patterns (`case Foo(x)`)
-/// are intentionally absent — they need an ordered record value the fusevm value
-/// model does not yet expose. The parser rejects them rather than mis-lowering.
+/// are lowered against the host-heap record model (see [`crate::compiler`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     /// `case _ =>` — matches anything, binds nothing.
@@ -220,6 +280,15 @@ pub enum Pattern {
     /// `case x: String =>` / `case _: Int =>` — matches when the scrutinee has the
     /// named runtime type; binds it to `name` (unless `name` is `_`).
     Typed { name: String, ty: String },
+    /// `case Point(x, y) =>` / `case Some(v) =>` — a constructor (extractor)
+    /// pattern: matches when the scrutinee is an instance of `name` (a `case
+    /// class`/`case object`) whose field arity matches, then binds each field
+    /// position against the corresponding sub-pattern (nesting and guards work).
+    Constructor { name: String, elems: Vec<Pattern> },
+    /// A capitalized stable-identifier pattern (`case None =>`) — Scala treats an
+    /// upper-case bare identifier in a pattern as a reference to a value/singleton
+    /// (e.g. the `None` object), matched by `==`, not a binding.
+    Stable(String),
 }
 
 /// Unary operators.
