@@ -1,0 +1,367 @@
+.\" scalaall(1) — comprehensive all-in-one man page for scalars
+.\" Modeled after zshall(1): every man page in one document.
+.\" Render with:  man -l man/man1/scalaall.1
+.\" Install:      cp man/man1/scalaall.1 /usr/local/share/man/man1/
+.TH SCALAALL 1 "2026" "scalars 0.1.0" "User Commands"
+.SH NAME
+scalaall \- the scalars comprehensive reference (invocation, language
+slice, bytecode VM, Cranelift JIT, numeric semantics, editor/debugger
+tooling)
+.SH OVERVIEW
+This is the all\-in\-one
+.B scalars
+manual, modeled on
+.BR zshall (1).
+It concatenates the major sections of the scalars reference into a single
+page so you can grep with `/`:
+.RS 2
+.PP
+.B 1.  INVOCATION
+.RB "\(em " "file run + introspection + LSP/DAP flags"
+.br
+.B 2.  LANGUAGE SLICE
+.RB "\(em " "entry object, statements, expressions, operators"
+.br
+.B 3.  VALUE MODEL
+.RB "\(em " "Int/Double/Boolean/String/null on the fusevm value model"
+.br
+.B 4.  NUMERIC SEMANTICS
+.RB "\(em " "Int/Double division dispatch, String +, structural ==, Double.toString"
+.br
+.B 5.  BYTECODE VM
+.RB "\(em " "lowering to fusevm ops, no bespoke VM, no JVM"
+.br
+.B 6.  CRANELIFT JIT
+.RB "\(em " "tiered compilation of hot loops"
+.br
+.B 7.  LSP SERVER
+.RB "\(em " "completion, hover, live diagnostics"
+.br
+.B 8.  DAP ADAPTER
+.RB "\(em " "source\-line breakpoints, stepping, variables"
+.br
+.B 9.  ENVIRONMENT
+.br
+.B 10. EXIT STATUS
+.br
+.B 11. FILES
+.br
+.B 12. EXAMPLES
+.br
+.B 13. GAPS
+.RE
+.PP
+For a shorter quick\-reference page see
+.BR scala (1).
+.SH "1.  INVOCATION"
+The program text is a single
+.B .scala
+file named as the first non\-option argument.  Arguments after the file
+are collected but not yet exposed to the program (slice 1 ignores
+.BR argv ).
+.TP
+.B \-\-dump\-tokens
+Print the lexer token stream and exit.
+.TP
+.B \-\-dump\-ast
+Print the parsed AST and exit.
+.TP
+.B \-\-disasm
+Print the lowered fusevm bytecode disassembly and exit.
+.TP
+.B \-\-lsp
+Speak the Language Server Protocol over stdio.
+.TP
+.B \-\-dap
+Speak the Debug Adapter Protocol over stdio.
+.TP
+.BR \-version ", " \-\-version
+Print the version banner and exit.
+.TP
+.BR \-h ", " \-\-help
+Print the option grammar and exit.
+.SH "2.  LANGUAGE SLICE"
+.SS Entry object
+A compilation unit is a single
+.BR object .
+scalars finds the entry point two ways:
+.B object Name extends App { <body> }
+runs
+.B <body>
+directly, and
+.B object Name { ... def main(args: Array[String]): Unit = { <body> } ... }
+runs its
+.BR main .
+Other members are skipped.  Optional
+.BR package / import
+prologue lines are tolerated and ignored.
+.SS Statements
+.BR val / var
+bindings (with an optional
+.BR ": Type"
+annotation), assignment and compound assignment
+.RB ( = ,
+.BR += ,
+.BR -= ,
+.BR *= ,
+.BR /= ,
+.BR %= ),
+.B if (cond) { .. } else { .. }
+,
+.B while (cond) { .. }
+,
+the range
+.B for (name <- start until|to end) { .. }
+comprehension in statement position, and
+.BR println / print .
+Statements are separated by inferred line breaks or explicit
+.BR ; .
+.SS Expressions
+Integer, floating, string, char (as a one\-char string), boolean, and
+.B null
+literals; variable reads; unary
+.BR - / ! ;
+and the binary operators below with precedence climbing.
+.SS Operators
+.B + - * / %
+(arithmetic),
+.B == != < > <= >=
+(comparison),
+.B && ||
+(short\-circuiting boolean).
+.SS Newline inference
+The hand\-written lexer emits a statement\-separator line break only where
+the previous token can end a statement, the next can begin one, and the
+cursor is not inside
+.BR (...) / [...] .
+.SH "3.  VALUE MODEL"
+Slice\-1 scalars runs on the fusevm value model directly, with no object
+heap of its own yet:
+.BR Int
+as a native integer,
+.BR Double
+as a float,
+.BR Boolean
+as a bool,
+.BR String
+as a VM string, and the
+.B null
+literal as
+.BR Value::Undef .
+Locals are addressed by name through
+.BR GetVar / SetVar
+in a single entry frame with no lexical scopes.
+.SH "4.  NUMERIC SEMANTICS"
+.SS Division
+fusevm's native division always floats, but Scala's
+.B /
+truncates for two
+.BR Int s
+.RB ( "7 / 2 == 3" )
+and floats when either operand is a
+.B Double
+.RB ( "7 / 2.0 == 3.5" ).
+Because slice 1 carries no static types, the choice is made at runtime by
+a type\-dispatching
+.B SDIV
+builtin.  Integer division by zero yields
+.B null
+(a documented gap; Scala throws
+.BR ArithmeticException ).
+.SS String +
+Scala's
+.B +
+is string concatenation when a
+.B String
+operand is involved:
+.B String.+(Any)
+(a String left operand) and numeric
+.B +(String)
+(a numeric left operand, String right).  Other mixed
+.B +
+operands are rejected rather than silently concatenated.
+.SS Structural ==
+.B ==
+/
+.B !=
+compare by value (Scala's
+.B ==
+is
+.BR equals ),
+so strings compare by content.
+.SS Double.toString
+Whole doubles print with a trailing
+.B .0
+; magnitude selects decimal notation for
+.B 1e-3 <= |x| < 1e7
+and computerized scientific
+.RB ( 1.0E7 ,
+.BR 1.0E-4 )
+otherwise, reproducing Java's
+.BR Double.toString .
+Non\-finite values print
+.BR NaN / Infinity / -Infinity .
+.SH "5.  BYTECODE VM"
+.B scalars
+lowers the Scala AST to a flat
+.B fusevm::Chunk
+of stack\-VM ops
+.RB ( LoadInt ,
+.BR Add ,
+.BR GetVar ,
+.BR JumpIfFalse ,
+.BR CallBuiltin ,
+\(em) and runs it on the shared engine.  There is no local
+.BR vm.rs / jit.rs
+and no JVM.  Short\-circuit
+.BR && / || ,
+control flow, and the range
+.B for
+resolve to jump\-patched offsets at compile time; a
+.B for
+snapshots its upper bound into a synthetic local, matching Scala's
+evaluate\-the\-range\-once semantics.
+.SH "6.  CRANELIFT JIT"
+Execution runs on fusevm's three\-tier Cranelift JIT; hot loops
+trace\-compile to native code, and the
+.B jit-disk-cache
+feature persists compiled native code across runs keyed by chunk hash.
+All\-numeric arithmetic stays on the native fast path; only operations
+with a non\-numeric operand delegate to the strict numeric hook in the
+host.
+.SH "7.  LSP SERVER"
+.B scala --lsp
+speaks the Language Server Protocol over stdio.  It is self\-contained and
+read\-only:
+.IP \[bu] 2
+.B completion
+of the recognized keyword / contextual\-word / Predef / operator corpus;
+.IP \[bu] 2
+.B hover
+rendering each name's category, one\-line doc, and a runnable example;
+.IP \[bu] 2
+.B diagnostics
+computed by the runtime's own parser \(em a syntax error maps to a
+diagnostic on the reported line.
+.PP
+The same corpus generates
+.B docs/reference.html
+via the
+.B gen-docs
+binary, so the editor and the static reference never drift.
+.SH "8.  DAP ADAPTER"
+.B scala --dap
+speaks the Debug Adapter Protocol over stdio: a single\-threaded
+source\-line debugger.  The program is compiled with a per\-statement
+.B DBG_LINE
+marker (emitted only in this mode) and run on the pure interpreter, so
+breakpoints and stepping land on real lines.  Supported requests:
+.BR setBreakpoints ,
+.BR stackTrace ,
+.BR scopes ,
+.BR variables ,
+.BR evaluate
+(bare local lookup),
+.BR continue ,
+.BR next ,
+.BR stepIn ,
+.BR stepOut .
+Program stdout is redirected to a pipe during the run and forwarded as
+.B output
+events, so
+.BR println / print
+never corrupt the JSON protocol channel.
+.SH "9.  ENVIRONMENT"
+scalars reads no environment variables of its own in the current slice.
+The shared fusevm JIT / disk\-cache honor their own variables.
+.SH "10. EXIT STATUS"
+.TP
+.B 0
+Successful completion.
+.TP
+.B 1
+Error during lexing, parsing, lowering, or execution.  Errors are written
+to stderr as
+.BR "scalars: <reason>" .
+.SH "11. FILES"
+.TP
+.I /usr/local/share/man/man1/scala.1
+Short reference man page.
+.TP
+.I /usr/local/share/man/man1/scalaall.1
+This man page.
+.SH "12. EXAMPLES"
+.PP
+Run a Scala file:
+.RS
+.nf
+scala hello.scala
+.fi
+.RE
+.PP
+Print the token stream, the AST, or the bytecode:
+.RS
+.nf
+scala --dump-tokens hello.scala
+scala --dump-ast   hello.scala
+scala --disasm     hello.scala
+.fi
+.RE
+.PP
+An entry object with a range loop and Int/Double division:
+.RS
+.nf
+object Demo extends App {
+  var sum = 0
+  for (i <- 1 to 10) { sum += i }
+  println(sum)              // 55
+  println(7 / 2)            // 3
+  println(7 / 2.0)          // 3.5
+  println("total = " + sum) // total = 55
+}
+.fi
+.RE
+.PP
+Editor / debugger tooling over stdio:
+.RS
+.nf
+scala --lsp
+scala --dap
+.fi
+.RE
+.SH "13. GAPS"
+.B scalars
+is an early slice.  Documented gaps (see
+.B BUGS.md
+in the source tree):
+.IP \[bu] 2
+User\-defined methods, classes, traits, and the collection library are not
+yet carried; a member call
+.RB ( x.foo() )
+or field access is a parse error.
+.IP \[bu] 2
+Integer division / modulo by zero yields
+.B null
+rather than throwing
+.BR ArithmeticException .
+.IP \[bu] 2
+.BR val
+reassignment is not rejected (no immutability enforcement yet).
+.IP \[bu] 2
+.B return ,
+.B for ... yield ,
+and the
+.B by
+range step are not yet supported.
+.SH SEE ALSO
+.BR scala (1),
+.BR awkrsall (1),
+.BR zshrsall (1)
+.PP
+Project home:
+.UR https://github.com/MenkeTechnologies/scalars
+.UE
+.SH BUGS
+Report bugs at
+.UR https://github.com/MenkeTechnologies/scalars/issues
+.UE .
