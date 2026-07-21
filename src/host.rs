@@ -22,7 +22,7 @@ use std::cell::RefCell;
 pub const SPRINTLN: u16 = 700;
 /// Builtin id for Predef `print` (one Scala-formatted arg, no newline).
 pub const SPRINT: u16 = 701;
-/// Builtin id for Scala `/` (type-dispatching division — see [`b_div`]).
+/// Builtin id for Scala `/` (type-dispatching division — see `b_div`).
 pub const SDIV: u16 = 702;
 /// Builtin id for the `scala --dap` per-statement debug marker. Emitted only by
 /// `compiler::compile_debug`; registered only on the debug run path

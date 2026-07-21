@@ -26,7 +26,7 @@ pub struct Cli {
     pub dap: bool,
 }
 
-/// Parse process args (excluding argv[0]).
+/// Parse process args (excluding `argv[0]`).
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
     let mut cli = Cli::default();
     for a in args {
