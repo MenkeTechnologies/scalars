@@ -44,11 +44,11 @@ pub const FFI_CALL: u16 = 705;
 /// `s.substring(1, 3)`). The stack holds the receiver (deepest), then the
 /// arguments, then the method name (a `Str`) on top; `argc` is the argument
 /// count plus two (receiver + name). Routes to the wired String/Int stdlib in
-/// [`b_method`].
+/// `b_method`.
 pub const SMETHOD: u16 = 706;
 /// Builtin id for `f"…"`-interpolator formatting. The stack holds the value
 /// (deepest) and the format spec (a `Str`, on top); `argc` is 2. Formats through
-/// the Java-`Formatter` subset in [`format_one`].
+/// the Java-`Formatter` subset in `format_one`.
 pub const SFORMAT: u16 = 707;
 /// Builtin id for a `match` typed-pattern runtime type test (`case x: String`).
 /// The stack holds the value (deepest) and the type name (a `Str`, on top);
@@ -63,7 +63,7 @@ pub const SMATCHERR: u16 = 709;
 /// `Str`, the comma-separated field-name list `Str` (empty for a no-field
 /// object), an `is_case` `Bool`, and an `is_object` `Bool` on top; `argc` is
 /// field-count + 4. Returns a `Value::Obj` handle into the frontend heap (see
-/// [`ScalaObj`]). `is_object` selects singleton `toString` (`None`, not `None()`).
+/// `ScalaObj`). `is_object` selects singleton `toString` (`None`, not `None()`).
 pub const OBJ_NEW: u16 = 710;
 /// Builtin id for reading a heap object's class name (for runtime method
 /// dispatch and constructor-pattern class tests). Pops one value; returns its
