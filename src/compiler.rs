@@ -21,13 +21,31 @@ struct Compiler {
     /// Distinguishes synthetic `for` upper-bound locals so nested loops do not
     /// alias one another.
     for_counter: u32,
+    /// When true, a per-statement `DBG_LINE` marker is emitted before each
+    /// statement (for `scala --dap`). Normal runs compile with `debug=false` and
+    /// carry zero extra ops.
+    debug: bool,
 }
 
 /// Compile a parsed [`Program`]'s entry body to a runnable fusevm chunk.
 pub fn compile(prog: &Program) -> Result<Chunk, String> {
+    compile_inner(prog, false)
+}
+
+/// Compile with a per-statement `DBG_LINE` marker before each statement, on the
+/// statement's source line, so the DAP adapter can stop on breakpoints and step.
+/// The marker is `CallBuiltin(DBG_LINE, 0)` followed by a `Pop` to stay stack
+/// balanced (the builtin returns `Unit`); it never runs under the tracing JIT
+/// (see `crate::run_chunk_debug`), so hot loops keep their markers.
+pub fn compile_debug(prog: &Program) -> Result<Chunk, String> {
+    compile_inner(prog, true)
+}
+
+fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         for_counter: 0,
+        debug,
     };
     for stmt in &prog.main {
         c.stmt(stmt)?;
@@ -37,8 +55,13 @@ pub fn compile(prog: &Program) -> Result<Chunk, String> {
 
 impl Compiler {
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
-        match s {
-            Stmt::Local { name, init, .. } => {
+        if self.debug && s.line != 0 {
+            self.b
+                .emit(Op::CallBuiltin(crate::host::DBG_LINE, 0), s.line);
+            self.b.emit(Op::Pop, s.line);
+        }
+        match &s.kind {
+            StmtKind::Local { name, init, .. } => {
                 if let Some(e) = init {
                     self.expr(e)?;
                     let idx = self.b.add_name(name);
@@ -49,7 +72,7 @@ impl Compiler {
                 // 1 does not enforce it).
                 Ok(())
             }
-            Stmt::Assign { name, op, value } => {
+            StmtKind::Assign { name, op, value } => {
                 let idx = self.b.add_name(name);
                 match op {
                     AssignOp::Assign => {
@@ -72,21 +95,21 @@ impl Compiler {
                 self.b.emit(Op::SetVar(idx), 0);
                 Ok(())
             }
-            Stmt::Expr(Expr::Println { newline, arg }) => {
+            StmtKind::Expr(Expr::Println { newline, arg }) => {
                 // The print builtin returns `Unit`; discard it in statement
                 // position.
                 self.println(*newline, arg.as_deref())?;
                 self.b.emit(Op::Pop, 0);
                 Ok(())
             }
-            Stmt::Expr(e) => {
+            StmtKind::Expr(e) => {
                 self.expr(e)?;
                 self.b.emit(Op::Pop, 0);
                 Ok(())
             }
-            Stmt::If { cond, then, els } => self.if_stmt(cond, then, els),
-            Stmt::While { cond, body } => self.while_stmt(cond, body),
-            Stmt::For {
+            StmtKind::If { cond, then, els } => self.if_stmt(cond, then, els),
+            StmtKind::While { cond, body } => self.while_stmt(cond, body),
+            StmtKind::For {
                 name,
                 start,
                 end,

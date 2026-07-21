@@ -23,6 +23,10 @@ pub const SPRINTLN: u16 = 700;
 pub const SPRINT: u16 = 701;
 /// Builtin id for Scala `/` (type-dispatching division — see [`b_div`]).
 pub const SDIV: u16 = 702;
+/// Builtin id for the `scala --dap` per-statement debug marker. Emitted only by
+/// `compiler::compile_debug`; registered only on the debug run path
+/// (`crate::run_chunk_debug`). It carries no args and returns `Unit`.
+pub const DBG_LINE: u16 = 703;
 
 /// Install scalars builtins on a VM: the Scala-formatting print builtins and the
 /// type-dispatching division operator. This is the single install choke point

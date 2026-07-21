@@ -34,6 +34,12 @@ path = "src/lib.rs"
 name = "scala"
 path = "src/main.rs"
 
+# Offline generator for docs/reference.html — renders the keyword/builtin
+# reference (src/lsp.rs corpus) as a static page. Run before pushing Pages.
+[[bin]]
+name = "gen-docs"
+path = "src/bin/gen_docs.rs"
+
 # Differential parity FUZZER: generates deterministic-output Scala programs (each
 # packing many probes to amortize the reference toolchain's JVM startup) biased
 # toward Int-vs-Double division dispatch, `+` concatenation coercion, structural
@@ -59,6 +65,16 @@ path = "src/bin/parity_fuzz.rs"
 fusevm = { version = "0.14.11", features = ["jit", "jit-disk-cache", "aot"] }
 
 thiserror = "2.0"
+
+# LSP (`scala --lsp`) + DAP (`scala --dap`) over stdio. libc gives the DAP server
+# a pipe + dup2 to capture the debuggee's stdout (println) so program output
+# streams as `output` events instead of corrupting the JSON-RPC channel, and
+# backs the LSP orphan guard.
+lsp-server = "0.7.9"
+lsp-types = "0.97.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

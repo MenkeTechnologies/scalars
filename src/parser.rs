@@ -248,7 +248,16 @@ impl Parser {
         }
     }
 
+    /// Parse one statement, tagging it with the source line of its first token
+    /// (the single choke point every statement — top-level or nested — flows
+    /// through, so `--dap` markers land on real lines).
     fn statement(&mut self) -> Result<Stmt, String> {
+        let line = self.line();
+        let kind = self.statement_kind()?;
+        Ok(Stmt { line, kind })
+    }
+
+    fn statement_kind(&mut self) -> Result<StmtKind, String> {
         match self.peek() {
             Tok::If => self.if_stmt(),
             Tok::While => self.while_stmt(),
@@ -263,7 +272,7 @@ impl Parser {
                 // A bare block: flatten into a single synthetic if-true. Slice 1
                 // has no lexical scopes, so inlining is behavior-preserving.
                 let body = self.block()?;
-                Ok(Stmt::If {
+                Ok(StmtKind::If {
                     cond: Expr::Bool(true),
                     then: body,
                     els: vec![],
@@ -274,7 +283,7 @@ impl Parser {
     }
 
     /// A `val`/`var` binding: `val x = e`, `var y: Int = e`.
-    fn local_decl(&mut self) -> Result<Stmt, String> {
+    fn local_decl(&mut self) -> Result<StmtKind, String> {
         let is_val = matches!(self.peek(), Tok::Val);
         self.advance(); // val/var
         let name = self.ident()?;
@@ -290,7 +299,7 @@ impl Parser {
         } else {
             None
         };
-        Ok(Stmt::Local {
+        Ok(StmtKind::Local {
             is_val,
             ty,
             name,
@@ -342,20 +351,20 @@ impl Parser {
     }
 
     /// Assignment (`x = e`, `x += e`) or a bare expression statement.
-    fn simple_statement(&mut self) -> Result<Stmt, String> {
+    fn simple_statement(&mut self) -> Result<StmtKind, String> {
         if let Tok::Ident(name) = self.peek().clone() {
             let next = &self.toks[self.pos + 1].kind;
             if let Some(op) = assign_op(next) {
                 self.advance(); // name
                 self.advance(); // op
                 let value = self.expression()?;
-                return Ok(Stmt::Assign { name, op, value });
+                return Ok(StmtKind::Assign { name, op, value });
             }
         }
-        Ok(Stmt::Expr(self.expression()?))
+        Ok(StmtKind::Expr(self.expression()?))
     }
 
-    fn if_stmt(&mut self) -> Result<Stmt, String> {
+    fn if_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::If)?;
         self.eat(&Tok::LParen)?;
         let cond = self.expression()?;
@@ -372,21 +381,21 @@ impl Parser {
             self.pos = save;
             vec![]
         };
-        Ok(Stmt::If { cond, then, els })
+        Ok(StmtKind::If { cond, then, els })
     }
 
-    fn while_stmt(&mut self) -> Result<Stmt, String> {
+    fn while_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::While)?;
         self.eat(&Tok::LParen)?;
         let cond = self.expression()?;
         self.eat(&Tok::RParen)?;
         let body = self.braced_or_single()?;
-        Ok(Stmt::While { cond, body })
+        Ok(StmtKind::While { cond, body })
     }
 
     /// `for (name <- start until|to end) <body>` — a range comprehension in
     /// statement position.
-    fn for_stmt(&mut self) -> Result<Stmt, String> {
+    fn for_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
         let name = self.ident()?;
@@ -423,7 +432,7 @@ impl Parser {
             ));
         }
         let body = self.braced_or_single()?;
-        Ok(Stmt::For {
+        Ok(StmtKind::For {
             name,
             start,
             end,

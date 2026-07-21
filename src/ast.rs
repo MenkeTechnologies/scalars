@@ -18,9 +18,17 @@ pub struct Program {
     pub main: Vec<Stmt>,
 }
 
-/// A Scala statement.
+/// A Scala statement with its 1-based source line (used by `scala --dap` to emit
+/// a per-statement debug marker so breakpoints and stepping land on real lines).
 #[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
+pub struct Stmt {
+    pub line: u32,
+    pub kind: StmtKind,
+}
+
+/// The kind of a Scala statement (see [`Stmt`] for the line it carries).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StmtKind {
     /// A local binding: `val x = expr`, `var y: Int = expr`. `is_val` records
     /// immutability for diagnostics; the declared type is retained for the same
     /// reason. The runtime is dynamically typed on the fusevm value model, so

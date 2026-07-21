@@ -21,6 +21,19 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if cli.lsp {
+        return match scalars::lsp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
+    if cli.dap {
+        return match scalars::dap::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
+
     let Some(file) = cli.file.clone() else {
         return fail("no input file (try `scala --help`)");
     };

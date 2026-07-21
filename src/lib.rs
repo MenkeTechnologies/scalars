@@ -10,8 +10,10 @@ pub mod ast;
 pub mod banner;
 pub mod cli;
 pub mod compiler;
+pub mod dap;
 pub mod host;
 pub mod lexer;
+pub mod lsp;
 pub mod parser;
 
 pub use banner::version_banner;
@@ -45,6 +47,43 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
 /// Compile and run a Scala source string; return the last VM value.
 pub fn run_str(src: &str) -> Result<Value, String> {
     run_chunk(compile(src)?)
+}
+
+/// Parse and lower Scala `src` with per-statement `DBG_LINE` markers (for
+/// `scala --dap`).
+pub fn compile_debug(src: &str) -> Result<fusevm::Chunk, String> {
+    let prog = parser::parse(src)?;
+    compiler::compile_debug(&prog)
+}
+
+/// The `DBG_LINE` marker builtin: hand control to the DAP adapter, which pauses
+/// on breakpoints/steps, then return `Unit`.
+fn dbg_line_builtin(vm: &mut VM, _argc: u8) -> Value {
+    dap::on_debug_line(vm);
+    Value::Undef
+}
+
+/// Run a debug-compiled chunk: install the host builtins and the `DBG_LINE`
+/// marker builtin, but do NOT enable the tracing JIT (it would compile hot loops
+/// and skip the markers). Used only by `scala --dap`.
+fn run_chunk_debug(chunk: fusevm::Chunk) -> Result<Value, String> {
+    let mut vm = VM::new(chunk);
+    host::install(&mut vm);
+    vm.register_builtin(host::DBG_LINE, dbg_line_builtin);
+    vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
+    match vm.run() {
+        VMResult::Ok(v) => Ok(v),
+        VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
+        VMResult::Error(e) => Err(e),
+    }
+}
+
+/// Read and run a `.scala` file under the debug marker path (for `scala --dap`).
+pub fn eval_file_debug(path: &str) -> Result<(), String> {
+    let src =
+        std::fs::read_to_string(path).map_err(|e| format!("scalars: cannot read {path}: {e}"))?;
+    run_chunk_debug(compile_debug(&src)?)?;
+    Ok(())
 }
 
 /// Read and run a `.scala` file.
