@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="scalars — Scala in Rust. A Scala frontend for fusevm: source lexed and parsed to an AST, lowered to fusevm bytecode, and run on the shared bytecode VM with a three-tier Cranelift JIT. No bespoke VM, no JVM. MIT licensed.">
+  <title>scalars — Documentation</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="hud-static.css">
+  <link rel="stylesheet" href="tutorial.css">
+  <style>
+    .tutorial-main { max-width: 68rem; }
+    .docs-build-line { margin:0.35rem 0 0;font-family:'Share Tech Mono',ui-monospace,monospace;font-size:11px;color:var(--text-dim);letter-spacing:0.03em;max-width:44rem;opacity:0.75; }
+    .hub-scheme-strip { border-bottom:1px dashed var(--border);background:color-mix(in srgb, var(--bg-secondary) 85%, transparent);padding:0.55rem 1.5rem 0.65rem;position:relative; }
+    .hub-scheme-strip-inner { max-width:68rem;margin:0 auto;display:flex;align-items:center;gap:0.85rem; }
+    .hub-scheme-strip .hud-scheme-label { flex:0 0 auto;font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--accent);text-align:left; }
+    .hub-scheme-strip .scheme-grid { flex:1 1 auto;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px; }
+    @media (max-width:720px){ .hub-scheme-strip-inner{flex-direction:column;align-items:stretch}.hub-scheme-strip .scheme-grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
+    .cat-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(16rem,1fr));gap:0.6rem;margin:0.7rem 0; }
+    .cat-card { border:1px solid var(--border);border-left:2px solid var(--cyan);padding:0.6rem 0.8rem;background:color-mix(in srgb, var(--bg-card) 92%, transparent);border-radius:2px; }
+    .cat-card h4 { font-family:'Orbitron',sans-serif;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--cyan);margin:0 0 0.35rem; }
+    .cat-card p { margin:0;font-size:11.5px;color:var(--text-dim);line-height:1.5; }
+    .cat-card code { font-size:11px;color:var(--accent-light); }
+    .reflection-table { width:100%;border-collapse:collapse;margin:0.6rem 0 0.2rem;font-size:12px; }
+    .reflection-table th { background:var(--bg-secondary);color:var(--cyan);font-family:'Orbitron',sans-serif;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;text-align:left;padding:6px 10px;border:1px solid var(--border); }
+    .reflection-table td { padding:6px 10px;border:1px solid var(--border);color:var(--text-dim);vertical-align:top; }
+    .reflection-table td code { color:var(--accent-light);background:var(--bg); }
+    .status-pill { display:inline-block;font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:2px 7px;border-radius:2px;border:1px solid var(--border); }
+    .status-implemented { color:var(--green); border-color:var(--green); }
+    .status-progress { color:var(--accent-light); }
+    .status-planned { color:var(--text-muted); }
+  </style>
+</head>
+<body>
+  <div class="app tutorial-app" id="docsApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand">// SCALARS — SCALA IN RUST</h1>
+          <nav class="tutorial-crumbs" aria-label="Breadcrumb">
+            <span class="current">Docs</span>
+            <span class="sep">/</span>
+            <a href="report.html">Engineering Report</a>
+            <span class="sep">/</span>
+            <a href="reference.html">Reference</a>
+            <span class="sep">/</span>
+            <a href="https://github.com/MenkeTechnologies/scalars" target="_blank" rel="noopener noreferrer">GitHub</a>
+          </nav>
+          <p class="docs-build-line">scalars v0.1.0 · Scala on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no bespoke VM, no JVM · a fusevm language host (with zshrs, stryke, awkrs, elisp, rubylang, pythonrs) · MIT · in active development</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="report.html">Report</a>
+          <a class="btn btn-secondary" href="reference.html">Reference</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/scalars" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>SCALARS REFERENCE</h2>
+      <p class="tutorial-subtitle">A Scala frontend written in Rust. Source is lexed and parsed to an AST, lowered to <code>fusevm</code> bytecode, and executed on the same language-agnostic VM + three-tier Cranelift JIT that hosts <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, <code>elisp</code>, <code>rubylang</code>, and <code>pythonrs</code>. There is no bespoke VM and no JVM. <strong>In active development — an early single-object slice.</strong></p>
+
+      <section class="tutorial-section">
+        <h2>What it is</h2>
+        <p><code>scalars</code> runs Scala programs as ordinary compiled bytecode: it lexes and parses the source, lowers it to <code>fusevm</code> instructions, and lets the shared engine execute and JIT-compile them. Arithmetic and comparisons lower to native fusevm ops so the Cranelift JIT can trace hot loops, while Scala-specific behaviour — <code>Int</code>-vs-<code>Double</code> division dispatch, <code>String</code> <code>+</code> concatenation, structural <code>==</code>, and <code>Double.toString</code> formatting — is served by the host's strict numeric hook (<code>src/host.rs</code>).</p>
+        <p>It is another language hosted on <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a>, the shared bytecode VM and Cranelift JIT behind <code>zshrs</code> (the shell), <code>stryke</code> (the language), <code>awkrs</code> (AWK), <code>elisp</code> (Emacs Lisp), <code>rubylang</code> (Ruby), and <code>pythonrs</code> (Python). scalars carries no VM or JIT of its own, and — unlike the reference Scala — no JVM: it targets fusevm bytecode directly.</p>
+        <p><strong>Scope today.</strong> This is an early slice: a single entry object (<code>object Name extends App { … }</code> whose body runs directly, or an <code>object Name { def main(args: Array[String]): Unit = { … } }</code>), <code>val</code>/<code>var</code> bindings, <code>if</code>/<code>while</code>/range <code>for</code>, <code>println</code>/<code>print</code>, and the arithmetic/comparison/boolean operators. User-defined methods, classes, traits, and the collection library are not yet carried — see <a href="https://github.com/MenkeTechnologies/scalars/blob/main/BUGS.md">BUGS.md</a> for the honest ledger.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Architecture</h2>
+        <p>The pipeline mirrors how <code>zshrs</code> hosts zsh and <code>rubylang</code> hosts Ruby:</p>
+        <pre>Scala source  →  lexer  →  parser (AST)  →  lower to fusevm bytecode  →  fusevm VM + Cranelift JIT
+                                                   │
+                                       host: numeric hook (String +, Int/Double /, ==) + Predef print</pre>
+        <div class="cat-grid">
+          <div class="cat-card"><h4>fusevm-hosted</h4><p>No local <code>vm.rs</code> / <code>jit.rs</code> and no JVM. Scala is lowered to fusevm bytecode and executed on the shared three-tier Cranelift JIT; <code>jit-disk-cache</code> persists native code across runs.</p></div>
+          <div class="cat-card"><h4>Newline inference</h4><p>A hand-written lexer applies Scala's statement-separator rule — a line break separates statements only where one can end and the next can begin, and never inside <code>(…)</code>/<code>[…]</code> (<code>src/lexer.rs</code>).</p></div>
+          <div class="cat-card"><h4>Faithful numerics</h4><p><code>7 / 2 == 3</code> but <code>7 / 2.0 == 3.5</code> (runtime Int/Double dispatch); <code>Double.toString</code> reproduces Java's decimal-vs-scientific threshold; <code>"n=" + 41</code> concatenates via the strict numeric hook.</p></div>
+          <div class="cat-card"><h4>Editor + debugger tooling</h4><p><code>scala --lsp</code> speaks LSP (completion, hover, live diagnostics from the real parser); <code>scala --dap</code> is a source-line debugger with breakpoints, stepping, and variable inspection.</p></div>
+        </div>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Example</h2>
+<pre>object Demo extends App {
+  var sum = 0
+  for (i &lt;- 1 to 10) {
+    sum += i
+  }
+  println(sum)              // =&gt; 55
+
+  println(7 / 2)            // =&gt; 3     (Int division truncates)
+  println(7 / 2.0)         // =&gt; 3.5   (Double division)
+  println("total = " + sum) // =&gt; total = 55
+  println(1.0e7)            // =&gt; 1.0E7 (Java Double.toString)
+}</pre>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Toolchain</h2>
+        <div class="cat-grid">
+          <div class="cat-card"><h4>scala &lt;file&gt;</h4><p>Lex, parse, lower, and run a <code>.scala</code> file on fusevm.</p></div>
+          <div class="cat-card"><h4>--dump-tokens / --dump-ast</h4><p>Print the lexer token stream or the parsed AST and exit.</p></div>
+          <div class="cat-card"><h4>--disasm</h4><p>Print the lowered fusevm bytecode disassembly and exit.</p></div>
+          <div class="cat-card"><h4>--lsp</h4><p>Language Server Protocol over stdio: keyword/Predef/operator completion, hover, and live parse diagnostics.</p></div>
+          <div class="cat-card"><h4>--dap</h4><p>Debug Adapter Protocol over stdio: per-statement breakpoints, single-stepping, stack/scopes/variables, forwarded program output.</p></div>
+          <div class="cat-card"><h4>--version / --help</h4><p>Print the version banner or the option grammar.</p></div>
+        </div>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Status &amp; roadmap</h2>
+        <p>The table below reflects the current state of the tree. See <a href="https://github.com/MenkeTechnologies/scalars/blob/main/BUGS.md">BUGS.md</a> for the honest ledger of what is not yet carried.</p>
+        <table class="reflection-table">
+          <thead><tr><th>Component</th><th>State</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>Lexer / parser → AST</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Newline-inferring tokenizer; single-object entry grammar (<code>src/lexer.rs</code>, <code>src/parser.rs</code>).</td></tr>
+            <tr><td>AST → fusevm bytecode lowering</td><td><span class="status-pill status-implemented">Implemented</span></td><td>No local VM, no JVM; native arithmetic + host hook (<code>src/compiler.rs</code>).</td></tr>
+            <tr><td><code>val</code>/<code>var</code>, <code>if</code>/<code>while</code>/range <code>for</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Bindings, assignments, compound assignment, range comprehensions in statement position.</td></tr>
+            <tr><td>Int/Double numerics, String <code>+</code>, structural <code>==</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Runtime division dispatch, Java <code>Double.toString</code>, concatenation coercion via the strict numeric hook (<code>src/host.rs</code>).</td></tr>
+            <tr><td><code>println</code>/<code>print</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Scala-formatted output (<code>true</code>/<code>false</code>, <code>3.0</code>, <code>null</code>).</td></tr>
+            <tr><td>Introspection (<code>--dump-tokens</code>/<code>--dump-ast</code>/<code>--disasm</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Token stream, AST, and fusevm bytecode listing (<code>src/main.rs</code>).</td></tr>
+            <tr><td>LSP server (<code>--lsp</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Completion + hover from the keyword/Predef corpus, live diagnostics from the real parser (<code>src/lsp.rs</code>).</td></tr>
+            <tr><td>DAP adapter (<code>--dap</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Source-line breakpoints, stepping, stack/scopes/variables, stdout forwarding (<code>src/dap.rs</code>).</td></tr>
+            <tr><td>Parity fuzzer vs reference <code>scala</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Differential probes diffed against a real Scala toolchain (<code>src/bin/parity_fuzz.rs</code>).</td></tr>
+            <tr><td>User methods, classes, traits, collections</td><td><span class="status-pill status-planned">Planned</span></td><td>Method/field calls, object construction, and the standard collection library pending.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Building from source</h2>
+        <p>scalars builds as a standalone Rust crate (it is not a workspace member of the meta repo):</p>
+<pre># clone
+git clone https://github.com/MenkeTechnologies/scalars
+cd scalars
+
+# build (produces target/debug/scala)
+cargo build
+
+# run a .scala file
+./target/debug/scala examples/hello.scala
+
+# introspection
+./target/debug/scala --disasm examples/hello.scala
+
+# editor / debugger tooling over stdio
+./target/debug/scala --lsp
+./target/debug/scala --dap
+
+# run tests
+cargo test</pre>
+        <p>fusevm is pulled from crates.io with the <code>jit</code>, <code>jit-disk-cache</code>, and <code>aot</code> features.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>License</h2>
+        <p>scalars is <strong>MIT licensed</strong> — free and open source. See <a href="https://github.com/MenkeTechnologies/scalars/blob/main/LICENSE">LICENSE</a>.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Repository &amp; links</h2>
+        <ul>
+          <li><strong>Engineering report</strong> — <a href="report.html">report.html</a> (architecture, fusevm hosting, roadmap, dependency posture)</li>
+          <li><strong>Language reference</strong> — <a href="reference.html">reference.html</a> (keywords, Predef, operators)</li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/scalars">github.com/MenkeTechnologies/scalars</a></li>
+          <li><strong>The shared VM</strong> — <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a> (also behind <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, <code>elisp</code>, <code>rubylang</code>, <code>pythonrs</code>)</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <script src="hud-theme.js"></script>
+</body>
+</html>

@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="scalars — Language reference. Keywords, Predef print builtins, and operators recognized by the current scalars build. MIT licensed.">
+  <title>scalars &mdash; Language Reference</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="hud-static.css">
+  <link rel="stylesheet" href="tutorial.css">
+  <style>
+    .tutorial-main { max-width: 76rem; }
+    .section-rule { border:none;border-top:1px dashed var(--border);margin:2rem 0; }
+    .docs-build-line { margin:0.35rem 0 0;font-family:'Share Tech Mono',ui-monospace,monospace;font-size:11px;color:var(--text-dim);letter-spacing:0.03em;max-width:52rem;opacity:0.75; }
+  </style>
+</head>
+<body>
+  <div class="app tutorial-app" id="docsApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand">// SCALARS — LANGUAGE REFERENCE</h1>
+          <nav class="tutorial-crumbs" aria-label="Breadcrumb">
+            <a href="index.html">Docs</a>
+            <span class="sep">/</span>
+            <span class="current">Language Reference</span>
+            <span class="sep">/</span>
+            <a href="https://github.com/MenkeTechnologies/scalars" target="_blank" rel="noopener noreferrer">GitHub</a>
+          </nav>
+          <p class="docs-build-line">scalars v0.1.0 · Scala on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no bespoke VM, no JVM · MIT · in active development</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="index.html">Docs</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/scalars" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <main class="tutorial-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>LANGUAGE REFERENCE</h2>
+      <p class="tutorial-subtitle">Every reserved keyword, contextual word, Predef print builtin, and operator the current scalars build recognizes, grouped by category. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>; Predef and operators mirror real lowering in <code>src/host.rs</code> and <code>src/compiler.rs</code>.</p>
+
+      <section class="tutorial-section" id="ch-keyword">
+        <h2>Keyword</h2>
+        <article class="doc-entry" id="doc-keyword-1">
+          <h3><a class="doc-anchor" href="#doc-keyword-1">#</a> <code>object</code></h3>
+          <p>declare a singleton object; scalars runs its `main` or `extends App` body</p>
+          <pre><code class="lang-scala">object T extends App { println("hi") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-2">
+          <h3><a class="doc-anchor" href="#doc-keyword-2">#</a> <code>def</code></h3>
+          <p>define a method; scalars locates and runs `def main(args: Array[String])`</p>
+          <pre><code class="lang-scala">object T { def main(args: Array[String]): Unit = { println(1) } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-3">
+          <h3><a class="doc-anchor" href="#doc-keyword-3">#</a> <code>val</code></h3>
+          <p>an immutable binding: `val x = expr`</p>
+          <pre><code class="lang-scala">val x = 41
+println(x + 1)   // =&gt; 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-4">
+          <h3><a class="doc-anchor" href="#doc-keyword-4">#</a> <code>var</code></h3>
+          <p>a mutable binding, reassignable with `=` / `+=` / `-=` / `*=` / `/=` / `%=`</p>
+          <pre><code class="lang-scala">var n = 0
+n += 5
+println(n)   // =&gt; 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-5">
+          <h3><a class="doc-anchor" href="#doc-keyword-5">#</a> <code>if</code></h3>
+          <p>conditional branch: `if (cond) { .. } else { .. }`</p>
+          <pre><code class="lang-scala">if (1 &lt; 2) println("yes") else println("no")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-6">
+          <h3><a class="doc-anchor" href="#doc-keyword-6">#</a> <code>else</code></h3>
+          <p>the fallback branch of an `if`</p>
+          <pre><code class="lang-scala">if (false) println(1) else println(2)   // =&gt; 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-7">
+          <h3><a class="doc-anchor" href="#doc-keyword-7">#</a> <code>while</code></h3>
+          <p>loop while the condition is true: `while (cond) { .. }`</p>
+          <pre><code class="lang-scala">var i = 0
+while (i &lt; 3) { i += 1 }
+println(i)   // =&gt; 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-8">
+          <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>for</code></h3>
+          <p>range comprehension in statement position: `for (i &lt;- a until b) { .. }`</p>
+          <pre><code class="lang-scala">for (i &lt;- 1 to 3) println(i)   // prints 1 2 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-9">
+          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>extends</code></h3>
+          <p>name a parent; `extends App` makes the object body the program entry point</p>
+          <pre><code class="lang-scala">object T extends App { println("run") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-10">
+          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>new</code></h3>
+          <p>instance-construction keyword (reserved; instantiation lands in a later slice)</p>
+          <pre><code class="lang-scala">new T()   // reserved</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-11">
+          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>return</code></h3>
+          <p>early return from a method (reserved; slice-1 `main` bodies fall off the end)</p>
+          <pre><code class="lang-scala">return x   // reserved</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-12">
+          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>true</code></h3>
+          <p>the Boolean true literal</p>
+          <pre><code class="lang-scala">println(true &amp;&amp; false)   // =&gt; false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-13">
+          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>false</code></h3>
+          <p>the Boolean false literal</p>
+          <pre><code class="lang-scala">println(false || true)   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-14">
+          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>null</code></h3>
+          <p>the null reference literal; prints as `null`</p>
+          <pre><code class="lang-scala">val x = null
+println(x)   // =&gt; null</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-contextual">
+        <h2>Contextual</h2>
+        <article class="doc-entry" id="doc-contextual-1">
+          <h3><a class="doc-anchor" href="#doc-contextual-1">#</a> <code>until</code></h3>
+          <p>exclusive range bound in a `for`: `a until b` iterates a..b-1</p>
+          <pre><code class="lang-scala">for (i &lt;- 0 until 3) print(i)   // =&gt; 012</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-2">
+          <h3><a class="doc-anchor" href="#doc-contextual-2">#</a> <code>to</code></h3>
+          <p>inclusive range bound in a `for`: `a to b` iterates a..b</p>
+          <pre><code class="lang-scala">for (i &lt;- 1 to 3) print(i)   // =&gt; 123</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-3">
+          <h3><a class="doc-anchor" href="#doc-contextual-3">#</a> <code>App</code></h3>
+          <p>the mixin whose object body scalars runs directly as the program</p>
+          <pre><code class="lang-scala">object T extends App { println("hi") }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-4">
+          <h3><a class="doc-anchor" href="#doc-contextual-4">#</a> <code>main</code></h3>
+          <p>the entry method scalars runs: `def main(args: Array[String]): Unit`</p>
+          <pre><code class="lang-scala">def main(args: Array[String]): Unit = { println(0) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-5">
+          <h3><a class="doc-anchor" href="#doc-contextual-5">#</a> <code>package</code></h3>
+          <p>a package prologue line; scalars skips it and runs the object entry</p>
+          <pre><code class="lang-scala">package demo
+object T extends App { println(1) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-6">
+          <h3><a class="doc-anchor" href="#doc-contextual-6">#</a> <code>import</code></h3>
+          <p>an import prologue line; skipped in slice 1</p>
+          <pre><code class="lang-scala">import scala.math._
+object T extends App { println(1) }</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-predef">
+        <h2>Predef</h2>
+        <article class="doc-entry" id="doc-predef-1">
+          <h3><a class="doc-anchor" href="#doc-predef-1">#</a> <code>println</code></h3>
+          <p>print one Scala-formatted argument followed by a newline; returns Unit</p>
+          <pre><code class="lang-scala">println(3.0)   // prints 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-predef-2">
+          <h3><a class="doc-anchor" href="#doc-predef-2">#</a> <code>print</code></h3>
+          <p>print one Scala-formatted argument with no trailing newline</p>
+          <pre><code class="lang-scala">print("a"); print("b")   // prints ab</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-operator">
+        <h2>Operator</h2>
+        <article class="doc-entry" id="doc-operator-1">
+          <h3><a class="doc-anchor" href="#doc-operator-1">#</a> <code>+</code></h3>
+          <p>numeric addition, or String concatenation when either operand is a String</p>
+          <pre><code class="lang-scala">println("n=" + 41)   // =&gt; n=41</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-2">
+          <h3><a class="doc-anchor" href="#doc-operator-2">#</a> <code>/</code></h3>
+          <p>division: truncating for two Ints (`7/2==3`), floating if either is a Double</p>
+          <pre><code class="lang-scala">println(7 / 2); println(7 / 2.0)   // =&gt; 3 then 3.5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-3">
+          <h3><a class="doc-anchor" href="#doc-operator-3">#</a> <code>%</code></h3>
+          <p>remainder of integer division</p>
+          <pre><code class="lang-scala">println(7 % 3)   // =&gt; 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-4">
+          <h3><a class="doc-anchor" href="#doc-operator-4">#</a> <code>==</code></h3>
+          <p>structural equality (Scala `==` is value `equals`, so strings compare by content)</p>
+          <pre><code class="lang-scala">println("a" == "a")   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-5">
+          <h3><a class="doc-anchor" href="#doc-operator-5">#</a> <code>&amp;&amp;</code></h3>
+          <p>short-circuiting logical AND</p>
+          <pre><code class="lang-scala">println(true &amp;&amp; false)   // =&gt; false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-6">
+          <h3><a class="doc-anchor" href="#doc-operator-6">#</a> <code>||</code></h3>
+          <p>short-circuiting logical OR</p>
+          <pre><code class="lang-scala">println(false || true)   // =&gt; true</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>More</h2>
+        <ul>
+          <li><strong>Docs</strong> — <a href="index.html">index.html</a> (overview, architecture, examples)</li>
+          <li><strong>Engineering report</strong> — <a href="report.html">report.html</a> (value model, status, dependencies)</li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/scalars">github.com/MenkeTechnologies/scalars</a></li>
+        </ul>
+      </section>
+    </main>
+
+  </div>
+
+  <script src="hud-theme.js"></script>
+</body>
+</html>
