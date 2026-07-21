@@ -69,18 +69,26 @@ pub enum StmtKind {
     },
     /// `while (cond) { .. }`.
     While { cond: Expr, body: Vec<Stmt> },
-    /// `for (name <- start until end) { .. }` — a Scala range for-comprehension
-    /// in statement (side-effecting) position. `inclusive` is `true` for `to`,
-    /// `false` for `until`. Step is 1 in slice 1 (`by` is a later wave).
-    For {
+    /// `return expr` / bare `return` — an early exit from the enclosing `def`.
+    Return(Option<Expr>),
+}
+
+/// One enumerator of a `for` comprehension: a range generator or an `if` guard.
+/// (Collection generators are not modeled — scalars has no `List`/`Vector`
+/// literal and no `map`/`flatMap` yet; only integer ranges are iterable.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForEnum {
+    /// `name <- start until|to end` — an integer range generator (step 1).
+    /// `inclusive` is `true` for `to`, `false` for `until`.
+    Gen {
         name: String,
         start: Expr,
         end: Expr,
         inclusive: bool,
-        body: Vec<Stmt>,
     },
-    /// `return expr` / bare `return` — an early exit from the enclosing `def`.
-    Return(Option<Expr>),
+    /// `if cond` — a filter that skips the remaining (inner) enumerators when the
+    /// condition is false, desugaring to `withFilter`.
+    Guard(Expr),
 }
 
 /// Compound-assignment operator. `Assign` is a plain `=`.
@@ -140,6 +148,78 @@ pub enum Expr {
         args: Vec<Expr>,
         line: u32,
     },
+    /// `if (cond) then [else els]` in *expression* position — a value-producing
+    /// conditional (`val r = if (c) a else b`). Distinct from [`StmtKind::If`]
+    /// (statement position, run for effect). When `els` is `None` the false path
+    /// yields `Unit` (Scala's `if` without `else` has type `Unit`).
+    If {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Option<Box<Expr>>,
+    },
+    /// A brace-delimited block used as an expression: `{ s1; s2; last }`. Its
+    /// value is the last statement's value (Scala's block expression); a block
+    /// whose last statement is not an expression, or an empty block, yields
+    /// `Unit`. Used as an `if`/`match` branch body.
+    Block(Vec<Stmt>),
+    /// `scrutinee match { case pat [if guard] => body … }` — a pattern match in
+    /// expression position. Arms are tried top-to-bottom; the first whose pattern
+    /// (and guard) matches produces the value. No arm matching is a
+    /// `scala.MatchError` at runtime. Constructor/case-class patterns are not
+    /// modeled (fusevm-blocked); see [`Pattern`].
+    Match {
+        scrut: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+    /// An `f"…"`-interpolator formatted splice: format `value` with the Java
+    /// `Formatter` spec `spec` (`%d`, `%.2f`, `%-8s`, …). Produced only by the
+    /// interpolated-string desugar in [`crate::parser`].
+    Format {
+        value: Box<Expr>,
+        spec: String,
+        line: u32,
+    },
+    /// `for (enums) yield body` — a comprehension that collects `body` for each
+    /// binding into a `Vector` (Scala's `IndexedSeq` result for a range
+    /// generator). Multiple generators nest (`flatMap`); `if` guards filter.
+    ForYield {
+        enums: Vec<ForEnum>,
+        body: Box<Expr>,
+    },
+    /// `for (enums) body` — the side-effecting comprehension (`foreach`); its
+    /// value is `Unit`. Multiple generators nest; `if` guards filter.
+    ForEach {
+        enums: Vec<ForEnum>,
+        body: Box<Expr>,
+    },
+}
+
+/// One arm of a [`Expr::Match`]: `case pat [if guard] => body`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pat: Pattern,
+    /// An optional `if` guard evaluated only after the pattern matches.
+    pub guard: Option<Expr>,
+    /// The arm body as a statement block; its last statement's value is the arm
+    /// result (see [`Expr::Block`]).
+    pub body: Vec<Stmt>,
+}
+
+/// A `match` pattern. Constructor/case-class/extractor patterns (`case Foo(x)`)
+/// are intentionally absent — they need an ordered record value the fusevm value
+/// model does not yet expose. The parser rejects them rather than mis-lowering.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// `case _ =>` — matches anything, binds nothing.
+    Wildcard,
+    /// `case 1 =>`, `case "x" =>`, `case true =>`, `case null =>` — matches when
+    /// the scrutinee equals this literal.
+    Literal(Expr),
+    /// `case x =>` — matches anything and binds the scrutinee to `x`.
+    Bind(String),
+    /// `case x: String =>` / `case _: Int =>` — matches when the scrutinee has the
+    /// named runtime type; binds it to `name` (unless `name` is `_`).
+    Typed { name: String, ty: String },
 }
 
 /// Unary operators.

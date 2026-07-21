@@ -25,6 +25,12 @@ struct Compiler {
     /// Distinguishes synthetic `for` upper-bound locals so nested loops do not
     /// alias one another.
     for_counter: u32,
+    /// Distinguishes synthetic `match`-scrutinee locals so nested matches do not
+    /// alias one another.
+    match_counter: u32,
+    /// Distinguishes synthetic `for … yield` result-array/length locals so
+    /// nested comprehensions do not alias one another.
+    yield_counter: u32,
     /// When true, a per-statement `DBG_LINE` marker is emitted before each
     /// statement (for `scala --dap`). Normal runs compile with `debug=false` and
     /// carry zero extra ops.
@@ -92,6 +98,8 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         for_counter: 0,
+        match_counter: 0,
+        yield_counter: 0,
         debug,
         has_ffi,
         func_arity,
@@ -198,13 +206,6 @@ impl Compiler {
             }
             StmtKind::If { cond, then, els } => self.if_stmt(cond, then, els),
             StmtKind::While { cond, body } => self.while_stmt(cond, body),
-            StmtKind::For {
-                name,
-                start,
-                end,
-                inclusive,
-                body,
-            } => self.for_stmt(name, start, end, *inclusive, body),
         }
     }
 
@@ -243,48 +244,89 @@ impl Compiler {
         Ok(())
     }
 
-    /// Lower `for (name <- start until|to end) body` to a counted loop. The
-    /// upper bound is evaluated once into a synthetic local so a body that
-    /// mutates its inputs cannot change the range (Scala snapshots the range).
-    fn for_stmt(
+    /// Lower a `for` comprehension. `yield_into` carries the `(result-array,
+    /// length-counter)` places for a `yield` (append each body value); it is
+    /// `None` for a side-effecting `foreach`. Enumerators are lowered
+    /// left-to-right by `idx`: a generator emits a counted loop whose body
+    /// recurses into the next enumerator; a guard emits a conditional around the
+    /// recursion (`withFilter`). The range's upper bound is snapshotted into a
+    /// synthetic local (Scala evaluates the range once).
+    fn lower_for(
         &mut self,
-        name: &str,
-        start: &Expr,
-        end: &Expr,
-        inclusive: bool,
-        body: &[Stmt],
+        enums: &[ForEnum],
+        idx: usize,
+        body: &Expr,
+        yield_into: Option<(Place, Place)>,
     ) -> Result<(), String> {
-        // name = start  (the loop variable is a fresh local — a frame slot
-        // inside a `def`, a global at top level).
-        self.expr(start)?;
-        let vplace = self.declare_place(name);
-        self.emit_store(vplace);
-        // bound = end   (synthetic local; the leading space makes the name
-        // impossible to collide with a lexed identifier)
-        self.for_counter += 1;
-        let bound = format!(" for_end_{}", self.for_counter);
-        self.expr(end)?;
-        let bplace = self.declare_place(&bound);
-        self.emit_store(bplace);
-        // top: while name < bound (or name <= bound for `to`)
-        let top = self.b.current_pos();
-        self.emit_load(vplace);
-        self.emit_load(bplace);
-        self.b
-            .emit(if inclusive { Op::NumLe } else { Op::NumLt }, 0);
-        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
-        for s in body {
-            self.stmt(s)?;
+        if idx == enums.len() {
+            // Innermost: evaluate the body per binding.
+            match yield_into {
+                Some((arr, len)) => {
+                    // result(len) = body; len += 1
+                    self.expr(body)?;
+                    self.emit_load(len);
+                    self.emit_array_set(arr);
+                    self.emit_load(len);
+                    self.b.emit(Op::LoadInt(1), 0);
+                    self.b.emit(Op::Add, 0);
+                    self.emit_store(len);
+                }
+                None => {
+                    // foreach: run for effect, discard the value.
+                    self.expr(body)?;
+                    self.b.emit(Op::Pop, 0);
+                }
+            }
+            return Ok(());
         }
-        // step: name += 1
-        self.emit_load(vplace);
-        self.b.emit(Op::LoadInt(1), 0);
-        self.b.emit(Op::Add, 0);
-        self.emit_store(vplace);
-        self.b.emit(Op::Jump(top), 0);
-        let end_pos = self.b.current_pos();
-        self.b.patch_jump(jf, end_pos);
+        match &enums[idx] {
+            ForEnum::Guard(cond) => {
+                self.expr(cond)?;
+                let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+                self.lower_for(enums, idx + 1, body, yield_into)?;
+                let end = self.b.current_pos();
+                self.b.patch_jump(jf, end);
+            }
+            ForEnum::Gen {
+                name,
+                start,
+                end,
+                inclusive,
+            } => {
+                self.expr(start)?;
+                let vplace = self.declare_place(name);
+                self.emit_store(vplace);
+                self.for_counter += 1;
+                let bound = format!(" for_end_{}", self.for_counter);
+                self.expr(end)?;
+                let bplace = self.declare_place(&bound);
+                self.emit_store(bplace);
+                let top = self.b.current_pos();
+                self.emit_load(vplace);
+                self.emit_load(bplace);
+                self.b
+                    .emit(if *inclusive { Op::NumLe } else { Op::NumLt }, 0);
+                let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+                self.lower_for(enums, idx + 1, body, yield_into)?;
+                self.emit_load(vplace);
+                self.b.emit(Op::LoadInt(1), 0);
+                self.b.emit(Op::Add, 0);
+                self.emit_store(vplace);
+                self.b.emit(Op::Jump(top), 0);
+                let end_pos = self.b.current_pos();
+                self.b.patch_jump(jf, end_pos);
+            }
+        }
         Ok(())
+    }
+
+    /// Emit an array element-set for `place` — `[value, index]` on the stack,
+    /// growing the array to fit (frame slot inside a `def`, global at top level).
+    fn emit_array_set(&mut self, p: Place) {
+        match p {
+            Place::Slot(s) => self.b.emit(Op::SlotArraySet(s), 0),
+            Place::Global(i) => self.b.emit(Op::ArraySet(i), 0),
+        };
     }
 
     /// Lower `println(arg)` / `print(arg)` to the Scala-formatting print builtin.
@@ -367,6 +409,140 @@ impl Compiler {
                 args,
                 line,
             } => self.method(recv, name, args, *line)?,
+            Expr::If { cond, then, els } => self.if_expr(cond, then, els.as_deref())?,
+            Expr::Block(stmts) => self.block_expr(stmts)?,
+            Expr::Match { scrut, arms } => self.match_expr(scrut, arms)?,
+            Expr::Format { value, spec, line } => {
+                self.expr(value)?;
+                let c = self.b.add_constant(Value::str(spec.clone()));
+                self.b.emit(Op::LoadConst(c), *line);
+                self.b.emit(Op::CallBuiltin(crate::host::SFORMAT, 2), *line);
+            }
+            Expr::ForYield { enums, body } => {
+                // result = empty Vector; len = 0
+                self.b.emit(Op::MakeArray(0), 0);
+                self.yield_counter += 1;
+                let arr = self.declare_place(&format!(" yield_{}", self.yield_counter));
+                self.emit_store(arr);
+                let len = self.declare_place(&format!(" yield_len_{}", self.yield_counter));
+                self.b.emit(Op::LoadInt(0), 0);
+                self.emit_store(len);
+                self.lower_for(enums, 0, body, Some((arr, len)))?;
+                // The comprehension's value is the accumulated Vector.
+                self.emit_load(arr);
+            }
+            Expr::ForEach { enums, body } => {
+                self.lower_for(enums, 0, body, None)?;
+                // `foreach` yields `Unit`.
+                self.b.emit(Op::LoadUndef, 0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower `if (cond) then [else els]` in value position: both branches leave
+    /// exactly one value on the stack; a missing `else` leaves `Unit`.
+    fn if_expr(&mut self, cond: &Expr, then: &Expr, els: Option<&Expr>) -> Result<(), String> {
+        self.expr(cond)?;
+        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.expr(then)?;
+        let jend = self.b.emit(Op::Jump(0), 0);
+        let else_start = self.b.current_pos();
+        self.b.patch_jump(jf, else_start);
+        match els {
+            Some(e) => self.expr(e)?,
+            None => {
+                self.b.emit(Op::LoadUndef, 0);
+            }
+        }
+        let end = self.b.current_pos();
+        self.b.patch_jump(jend, end);
+        Ok(())
+    }
+
+    /// Lower a block used as an expression: run every statement but the last for
+    /// effect, and leave the last statement's value on the stack (its expression
+    /// value, or `Unit` for a non-expression last statement or an empty block).
+    fn block_expr(&mut self, stmts: &[Stmt]) -> Result<(), String> {
+        let Some((last, init)) = stmts.split_last() else {
+            self.b.emit(Op::LoadUndef, 0);
+            return Ok(());
+        };
+        for s in init {
+            self.stmt(s)?;
+        }
+        match &last.kind {
+            // A trailing expression (including `println`, which leaves `Unit`) is
+            // the block's value.
+            StmtKind::Expr(e) => self.expr(e)?,
+            // A non-expression last statement runs for effect; the block is `Unit`.
+            _ => {
+                self.stmt(last)?;
+                self.b.emit(Op::LoadUndef, 0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower `scrutinee match { arms }`. The scrutinee is evaluated once into a
+    /// synthetic local; arms are tried top-to-bottom. Each arm tests its pattern
+    /// (jumping to the next arm on mismatch), binds any variable, checks its
+    /// guard, then leaves its body's value and jumps to the end. Falling off the
+    /// last arm raises `scala.MatchError` (via [`crate::host::SMATCHERR`]).
+    fn match_expr(&mut self, scrut: &Expr, arms: &[MatchArm]) -> Result<(), String> {
+        self.expr(scrut)?;
+        self.match_counter += 1;
+        let sname = format!(" match_{}", self.match_counter);
+        let splace = self.declare_place(&sname);
+        self.emit_store(splace);
+
+        let mut end_jumps = Vec::new();
+        for arm in arms {
+            let mut fail_jumps = Vec::new();
+            match &arm.pat {
+                Pattern::Wildcard => {}
+                Pattern::Bind(name) => {
+                    let p = self.declare_place(name);
+                    self.emit_load(splace);
+                    self.emit_store(p);
+                }
+                Pattern::Literal(lit) => {
+                    self.emit_load(splace);
+                    self.expr(lit)?;
+                    self.b.emit(Op::NumEq, 0);
+                    fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+                }
+                Pattern::Typed { name, ty } => {
+                    self.emit_load(splace);
+                    let c = self.b.add_constant(Value::str(ty.clone()));
+                    self.b.emit(Op::LoadConst(c), 0);
+                    self.b.emit(Op::CallBuiltin(crate::host::SISTYPE, 2), 0);
+                    fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+                    if name != "_" {
+                        let p = self.declare_place(name);
+                        self.emit_load(splace);
+                        self.emit_store(p);
+                    }
+                }
+            }
+            if let Some(g) = &arm.guard {
+                self.expr(g)?;
+                fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+            }
+            self.block_expr(&arm.body)?;
+            end_jumps.push(self.b.emit(Op::Jump(0), 0));
+            let next = self.b.current_pos();
+            for jf in fail_jumps {
+                self.b.patch_jump(jf, next);
+            }
+        }
+        // No arm matched: raise MatchError with the scrutinee. The builtin faults
+        // (halting the VM) but still returns a value to keep the stack balanced.
+        self.emit_load(splace);
+        self.b.emit(Op::CallBuiltin(crate::host::SMATCHERR, 1), 0);
+        let end = self.b.current_pos();
+        for je in end_jumps {
+            self.b.patch_jump(je, end);
         }
         Ok(())
     }
@@ -636,9 +812,6 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
             expr_has_ffi(cond) || body_has_ffi(then) || body_has_ffi(els)
         }
         StmtKind::While { cond, body } => expr_has_ffi(cond) || body_has_ffi(body),
-        StmtKind::For {
-            start, end, body, ..
-        } => expr_has_ffi(start) || expr_has_ffi(end) || body_has_ffi(body),
         StmtKind::Return(e) => e.as_ref().is_some_and(expr_has_ffi),
     })
 }
@@ -650,12 +823,34 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
         Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
         Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
+        Expr::If { cond, then, els } => {
+            expr_has_ffi(cond) || expr_has_ffi(then) || els.as_deref().is_some_and(expr_has_ffi)
+        }
+        Expr::Block(stmts) => body_has_ffi(stmts),
+        Expr::Match { scrut, arms } => {
+            expr_has_ffi(scrut)
+                || arms
+                    .iter()
+                    .any(|a| a.guard.as_ref().is_some_and(expr_has_ffi) || body_has_ffi(&a.body))
+        }
+        Expr::Format { value, .. } => expr_has_ffi(value),
+        Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
+            enums.iter().any(enum_has_ffi) || expr_has_ffi(body)
+        }
         Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::Null
         | Expr::Var(_) => false,
+    }
+}
+
+/// True if a `for` enumerator (generator bounds / guard) evaluates an FFI call.
+fn enum_has_ffi(e: &ForEnum) -> bool {
+    match e {
+        ForEnum::Gen { start, end, .. } => expr_has_ffi(start) || expr_has_ffi(end),
+        ForEnum::Guard(c) => expr_has_ffi(c),
     }
 }
 

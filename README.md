@@ -169,14 +169,24 @@ Implemented and checked against the reference `scala`:
   literals; the binary operators `+ - * / %`, `== != < > <= >=`, `&& ||`
   (short-circuiting); unary `-` and `!`; parenthesised grouping; Scala's `+`
   string concatenation; `Int`-vs-`Double` division dispatch (integer `/ 0`
-  throws `ArithmeticException`, floating `/ 0.0` is `Infinity`).
+  throws `ArithmeticException`, floating `/ 0.0` is `Infinity`); `if`/`else` in
+  value position (`val r = if (c) a else b`, including block branches).
+- **String interpolation** — `s"…"` with `$id` and `${expr}` splices, `f"…"`
+  with Java-`Formatter` specs (`%d`, `%.2f`, `%-5s`, `%05d`, `%x`, `%b`, …), and
+  `raw"…"` (escapes stay literal).
+- **Pattern matching** — `expr match { case … }` over literal, `_` wildcard,
+  variable-binding, typed (`case s: String`), and guarded (`case x if x > 0`)
+  patterns; a non-exhaustive match throws `scala.MatchError`. Constructor /
+  case-class patterns are not modeled (fusevm-blocked — see [`BUGS.md`](BUGS.md)).
 - **Method dispatch** — postfix `.` on core values: `String` (`length`,
   `toUpperCase`/`toLowerCase`, `trim`, `reverse`, `substring`, `charAt`,
   `contains`/`startsWith`/`endsWith`, `toInt`/`toDouble`, …), `Int`/`Double`
   (`abs`, `min`/`max`, `round`, `toDouble`/`toInt`, …), and `toString` on any
   value; chains left-to-right (`s.trim.length`).
-- **Control flow** — `if` / `else if` / `else`, `while`, and the Scala range
-  `for (i <- start until end)` / `for (i <- start to end)` in statement position.
+- **Control flow** — `if` / `else if` / `else` (statement *and* expression
+  position), `while`, and Scala range `for` comprehensions: side-effecting
+  `for (i <- a until b) …` and `for (i <- a to b) yield …` (collecting a
+  `Vector`), with multiple `;`-separated generators and `if` guards.
 - **Statement separators** — inferred line breaks *or* explicit `;` (the lexer
   applies Scala's can-end / can-begin newline rule, so no semicolons are needed).
 - **Output** — `println(x)` / `print(x)` with Scala value formatting.
@@ -232,8 +242,11 @@ division (integer `/ 0` throws `ArithmeticException`), and
 `Double.toString`-accurate float formatting — all verified byte-for-byte against
 a reference `scala` and continuously fuzzed against it (see below). Added since
 slice 1: user-defined `def`s (parameters, recursion, mutual recursion, `return`,
-tail `if`/`else` result) over fusevm's native `Op::Call` frame ABI, and postfix
-`.` dispatch wiring a core `String`/`Int`/`Double` method slice.
+tail `if`/`else` result) over fusevm's native `Op::Call` frame ABI; postfix `.`
+dispatch wiring a core `String`/`Int`/`Double` method slice; `s`/`f`/`raw` string
+interpolation; `if`/`else` in expression position; `match`/`case` over
+literal / wildcard / variable / typed / guarded patterns; and `for … yield`
+range comprehensions (multi-generator + `if` guards) collecting a `Vector`.
 
 ### Differential parity fuzzer
 
@@ -251,14 +264,14 @@ fixes; 32,000+ probes now run clean.
 Next waves, in priority order:
 
 1. **Reference types** — the wider `String`/numeric method surface, collections
-   (`List`, `Array`, `Map`), and a class/`case class`/trait object model. The
-   last is blocked on an ordered, type-tagged record value (fusevm's `Value` has
-   only an unordered `Hash` and an opaque `Obj` handle) — see
-   [`BUGS.md`](BUGS.md).
-2. **Expression-position `if`/`else`** (`val r = if (c) a else b`) — a tail
-   `if`/`else` as a whole `def` body already works.
-3. **Scala idioms** — `s"…"` string interpolation, `match`/`case` pattern
-   matching, `for … yield` comprehensions, lambdas.
+   (`List`, `Array`, `Map`) as first-class values with `map`/`flatMap`/`filter`,
+   and a class/`case class`/trait object model. The last is blocked on an
+   ordered, type-tagged record value (fusevm's `Value` has only an unordered
+   `Hash` and an opaque `Obj` handle) — see [`BUGS.md`](BUGS.md). Collection
+   generators in `for` (`for (x <- List(1,2,3))`) and constructor patterns in
+   `match` (`case Some(x)`) unlock with it.
+2. **Scala idioms** — lambdas / function values (needed for real
+   `map`/`flatMap`/`withFilter` desugaring), tuples, and `Option`.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

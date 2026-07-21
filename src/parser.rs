@@ -345,7 +345,9 @@ impl Parser {
         match self.peek() {
             Tok::If => self.if_stmt(),
             Tok::While => self.while_stmt(),
-            Tok::For => self.for_stmt(),
+            // A `for` in statement position is the comprehension expression run
+            // for effect (its `Vector`/`Unit` value is discarded).
+            Tok::For => Ok(StmtKind::Expr(self.for_comprehension()?)),
             Tok::Val | Tok::Var => self.local_decl(),
             Tok::Return => self.return_stmt(),
             Tok::LBrace => {
@@ -489,58 +491,107 @@ impl Parser {
         Ok(StmtKind::While { cond, body })
     }
 
-    /// `for (name <- start until|to end) <body>` — a range comprehension in
-    /// statement position.
-    fn for_stmt(&mut self) -> Result<StmtKind, String> {
+    /// `for (enums) [yield] body` — a range comprehension. With `yield` it is an
+    /// [`Expr::ForYield`] (collects a `Vector`); without, an [`Expr::ForEach`]
+    /// (side-effecting, `Unit`). Enumerators are `;`-separated inside the parens
+    /// (the lexer suppresses newlines there, so `;` is the separator).
+    fn for_comprehension(&mut self) -> Result<Expr, String> {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
-        let name = self.ident()?;
-        self.eat(&Tok::LArrow)?;
-        let start = self.expression()?;
-        let inclusive = match self.peek().clone() {
-            Tok::Ident(w) if w == "until" => {
-                self.advance();
-                false
-            }
-            Tok::Ident(w) if w == "to" => {
-                self.advance();
-                true
-            }
-            other => {
-                return Err(format!(
-                    "scalars: only `<- a until b` / `<- a to b` ranges are supported in `for` (found {other}) on line {}",
-                    self.line()
-                ))
-            }
-        };
-        let end = self.expression()?;
-        if matches!(self.peek(), Tok::Ident(w) if w == "by") {
-            return Err(format!(
-                "scalars: `by` step in `for` ranges is not supported yet (line {})",
-                self.line()
-            ));
-        }
+        let enums = self.for_enums()?;
         self.eat(&Tok::RParen)?;
         if matches!(self.peek(), Tok::Ident(w) if w == "yield") {
-            return Err(format!(
-                "scalars: `for … yield` comprehensions are not supported yet (line {})",
-                self.line()
-            ));
+            self.advance();
+            // A `yield` body is a value expression (or block expression).
+            let body = self.branch_expr()?;
+            Ok(Expr::ForYield {
+                enums,
+                body: Box::new(body),
+            })
+        } else {
+            // A side-effecting body is a statement block, so assignments
+            // (`for (i <- …) s += i`) parse as statements, not expressions.
+            self.skip_seps();
+            let body = if self.is(&Tok::LBrace) {
+                self.advance();
+                Expr::Block(self.block()?)
+            } else {
+                Expr::Block(vec![self.statement()?])
+            };
+            Ok(Expr::ForEach {
+                enums,
+                body: Box::new(body),
+            })
         }
-        let body = self.braced_or_single()?;
-        Ok(StmtKind::For {
-            name,
-            start,
-            end,
-            inclusive,
-            body,
-        })
+    }
+
+    /// Parse the enumerator list of a `for (...)`: one or more range generators
+    /// (`name <- a until|to b`) with optional trailing `if` guards, separated by
+    /// `;`.
+    fn for_enums(&mut self) -> Result<Vec<ForEnum>, String> {
+        let mut out = Vec::new();
+        loop {
+            self.skip_seps();
+            let name = self.ident()?;
+            self.eat(&Tok::LArrow)?;
+            let start = self.expression()?;
+            let inclusive = match self.peek().clone() {
+                Tok::Ident(w) if w == "until" => {
+                    self.advance();
+                    false
+                }
+                Tok::Ident(w) if w == "to" => {
+                    self.advance();
+                    true
+                }
+                other => {
+                    return Err(format!(
+                        "scalars: only `<- a until b` / `<- a to b` ranges are supported in `for` (found {other}) on line {}",
+                        self.line()
+                    ))
+                }
+            };
+            let end = self.expression()?;
+            if matches!(self.peek(), Tok::Ident(w) if w == "by") {
+                return Err(format!(
+                    "scalars: `by` step in `for` ranges is not supported yet (line {})",
+                    self.line()
+                ));
+            }
+            out.push(ForEnum::Gen {
+                name,
+                start,
+                end,
+                inclusive,
+            });
+            // Trailing `if` guards bind to the generator just parsed.
+            while self.is(&Tok::If) {
+                self.advance();
+                out.push(ForEnum::Guard(self.expression()?));
+            }
+            // Another enumerator follows only after an explicit `;`.
+            if self.is(&Tok::Semi) {
+                self.skip_seps();
+                if self.is(&Tok::RParen) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     // ── expressions (precedence climbing) ─────────────────────────────────
 
     fn expression(&mut self) -> Result<Expr, String> {
-        self.binary(0)
+        // `match` binds looser than every binary operator (`a + b match { … }`
+        // matches on the sum), so it wraps the fully-parsed binary expression.
+        let mut e = self.binary(0)?;
+        while self.is(&Tok::Match) {
+            e = self.match_expr(e)?;
+        }
+        Ok(e)
     }
 
     fn binary(&mut self, min_bp: u8) -> Result<Expr, String> {
@@ -644,6 +695,22 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Null)
             }
+            // `if` in expression position: `val r = if (c) a else b`.
+            Tok::If => self.if_expr(),
+            // `for (...) yield …` / `for (...) …` in expression position.
+            Tok::For => self.for_comprehension(),
+            // An interpolated string `s"…"` / `f"…"` / `raw"…"` desugars to a
+            // concatenation of its literal parts and (formatted) splices.
+            Tok::InterpStr {
+                raw,
+                is_f,
+                parts,
+                exprs,
+                fmts,
+            } => {
+                self.advance();
+                self.build_interp(raw, is_f, &parts, &exprs, &fmts)
+            }
             Tok::LParen => {
                 self.advance();
                 let e = self.expression()?;
@@ -706,6 +773,195 @@ impl Parser {
         Ok(Expr::Println { newline, arg })
     }
 
+    /// `if (cond) then [else els]` as a value-producing expression. Each branch
+    /// is a single expression or a `{ … }` block (an [`Expr::Block`]); a missing
+    /// `else` yields `Unit`.
+    fn if_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::If)?;
+        self.eat(&Tok::LParen)?;
+        let cond = self.expression()?;
+        self.eat(&Tok::RParen)?;
+        let then = self.branch_expr()?;
+        // A line break may precede `else`; tolerate one defensively.
+        let save = self.pos;
+        self.skip_seps();
+        let els = if self.is(&Tok::Else) {
+            self.advance();
+            Some(Box::new(self.branch_expr()?))
+        } else {
+            self.pos = save;
+            None
+        };
+        Ok(Expr::If {
+            cond: Box::new(cond),
+            then: Box::new(then),
+            els,
+        })
+    }
+
+    /// An `if`/`match`-branch expression: a `{ … }` block (parsed to an
+    /// [`Expr::Block`]) or a single expression.
+    fn branch_expr(&mut self) -> Result<Expr, String> {
+        self.skip_seps();
+        if self.is(&Tok::LBrace) {
+            self.advance();
+            Ok(Expr::Block(self.block()?))
+        } else {
+            self.expression()
+        }
+    }
+
+    /// `scrutinee match { case … }` — the cursor is on `match`, `scrut` already
+    /// parsed.
+    fn match_expr(&mut self, scrut: Expr) -> Result<Expr, String> {
+        self.eat(&Tok::Match)?;
+        self.skip_seps();
+        self.eat(&Tok::LBrace)?;
+        self.skip_seps();
+        let mut arms = Vec::new();
+        while self.is(&Tok::Case) {
+            arms.push(self.match_arm()?);
+            self.skip_seps();
+        }
+        self.eat(&Tok::RBrace)?;
+        if arms.is_empty() {
+            return Err(format!(
+                "scalars: `match` requires at least one `case` (line {})",
+                self.line()
+            ));
+        }
+        Ok(Expr::Match {
+            scrut: Box::new(scrut),
+            arms,
+        })
+    }
+
+    /// One `case pat [if guard] => body` arm. The body runs to the next `case`,
+    /// the closing `}`, or EOF.
+    fn match_arm(&mut self) -> Result<MatchArm, String> {
+        self.eat(&Tok::Case)?;
+        let pat = self.pattern()?;
+        let guard = if self.is(&Tok::If) {
+            self.advance();
+            Some(self.expression()?)
+        } else {
+            None
+        };
+        self.eat(&Tok::FatArrow)?;
+        self.skip_seps();
+        let mut body = Vec::new();
+        while !self.is(&Tok::Case) && !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+            body.push(self.statement()?);
+            self.skip_seps();
+        }
+        Ok(MatchArm { pat, guard, body })
+    }
+
+    /// A `case` pattern: literal, `_` wildcard, variable binding, or typed
+    /// `name: Type` / `_: Type`. Constructor/extractor patterns (`Foo(x)`) are
+    /// rejected — the fusevm value model has no ordered record value to bind.
+    fn pattern(&mut self) -> Result<Pattern, String> {
+        match self.peek().clone() {
+            Tok::Int(n) => {
+                self.advance();
+                Ok(Pattern::Literal(Expr::Int(n)))
+            }
+            Tok::Float(f) => {
+                self.advance();
+                Ok(Pattern::Literal(Expr::Float(f)))
+            }
+            Tok::Str(s) => {
+                self.advance();
+                Ok(Pattern::Literal(Expr::Str(s)))
+            }
+            Tok::True => {
+                self.advance();
+                Ok(Pattern::Literal(Expr::Bool(true)))
+            }
+            Tok::False => {
+                self.advance();
+                Ok(Pattern::Literal(Expr::Bool(false)))
+            }
+            Tok::Null => {
+                self.advance();
+                Ok(Pattern::Literal(Expr::Null))
+            }
+            // A negative numeric literal pattern (`case -1 =>`).
+            Tok::Minus => {
+                self.advance();
+                match self.advance() {
+                    Tok::Int(n) => Ok(Pattern::Literal(Expr::Int(-n))),
+                    Tok::Float(f) => Ok(Pattern::Literal(Expr::Float(-f))),
+                    other => Err(format!(
+                        "scalars: expected a numeric literal after `-` in a pattern, found {other} (line {})",
+                        self.line()
+                    )),
+                }
+            }
+            Tok::Ident(name) => {
+                self.advance();
+                // `Foo(...)` — a constructor/extractor pattern (fusevm-blocked).
+                if self.is(&Tok::LParen) {
+                    return Err(format!(
+                        "scalars: constructor patterns (`case {name}(…)`) are not supported (line {})",
+                        self.line()
+                    ));
+                }
+                if self.is(&Tok::Colon) {
+                    self.advance();
+                    let ty = self.type_ref()?;
+                    Ok(Pattern::Typed { name, ty })
+                } else if name == "_" {
+                    Ok(Pattern::Wildcard)
+                } else {
+                    Ok(Pattern::Bind(name))
+                }
+            }
+            other => Err(format!(
+                "scalars: unsupported pattern {other} on line {}",
+                self.line()
+            )),
+        }
+    }
+
+    /// Build the desugared concatenation for an interpolated string. `s`/`raw`
+    /// splices concatenate directly; `f` splices wrap each value in an
+    /// [`Expr::Format`] with its spec (defaulting to `%s`). A leading empty
+    /// `parts[0]` (`s"$x"`) still makes the whole chain a `String.+`, so a
+    /// numeric first splice concatenates rather than adds.
+    fn build_interp(
+        &mut self,
+        _raw: bool,
+        is_f: bool,
+        parts: &[String],
+        exprs: &[String],
+        fmts: &[Option<String>],
+    ) -> Result<Expr, String> {
+        let mut result = Expr::Str(parts[0].clone());
+        for (idx, esrc) in exprs.iter().enumerate() {
+            let mut val = parse_fragment(esrc)?;
+            if is_f {
+                let spec = fmts[idx].clone().unwrap_or_else(|| "%s".to_string());
+                val = Expr::Format {
+                    value: Box::new(val),
+                    spec,
+                    line: 0,
+                };
+            }
+            result = Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(result),
+                rhs: Box::new(val),
+            };
+            result = Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(result),
+                rhs: Box::new(Expr::Str(parts[idx + 1].clone())),
+            };
+        }
+        Ok(result)
+    }
+
     fn ident(&mut self) -> Result<String, String> {
         match self.advance() {
             Tok::Ident(s) => Ok(s),
@@ -715,6 +971,20 @@ impl Parser {
             )),
         }
     }
+}
+
+/// Parse a single expression from a splice source fragment (an interpolation's
+/// `$id` / `${expr}`). Runs a fresh sub-parser so the fragment can be any
+/// expression the grammar accepts.
+fn parse_fragment(src: &str) -> Result<Expr, String> {
+    let tokens = crate::lexer::lex(src)?;
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        funcs: Vec::new(),
+    };
+    p.skip_seps();
+    p.expression()
 }
 
 /// Map a token to a compound-assignment operator, if it is one.

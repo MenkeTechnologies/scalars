@@ -28,6 +28,18 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
+    /// An interpolated string literal — `s"…"`, `f"…"`, or `raw"…"`. Carries the
+    /// literal segments (`parts`, length `exprs.len() + 1`), the raw source of
+    /// each `$id` / `${expr}` splice (`exprs`), and, for the `f` interpolator,
+    /// the per-splice format spec (`fmts`, `%d`/`%.2f`/… or `None` → `%s`). The
+    /// parser re-parses each splice source and desugars to string concatenation.
+    InterpStr {
+        raw: bool,
+        is_f: bool,
+        parts: Vec<String>,
+        exprs: Vec<String>,
+        fmts: Vec<Option<String>>,
+    },
     Ident(String),
     // keywords
     Object,
@@ -41,6 +53,8 @@ pub enum Tok {
     Extends,
     New,
     Return,
+    Match,
+    Case,
     True,
     False,
     Null,
@@ -59,6 +73,8 @@ pub enum Tok {
     Colon,
     /// `<-` — a for-comprehension generator arrow.
     LArrow,
+    /// `=>` — a `case` arm / function-literal arrow.
+    FatArrow,
     // operators
     Assign,
     PlusAssign,
@@ -92,6 +108,7 @@ impl Tok {
             Tok::Int(_)
                 | Tok::Float(_)
                 | Tok::Str(_)
+                | Tok::InterpStr { .. }
                 | Tok::Ident(_)
                 | Tok::True
                 | Tok::False
@@ -113,6 +130,7 @@ impl Tok {
             Tok::Int(_)
                 | Tok::Float(_)
                 | Tok::Str(_)
+                | Tok::InterpStr { .. }
                 | Tok::Ident(_)
                 | Tok::True
                 | Tok::False
@@ -238,6 +256,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
             }
             let word = &src[start..i];
+            // Interpolator prefix: `s"…"` / `f"…"` / `raw"…"` — the ident is an
+            // interpolator only when a `"` follows with no intervening whitespace
+            // (Scala requires adjacency). Otherwise it is a plain identifier.
+            if matches!(word, "s" | "f" | "raw") && i < bytes.len() && bytes[i] == b'"' {
+                let (tok, ni, nl) = lex_interp(word, bytes, src, i, line)?;
+                i = ni;
+                line = nl;
+                push!(tok, line);
+                continue;
+            }
             push!(keyword_or_ident(word), line);
             continue;
         }
@@ -357,6 +385,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         };
         let (kind, adv) = match two {
             "<-" => (Tok::LArrow, 2),
+            "=>" => (Tok::FatArrow, 2),
             "+=" => (Tok::PlusAssign, 2),
             "-=" => (Tok::MinusAssign, 2),
             "*=" => (Tok::StarAssign, 2),
@@ -419,10 +448,171 @@ fn keyword_or_ident(word: &str) -> Tok {
         "extends" => Tok::Extends,
         "new" => Tok::New,
         "return" => Tok::Return,
+        "match" => Tok::Match,
+        "case" => Tok::Case,
         "true" => Tok::True,
         "false" => Tok::False,
         "null" => Tok::Null,
         _ => Tok::Ident(word.to_string()),
+    }
+}
+
+/// Lex an interpolated string `s"…"` / `f"…"` / `raw"…"`. `i` points at the
+/// opening `"`; returns the [`Tok::InterpStr`] token, the index past the closing
+/// `"`, and the updated line. Splits the body into literal `parts` and `$id` /
+/// `${expr}` splices; for `f`, captures each splice's trailing `%…` format spec.
+/// `raw` keeps backslash escapes literal (`raw"\n"` is a backslash then `n`).
+fn lex_interp(
+    prefix: &str,
+    bytes: &[u8],
+    src: &str,
+    mut i: usize,
+    mut line: u32,
+) -> Result<(Tok, usize, u32), String> {
+    let raw = prefix == "raw";
+    let is_f = prefix == "f";
+    let start_line = line;
+    i += 1; // opening quote
+    let mut parts: Vec<String> = Vec::new();
+    let mut exprs: Vec<String> = Vec::new();
+    let mut fmts: Vec<Option<String>> = Vec::new();
+    let mut cur = String::new();
+
+    while i < bytes.len() && bytes[i] != b'"' {
+        let c = bytes[i] as char;
+        // Escapes: raw keeps them verbatim, others decode.
+        if c == '\\' && i + 1 < bytes.len() {
+            if raw {
+                cur.push('\\');
+                let ch = src[i + 1..].chars().next().unwrap();
+                cur.push(ch);
+                i += 1 + ch.len_utf8();
+            } else {
+                cur.push(unescape(bytes[i + 1] as char));
+                i += 2;
+            }
+            continue;
+        }
+        // Splices.
+        if c == '$' && i + 1 < bytes.len() {
+            let n = bytes[i + 1] as char;
+            if n == '$' {
+                cur.push('$');
+                i += 2;
+                continue;
+            }
+            if n == '{' {
+                // `${ balanced-braces }` — capture the inner source.
+                i += 2;
+                let estart = i;
+                let mut depth = 1i32;
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        b'\n' => line += 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return Err(format!(
+                        "scalars: unterminated `${{`-interpolation on line {start_line}"
+                    ));
+                }
+                let esrc = src[estart..i].to_string();
+                i += 1; // closing `}`
+                parts.push(std::mem::take(&mut cur));
+                exprs.push(esrc);
+                fmts.push(if is_f { read_fmt(bytes, &mut i) } else { None });
+                continue;
+            }
+            if n.is_ascii_alphabetic() || n == '_' {
+                // `$identifier` — a bare Scala identifier splice.
+                let estart = i + 1;
+                i += 1;
+                while i < bytes.len() {
+                    let ch = bytes[i] as char;
+                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let esrc = src[estart..i].to_string();
+                parts.push(std::mem::take(&mut cur));
+                exprs.push(esrc);
+                fmts.push(if is_f { read_fmt(bytes, &mut i) } else { None });
+                continue;
+            }
+            return Err(format!(
+                "scalars: invalid interpolation after `$` on line {line}"
+            ));
+        }
+        // `f`-string literal `%%` decodes to a single `%` (Java Formatter).
+        if is_f && c == '%' && i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+            cur.push('%');
+            i += 2;
+            continue;
+        }
+        let ch = src[i..].chars().next().unwrap();
+        if ch == '\n' {
+            line += 1;
+        }
+        cur.push(ch);
+        i += ch.len_utf8();
+    }
+    if i >= bytes.len() {
+        return Err(format!(
+            "scalars: unterminated interpolated string on line {start_line}"
+        ));
+    }
+    i += 1; // closing quote
+    parts.push(cur);
+    Ok((
+        Tok::InterpStr {
+            raw,
+            is_f,
+            parts,
+            exprs,
+            fmts,
+        },
+        i,
+        line,
+    ))
+}
+
+/// Read an `f`-interpolator format spec `%[flags][width][.precision]conv`
+/// immediately after a splice, advancing `i` past it. Returns `None` (leaving `i`
+/// unmoved) when no `%`-spec follows, or when a `%%` (a literal percent) does.
+fn read_fmt(bytes: &[u8], i: &mut usize) -> Option<String> {
+    if *i >= bytes.len() || bytes[*i] != b'%' {
+        return None;
+    }
+    if *i + 1 < bytes.len() && bytes[*i + 1] == b'%' {
+        return None; // `%%` is a literal percent, not this splice's format
+    }
+    let start = *i;
+    *i += 1; // `%`
+    while *i < bytes.len()
+        && matches!(
+            bytes[*i],
+            b'0'..=b'9' | b'.' | b'-' | b'+' | b' ' | b'#' | b','
+        )
+    {
+        *i += 1;
+    }
+    if *i < bytes.len() && (bytes[*i] as char).is_ascii_alphabetic() {
+        *i += 1; // conversion letter
+        Some(String::from_utf8_lossy(&bytes[start..*i]).into_owned())
+    } else {
+        *i = start; // not a valid spec — leave the `%` as literal text
+        None
     }
 }
 

@@ -434,3 +434,233 @@ fn substring_out_of_range_throws() {
     let (_out, ok) = run(&wrap(r#"println("hi".substring(0, 9))"#));
     assert!(!ok, "an out-of-range substring must throw");
 }
+
+// ── string interpolation (`s` / `f` / `raw`) ──────────────────────────────
+
+#[test]
+fn s_interpolator_id_and_block_splices() {
+    // `$id` and `${expr}` splices; every expected output diffed against `scala`.
+    let (out, ok) = run(&wrap(
+        r#"val name = "Ada"; val n = 7; println(s"hi $name, n=${n * 2}")"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "hi Ada, n=14\n");
+}
+
+#[test]
+fn s_interpolator_method_call_in_splice() {
+    // A `${…}` splice is a full expression: method calls, chaining.
+    let (out, ok) = run(&wrap(
+        r#"val name = "Ada"; println(s"len=${"abcd".length} up=${name.toUpperCase}")"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "len=4 up=ADA\n");
+}
+
+#[test]
+fn s_interpolator_adjacent_splices() {
+    // `$n$name` — back-to-back splices with an empty literal between them.
+    let (out, ok) = run(&wrap(r#"val name = "Ada"; val n = 7; println(s"$n$name")"#));
+    assert!(ok);
+    assert_eq!(out, "7Ada\n");
+}
+
+#[test]
+fn f_interpolator_printf_formatting() {
+    // `%.2f`, `%05d`, and left-justified `%-5s` — Java `Formatter` semantics.
+    let (out, ok) = run(&wrap(
+        r#"val n = 7; val name = "Ada"; println(f"${3.14159}%.2f|${n}%05d|${name}%-5s|end")"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "3.14|00007|Ada  |end\n");
+}
+
+#[test]
+fn f_interpolator_signed_and_hex_conversions() {
+    let (out, ok) = run(&wrap(r#"println(f"${-3}%+d ${255}%x ${42}%d")"#));
+    assert!(ok);
+    assert_eq!(out, "-3 ff 42\n");
+}
+
+#[test]
+fn f_interpolator_default_conversion_is_string() {
+    // A bare `$id` in an `f"…"` defaults to `%s`.
+    let (out, ok) = run(&wrap(r#"val name = "Ada"; println(f"hi $name!")"#));
+    assert!(ok);
+    assert_eq!(out, "hi Ada!\n");
+}
+
+#[test]
+fn raw_interpolator_keeps_escapes_literal() {
+    // `raw"…"` does not process `\t` / `\n` — they stay two characters each.
+    let (out, ok) = run(&wrap(r#"println(raw"tab\tnl\n done")"#));
+    assert!(ok);
+    assert_eq!(out, "tab\\tnl\\n done\n");
+}
+
+#[test]
+fn interpolator_prefix_needs_adjacent_quote() {
+    // `s` with a space before the string is a plain identifier, not the `s`
+    // interpolator — so a variable named `s` still works.
+    let (out, ok) = run(&wrap(r#"val s = "plain"; println(s)"#));
+    assert!(ok);
+    assert_eq!(out, "plain\n");
+}
+
+// ── `if` / `else` as a value-producing expression ─────────────────────────
+
+#[test]
+fn if_expression_in_val_binding() {
+    let (out, ok) = run(&wrap(
+        r#"val x = 5; val r = if (x > 0) "pos" else "neg"; println(r)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "pos\n");
+}
+
+#[test]
+fn if_expression_in_argument_position() {
+    let (out, ok) = run(&wrap(
+        r#"val x = 5; println(if (x % 2 == 0) "even" else "odd")"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "odd\n");
+}
+
+#[test]
+fn if_else_if_chain_as_expression() {
+    let (out, ok) = run(&wrap(
+        "val x = 5; val b = if (x > 10) 1 else if (x > 3) 2 else 3; println(b)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn if_expression_with_block_branches() {
+    // A brace branch is a block expression: its last statement is the value.
+    let (out, ok) = run(&wrap(
+        "val x = 5; val v = if (x > 0) { val t = x * x; t + 1 } else 0; println(v)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "26\n");
+}
+
+// ── `match` (non-constructor patterns) ────────────────────────────────────
+
+#[test]
+fn match_literal_and_wildcard() {
+    let (out, ok) = run(&wrap(
+        r#"val x = 5; println(x match { case 0 => "zero"; case 5 => "five"; case _ => "other" })"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "five\n");
+}
+
+#[test]
+fn match_string_literals() {
+    let (out, ok) = run(&wrap(
+        r#"println("go" match { case "stop" => 0; case "go" => 1; case _ => -1 })"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn match_guard_and_variable_binding() {
+    let (out, ok) = run(&wrap(
+        r#"val x = 5; println(x match { case k if k > 3 => "big:" + k; case _ => "small" })"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "big:5\n");
+}
+
+#[test]
+fn match_typed_patterns() {
+    // `case s: String` / `case i: Int` / … — a runtime type test that binds.
+    let src = "object M {\n  def kind(a: Any): String = a match {\n    case s: String => \"string:\" + s\n    case i: Int => \"int:\" + i\n    case d: Double => \"double:\" + d\n    case b: Boolean => \"bool:\" + b\n    case _ => \"unknown\"\n  }\n  def main(z: Array[String]): Unit = { println(kind(\"hey\")); println(kind(3)); println(kind(2.5)); println(kind(true)) } }";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "string:hey\nint:3\ndouble:2.5\nbool:true\n");
+}
+
+#[test]
+fn match_without_matching_arm_throws() {
+    // A non-exhaustive match that falls through raises `scala.MatchError`.
+    let (_out, ok) = run(&wrap(
+        r#"val x = 5; println(x match { case 1 => "one"; case 2 => "two" })"#,
+    ));
+    assert!(!ok, "a non-exhaustive match must throw scala.MatchError");
+}
+
+#[test]
+fn match_constructor_pattern_is_rejected() {
+    // Constructor/case-class patterns are not modeled (fusevm-blocked); the
+    // parser rejects them rather than mis-lowering.
+    let (_out, ok) = run(&wrap(
+        r#"val x = 5; println(x match { case Some(y) => y; case _ => 0 })"#,
+    ));
+    assert!(!ok, "constructor patterns must be rejected");
+}
+
+// ── `for … yield` comprehensions ──────────────────────────────────────────
+
+#[test]
+fn for_yield_range_makes_a_vector() {
+    let (out, ok) = run(&wrap("println(for (i <- 1 to 4) yield i * i)"));
+    assert!(ok);
+    assert_eq!(out, "Vector(1, 4, 9, 16)\n");
+}
+
+#[test]
+fn for_yield_multiple_generators_nest() {
+    let (out, ok) = run(&wrap(
+        "println(for (i <- 1 to 3; j <- 1 to 2) yield i * 10 + j)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "Vector(11, 12, 21, 22, 31, 32)\n");
+}
+
+#[test]
+fn for_yield_guard_filters() {
+    let (out, ok) = run(&wrap("println(for (i <- 1 to 10 if i % 3 == 0) yield i)"));
+    assert!(ok);
+    assert_eq!(out, "Vector(3, 6, 9)\n");
+}
+
+#[test]
+fn for_yield_empty_range_is_empty_vector() {
+    let (out, ok) = run(&wrap("println(for (i <- 0 until 0) yield i)"));
+    assert!(ok);
+    assert_eq!(out, "Vector()\n");
+}
+
+#[test]
+fn for_yield_nested_produces_nested_vectors() {
+    let (out, ok) = run(&wrap(
+        "println(for (i <- 1 to 2) yield for (j <- 1 to 2) yield i * j)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "Vector(Vector(1, 2), Vector(2, 4))\n");
+}
+
+#[test]
+fn for_yield_inside_a_def_is_frame_local() {
+    // The comprehension's accumulator is a frame slot inside a `def`, so a
+    // second call does not see the first call's collected values.
+    let src = "object M { def sq(n: Int) = for (i <- 1 to n) yield i * i\n  def main(a: Array[String]): Unit = { println(sq(3)); println(sq(4)) } }";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "Vector(1, 4, 9)\nVector(1, 4, 9, 16)\n");
+}
+
+#[test]
+fn for_side_effecting_with_assignment_body() {
+    // A `for` without `yield` runs its body for effect; an unbraced assignment
+    // body still parses as a statement.
+    let (out, ok) = run(&wrap(
+        "var acc = 0; for (i <- 1 to 4) acc += i; println(acc)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "10\n");
+}

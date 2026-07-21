@@ -43,6 +43,17 @@ pub const FFI_CALL: u16 = 705;
 /// count plus two (receiver + name). Routes to the wired String/Int stdlib in
 /// [`b_method`].
 pub const SMETHOD: u16 = 706;
+/// Builtin id for `f"…"`-interpolator formatting. The stack holds the value
+/// (deepest) and the format spec (a `Str`, on top); `argc` is 2. Formats through
+/// the Java-`Formatter` subset in [`format_one`].
+pub const SFORMAT: u16 = 707;
+/// Builtin id for a `match` typed-pattern runtime type test (`case x: String`).
+/// The stack holds the value (deepest) and the type name (a `Str`, on top);
+/// `argc` is 2. Returns a `Bool`.
+pub const SISTYPE: u16 = 708;
+/// Builtin id for a non-exhaustive `match` fall-through. Pops the unmatched
+/// scrutinee and faults with `scala.MatchError`, matching an uncaught throw.
+pub const SMATCHERR: u16 = 709;
 
 thread_local! {
     /// Set by a runtime fault raised inside a builtin (an FFI compile/dispatch
@@ -73,6 +84,214 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(FFI_COMPILE, b_ffi_compile);
     vm.register_builtin(FFI_CALL, b_ffi_call);
     vm.register_builtin(SMETHOD, b_method);
+    vm.register_builtin(SFORMAT, b_format);
+    vm.register_builtin(SISTYPE, b_istype);
+    vm.register_builtin(SMATCHERR, b_matcherr);
+}
+
+/// `SFORMAT` builtin: pop the format spec (top) and the value, and format the
+/// value per the Java-`Formatter` subset. A malformed/unsupported spec halts the
+/// VM with the message parked for the runner.
+fn b_format(vm: &mut VM, _argc: u8) -> Value {
+    let spec = vm.pop().as_str_cow().into_owned();
+    let v = vm.pop();
+    match format_one(&spec, &v) {
+        Ok(s) => Value::str(s),
+        Err(e) => fault(vm, e),
+    }
+}
+
+/// `SISTYPE` builtin: pop the type name (top) and the value; push whether the
+/// value's runtime type matches (for a `match` typed pattern).
+fn b_istype(vm: &mut VM, _argc: u8) -> Value {
+    let ty = vm.pop().as_str_cow().into_owned();
+    let v = vm.pop();
+    Value::bool(value_is_type(&v, &ty))
+}
+
+/// `SMATCHERR` builtin: pop the unmatched scrutinee and raise `scala.MatchError`,
+/// with the boxed class name Scala reports (`java.lang.Integer`, …).
+fn b_matcherr(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    let class = match &v {
+        Value::Int(_) => "java.lang.Integer",
+        Value::Float(_) => "java.lang.Double",
+        Value::Bool(_) => "java.lang.Boolean",
+        Value::Str(_) => "java.lang.String",
+        _ => "scala.runtime.Null$",
+    };
+    fault(
+        vm,
+        format!("scala.MatchError: {} (of class {class})", scala_str(&v)),
+    )
+}
+
+/// Whether `v`'s runtime type satisfies the Scala type name `ty` (a `match`
+/// typed-pattern test). Covers the primitive/`String` types this frontend
+/// models; `Any`/`AnyRef`/`AnyVal` match everything.
+fn value_is_type(v: &Value, ty: &str) -> bool {
+    match ty {
+        "String" | "CharSequence" => matches!(v, Value::Str(_)),
+        "Int" | "Integer" | "Long" | "Short" | "Byte" => matches!(v, Value::Int(_)),
+        "Double" | "Float" => matches!(v, Value::Float(_)),
+        "Boolean" => matches!(v, Value::Bool(_)),
+        "Any" | "AnyRef" | "AnyVal" | "Object" => true,
+        _ => false,
+    }
+}
+
+/// Format one value with a Java-`Formatter` conversion spec
+/// (`%[flags][width][.precision]conv`). A faithful subset:
+///
+/// * `s`/`S` — string (`toString`), precision truncates, width pads;
+/// * `d` — decimal integer, `0`/`-`/`+`/space flags + width;
+/// * `f` — fixed-point float, precision (default 6), `0`/`-`/`+`/space + width;
+/// * `b`/`B` — boolean (`false` only for `false`/`null`), width;
+/// * `c` — character (from a code point or the first char of a string).
+///
+/// An unsupported conversion returns an error (the VM faults) rather than
+/// emitting something Java would not.
+fn format_one(spec: &str, v: &Value) -> Result<String, String> {
+    let sb = spec.as_bytes();
+    if sb.first() != Some(&b'%') || sb.len() < 2 {
+        return Err(format!("scalars: malformed format spec `{spec}`"));
+    }
+    let conv = sb[sb.len() - 1] as char;
+    let mid = &sb[1..sb.len() - 1];
+
+    let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+    let mut j = 0;
+    while j < mid.len() && matches!(mid[j], b'-' | b'0' | b'+' | b' ' | b'#' | b',') {
+        match mid[j] {
+            b'-' => left = true,
+            b'0' => zero = true,
+            b'+' => plus = true,
+            b' ' => space = true,
+            _ => {}
+        }
+        j += 1;
+    }
+    let mut width = 0usize;
+    while j < mid.len() && mid[j].is_ascii_digit() {
+        width = width * 10 + (mid[j] - b'0') as usize;
+        j += 1;
+    }
+    let mut prec: Option<usize> = None;
+    if j < mid.len() && mid[j] == b'.' {
+        j += 1;
+        let mut p = 0usize;
+        while j < mid.len() && mid[j].is_ascii_digit() {
+            p = p * 10 + (mid[j] - b'0') as usize;
+            j += 1;
+        }
+        prec = Some(p);
+    }
+
+    match conv {
+        's' | 'S' => {
+            let mut s = scala_str(v);
+            if let Some(p) = prec {
+                s = s.chars().take(p).collect();
+            }
+            if conv == 'S' {
+                s = s.to_uppercase();
+            }
+            Ok(pad_str(s, left, width))
+        }
+        'd' => {
+            let n = v.to_int();
+            let digits = (n as i128).unsigned_abs().to_string();
+            Ok(pad_num(digits, n < 0, left, zero, plus, space, width))
+        }
+        'f' => {
+            let x = v.to_float();
+            let p = prec.unwrap_or(6);
+            let digits = format!("{:.*}", p, x.abs());
+            Ok(pad_num(digits, x < 0.0, left, zero, plus, space, width))
+        }
+        // Radix conversions. Rust's `{:x}`/`{:X}`/`{:o}` on a signed integer
+        // format the two's-complement bit pattern with no sign — identical to
+        // Java for non-negative values; a negative value renders as 64-bit
+        // (Scala `Long`) two's complement (this frontend models every integer as
+        // `i64`, so it cannot pick Java's 32-bit `Int` width).
+        'x' | 'X' | 'o' => {
+            let n = v.to_int();
+            let body = match conv {
+                'x' => format!("{n:x}"),
+                'X' => format!("{n:X}"),
+                _ => format!("{n:o}"),
+            };
+            Ok(pad_num(body, false, left, zero, false, false, width))
+        }
+        'b' | 'B' => {
+            let truthy = match v {
+                Value::Bool(b) => *b,
+                Value::Undef => false,
+                _ => true,
+            };
+            let mut s = if truthy { "true" } else { "false" }.to_string();
+            if conv == 'B' {
+                s = s.to_uppercase();
+            }
+            Ok(pad_str(s, left, width))
+        }
+        'c' => {
+            let ch = match v {
+                Value::Str(s) => s.chars().next().unwrap_or('\0'),
+                _ => char::from_u32(v.to_int() as u32).unwrap_or('\u{fffd}'),
+            };
+            Ok(pad_str(ch.to_string(), left, width))
+        }
+        other => Err(format!("scalars: unsupported format conversion `%{other}`")),
+    }
+}
+
+/// Pad a string body to `width` (left- or right-justified with spaces).
+fn pad_str(s: String, left: bool, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        return s;
+    }
+    let padn = width - len;
+    if left {
+        format!("{s}{}", " ".repeat(padn))
+    } else {
+        format!("{}{s}", " ".repeat(padn))
+    }
+}
+
+/// Pad a numeric body (`digits`, already sign-stripped) to `width`, applying the
+/// sign and the `0`/`-` flags (zero-pad goes between sign and digits).
+fn pad_num(
+    digits: String,
+    negative: bool,
+    left: bool,
+    zero: bool,
+    plus: bool,
+    space: bool,
+    width: usize,
+) -> String {
+    let sign = if negative {
+        "-"
+    } else if plus {
+        "+"
+    } else if space {
+        " "
+    } else {
+        ""
+    };
+    let total = sign.len() + digits.len();
+    if total >= width {
+        return format!("{sign}{digits}");
+    }
+    let padn = width - total;
+    if left {
+        format!("{sign}{digits}{}", " ".repeat(padn))
+    } else if zero {
+        format!("{sign}{}{digits}", "0".repeat(padn))
+    } else {
+        format!("{}{sign}{digits}", " ".repeat(padn))
+    }
 }
 
 /// `SMETHOD` builtin: universal postfix method dispatch. The stack holds
@@ -327,6 +546,13 @@ pub fn scala_str(v: &Value) -> String {
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Float(f) => format_double(*f),
         Value::Undef => "null".to_string(),
+        // The only arrays this frontend produces are `for … yield` results, whose
+        // static type over a range generator is `IndexedSeq`/`Vector`; render them
+        // as Scala's `Vector(e0, e1, …)` (elements via `toString`, unquoted).
+        Value::Array(items) => {
+            let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(", ");
+            format!("Vector({inner})")
+        }
         other => other.as_str_cow().into_owned(),
     }
 }
