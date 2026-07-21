@@ -517,15 +517,19 @@ impl Parser {
                 Ok(e)
             }
             Tok::Ident(name) => {
-                // `println(...)` / `print(...)`, a var read, or an unsupported
-                // call/field access.
+                // `println(...)` / `print(...)`, a named call `name(args)`, a var
+                // read, or an unsupported field access.
                 if (name == "println" || name == "print")
                     && matches!(self.toks[self.pos + 1].kind, Tok::LParen)
                 {
                     return self.print_call(name == "println");
                 }
+                let line = self.line();
                 self.advance();
-                if self.is(&Tok::LParen) || self.is(&Tok::Dot) {
+                if self.is(&Tok::LParen) {
+                    return self.call(name, line);
+                }
+                if self.is(&Tok::Dot) {
                     return Err(format!(
                         "scalars: method/field access on `{name}` is not supported yet (line {})",
                         self.line()
@@ -538,6 +542,27 @@ impl Parser {
                 self.line()
             )),
         }
+    }
+
+    /// Parse a named call `name(arg, arg, …)` — the cursor is on the `(` and
+    /// `name`/`line` are already consumed. Resolved in the compiler: either the
+    /// `__rust_compile` FFI-block builtin or a call to an FFI-exported bareword.
+    fn call(&mut self, name: String, line: u32) -> Result<Expr, String> {
+        self.eat(&Tok::LParen)?;
+        let mut args = Vec::new();
+        if !self.is(&Tok::RParen) {
+            loop {
+                args.push(self.expression()?);
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                    self.skip_seps();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        Ok(Expr::Call { name, args, line })
     }
 
     /// Parse `println(arg)` / `print(arg)` (the cursor is on the ident).

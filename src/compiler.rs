@@ -16,6 +16,9 @@
 use crate::ast::*;
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 
+/// The desugar target a `rust { ... }` block lowers to (see [`crate::rust_ffi`]).
+const RUST_COMPILE: &str = "__rust_compile";
+
 struct Compiler {
     b: ChunkBuilder,
     /// Distinguishes synthetic `for` upper-bound locals so nested loops do not
@@ -25,6 +28,11 @@ struct Compiler {
     /// statement (for `scala --dap`). Normal runs compile with `debug=false` and
     /// carry zero extra ops.
     debug: bool,
+    /// True when the program contains a `rust { ... }` FFI block (a
+    /// `__rust_compile` call). Only then does an unknown call name lower to a
+    /// runtime FFI dispatch instead of a compile error — so non-FFI programs keep
+    /// their exact "not found" compile-time diagnostic.
+    has_ffi: bool,
 }
 
 /// Compile a parsed [`Program`]'s entry body to a runnable fusevm chunk.
@@ -42,10 +50,12 @@ pub fn compile_debug(prog: &Program) -> Result<Chunk, String> {
 }
 
 fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
+    let has_ffi = body_has_ffi(&prog.main);
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         for_counter: 0,
         debug,
+        has_ffi,
     };
     for stmt in &prog.main {
         c.stmt(stmt)?;
@@ -258,7 +268,42 @@ impl Compiler {
             Expr::Println { newline, arg } => {
                 self.println(*newline, arg.as_deref())?;
             }
+            Expr::Call { name, args, line } => self.call(name, args, *line)?,
         }
+        Ok(())
+    }
+
+    /// Lower a named call. Two shapes reach here (slice 1 has no user methods):
+    ///
+    /// * `__rust_compile("<b64>", line)` — the desugar target of a `rust { ... }`
+    ///   block. Compile the base64 body string and hand it to the FFI-compile
+    ///   builtin; the call evaluates to `Unit`.
+    /// * an FFI-exported bareword (`add(2, 3)`) — only when the program carries a
+    ///   `rust { ... }` block. Push the args (deepest first) and the name, then
+    ///   dispatch by name through the FFI-call builtin. Without any FFI block, an
+    ///   unknown call is a compile-time error, preserving the normal diagnostic.
+    fn call(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        if name == RUST_COMPILE {
+            // Only the base64 body (first arg) is needed; the line arg is dropped.
+            if let Some(body) = args.first() {
+                self.expr(body)?;
+                self.b.emit(Op::CallBuiltin(crate::host::FFI_COMPILE, 1), line);
+            } else {
+                self.b.emit(Op::LoadUndef, line);
+            }
+            return Ok(());
+        }
+        if !self.has_ffi {
+            return Err(format!("scalars: not found: {name} (line {line})"));
+        }
+        for a in args {
+            self.expr(a)?;
+        }
+        let c = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(c), line);
+        // argc is the arg count plus one (the name) — see `host::b_ffi_call`.
+        self.b
+            .emit(Op::CallBuiltin(crate::host::FFI_CALL, args.len() as u8 + 1), line);
         Ok(())
     }
 
@@ -309,6 +354,38 @@ impl Compiler {
         };
         self.b.emit(vop, 0);
         Ok(())
+    }
+}
+
+// ── FFI detection (does the program contain a `rust { ... }` block?) ────────
+
+/// True if any statement in `body` (recursively) evaluates a `__rust_compile`
+/// call — the desugar target of a `rust { ... }` block.
+fn body_has_ffi(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match &s.kind {
+        StmtKind::Local { init, .. } => init.as_ref().is_some_and(expr_has_ffi),
+        StmtKind::Assign { value, .. } => expr_has_ffi(value),
+        StmtKind::Expr(e) => expr_has_ffi(e),
+        StmtKind::If { cond, then, els } => {
+            expr_has_ffi(cond) || body_has_ffi(then) || body_has_ffi(els)
+        }
+        StmtKind::While { cond, body } => expr_has_ffi(cond) || body_has_ffi(body),
+        StmtKind::For {
+            start, end, body, ..
+        } => expr_has_ffi(start) || expr_has_ffi(end) || body_has_ffi(body),
+    })
+}
+
+fn expr_has_ffi(e: &Expr) -> bool {
+    match e {
+        Expr::Call { name, args, .. } => {
+            name == RUST_COMPILE || args.iter().any(expr_has_ffi)
+        }
+        Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
+        Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
+        Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null
+        | Expr::Var(_) => false,
     }
 }
 

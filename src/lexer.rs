@@ -141,7 +141,15 @@ impl fmt::Display for Tok {
 
 /// Lex `src` into a token vector terminated by `Tok::Eof`, with inferred
 /// [`Tok::Newline`] statement separators.
+///
+/// Before tokenizing, every inline `rust { ... }` FFI block is rewritten to a
+/// `__rust_compile("<base64>", <line>)` call by [`crate::rust_ffi::desugar`], so
+/// the lexer/parser never see raw Rust source. This is the single source-level
+/// choke point every path (`parse`, `--dump-tokens`) flows through; it is a
+/// no-op when the source has no `rust` block.
 pub fn lex(src: &str) -> Result<Vec<Token>, String> {
+    let desugared = crate::rust_ffi::desugar(src);
+    let src = desugared.as_str();
     let bytes = src.as_bytes();
     let mut i = 0usize;
     let mut line = 1u32;

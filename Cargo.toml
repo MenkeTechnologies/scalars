@@ -62,7 +62,12 @@ path = "src/bin/parity_fuzz.rs"
 # persistent on-disk cache of compiled native code (keyed by chunk hash), so hot
 # Scala loops trace-compile and warm runs skip recompilation. `aot` enables the
 # ahead-of-time object emitter used by later `scala --build` work.
-fusevm = { version = "0.14.11", features = ["jit", "jit-disk-cache", "aot"] }
+#
+# `ffi` enables fusevm's inline-Rust FFI bridge: a `rust { pub extern "C" fn … }`
+# block in Scala source is scanned/rewritten by `fusevm::RustSugar`
+# (src/rust_ffi.rs), compiled to a cdylib, and its exports are called by name
+# (the `__rust_compile` / by-name-call dispatch into `fusevm::ffi`).
+fusevm = { version = "0.14.11", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 thiserror = "2.0"
 

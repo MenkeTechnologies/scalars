@@ -15,6 +15,7 @@ pub mod host;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod rust_ffi;
 
 pub use banner::version_banner;
 use fusevm::{VMResult, Value, VM};
@@ -37,7 +38,14 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
     vm.enable_tracing_jit();
-    match vm.run() {
+    let _ = host::take_error(); // clear any stale FFI fault from a prior run
+    let res = vm.run();
+    // An FFI compile/dispatch fault halts the VM and parks its message; surface
+    // it as an error rather than the (Undef) top of stack.
+    if let Some(err) = host::take_error() {
+        return Err(err);
+    }
+    match res {
         VMResult::Ok(v) => Ok(v),
         VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
         VMResult::Error(e) => Err(e),

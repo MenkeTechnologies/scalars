@@ -16,6 +16,7 @@
 //!    the same [`scala_str`].
 
 use fusevm::{NumOp, Value, VM};
+use std::cell::RefCell;
 
 /// Builtin id for Predef `println` (one Scala-formatted arg + newline).
 pub const SPRINTLN: u16 = 700;
@@ -27,14 +28,74 @@ pub const SDIV: u16 = 702;
 /// `compiler::compile_debug`; registered only on the debug run path
 /// (`crate::run_chunk_debug`). It carries no args and returns `Unit`.
 pub const DBG_LINE: u16 = 703;
+/// Builtin id for compiling + registering an inline `rust { ... }` FFI block.
+/// Pops the base64 block body (a `Str`) and hands it to
+/// `fusevm::ffi::compile_and_register`. Returns `Unit`.
+pub const FFI_COMPILE: u16 = 704;
+/// Builtin id for calling an FFI-exported function by name. The stack holds the
+/// args (deepest first) with the function name (a `Str`) on top; `argc` is the
+/// arg count plus one (the name). Dispatches through `fusevm::ffi::try_call` and
+/// returns the result.
+pub const FFI_CALL: u16 = 705;
 
-/// Install scalars builtins on a VM: the Scala-formatting print builtins and the
-/// type-dispatching division operator. This is the single install choke point
-/// later waves (methods, `String`/collection objects) grow into.
+thread_local! {
+    /// Set by a runtime fault raised inside a builtin (an FFI compile/dispatch
+    /// error) so the runner can surface it as an error after `VM::run` returns
+    /// (a builtin can only return a `Value`, not an error).
+    static FFI_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Take and clear any pending FFI-fault message.
+pub fn take_error() -> Option<String> {
+    FFI_ERROR.with(|e| e.borrow_mut().take())
+}
+
+fn fault(vm: &mut VM, msg: impl Into<String>) -> Value {
+    FFI_ERROR.with(|e| *e.borrow_mut() = Some(msg.into()));
+    vm.request_halt();
+    Value::Undef
+}
+
+/// Install scalars builtins on a VM: the Scala-formatting print builtins, the
+/// type-dispatching division operator, and the inline-Rust FFI bridge. This is
+/// the single install choke point later waves (methods, `String`/collection
+/// objects) grow into.
 pub fn install(vm: &mut VM) {
     vm.register_builtin(SPRINTLN, b_println);
     vm.register_builtin(SPRINT, b_print);
     vm.register_builtin(SDIV, b_div);
+    vm.register_builtin(FFI_COMPILE, b_ffi_compile);
+    vm.register_builtin(FFI_CALL, b_ffi_call);
+}
+
+/// `FFI_COMPILE` builtin: pop the base64-encoded `rust { ... }` block body and
+/// compile + register it via `fusevm::ffi`. Returns `Unit`; a compile error
+/// halts the VM with the message parked for the runner.
+fn b_ffi_compile(vm: &mut VM, _argc: u8) -> Value {
+    let body = vm.pop();
+    let b64 = body.as_str_cow().into_owned();
+    if let Err(e) = fusevm::ffi::compile_and_register(&b64) {
+        return fault(vm, format!("rust {{}} block: {e}"));
+    }
+    Value::Undef
+}
+
+/// `FFI_CALL` builtin: the stack holds `[arg0 .. arg{n-1}, name]` with the
+/// function name on top and `argc == n + 1`. Pop the name, pop the args, and
+/// dispatch through `fusevm::ffi::try_call`, returning its result.
+fn b_ffi_call(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().as_str_cow().into_owned();
+    let n = (argc as usize).saturating_sub(1);
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    match fusevm::ffi::try_call(&name, &args) {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => fault(vm, format!("rust FFI call `{name}`: {e}")),
+        None => fault(vm, format!("scalars: not found: {name}")),
+    }
 }
 
 /// Scala `/` builtin. fusevm's native `Op::Div` is *always* floating (`7 / 2`

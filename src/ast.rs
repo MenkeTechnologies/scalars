@@ -106,6 +106,16 @@ pub enum Expr {
         newline: bool,
         arg: Option<Box<Expr>>,
     },
+    /// A named call `name(arg, …)`. Slice 1 has no user methods, so this carries
+    /// only two shapes: `__rust_compile("<b64>", line)` (the desugar target of a
+    /// `rust { ... }` FFI block) and calls to functions exported by such a block
+    /// (`add(2, 3)`). Both are resolved in [`crate::compiler`]. `line` is the
+    /// source line of the callee, for diagnostics.
+    Call {
+        name: String,
+        args: Vec<Expr>,
+        line: u32,
+    },
 }
 
 /// Unary operators.
