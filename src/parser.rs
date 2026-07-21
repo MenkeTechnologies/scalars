@@ -18,6 +18,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
+        funcs: Vec::new(),
     };
     p.program()
 }
@@ -25,6 +26,9 @@ pub fn parse(src: &str) -> Result<Program, String> {
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// User-defined `def`s collected while parsing (both object members and
+    /// `def`s hoisted out of a body block). Flattened into `Program::functions`.
+    funcs: Vec<Func>,
 }
 
 impl Parser {
@@ -107,20 +111,28 @@ impl Parser {
         self.eat(&Tok::LBrace)?;
 
         if app_mode {
-            // The whole object body is the program.
+            // The whole object body is the program; any `def` inside is hoisted
+            // into `self.funcs` by `block`.
             let body = self.block()?;
             return Ok(Program {
                 object_name,
                 main: body,
+                functions: std::mem::take(&mut self.funcs),
             });
         }
 
-        // Otherwise scan members for `def main`.
+        // Otherwise scan members: `def main` is the entry, other `def`s are
+        // functions, everything else (object fields, nested types) is skipped.
         let mut main = None;
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-            if let Some(body) = self.try_main()? {
-                main = Some(body);
+            if self.is(&Tok::Def) {
+                if let Some(body) = self.try_main()? {
+                    main = Some(body);
+                } else {
+                    let f = self.parse_def()?;
+                    self.funcs.push(f);
+                }
             } else {
                 self.skip_member()?;
             }
@@ -128,11 +140,76 @@ impl Parser {
         }
 
         match main {
-            Some(main) => Ok(Program { object_name, main }),
+            Some(main) => Ok(Program {
+                object_name,
+                main,
+                functions: std::mem::take(&mut self.funcs),
+            }),
             None => Err(format!(
                 "scalars: object `{object_name}` has no `def main(args: Array[String])` and does not `extend App`"
             )),
         }
+    }
+
+    /// Parse a non-`main` `def name[(...)]: T = body` into a [`Func`]. The cursor
+    /// is on `def`. Type parameters and parameter/return types are consumed but
+    /// only parameter *names* are kept (the runtime is dynamically typed).
+    fn parse_def(&mut self) -> Result<Func, String> {
+        self.eat(&Tok::Def)?;
+        let name = self.ident()?;
+        // Optional `[T, U]` type-parameter clause — skip the whole bracket group.
+        if self.is(&Tok::LBracket) {
+            let mut depth = 0;
+            loop {
+                match self.advance() {
+                    Tok::LBracket => depth += 1,
+                    Tok::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Tok::Eof => break,
+                    _ => {}
+                }
+            }
+        }
+        // Parameter list. Scala allows a parameterless `def name = …`, so the
+        // `(` is optional.
+        let mut params = Vec::new();
+        if self.is(&Tok::LParen) {
+            self.advance();
+            self.skip_seps();
+            while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
+                let pname = self.ident()?;
+                if self.is(&Tok::Colon) {
+                    self.advance();
+                    self.type_ref()?;
+                }
+                params.push(pname);
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                    self.skip_seps();
+                } else {
+                    break;
+                }
+            }
+            self.eat(&Tok::RParen)?;
+        }
+        // Optional `: ReturnType`.
+        if self.is(&Tok::Colon) {
+            self.advance();
+            self.type_ref()?;
+        }
+        self.eat(&Tok::Assign)?;
+        self.skip_seps();
+        let body = if self.is(&Tok::LBrace) {
+            self.advance();
+            self.block()?
+        } else {
+            vec![self.statement()?]
+        };
+        Ok(Func { name, params, body })
     }
 
     /// If the cursor is at `def main(…) [: Type] = <body>`, parse the body and
@@ -225,11 +302,18 @@ impl Parser {
     }
 
     /// Parse a `{ ... }` body already past the opening brace; consumes the `}`.
+    /// A nested `def` is hoisted into `self.funcs` (slice-1 has a flat function
+    /// namespace) rather than becoming a statement.
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
         let mut out = Vec::new();
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-            out.push(self.statement()?);
+            if self.is(&Tok::Def) {
+                let f = self.parse_def()?;
+                self.funcs.push(f);
+            } else {
+                out.push(self.statement()?);
+            }
             self.skip_seps();
         }
         self.eat(&Tok::RBrace)?;
@@ -263,10 +347,7 @@ impl Parser {
             Tok::While => self.while_stmt(),
             Tok::For => self.for_stmt(),
             Tok::Val | Tok::Var => self.local_decl(),
-            Tok::Return => Err(format!(
-                "scalars: `return` is not supported yet (slice 1 `main` bodies fall off the end) — line {}",
-                self.line()
-            )),
+            Tok::Return => self.return_stmt(),
             Tok::LBrace => {
                 self.advance();
                 // A bare block: flatten into a single synthetic if-true. Slice 1
@@ -279,6 +360,21 @@ impl Parser {
                 })
             }
             _ => self.simple_statement(),
+        }
+    }
+
+    /// `return [expr]` — an early exit from the enclosing `def`. A bare `return`
+    /// (followed by a statement separator or `}`) yields `Unit`.
+    fn return_stmt(&mut self) -> Result<StmtKind, String> {
+        self.eat(&Tok::Return)?;
+        if self.is(&Tok::Newline)
+            || self.is(&Tok::Semi)
+            || self.is(&Tok::RBrace)
+            || self.is(&Tok::Eof)
+        {
+            Ok(StmtKind::Return(None))
+        } else {
+            Ok(StmtKind::Return(Some(self.expression()?)))
         }
     }
 
@@ -480,8 +576,46 @@ impl Parser {
                     rhs: Box::new(self.unary()?),
                 })
             }
-            _ => self.primary(),
+            _ => self.postfix(),
         }
+    }
+
+    /// Postfix method/field dispatch: `primary ( '.' member [ '(' args ')' ] )*`.
+    /// A paren-less member (`s.length`, `n.toString`) is a zero-argument call;
+    /// chains left-associatively (`s.trim.length`).
+    fn postfix(&mut self) -> Result<Expr, String> {
+        let mut e = self.primary()?;
+        while self.is(&Tok::Dot) {
+            self.advance(); // `.`
+            let line = self.line();
+            let name = self.ident()?;
+            let args = if self.is(&Tok::LParen) {
+                self.advance();
+                let mut args = Vec::new();
+                if !self.is(&Tok::RParen) {
+                    loop {
+                        args.push(self.expression()?);
+                        if self.is(&Tok::Comma) {
+                            self.advance();
+                            self.skip_seps();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.eat(&Tok::RParen)?;
+                args
+            } else {
+                Vec::new()
+            };
+            e = Expr::Method {
+                recv: Box::new(e),
+                name,
+                args,
+                line,
+            };
+        }
+        Ok(e)
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
@@ -517,8 +651,8 @@ impl Parser {
                 Ok(e)
             }
             Tok::Ident(name) => {
-                // `println(...)` / `print(...)`, a named call `name(args)`, a var
-                // read, or an unsupported field access.
+                // `println(...)` / `print(...)`, a named call `name(args)`, or a
+                // var read. Postfix `.member` dispatch is layered on in `postfix`.
                 if (name == "println" || name == "print")
                     && matches!(self.toks[self.pos + 1].kind, Tok::LParen)
                 {
@@ -528,12 +662,6 @@ impl Parser {
                 self.advance();
                 if self.is(&Tok::LParen) {
                     return self.call(name, line);
-                }
-                if self.is(&Tok::Dot) {
-                    return Err(format!(
-                        "scalars: method/field access on `{name}` is not supported yet (line {})",
-                        self.line()
-                    ));
                 }
                 Ok(Expr::Var(name))
             }

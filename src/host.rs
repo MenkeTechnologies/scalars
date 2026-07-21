@@ -37,6 +37,12 @@ pub const FFI_COMPILE: u16 = 704;
 /// arg count plus one (the name). Dispatches through `fusevm::ffi::try_call` and
 /// returns the result.
 pub const FFI_CALL: u16 = 705;
+/// Builtin id for universal postfix method dispatch (`s.length`, `n.toString`,
+/// `s.substring(1, 3)`). The stack holds the receiver (deepest), then the
+/// arguments, then the method name (a `Str`) on top; `argc` is the argument
+/// count plus two (receiver + name). Routes to the wired String/Int stdlib in
+/// [`b_method`].
+pub const SMETHOD: u16 = 706;
 
 thread_local! {
     /// Set by a runtime fault raised inside a builtin (an FFI compile/dispatch
@@ -66,6 +72,159 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SDIV, b_div);
     vm.register_builtin(FFI_COMPILE, b_ffi_compile);
     vm.register_builtin(FFI_CALL, b_ffi_call);
+    vm.register_builtin(SMETHOD, b_method);
+}
+
+/// `SMETHOD` builtin: universal postfix method dispatch. The stack holds
+/// `[recv, arg0 .. arg{k-1}, name]` (name on top) with `argc == k + 2`. Pops the
+/// name, the `k` arguments, and the receiver, then routes to a small faithful
+/// slice of the Scala `String`/`Int`/`Double`/`Any` stdlib.
+///
+/// Unknown method / arity / receiver-type combinations halt the VM with a
+/// message parked for the runner — the frontend has no exception machinery, so
+/// an unresolved call aborts like an uncaught error rather than guessing.
+fn b_method(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().as_str_cow().into_owned();
+    let k = (argc as usize).saturating_sub(2);
+    let mut args = Vec::with_capacity(k);
+    for _ in 0..k {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let recv = vm.pop();
+
+    match dispatch_method(&recv, &name, &args) {
+        Ok(v) => v,
+        Err(e) => fault(vm, e),
+    }
+}
+
+/// Resolve `recv.name(args)` against the wired stdlib, or return the Scala-style
+/// error message for an unresolved call. Kept host-only (no VM handle) so it is
+/// straightforward to unit-test.
+fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // `toString` is defined on every value (Scala's `Any.toString`).
+    if name == "toString" && args.is_empty() {
+        return Ok(Value::str(scala_str(recv)));
+    }
+    match recv {
+        Value::Str(s) => string_method(s, name, args),
+        Value::Int(n) => int_method(*n, name, args),
+        Value::Float(f) => double_method(*f, name, args),
+        _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// `String` methods (a faithful subset of `java.lang.String` / Scala
+/// `StringOps`). Lengths/indices are in `char`s — matching Scala for the BMP
+/// text this frontend handles.
+fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
+    let arity_err = || format!("scalars: String.{name}: wrong number of arguments");
+    match (name, args.len()) {
+        ("length" | "size", 0) => Ok(Value::int(s.chars().count() as i64)),
+        ("isEmpty", 0) => Ok(Value::bool(s.is_empty())),
+        ("nonEmpty", 0) => Ok(Value::bool(!s.is_empty())),
+        ("toUpperCase", 0) => Ok(Value::str(s.to_uppercase())),
+        ("toLowerCase", 0) => Ok(Value::str(s.to_lowercase())),
+        ("trim", 0) => Ok(Value::str(s.trim())),
+        ("reverse", 0) => Ok(Value::str(s.chars().rev().collect::<String>())),
+        ("toInt", 0) => s.trim().parse::<i64>().map(Value::int).map_err(|_| {
+            format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
+        }),
+        ("toDouble", 0) => s.trim().parse::<f64>().map(Value::float).map_err(|_| {
+            format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
+        }),
+        ("charAt", 1) => {
+            let i = args[0].to_int();
+            let chars: Vec<char> = s.chars().collect();
+            if i < 0 || i as usize >= chars.len() {
+                Err(format!(
+                    "scalars: java.lang.StringIndexOutOfBoundsException: index {i}, length {}",
+                    chars.len()
+                ))
+            } else {
+                Ok(Value::str(chars[i as usize].to_string()))
+            }
+        }
+        ("contains", 1) => Ok(Value::bool(s.contains(&*args[0].as_str_cow()))),
+        ("startsWith", 1) => Ok(Value::bool(s.starts_with(&*args[0].as_str_cow()))),
+        ("endsWith", 1) => Ok(Value::bool(s.ends_with(&*args[0].as_str_cow()))),
+        ("substring", 1) => substring(s, args[0].to_int(), s.chars().count() as i64),
+        ("substring", 2) => substring(s, args[0].to_int(), args[1].to_int()),
+        // A recognized name with the wrong arity is an arity error; an
+        // unrecognized name is "no such method".
+        (
+            "length" | "size" | "isEmpty" | "nonEmpty" | "toUpperCase" | "toLowerCase" | "trim"
+            | "reverse" | "toInt" | "toDouble" | "charAt" | "contains" | "startsWith" | "endsWith"
+            | "substring",
+            _,
+        ) => Err(arity_err()),
+        _ => Err(no_such_method(&Value::str(s), name)),
+    }
+}
+
+/// Scala/Java `String.substring(begin, end)` — a half-open `char` slice that
+/// throws `StringIndexOutOfBoundsException` for an out-of-range or inverted range.
+fn substring(s: &str, begin: i64, end: i64) -> Result<Value, String> {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    if begin < 0 || end > len || begin > end {
+        return Err(format!(
+            "scalars: java.lang.StringIndexOutOfBoundsException: begin {begin}, end {end}, length {len}"
+        ));
+    }
+    Ok(Value::str(
+        chars[begin as usize..end as usize]
+            .iter()
+            .collect::<String>(),
+    ))
+}
+
+/// `Int` methods (a faithful subset of `scala.Int` / `RichInt`).
+fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
+    match (name, args.len()) {
+        ("abs", 0) => Ok(Value::int(n.wrapping_abs())),
+        ("toDouble" | "toFloat", 0) => Ok(Value::float(n as f64)),
+        ("toInt" | "toLong", 0) => Ok(Value::int(n)),
+        ("max", 1) => Ok(Value::int(n.max(args[0].to_int()))),
+        ("min", 1) => Ok(Value::int(n.min(args[0].to_int()))),
+        ("abs" | "toDouble" | "toFloat" | "toInt" | "toLong" | "max" | "min", _) => {
+            Err(format!("scalars: Int.{name}: wrong number of arguments"))
+        }
+        _ => Err(no_such_method(&Value::int(n), name)),
+    }
+}
+
+/// `Double` methods (a faithful subset of `scala.Double` / `RichDouble`).
+fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
+    match (name, args.len()) {
+        ("abs", 0) => Ok(Value::float(f.abs())),
+        ("toInt" | "toLong", 0) => Ok(Value::int(f as i64)),
+        ("toDouble" | "toFloat", 0) => Ok(Value::float(f)),
+        ("isNaN", 0) => Ok(Value::bool(f.is_nan())),
+        ("isInfinity" | "isInfinite", 0) => Ok(Value::bool(f.is_infinite())),
+        ("round", 0) => Ok(Value::int(f.round() as i64)),
+        (
+            "abs" | "toInt" | "toLong" | "toDouble" | "toFloat" | "isNaN" | "isInfinity"
+            | "isInfinite" | "round",
+            _,
+        ) => Err(format!("scalars: Double.{name}: wrong number of arguments")),
+        _ => Err(no_such_method(&Value::float(f), name)),
+    }
+}
+
+/// The Scala compile-error a bad member access resembles (a `value … is not a
+/// member of …`). slice-1 resolves methods at runtime, so it surfaces here.
+fn no_such_method(recv: &Value, name: &str) -> String {
+    let ty = match recv {
+        Value::Str(_) => "String",
+        Value::Int(_) => "Int",
+        Value::Float(_) => "Double",
+        Value::Bool(_) => "Boolean",
+        Value::Undef => "Null",
+        _ => "value",
+    };
+    format!("scalars: value {name} is not a member of {ty}")
 }
 
 /// `FFI_COMPILE` builtin: pop the base64-encoded `rust { ... }` block body and
@@ -105,16 +264,20 @@ fn b_ffi_call(vm: &mut VM, argc: u8) -> Value {
 /// truncating integer division (toward zero, like Scala/Java); otherwise a
 /// double divide (so `7 / 2.0 == 3.5`, `1.0 / 0.0 == Infinity`).
 ///
-/// Integer division by zero throws `ArithmeticException` in Scala; slice 1 has
-/// no exception machinery, so it yields `null` (a documented gap — see
-/// `BUGS.md`). A `wrapping_div` avoids the `i64::MIN / -1` overflow panic.
+/// Integer division by zero throws `java.lang.ArithmeticException: / by zero` in
+/// Scala (a JVM `idiv`/`irem` trap). slice 1 has no `try`/`catch`, so an
+/// uncaught throw halts the VM with that exact message parked for the runner
+/// (surfaced as `scalars: java.lang.ArithmeticException: / by zero`), matching an
+/// uncaught exception aborting `scala`. A `wrapping_div` avoids the
+/// `i64::MIN / -1` overflow panic. Floating-point `/ 0.0` is NOT an error in
+/// Scala/IEEE-754 — it yields `Infinity`/`NaN` — so it stays on the float path.
 fn b_div(vm: &mut VM, _argc: u8) -> Value {
     let b = vm.stack.pop().unwrap_or(Value::Undef);
     let a = vm.stack.pop().unwrap_or(Value::Undef);
     match (&a, &b) {
         (Value::Int(x), Value::Int(y)) => {
             if *y == 0 {
-                Value::Undef
+                fault(vm, "java.lang.ArithmeticException: / by zero")
             } else {
                 Value::int(x.wrapping_div(*y))
             }

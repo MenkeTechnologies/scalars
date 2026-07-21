@@ -74,10 +74,14 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   against a live `scala` across ten generators (32,000+ probes clean).
 
 This is an early slice: single-object programs whose entry point (`def main`, or
-an `extends App` body) uses `val`/`var` bindings, arithmetic, `if`/`while`, the
-Scala range `for`, and `println`/`print`. User methods, classes, collections,
-and the standard library are the next waves (see [`BUGS.md`](BUGS.md)). Nothing
-is faked — an unsupported construct is a parse error, not a silent mis-run.
+an `extends App` body) uses `val`/`var` bindings (with `val` immutability
+enforced), arithmetic, `if`/`while`, the Scala range `for`, and `println`/`print`.
+User-defined `def`s — parameters, recursion, mutual recursion, `return`, and a
+tail `if`/`else` result — compile to fusevm's native call frames, and postfix
+`.` dispatch wires a core `String`/`Int`/`Double` method slice. Classes,
+collections, and the wider standard library are the next waves (see
+[`BUGS.md`](BUGS.md)). Nothing is faked — an unsupported construct is a parse
+error or an honest runtime throw, not a silent mis-run.
 
 ---
 
@@ -153,11 +157,24 @@ Implemented and checked against the reference `scala`:
   also declares other members still finds and runs its `main`.
 - **Bindings** — `val` / `var` with optional type ascription
   (`val x: Int = …`, `var s = …`), type inferred as storage; plain and compound
-  assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`).
+  assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`). Reassigning a `val`
+  (or a method parameter) is a compile error, as in `scalac`.
+- **User-defined methods** — helper `def f(a: T, b: U): R = body` alongside
+  `main` (or in an `App` body) compile to fusevm's native `Op::Call` frames:
+  parameters bind to per-call frame slots, so recursion and mutual recursion are
+  correct; the body's last expression (including a tail `if`/`else`) is the
+  result; `return e` / bare `return` exit early; a zero-parameter `def` is
+  callable paren-less.
 - **Expressions** — integer / floating / string / char / boolean / `null`
   literals; the binary operators `+ - * / %`, `== != < > <= >=`, `&& ||`
   (short-circuiting); unary `-` and `!`; parenthesised grouping; Scala's `+`
-  string concatenation; `Int`-vs-`Double` division dispatch.
+  string concatenation; `Int`-vs-`Double` division dispatch (integer `/ 0`
+  throws `ArithmeticException`, floating `/ 0.0` is `Infinity`).
+- **Method dispatch** — postfix `.` on core values: `String` (`length`,
+  `toUpperCase`/`toLowerCase`, `trim`, `reverse`, `substring`, `charAt`,
+  `contains`/`startsWith`/`endsWith`, `toInt`/`toDouble`, …), `Int`/`Double`
+  (`abs`, `min`/`max`, `round`, `toDouble`/`toInt`, …), and `toString` on any
+  value; chains left-to-right (`s.trim.length`).
 - **Control flow** — `if` / `else if` / `else`, `while`, and the Scala range
   `for (i <- start until end)` / `for (i <- start to end)` in statement position.
 - **Statement separators** — inferred line breaks *or* explicit `;` (the lexer
@@ -208,11 +225,15 @@ Scala source → lexer → parser (AST) → lower to fusevm bytecode → fusevm 
 
 ## [0x06] STATUS & ROADMAP
 
-Slice 1 (this release): single-object programs, `def main` / `extends App`,
-`val`/`var`, arithmetic / comparison / logic, `if` / `while` / range `for`,
-`println`/`print`, Scala 3 `+` rules, `Int`-vs-`Double` division, and
+This release: single-object programs, `def main` / `extends App`, `val`/`var`
+(with `val` immutability enforced), arithmetic / comparison / logic, `if` /
+`while` / range `for`, `println`/`print`, Scala 3 `+` rules, `Int`-vs-`Double`
+division (integer `/ 0` throws `ArithmeticException`), and
 `Double.toString`-accurate float formatting — all verified byte-for-byte against
-a reference `scala` and continuously fuzzed against it (see below).
+a reference `scala` and continuously fuzzed against it (see below). Added since
+slice 1: user-defined `def`s (parameters, recursion, mutual recursion, `return`,
+tail `if`/`else` result) over fusevm's native `Op::Call` frame ABI, and postfix
+`.` dispatch wiring a core `String`/`Int`/`Double` method slice.
 
 ### Differential parity fuzzer
 
@@ -229,10 +250,13 @@ fixes; 32,000+ probes now run clean.
 
 Next waves, in priority order:
 
-1. **User-defined methods** (recursion, parameters, returns) over fusevm's
-   native `Op::Call` frame ABI.
-2. **Reference types** — real `String` methods, collections (`List`, `Array`,
-   `Map`), and a class/`case class`/trait object model on a host heap.
+1. **Reference types** — the wider `String`/numeric method surface, collections
+   (`List`, `Array`, `Map`), and a class/`case class`/trait object model. The
+   last is blocked on an ordered, type-tagged record value (fusevm's `Value` has
+   only an unordered `Hash` and an opaque `Obj` handle) — see
+   [`BUGS.md`](BUGS.md).
+2. **Expression-position `if`/`else`** (`val r = if (c) a else b`) — a tail
+   `if`/`else` as a whole `def` body already works.
 3. **Scala idioms** — `s"…"` string interpolation, `match`/`case` pattern
    matching, `for … yield` comprehensions, lambdas.
 

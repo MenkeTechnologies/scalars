@@ -4,24 +4,41 @@ An honest list of what scalars does **not** do yet. Slice 1 is a single-object,
 single entry-point subset; unsupported constructs are reported as parse errors,
 never silently mis-run.
 
-## Not implemented (parse errors today)
+## Supported
 
-- **User-defined methods.** Only the entry point is compiled. Calling a helper
-  `def`, or any method, is rejected. (Next wave: fusevm's native `Op::Call`
-  frame ABI.)
+- **User-defined methods (`def`).** Helper `def`s alongside `main` (or inside an
+  `extends App` body) are compiled to fusevm's native `Op::Call` frame ABI:
+  parameters bind to per-call frame slots, recursion and mutual recursion work,
+  the body's last expression (including a tail `if`/`else`) is the result, and
+  `return` performs an early exit. A zero-parameter `def` is callable paren-less
+  (`def x = …; x`). Parameter types and return types are parsed but not checked.
+- **Postfix method dispatch on core values.** `s.length`/`.size`,
+  `.toUpperCase`/`.toLowerCase`, `.trim`, `.reverse`, `.isEmpty`/`.nonEmpty`,
+  `.substring`, `.charAt`, `.contains`/`.startsWith`/`.endsWith`,
+  `.toInt`/`.toDouble` on `String`; `.abs`/`.min`/`.max`/`.toDouble` on `Int`;
+  `.abs`/`.round`/`.isNaN`/`.toInt` on `Double`; and `.toString` on any value.
+  Method chaining works (`s.trim.length`). Out-of-range/parse failures throw
+  faithfully (`StringIndexOutOfBoundsException`, `NumberFormatException`).
+
+## Not implemented (parse errors / unresolved today)
+
 - **Classes, traits, `case class`, objects-as-values, `new`.** No instance
-  model, no fields, no constructors, no `this`. `new` is lexed but has no
-  semantics.
-- **Collections and arrays.** `Array`, `List`, `Seq`, `Map`, indexing, `.length`,
-  `.size`. The `args` parameter of `main` is parsed and ignored.
-- **The standard library.** No `math`, `String` methods, `.toInt`, `scala.io`,
-  `scala.collection.*`. Only `println`/`print` exist.
-- **Method/field access on values.** `x.foo`, `s.length`, `xs.map(...)`.
+  model, no fields, no constructors, no `this`, no auto-derived
+  `equals`/`hashCode`/`toString`/`apply`. `new` is lexed but has no semantics.
+  (This needs an ordered, type-tagged record value that fusevm's `Value` does
+  not yet provide — see the note at the bottom.)
+- **Collections and arrays.** `Array`, `List`, `Seq`, `Map`, indexing,
+  higher-order `.map`/`.filter`. The `args` parameter of `main` is parsed and
+  ignored.
+- **The wider standard library.** `math`, `scala.io`, `scala.collection.*`, and
+  the many `String`/numeric methods beyond the wired subset above.
+- **`if`/`else` as an expression in operand position.** `val r = if (c) a else b`
+  is rejected; a tail `if`/`else` as a whole `def` body is supported.
 - **String interpolation.** `s"$name"`, `f"$x%.2f"`, `raw"..."`.
 - **`for … yield` comprehensions and the `by` step** — only side-effecting
   `for (i <- a until|to b)` ranges with step 1 run today.
 - **`match`/`case`, pattern matching, `do/while`, `try`/`catch`/`finally`,
-  `throw`, `return`.**
+  `throw` (user-raised).**
 - **Functions as values, lambdas (`=>`), by-name params, `given`/`using`,
   generics, `@main` (Scala 3 annotation entry).**
 
@@ -30,9 +47,6 @@ never silently mis-run.
 - **Types are not checked.** Declared types (`Int`, `String`, …) are retained for
   diagnostics but do not gate execution — the runtime is dynamically typed on the
   fusevm value model. Type errors that `scalac` would reject may run.
-- **`val` is not enforced immutable.** A `val` reassignment is accepted rather
-  than rejected as it would be by `scalac`. Immutability is retained on the AST
-  for a later check.
 - **`==` on non-numbers compares by value** (structural), which matches Scala's
   `==`/`equals` for the strings and booleans slice 1 handles. Reference identity
   (`eq`) is not modeled.
@@ -45,10 +59,25 @@ never silently mis-run.
   truncate, otherwise a double divide. This matches Scala for every monomorphic
   case (`7 / 2 == 3`, `7 / 2.0 == 3.5`), and floating `/0.0` yields `Infinity` as
   Scala does.
-- **Integer division by zero yields `null`** instead of throwing
-  `ArithmeticException` (slice 1 has no exception machinery). Floating `/0.0` is
-  `Infinity`, matching Scala.
+- **Integer division by zero throws** `java.lang.ArithmeticException: / by zero`,
+  matching Scala/the JVM `idiv` trap. Since there is no `try`/`catch` yet, the
+  uncaught throw aborts the program with that message on stderr. Floating `/0.0`
+  is `Infinity` (not an exception), also matching Scala.
 - **Uninitialized bindings are unbound** rather than rejected; reading one before
   assignment yields `null` instead of a compile error.
-- **`object … extends App` runs the object body directly.** Members other than
-  top-level statements inside an `App` object are not supported in slice 1.
+- **`object … extends App` runs the object body directly.** Statements run in
+  order and any `def` members are hoisted and callable; other member kinds
+  (fields, nested types) are skipped.
+
+## Missing substrate (blocks `case class`)
+
+Faithful `case class` support is blocked on the value model, not the frontend.
+`case class Point(x, y)` needs an **ordered, type-tagged record** so that
+`toString` renders `Point(1, 2)` in declared field order and structural
+`equals`/`hashCode` compare field-by-field. fusevm's `Value` offers only an
+unordered `Hash(HashMap<String, Value>)` (loses field order) and an opaque
+`Obj(u32)` handle into a frontend-owned heap that scalars does not yet maintain.
+Until scalars either (a) grows a small object heap behind `Value::Obj` with a
+class registry (name → ordered field names, keyed so the host method dispatcher
+can resolve fields and derive `toString`), or (b) fusevm adds an ordered record
+value, `class`/`case class` stays a parse-level gap rather than a mis-run.

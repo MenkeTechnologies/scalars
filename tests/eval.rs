@@ -228,3 +228,209 @@ fn boolean_or_null_plus_string_is_rejected() {
     let (_o2, ok2) = run(&wrap(r#"println(null + "a")"#));
     assert!(!ok2, "`null + String` must be rejected (no Scala 3 `+`)");
 }
+
+// ── val immutability + arithmetic exceptions ──────────────────────────────
+
+#[test]
+fn reassigning_a_val_is_a_compile_error() {
+    // Scala rejects `x = 2` when `x` is a `val`; scalars does too.
+    let (_out, ok) = run(&wrap("val x = 1; x = 2; println(x)"));
+    assert!(!ok, "reassignment to a `val` must be rejected");
+}
+
+#[test]
+fn compound_assign_to_a_val_is_a_compile_error() {
+    let (_out, ok) = run(&wrap("val x = 1; x += 1; println(x)"));
+    assert!(!ok, "compound reassignment to a `val` must be rejected");
+}
+
+#[test]
+fn reassigning_a_var_is_allowed() {
+    // The mirror of the above: a `var` still reassigns.
+    let (out, ok) = run(&wrap("var x = 1; x = 2; println(x)"));
+    assert!(ok);
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn integer_division_by_zero_throws() {
+    // Scala/JVM `idiv` traps: `java.lang.ArithmeticException: / by zero`.
+    let (_out, ok) = run(&wrap("println(1 / 0)"));
+    assert!(!ok, "integer `/ 0` must throw, not yield null");
+}
+
+#[test]
+fn integer_modulo_via_div_builtin_path_still_computes() {
+    // Sanity: non-zero integer division is unaffected by the throw path.
+    let (out, ok) = run(&wrap("println(7 / 2)"));
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn float_division_by_zero_is_infinity_not_an_error() {
+    // IEEE-754 `/ 0.0` is not an exception in Scala — it is `Infinity`.
+    let (out, ok) = run(&wrap("println(1.0 / 0.0); println(-1.0 / 0.0)"));
+    assert!(ok);
+    assert_eq!(out, "Infinity\n-Infinity\n");
+}
+
+// ── user-defined methods (`def`) ──────────────────────────────────────────
+
+#[test]
+fn recursive_def_computes_factorial() {
+    // The canonical tail-`if` recursion. Exercises `Op::Call` frames, param
+    // slots, and recursion.
+    let (out, ok) = run(
+        "object M { def fact(n: Int): Int = if (n <= 1) 1 else n * fact(n - 1)\n  def main(a: Array[String]): Unit = println(fact(5)) }",
+    );
+    assert!(ok);
+    assert_eq!(out, "120\n");
+}
+
+#[test]
+fn def_with_multiple_params() {
+    let (out, ok) = run(
+        "object M { def add(a: Int, b: Int): Int = a + b\n  def main(z: Array[String]): Unit = println(add(20, 22)) }",
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn def_early_return() {
+    // `return` leaves the enclosing `def`; the fall-through path is the tail.
+    let (out, ok) = run(
+        "object M { def f(n: Int): Int = { if (n < 0) return 0; n * 2 }\n  def main(a: Array[String]): Unit = { println(f(-5)); println(f(5)) } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "0\n10\n");
+}
+
+#[test]
+fn def_in_app_body() {
+    // A `def` alongside statements in an `extends App` body is hoisted and
+    // callable.
+    let (out, ok) = run("object T extends App { def sq(x: Int): Int = x * x; println(sq(7)) }");
+    assert!(ok);
+    assert_eq!(out, "49\n");
+}
+
+#[test]
+fn mutual_recursion_between_defs() {
+    let (out, ok) = run(
+        "object M {\n  def isEven(n: Int): Boolean = if (n == 0) true else isOdd(n - 1)\n  def isOdd(n: Int): Boolean = if (n == 0) false else isEven(n - 1)\n  def main(a: Array[String]): Unit = { println(isEven(10)); println(isOdd(7)) } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "true\ntrue\n");
+}
+
+#[test]
+fn recursion_keeps_frame_local_state() {
+    // Non-linear recursion: fib re-enters the same `def` twice per call, so a
+    // shared (global) `n` would clobber. Correct output proves params are
+    // frame-local slots.
+    let (out, ok) = run(
+        "object M { def fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)\n  def main(a: Array[String]): Unit = println(fib(10)) }",
+    );
+    assert!(ok);
+    assert_eq!(out, "55\n");
+}
+
+#[test]
+fn def_with_function_local_loop() {
+    // A `while` loop with its own `var`s inside a `def`, called twice — the
+    // loop locals must be frame-scoped, not leak between calls.
+    let (out, ok) = run(
+        "object M { def sumTo(n: Int): Int = { var s = 0; var i = 1; while (i <= n) { s += i; i += 1 }; s }\n  def main(a: Array[String]): Unit = { println(sumTo(5)); println(sumTo(10)) } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "15\n55\n");
+}
+
+#[test]
+fn parameterless_def_is_a_parenless_call() {
+    // Scala lets `def x = …` be referenced bare; a bare `answer` calls it.
+    let (out, ok) = run("object T extends App { def answer: Int = 42; println(answer) }");
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn parameter_reassignment_is_a_compile_error() {
+    // Scala method parameters are `val`s.
+    let (_out, ok) = run(
+        "object M { def f(x: Int): Int = { x = 5; x }\n  def main(a: Array[String]): Unit = println(f(1)) }",
+    );
+    assert!(!ok, "reassigning a method parameter must be rejected");
+}
+
+// ── postfix `.` method dispatch (core stdlib) ─────────────────────────────
+
+#[test]
+fn string_length_and_case_methods() {
+    let (out, ok) = run(&wrap(
+        r#"val s = "hello"; println(s.length); println(s.toUpperCase); println(s.toLowerCase)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "5\nHELLO\nhello\n");
+}
+
+#[test]
+fn tostring_on_any_value() {
+    let (out, ok) = run(&wrap(
+        "println(42.toString); println(true.toString); println(3.5.toString)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "42\ntrue\n3.5\n");
+}
+
+#[test]
+fn string_substring_and_method_chaining() {
+    let (out, ok) = run(&wrap(
+        r#"println("hello world".substring(0, 6) + "scala"); println("  hi  ".trim.length)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "hello scala\n2\n");
+}
+
+#[test]
+fn string_predicate_and_reverse_methods() {
+    let (out, ok) = run(&wrap(
+        r#"println("scala".contains("cal")); println("scala".startsWith("sc")); println("abc".reverse)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "true\ntrue\ncba\n");
+}
+
+#[test]
+fn int_min_max_abs_methods() {
+    let (out, ok) = run(&wrap(
+        "println(3.max(7)); println(3.min(7)); println((-4).abs)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "7\n3\n4\n");
+}
+
+#[test]
+fn string_to_int_conversion_method() {
+    let (out, ok) = run(&wrap(r#"println("41".toInt + 1)"#));
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn unknown_method_is_an_error() {
+    let (_out, ok) = run(&wrap(r#"println("x".frobnicate)"#));
+    assert!(
+        !ok,
+        "an unresolved method must be rejected, not silently null"
+    );
+}
+
+#[test]
+fn substring_out_of_range_throws() {
+    // Faithful to Java `String.substring`'s bounds check.
+    let (_out, ok) = run(&wrap(r#"println("hi".substring(0, 9))"#));
+    assert!(!ok, "an out-of-range substring must throw");
+}

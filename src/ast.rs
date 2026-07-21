@@ -7,8 +7,8 @@
 //! fields, classes, and traits are parsed no further than the entry point today
 //! (see `BUGS.md`); the AST is shaped to grow into them.
 
-/// A parsed compilation unit: the entry object name and the body of its entry
-/// point (`main`, or the `extends App` body).
+/// A parsed compilation unit: the entry object name, the body of its entry
+/// point (`main`, or the `extends App` body), and the object's other `def`s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     /// The name of the object that declares the entry point (informational; used
@@ -16,6 +16,20 @@ pub struct Program {
     pub object_name: String,
     /// The statements of the entry point.
     pub main: Vec<Stmt>,
+    /// User-defined methods (every `def` other than `main`), hoisted to a flat
+    /// object-level namespace. Each is callable by name from `main`, from
+    /// another `def`, or recursively (see [`crate::compiler`]).
+    pub functions: Vec<Func>,
+}
+
+/// A user-defined method: `def name(p0: T0, p1: T1, …): R = body`. Parameter and
+/// return types are parsed for diagnostics but do not gate the dynamically typed
+/// runtime, so only the parameter *names* are retained (bound to frame slots).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Func {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
 }
 
 /// A Scala statement with its 1-based source line (used by `scala --dap` to emit
@@ -65,6 +79,8 @@ pub enum StmtKind {
         inclusive: bool,
         body: Vec<Stmt>,
     },
+    /// `return expr` / bare `return` — an early exit from the enclosing `def`.
+    Return(Option<Expr>),
 }
 
 /// Compound-assignment operator. `Assign` is a plain `=`.
@@ -106,12 +122,20 @@ pub enum Expr {
         newline: bool,
         arg: Option<Box<Expr>>,
     },
-    /// A named call `name(arg, …)`. Slice 1 has no user methods, so this carries
-    /// only two shapes: `__rust_compile("<b64>", line)` (the desugar target of a
-    /// `rust { ... }` FFI block) and calls to functions exported by such a block
-    /// (`add(2, 3)`). Both are resolved in [`crate::compiler`]. `line` is the
-    /// source line of the callee, for diagnostics.
+    /// A named call `name(arg, …)`: a user-defined `def` (lowered to `Op::Call`),
+    /// the `__rust_compile("<b64>", line)` FFI-block desugar target, or a call to
+    /// a function exported by such a block (`add(2, 3)`). Resolved in
+    /// [`crate::compiler`]. `line` is the source line of the callee.
     Call {
+        name: String,
+        args: Vec<Expr>,
+        line: u32,
+    },
+    /// Postfix method/field dispatch on a receiver: `s.length`, `n.toString`,
+    /// `s.substring(1, 3)`. A paren-less member is 0 arguments. Routed through
+    /// the host's universal method dispatcher (see [`crate::host`]).
+    Method {
+        recv: Box<Expr>,
         name: String,
         args: Vec<Expr>,
         line: u32,
