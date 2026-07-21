@@ -1,0 +1,14 @@
+#compdef scala
+# Zsh completion for the scalars `scala` binary.
+
+_scala() {
+  _arguments -s \
+    '(-version --version)'{-version,--version}'[print the version banner and exit]' \
+    '(-h --help -help)'{-h,--help,-help}'[print usage and exit]' \
+    '--dump-tokens[print the lexer token stream and exit]' \
+    '--dump-ast[print the parsed AST and exit]' \
+    '--disasm[print the lowered fusevm bytecode and exit]' \
+    '*:scala file:_files -g "*.scala"'
+}
+
+_scala "$@"
