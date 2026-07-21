@@ -59,12 +59,19 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Scala `/` semantics** — a type-dispatching division builtin truncates when
   both operands are `Int` (`7 / 2 == 3`) and floats when either is a `Double`
   (`7 / 2.0 == 3.5`), because fusevm's native divide is always floating.
-- **Scala `+` overloading** — a strict numeric hook supplies string
-  concatenation (`"x=" + x`) for the mixed operands the VM's native arithmetic
-  does not compute, while all-numeric arithmetic stays on the JIT fast path.
-- **Verified against Scala** — the example programs and the test corpus are
-  diffed byte-for-byte against a reference `scala`; the tests freeze that output
-  so CI needs no Scala toolchain installed.
+- **Scala 3 `+` rules** — a strict numeric hook supplies `String` concatenation
+  (`"x=" + x`, `1 + "a"`) for the mixed operands the VM's native arithmetic does
+  not compute, while rejecting `Boolean`/`null` `+ String` exactly as Scala 3
+  does (the universal `any2stringadd` was removed); all-numeric arithmetic stays
+  on the JIT fast path.
+- **`Double.toString` fidelity** — whole/decimal values in `[1e-3, 1e7)` print
+  plain (`3.0`, `9999999.0`), everything else in Java's computerized scientific
+  notation (`1.0E7`, `1.23456789E8`, `1.0E-4`), and exponent literals (`6.022e23`,
+  `1E10`) lex — all matching `scala`.
+- **Verified against Scala** — the examples and test corpus are diffed
+  byte-for-byte against a reference `scala` and frozen (CI needs no Scala
+  toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
+  against a live `scala` across ten generators (32,000+ probes clean).
 
 This is an early slice: single-object programs whose entry point (`def main`, or
 an `extends App` body) uses `val`/`var` bindings, arithmetic, `if`/`while`, the
@@ -203,8 +210,22 @@ Scala source → lexer → parser (AST) → lower to fusevm bytecode → fusevm 
 
 Slice 1 (this release): single-object programs, `def main` / `extends App`,
 `val`/`var`, arithmetic / comparison / logic, `if` / `while` / range `for`,
-`println`/`print`, string concatenation, `Int`-vs-`Double` division — all
-verified byte-for-byte against a reference `scala`.
+`println`/`print`, Scala 3 `+` rules, `Int`-vs-`Double` division, and
+`Double.toString`-accurate float formatting — all verified byte-for-byte against
+a reference `scala` and continuously fuzzed against it (see below).
+
+### Differential parity fuzzer
+
+`cargo run --bin parity-fuzz -- --count 300 --probes 40` generates
+deterministic-output Scala programs — each packing many probes to amortize the
+reference toolchain's JVM startup — biased toward the historically weak areas of
+a from-scratch frontend (`Int`-vs-`Double` division, `+` concatenation rules,
+structural `==`, `Double.toString` notation, range `for`) and diffs `scala
+<file>` against this frontend, shrinking any divergence to the offending probe.
+It needs a real `scala` on `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it;
+`tests/parity.rs` replays a frozen, scala-verified corpus instead. The fuzzer
+found the float-notation and `Boolean/null + String` gaps that this release
+fixes; 32,000+ probes now run clean.
 
 Next waves, in priority order:
 
@@ -214,9 +235,6 @@ Next waves, in priority order:
    `Map`), and a class/`case class`/trait object model on a host heap.
 3. **Scala idioms** — `s"…"` string interpolation, `match`/`case` pattern
    matching, `for … yield` comprehensions, lambdas.
-4. **A differential parity harness** — a snippet corpus diffed live against a
-   reference `scala`, frozen and replayed in CI (the pattern `ruby`/`node`/
-   `python` frontends use).
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

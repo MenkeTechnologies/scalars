@@ -183,3 +183,48 @@ fn missing_entry_point_is_an_error() {
         "an object with no main and no `extends App` should fail"
     );
 }
+
+#[test]
+fn double_uses_java_scientific_notation() {
+    // `Double.toString`: decimal in [1e-3, 1e7), scientific outside. Verified
+    // byte-for-byte against reference scala (found by the parity fuzzer).
+    let (out, _) = run(&wrap(
+        "println(1e7); println(1e-4); println(123456789.0); println(1.5e300); println(9999999.0); println(0.001)",
+    ));
+    assert_eq!(
+        out,
+        "1.0E7\n1.0E-4\n1.23456789E8\n1.5E300\n9999999.0\n0.001\n"
+    );
+}
+
+#[test]
+fn exponent_float_literals_parse() {
+    let (out, ok) = run(&wrap(
+        "println(6.022e23); println(1E10); println(2.5e-8 * 2.0)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "6.022E23\n1.0E10\n5.0E-8\n");
+}
+
+#[test]
+fn string_left_plus_concatenates_anything() {
+    let (out, _) = run(&wrap(
+        r#"println("a" + false); println("a" + null); println("n=" + 3 + "!")"#,
+    ));
+    assert_eq!(out, "afalse\nanull\nn=3!\n");
+}
+
+#[test]
+fn numeric_plus_string_concatenates() {
+    let (out, _) = run(&wrap(r#"println(1 + "a"); println(1.5 + "b")"#));
+    assert_eq!(out, "1a\n1.5b\n");
+}
+
+#[test]
+fn boolean_or_null_plus_string_is_rejected() {
+    // Scala 3 removed the universal `any2stringadd`, so these do not compile.
+    let (_o1, ok1) = run(&wrap(r#"println(false + "a")"#));
+    assert!(!ok1, "`Boolean + String` must be rejected (no Scala 3 `+`)");
+    let (_o2, ok2) = run(&wrap(r#"println(null + "a")"#));
+    assert!(!ok2, "`null + String` must be rejected (no Scala 3 `+`)");
+}

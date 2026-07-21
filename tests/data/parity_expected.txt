@@ -1,0 +1,16 @@
+object T extends App { println(2 + 3 * 4 - 1); println((7 - 2) * 3) }	13\n15\n
+object T extends App { println(7 / 2); println(7 % 3); println(-7 / 2); println(-7 % 3); println(9 / -2) }	3\n1\n-3\n-1\n-4\n
+object T extends App { println(7 / 2.0); println(7.0 / 2); println(10.0 / 3.0) }	3.5\n3.5\n3.3333333333333335\n
+object T extends App { println(1e7); println(1e-4); println(123456789.0); println(1.5e300); println(9999999.0); println(0.001); println(1e-300) }	1.0E7\n1.0E-4\n1.23456789E8\n1.5E300\n9999999.0\n0.001\n1.0E-300\n
+object T extends App { println(6.022e23); println(1E10); println(2.5e-8 * 2.0); println(0.1 + 0.2) }	6.022E23\n1.0E10\n5.0E-8\n0.30000000000000004\n
+object T extends App { println(3.0); println(3.5); println(-0.0); println(0.0); println(100.0) }	3.0\n3.5\n-0.0\n0.0\n100.0\n
+object T extends App { println("x=" + 21 * 2); println("a" + false); println("a" + null); println(1 + "b"); println(1.5 + "c") }	x=42\nafalse\nanull\n1b\n1.5c\n
+object T extends App { println(3 > 2); println(1 == 2); println("hi" == "hi"); println("a" != "b"); println(2.5 <= 2.5) }	true\nfalse\ntrue\ntrue\ntrue\n
+object T extends App { println(true && false); println(true || false); println(!(3 > 5)); println(3 > 1 && 2 < 5) }	false\ntrue\ntrue\ntrue\n
+object T extends App { val n = 5; if (n < 0) println("neg") else if (n == 0) println("zero") else println("pos") }	pos\n
+object T extends App { var s = 0; var i = 1; while (i <= 5) { s += i; i += 1 }; println(s) }	15\n
+object T extends App { for (i <- 0 until 4) println(i); for (j <- 1 to 3) println("t" + j) }	0\n1\n2\n3\nt1\nt2\nt3\n
+object T extends App { var s = 0; for (a <- 0 until 3) { for (b <- 0 until 2) { s += a * 10 + b } }; println(s) }	63\n
+object T extends App { val x = 9; val y = 4; println("q=" + x / y + " r=" + x % y) }	q=2 r=1\n
+object T extends App { var p = 1; for (i <- 1 to 6) { p = p * i }; println(p) }	720\n
+object M { def main(args: Array[String]): Unit = { println("from main"); println(40 + 2) } }	from main\n42\n

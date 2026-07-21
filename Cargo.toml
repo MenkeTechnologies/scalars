@@ -34,6 +34,18 @@ path = "src/lib.rs"
 name = "scala"
 path = "src/main.rs"
 
+# Differential parity FUZZER: generates deterministic-output Scala programs (each
+# packing many probes to amortize the reference toolchain's JVM startup) biased
+# toward Int-vs-Double division dispatch, `+` concatenation coercion, structural
+# `==`, Double.toString notation, and range `for`, then diffs `scala <file>`
+# against this frontend. Development tool — needs a real `scala` on PATH (or
+# `SCALARS_FUZZ_SCALA`), so CI never builds it; its frozen outputs live in
+# tests/data/parity_expected.txt, which tests/parity.rs replays with no Scala
+# toolchain installed.
+[[bin]]
+name = "parity-fuzz"
+path = "src/bin/parity_fuzz.rs"
+
 [dependencies]
 # Scala executes on fusevm. scalars is a pure frontend: it lexes/parses Scala and
 # lowers it to fusevm bytecode (src/compiler.rs). There is no local vm.rs/jit.rs

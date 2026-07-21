@@ -252,6 +252,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     i += 1;
                 }
             }
+            // exponent part: (e|E)[+|-]digits — `1e7`, `1.5e300`, `2.5e-8`. Only
+            // consume the `e` when a digit (after an optional sign) actually
+            // follows, so `1 else` / a trailing `e` identifier is left intact.
+            if i < bytes.len() && matches!(bytes[i], b'e' | b'E') {
+                let mut j = i + 1;
+                if j < bytes.len() && matches!(bytes[j], b'+' | b'-') {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] as char).is_ascii_digit() {
+                    is_float = true;
+                    i = j;
+                    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            }
             // long/float/double suffixes are accepted and dropped
             if i < bytes.len() && matches!(bytes[i], b'L' | b'l' | b'f' | b'F' | b'd' | b'D') {
                 if matches!(bytes[i], b'f' | b'F' | b'd' | b'D') {

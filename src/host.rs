@@ -103,18 +103,57 @@ pub fn scala_str(v: &Value) -> String {
     }
 }
 
-/// Scala's `Double.toString` (Java's) prints whole values with a trailing `.0`
-/// (`3.0`, not `3`) and keeps a decimal point; non-finite values print as
-/// `Infinity`/`-Infinity`/`NaN`.
+/// Scala's `Double.toString` (Java's) rendering, ported faithfully.
+///
+/// Non-finite values print `NaN`/`Infinity`/`-Infinity`; `0.0`/`-0.0` keep their
+/// sign. Otherwise Java chooses notation by magnitude: **decimal** when
+/// `1e-3 <= |x| < 1e7` (`0.001`, `123.456`, `9999999.0`), **computerized
+/// scientific** otherwise (`1.0E7`, `1.23456789E8`, `1.0E-4`, `1.5E300`). Both
+/// forms carry the shortest round-tripping digit string and always keep at least
+/// one fractional digit.
+///
+/// The shortest digits and the base-10 exponent come from Rust's `{:e}` (which,
+/// like Java, emits the shortest representation that round-trips) normalized to a
+/// single leading digit; only the *placement* (plain vs `E`-notation) is Java's.
 fn format_double(f: f64) -> String {
     if f.is_nan() {
-        "NaN".to_string()
-    } else if f.is_infinite() {
-        if f < 0.0 { "-Infinity" } else { "Infinity" }.to_string()
-    } else if f.fract() == 0.0 && f.abs() < 1e16 {
-        format!("{f}.0")
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    let neg = f < 0.0;
+    let m = f.abs();
+    // `{:e}` → "d[.ddd]e<exp>" with one leading digit and a clean base-10 exponent.
+    let sci = format!("{m:e}");
+    let (mant, exp_str) = sci.split_once('e').expect("`{:e}` always contains `e`");
+    let exp: i32 = exp_str.parse().expect("`{:e}` exponent is an integer");
+
+    let body = if (-3..=6).contains(&exp) {
+        // Decimal notation. The plain shortest form matches Java's digits in this
+        // range; just guarantee a fractional digit (`5` → `5.0`).
+        let plain = format!("{m}");
+        if plain.contains('.') {
+            plain
+        } else {
+            format!("{plain}.0")
+        }
     } else {
-        format!("{f}")
+        // Scientific notation: `mantissa` (with a fractional digit) + `E` + exp.
+        let mant = if mant.contains('.') {
+            mant.to_string()
+        } else {
+            format!("{mant}.0")
+        };
+        format!("{mant}E{exp}")
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
     }
 }
 
@@ -124,9 +163,27 @@ fn format_double(f: f64) -> String {
 /// (it stays on the native fast path and the JIT).
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     match op {
-        // Scala `+`: if either side is non-numeric (a String), concatenate using
-        // Scala's value-to-string rules.
-        NumOp::Add => Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b)))),
+        // Scala 3 `+` on a mixed operand. Unlike Scala 2, there is NO universal
+        // `any2stringadd`, so `+` is defined only two ways when a non-numeric
+        // operand is involved:
+        //   * `String.+(Any)`   — a String *left* operand concatenates anything.
+        //   * numeric `+(String)` — `Int`/`Double`/… define `+(String): String`,
+        //     so a numeric left operand concatenates a String *right* operand.
+        // Everything else (`Boolean`/`null`/… on the left, or numeric `+` a
+        // non-String) has no `+` method and is a compile error in Scala 3; reject
+        // it rather than silently concatenating. (The hook only fires when an
+        // operand is non-numeric, so a numeric `a` here implies a non-numeric `b`.)
+        NumOp::Add => match a {
+            Value::Str(_) => Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b)))),
+            Value::Int(_) | Value::Float(_) if matches!(b, Value::Str(_)) => {
+                Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b))))
+            }
+            _ => Err(format!(
+                "scalars: `+` is not defined between `{}` and `{}`",
+                scala_str(a),
+                scala_str(b)
+            )),
+        },
         // Value equality/ordering against a string operand (Scala's `==` is
         // structural `equals`, so string `==` compares by content).
         NumOp::Eq => Ok(Value::bool(scala_str(a) == scala_str(b))),
