@@ -1,6 +1,6 @@
 [package]
 name = "scala-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Scala as a fusevm frontend: lexer, parser, and compiler to fusevm::Chunk, run on the shared three-tier Cranelift JIT — no bespoke VM or JVM"
