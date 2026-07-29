@@ -71,12 +71,13 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
-  against a live `scala` across ten generators (32,000+ probes clean).
+  against a live `scala` across thirteen generators (39,000+ probes clean).
 
 This is an early slice: programs with an entry point (`def main`, or an
 `extends App` body) plus sibling `class`/`object` declarations, using `val`/`var`
 bindings (with `val` immutability enforced), arithmetic, `if`/`while`, the Scala
-range `for`, and `println`/`print`. User-defined `def`s — parameters, recursion,
+range `for` (with a `by` step), `try`/`catch`/`finally`/`throw`, and
+`println`/`print`. User-defined `def`s — parameters, recursion,
 mutual recursion, `return`, and a tail `if`/`else` result — compile to fusevm's
 native call frames, and postfix `.` dispatch wires a core `String`/`Int`/`Double`
 method slice. A host-side object model (`class`/`object`/`case class`, `new`,
@@ -178,6 +179,18 @@ Implemented and checked against the reference `scala`:
   string concatenation; `Int`-vs-`Double` division dispatch (integer `/ 0`
   throws `ArithmeticException`, floating `/ 0.0` is `Infinity`); `if`/`else` in
   value position (`val r = if (c) a else b`, including block branches).
+- **Exceptions** — `try { … } catch { case e: T [if guard] => … } finally { … }`
+  and `throw e`, both value-producing expressions. Handler arms match the JVM
+  throwable hierarchy (`case e: Exception` catches an
+  `IllegalArgumentException`), an unmatched arm keeps unwinding, and `finally`
+  runs on the normal *and* the exceptional exit. Runtime faults the host already
+  raised are catchable with their JDK messages (`ArithmeticException: / by
+  zero`, `NumberFormatException: For input string: "zz"`, `scala.MatchError`);
+  `new RuntimeException("…")` and the other built-in throwables construct
+  without a user `class`, and expose `getMessage`/`toString`.
+- **`by`-step ranges** — `for (i <- a until|to b by s)`, with `s` a literal or a
+  runtime value and either sign; a zero step throws `IllegalArgumentException`
+  as Scala's `Range` does.
 - **String interpolation** — `s"…"` with `$id` and `${expr}` splices, `f"…"`
   with Java-`Formatter` specs (`%d`, `%.2f`, `%-5s`, `%05d`, `%x`, `%b`, …), and
   `raw"…"` (escapes stay literal).
@@ -278,9 +291,12 @@ dispatch wiring a core `String`/`Int`/`Double` method slice; `s`/`f`/`raw` strin
 interpolation; `if`/`else` in expression position; `match`/`case` over
 literal / wildcard / variable / typed / guarded / **constructor** patterns; a
 `for … yield` range comprehension (multi-generator + `if` guards) collecting a
-`Vector`; and a **host-side object model** — `class`/`object`/`case class`,
+`Vector`; a **host-side object model** — `class`/`object`/`case class`,
 `new`, fields, `this`, method dispatch, structural `equals`/`hashCode`,
-`toString`, `copy`, companion `apply`/`unapply`, and built-in `Option`.
+`toString`, `copy`, companion `apply`/`unapply`, and built-in `Option`; `by`
+steps on range comprehensions; and **exceptions** —
+`try`/`catch`/`finally`/`throw` with JVM-hierarchy handler matching, over a
+statement-granular unwind protocol that needs no fusevm changes.
 
 ### Differential parity fuzzer
 
@@ -288,12 +304,14 @@ literal / wildcard / variable / typed / guarded / **constructor** patterns; a
 deterministic-output Scala programs — each packing many probes to amortize the
 reference toolchain's JVM startup — biased toward the historically weak areas of
 a from-scratch frontend (`Int`-vs-`Double` division, `+` concatenation rules,
-structural `==`, `Double.toString` notation, range `for`) and diffs `scala
-<file>` against this frontend, shrinking any divergence to the offending probe.
-It needs a real `scala` on `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it;
-`tests/parity.rs` replays a frozen, scala-verified corpus instead. The fuzzer
-found the float-notation and `Boolean/null + String` gaps that this release
-fixes; 32,000+ probes now run clean.
+structural `==`, `Double.toString` notation, range `for`, `by` steps, IEEE
+division by zero, and `try`/`catch`) and diffs `scala <file>` against this
+frontend, shrinking any divergence to the offending probe. Individual generators
+run with `--mode <name>` (`step`, `ieee`, `exc`, …). It needs a real `scala` on
+`PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
+a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
+`Boolean/null + String` gaps, and the `catch`-guard binding bug fixed in this
+release; 39,000+ probes now run clean.
 
 Next waves, in priority order:
 

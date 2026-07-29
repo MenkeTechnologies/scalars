@@ -15,9 +15,11 @@
 //! The generator is biased toward the historically weak areas of a from-scratch
 //! Scala frontend: `Int`-vs-`Double` division dispatch (`7/2==3`, `7/2.0==3.5`),
 //! `+` string-concatenation coercion, structural `==`/`!=`, `Double.toString`
-//! notation (the decimal/scientific threshold), and the range `for`. Pure random
-//! bytes only produce mutual parse errors that agree on both sides and teach
-//! nothing.
+//! notation (the decimal/scientific threshold), the range `for` (including `by`
+//! steps and their sign-dependent bound test), IEEE division by zero
+//! (`x/0.0 == Infinity`, `0.0/0.0 == NaN`), and `try`/`catch`/`finally`/`throw`
+//! unwinding. Pure random bytes only produce mutual parse errors that agree on
+//! both sides and teach nothing.
 //!
 //! Scope + determinism invariants (mirroring the node-js/pythonrs harnesses):
 //!   * Only constructs scalars actually implements are emitted — an unsupported
@@ -26,9 +28,13 @@
 //!     identity hashes, unordered collections). Every probe's output is a pure
 //!     function of its source.
 //!   * Documented known gaps are NOT generated: integer overflow (operands and
-//!     products are kept well inside `Int` range) and integer division/modulo by
-//!     zero (divisors are always non-zero). Generating them would only reproduce
-//!     `BUGS.md` entries.
+//!     products are kept well inside `Int` range), and *uncaught* integer
+//!     division/modulo by zero (divisors are non-zero outside the `exc` mode,
+//!     where a `try` makes the throw catchable and therefore comparable).
+//!     Generating a gap would only reproduce a `BUGS.md` entry.
+//!   * Probe-local `def` names carry a per-probe suffix: scalars hoists every
+//!     `def` into one flat table, so two probes declaring the same name would
+//!     collide — a documented gap, not a parity signal.
 //!
 //! Subprocess-only: this binary never links the scalars library — it compares
 //! two `scala` processes, exactly as a user would observe them.
@@ -248,6 +254,132 @@ fn g_loop(r: &mut Rng) -> String {
     }
 }
 
+/// `by`-step ranges. Both directions and both bound kinds (`until`/`to`), with
+/// the step as a literal (compile-time direction) and as a `val` (runtime
+/// direction) — those take different lowerings, so both must be probed. Empty
+/// ranges (`5 until 0 by 1`) are included deliberately: getting the flipped
+/// bound test wrong yields an infinite loop or an off-by-one, and only an empty
+/// range catches the "always run once" flavour of that bug.
+fn g_step(r: &mut Rng) -> String {
+    let lo = r.below(12) as i64;
+    let hi = r.below(12) as i64;
+    // Non-zero, both signs; `by 0` is generated only by `g_exc` (it throws).
+    let step = *pick(r, &["1", "2", "3", "4", "-1", "-2", "-3", "5"]);
+    let bound = if r.below(2) == 0 { "until" } else { "to" };
+    match r.below(4) {
+        0 => format!("{{ var s = \"\"; for (i <- {lo} {bound} {hi} by {step}) s += i + \",\"; println(s) }}"),
+        1 => format!("{{ var s = 0; for (i <- {lo} {bound} {hi} by {step}) s += i; println(s) }}"),
+        // A `val` step: the direction is only known at runtime.
+        2 => format!("{{ val k = {step}; var s = \"\"; for (i <- {lo} {bound} {hi} by k) s += i + \";\"; println(s) }}"),
+        // A `yield` over a stepped range, which materializes through a Vector.
+        _ => format!("println((for (i <- {lo} {bound} {hi} by {step}) yield i * 2).mkString(\"|\"))"),
+    }
+}
+
+/// IEEE floating-point division by zero: unlike integer `/ 0` (which throws),
+/// `x / 0.0` is `±Infinity` and `0.0 / 0.0` is `NaN`. The sign of the zero and
+/// of the dividend both matter (`-1.0 / 0.0` is `-Infinity`, `1.0 / -0.0` is
+/// too), so the probe enumerates the sign combinations rather than sampling one.
+fn g_ieee(r: &mut Rng) -> String {
+    let num = *pick(r, &["1.0", "-1.0", "2.5", "-2.5", "0.0", "-0.0", "1e300"]);
+    let den = if r.below(2) == 0 { "0.0" } else { "-0.0" };
+    match r.below(5) {
+        0 => format!("println({num} / {den})"),
+        1 => format!("println(({num} / {den}).isNaN)"),
+        // Int-numerator over a Double zero still takes the floating path.
+        2 => format!("println({} / {den})", pick(r, INTS)),
+        3 => format!("println({num} / {den} + 1.0)"),
+        // An Infinity/NaN result flowing through `toString` and comparison.
+        _ => format!(
+            "println(\"v=\" + ({num} / {den}) + \" eq=\" + ({num} / {den} == {num} / {den}))"
+        ),
+    }
+}
+
+/// `try`/`catch`/`finally`/`throw`. Every probe prints on both the normal and
+/// the exceptional path so a handler that silently never fires (or one that
+/// fires when it should not) shows up as a stdout difference rather than as an
+/// equal-but-empty result.
+///
+/// Integer `/ 0` and a zero range step ARE generated here, unlike elsewhere in
+/// this file: inside a `try` they are no longer the documented uncatchable-abort
+/// gap but ordinary catchable exceptions, and they are the cheapest way to raise
+/// a *runtime* (rather than user-thrown) exception.
+fn g_exc(r: &mut Rng) -> String {
+    let msg = *pick(r, &["\"boom\"", "\"x\"", "\"a b\"", "\"\""]);
+    let n = pick(r, INTS);
+    let d = *pick(r, &["0", "2", "3"]);
+    match r.below(13) {
+        // Runtime exception (integer /0) caught by its exact type, vs. not raised.
+        0 => format!(
+            "try {{ println({n} / {d}) }} catch {{ case e: ArithmeticException => println(\"AE:\" + e.getMessage) }}"
+        ),
+        // Caught by a supertype — exercises the throwable hierarchy walk.
+        1 => format!(
+            "try {{ println({n} / {d}) }} catch {{ case e: RuntimeException => println(\"RE:\" + e) }}"
+        ),
+        2 => format!(
+            "try {{ println({n} / {d}) }} catch {{ case e: Throwable => println(\"T:\" + e.getMessage) }} finally {{ println(\"fin\") }}"
+        ),
+        // User `throw`, conditional on a value so both paths are reachable.
+        3 => format!(
+            "try {{ if ({d} == 0) throw new RuntimeException({msg}); println(\"ok\" + {d}) }} catch {{ case e: RuntimeException => println(\"UT:\" + e.getMessage) }}"
+        ),
+        // `try` as a value.
+        4 => format!(
+            "println(try {{ {n} / {d} }} catch {{ case _: ArithmeticException => -1 }})"
+        ),
+        // Non-matching handler: the exception escapes the inner `try` (running
+        // its `finally`) and is caught outside.
+        5 => format!(
+            "try {{ try {{ println({n} / {d}) }} catch {{ case e: NumberFormatException => println(\"wrong\") }} finally {{ println(\"innerFin\") }} }} catch {{ case e: Throwable => println(\"outer:\" + e.getMessage) }}"
+        ),
+        // A guard on the handler.
+        6 => format!(
+            "try {{ throw new IllegalStateException({msg}) }} catch {{ case e: IllegalStateException if e.getMessage.length > 1 => println(\"long:\" + e.getMessage); case e: IllegalStateException => println(\"short:\" + e.getMessage) }}"
+        ),
+        // Raised inside a loop: the loop must abandon its remaining iterations.
+        7 => format!(
+            "try {{ for (i <- 0 to 4) {{ println(\"i\" + i); if (i == {}) throw new RuntimeException({msg}) }} }} catch {{ case e: Throwable => println(\"loop:\" + e.getMessage) }}",
+            r.below(6)
+        ),
+        // Raised two frames deep, so both `def` frames must unwind. The `def`
+        // names carry a per-probe suffix: scalars hoists every `def` into one
+        // flat table, so two probes declaring the same name would collide (a
+        // documented gap, not a parity signal).
+        8 => {
+            let u = r.next_u64() % 100_000;
+            format!(
+                "{{ def lo{u}(x: Int): Int = 10 / x; def hi{u}(x: Int): Int = lo{u}(x) + 1; try {{ println(hi{u}({d})) }} catch {{ case e: ArithmeticException => println(\"deep:\" + e.getMessage) }} }}"
+            )
+        }
+        // `finally` runs on the normal path too, before the value is produced.
+        9 => {
+            let u = r.next_u64() % 100_000;
+            format!(
+                "{{ def f{u}(): Int = try {{ {n} + 1 }} finally {{ println(\"ffin\") }}; println(f{u}()) }}"
+            )
+        }
+        // A zero range step throws IllegalArgumentException.
+        10 => format!(
+            "try {{ for (i <- 0 until 3 by {}) println(i) }} catch {{ case e: IllegalArgumentException => println(\"step:\" + e.getMessage) }}",
+            if r.below(2) == 0 { 0 } else { 2 }
+        ),
+        // A `var` mutated *inside* the `try` and then read by the handler: a
+        // raise part-way through the assignment must not commit garbage to the
+        // binding. This is the shape that caught the missing store guard.
+        11 => format!(
+            "{{ var acc{u} = 7; try {{ acc{u} += 10 / {d} }} catch {{ case _: ArithmeticException => acc{u} += 100 }}; println(acc{u}) }}",
+            u = r.next_u64() % 100_000
+        ),
+        // A library exception (`toInt` on a non-number) plus the success path.
+        _ => format!(
+            "try {{ println({}.toInt + 1) }} catch {{ case e: NumberFormatException => println(\"NF:\" + e.getMessage) }}",
+            pick(r, &["\"12\"", "\"zz\"", "\"-4\"", "\"1x\""])
+        ),
+    }
+}
+
 fn g_mixed(r: &mut Rng) -> String {
     let x = pick(r, INTS);
     let y = pick(r, DIVS);
@@ -269,6 +401,9 @@ enum Mode {
     Cond,
     Loop,
     Mixed,
+    Step,
+    Ieee,
+    Exc,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -284,6 +419,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Cond => "cond",
         Mode::Loop => "loop",
         Mode::Mixed => "mixed",
+        Mode::Step => "step",
+        Mode::Ieee => "ieee",
+        Mode::Exc => "exc",
     }
 }
 
@@ -300,6 +438,9 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "cond" => Mode::Cond,
         "loop" => Mode::Loop,
         "mixed" => Mode::Mixed,
+        "step" => Mode::Step,
+        "ieee" => Mode::Ieee,
+        "exc" => Mode::Exc,
         _ => return None,
     })
 }
@@ -315,6 +456,9 @@ const CONCRETE: &[Mode] = &[
     Mode::Cond,
     Mode::Loop,
     Mode::Mixed,
+    Mode::Step,
+    Mode::Ieee,
+    Mode::Exc,
 ];
 
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
@@ -334,6 +478,9 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Cond => g_cond(r),
         Mode::Loop => g_loop(r),
         Mode::Mixed => g_mixed(r),
+        Mode::Step => g_step(r),
+        Mode::Ieee => g_ieee(r),
+        Mode::Exc => g_exc(r),
         Mode::All => unreachable!(),
     }
 }

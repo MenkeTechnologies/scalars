@@ -6,8 +6,10 @@
 //! test replays every program through the built `scala` frontend and asserts the
 //! frozen output, so the parity-critical behaviors — Int-vs-Double division,
 //! `Double.toString` notation, `+` concatenation rules, structural `==`, range
-//! `for` — stay locked WITHOUT any Scala toolchain installed. CI runs this; the
-//! live `parity-fuzz` differential harness is a developer tool.
+//! `for` and its `by` step, IEEE division by zero, and
+//! `try`/`catch`/`finally`/`throw` unwinding (including the exact JDK exception
+//! messages) — stay locked WITHOUT any Scala toolchain installed. CI runs this;
+//! the live `parity-fuzz` differential harness is a developer tool.
 //!
 //! Format: one record per line, `program<TAB>expected`, with `\n` in `expected`
 //! encoded as the two characters backslash-n.

@@ -55,6 +55,10 @@ pub enum Tok {
     Return,
     Match,
     Case,
+    Try,
+    Catch,
+    Finally,
+    Throw,
     True,
     False,
     Null,
@@ -151,6 +155,10 @@ impl Tok {
                 | Tok::Def
                 | Tok::Object
                 | Tok::Return
+                // `try`/`throw` open a statement; `catch`/`finally` deliberately
+                // stay out so a line break before them continues the `try`.
+                | Tok::Try
+                | Tok::Throw
         )
     }
 }
@@ -456,6 +464,10 @@ fn keyword_or_ident(word: &str) -> Tok {
         "return" => Tok::Return,
         "match" => Tok::Match,
         "case" => Tok::Case,
+        "try" => Tok::Try,
+        "catch" => Tok::Catch,
+        "finally" => Tok::Finally,
+        "throw" => Tok::Throw,
         "true" => Tok::True,
         "false" => Tok::False,
         "null" => Tok::Null,

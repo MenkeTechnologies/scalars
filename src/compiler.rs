@@ -85,6 +85,39 @@ struct Compiler {
     pending_closures: VecDeque<PendingClosure>,
     /// Monotonic id for synthetic closure body names (`$closure_0`, …).
     closures_seen: u32,
+    /// True when the program contains a `try` anywhere. Only then are the
+    /// per-statement unwind checks emitted, so an exception-free program keeps
+    /// byte-identical bytecode (and its speed).
+    has_try: bool,
+    /// Where a pending exception unwinds to from the statement currently being
+    /// compiled — innermost last. Empty means top level (abort the run).
+    unwind: Vec<UnwindFrame>,
+    /// Distinguishes synthetic `try`-result locals so nested `try`s do not alias.
+    try_counter: u32,
+}
+
+/// Where the unwind check emitted after a statement jumps when an exception is
+/// in flight. Each variant corresponds to one enclosing construct, and they
+/// compose: a raise inside a loop inside a `def` inside a `try` breaks the loop,
+/// returns from the frame, then lands in the `catch` dispatch.
+#[derive(Clone, Copy, PartialEq)]
+enum UnwindKind {
+    /// Into the enclosing `try`'s `catch` dispatch (or, for a handler body, past
+    /// the handlers into its `finally`).
+    Try,
+    /// Out of the enclosing loop; the check after the loop statement continues
+    /// the walk outward.
+    Loop,
+    /// Out of the enclosing `def`/method/closure frame, returning `Unit`.
+    Def,
+}
+
+/// One entry of [`Compiler::unwind`]: the target kind plus the forward jumps
+/// awaiting patching to it. `Def` needs no jump list (it returns inline), but
+/// carrying one uniformly keeps the push/pop protocol simple.
+struct UnwindFrame {
+    kind: UnwindKind,
+    jumps: Vec<usize>,
 }
 
 /// A lambda body queued for emission as a subroutine region. `captures` are the
@@ -231,6 +264,18 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         obj_counter: 0,
         pending_closures: VecDeque::new(),
         closures_seen: 0,
+        // Scan once up front: the unwind checks cost two ops per statement, so
+        // they are emitted only for programs that can actually catch.
+        has_try: body_has_try(&prog.main)
+            || prog.functions.iter().any(|f| body_has_try(&f.body))
+            || classes
+                .iter()
+                .any(|c| body_has_try(&c.body) || c.methods.iter().any(|m| body_has_try(&m.body)))
+            || objects
+                .iter()
+                .any(|o| body_has_try(&o.body) || o.methods.iter().any(|m| body_has_try(&m.body))),
+        unwind: Vec::new(),
+        try_counter: 0,
     };
 
     // Singleton-object `val`s initialize once before `main` (into `Name.val`
@@ -320,7 +365,91 @@ fn object_field_global(obj: &str, field: &str) -> String {
 }
 
 impl Compiler {
+    /// Compile one statement, then — in a program that contains a `try` — the
+    /// unwind check that carries an in-flight exception outward.
+    ///
+    /// The check lives at the statement boundary, which is the only point where
+    /// the operand stack is guaranteed balanced, so jumping away from it cannot
+    /// strand a partial value.
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
+        self.stmt_inner(s)?;
+        self.unwind_check();
+        Ok(())
+    }
+
+    /// Emit the post-statement `EXC_PENDING` test and the jump the innermost
+    /// enclosing construct wants for it. A no-op unless the program has a `try`.
+    fn unwind_check(&mut self) {
+        self.unwind_check_dropping(0);
+    }
+
+    /// [`unwind_check`](Self::unwind_check) at a point where `drop` values are
+    /// sitting on the operand stack: they are popped on the unwind path so the
+    /// jump leaves the stack balanced.
+    ///
+    /// The `drop == 1` form guards a *binding store*. Without it, a raise while
+    /// computing an initializer would still commit the resulting garbage to the
+    /// `val`/`var` before control reached the handler, and a handler that reads
+    /// that binding would see `null` instead of its previous value — visible in
+    /// `try { acc += 10 / 0 } catch { case _ => acc += 100 }`.
+    fn unwind_check_dropping(&mut self, drop: usize) {
+        if !self.has_try {
+            return;
+        }
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_PENDING, 0), 0);
+        let j_ok = self.b.emit(Op::JumpIfFalse(0), 0);
+        for _ in 0..drop {
+            self.b.emit(Op::Pop, 0);
+        }
+        match self.unwind.last().map(|f| f.kind) {
+            // A `try` body or a loop body: jump forward to the construct's
+            // exception exit, patched by whoever pushed the frame.
+            Some(UnwindKind::Try) | Some(UnwindKind::Loop) => {
+                let j = self.b.emit(Op::Jump(0), 0);
+                self.unwind
+                    .last_mut()
+                    .expect("just matched a frame")
+                    .jumps
+                    .push(j);
+            }
+            // A `def`/method/closure body: return `Unit` immediately; the
+            // caller's own check resumes the walk in its frame. `ReturnValue`
+            // (not the bare `Return` the Unit tail paths use) so the call site
+            // still receives exactly one value whatever position it is in.
+            Some(UnwindKind::Def) => {
+                self.b.emit(Op::LoadUndef, 0);
+                self.b.emit(Op::ReturnValue, 0);
+            }
+            // Top level: nothing left to unwind into, so the exception is
+            // uncaught and stops the run.
+            None => {
+                self.b.emit(Op::CallBuiltin(crate::host::EXC_ABORT, 0), 0);
+                self.b.emit(Op::Pop, 0);
+            }
+        }
+        let at = self.b.current_pos();
+        self.b.patch_jump(j_ok, at);
+    }
+
+    /// Push an unwind frame for a construct that catches the walk (`try` body,
+    /// loop body, function body).
+    fn push_unwind(&mut self, kind: UnwindKind) {
+        self.unwind.push(UnwindFrame {
+            kind,
+            jumps: Vec::new(),
+        });
+    }
+
+    /// Pop the innermost unwind frame and patch its collected jumps to `target`.
+    fn pop_unwind_to(&mut self, target: usize) {
+        if let Some(f) = self.unwind.pop() {
+            for j in f.jumps {
+                self.b.patch_jump(j, target);
+            }
+        }
+    }
+
+    fn stmt_inner(&mut self, s: &Stmt) -> Result<(), String> {
         if self.debug && s.line != 0 {
             self.b
                 .emit(Op::CallBuiltin(crate::host::DBG_LINE, 0), s.line);
@@ -334,6 +463,7 @@ impl Compiler {
                 self.vals.insert(name.clone(), *is_val);
                 if let Some(e) = init {
                     self.expr(e)?;
+                    self.unwind_check_dropping(1);
                     self.emit_store(place);
                 }
                 // An initializer-less binding is unbound until first assigned
@@ -391,6 +521,7 @@ impl Compiler {
                         self.b.emit(compound_op(*op), 0);
                     }
                 }
+                self.unwind_check_dropping(1);
                 self.emit_store(place);
                 Ok(())
             }
@@ -452,11 +583,15 @@ impl Compiler {
         let top = self.b.current_pos();
         self.expr(cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+        // A raise inside the body must leave the loop instead of spinning on
+        // garbage; the check after the whole `while` statement continues outward.
+        self.push_unwind(UnwindKind::Loop);
         for s in body {
             self.stmt(s)?;
         }
         self.b.emit(Op::Jump(top), 0);
         let end = self.b.current_pos();
+        self.pop_unwind_to(end);
         self.b.patch_jump(jf, end);
         Ok(())
     }
@@ -514,6 +649,7 @@ impl Compiler {
                 start,
                 end,
                 inclusive,
+                step,
             } => {
                 self.expr(start)?;
                 let vplace = self.declare_place(name);
@@ -523,20 +659,98 @@ impl Compiler {
                 self.expr(end)?;
                 let bplace = self.declare_place(&bound);
                 self.emit_store(bplace);
+                // The step is snapshotted alongside the bound: Scala evaluates
+                // the whole `a until b by s` range object once, before iterating.
+                // `None` (no `by`) keeps the historical `LoadInt(1)` increment so
+                // step-less loops emit byte-identical code to before.
+                let splace = match step {
+                    Some(s) => {
+                        self.for_counter += 1;
+                        let sname = format!(" for_step_{}", self.for_counter);
+                        self.expr(s)?;
+                        let p = self.declare_place(&sname);
+                        self.emit_store(p);
+                        Some(p)
+                    }
+                    None => None,
+                };
+                // A zero step has no direction and would spin forever, so guard
+                // it exactly as Scala's `Range` does. Skipped when the step is a
+                // literal known non-zero (the usual case), so `by 2` costs
+                // nothing.
+                let j_zero = match splace {
+                    Some(sp) if const_step(step.as_ref()).is_none() => {
+                        self.emit_load(sp);
+                        self.b.emit(Op::LoadInt(0), 0);
+                        self.b.emit(Op::NumEq, 0);
+                        let j_ok = self.b.emit(Op::JumpIfFalse(0), 0);
+                        self.emit_throwable(
+                            "java.lang.IllegalArgumentException",
+                            "step cannot be 0.",
+                        );
+                        let j = self.b.emit(Op::Jump(0), 0);
+                        let ok = self.b.current_pos();
+                        self.b.patch_jump(j_ok, ok);
+                        Some(j)
+                    }
+                    _ => None,
+                };
                 let top = self.b.current_pos();
-                self.emit_load(vplace);
-                self.emit_load(bplace);
-                self.b
-                    .emit(if *inclusive { Op::NumLe } else { Op::NumLt }, 0);
+                match (splace, const_step(step.as_ref())) {
+                    // No `by`, or a literal `by` whose sign is known at compile
+                    // time: one static bound test, exactly as before.
+                    (None, _) | (Some(_), Some(_)) => {
+                        let descending = const_step(step.as_ref()).is_some_and(|n| n < 0);
+                        self.emit_load(vplace);
+                        self.emit_load(bplace);
+                        self.b.emit(range_test(*inclusive, descending), 0);
+                    }
+                    // A non-literal `by`: the direction is only known at runtime,
+                    // so branch on `step > 0` and pick the matching bound test.
+                    (Some(sp), None) => {
+                        self.emit_load(sp);
+                        self.b.emit(Op::LoadInt(0), 0);
+                        self.b.emit(Op::NumGt, 0);
+                        let j_desc = self.b.emit(Op::JumpIfFalse(0), 0);
+                        self.emit_load(vplace);
+                        self.emit_load(bplace);
+                        self.b.emit(range_test(*inclusive, false), 0);
+                        let j_done = self.b.emit(Op::Jump(0), 0);
+                        let desc_at = self.b.current_pos();
+                        self.b.patch_jump(j_desc, desc_at);
+                        self.emit_load(vplace);
+                        self.emit_load(bplace);
+                        self.b.emit(range_test(*inclusive, true), 0);
+                        let done_at = self.b.current_pos();
+                        self.b.patch_jump(j_done, done_at);
+                    }
+                }
                 let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+                // As in `while_stmt`: a raise in the body exits the loop rather
+                // than iterating on garbage.
+                self.push_unwind(UnwindKind::Loop);
                 self.lower_for(enums, idx + 1, body, yield_into)?;
+                // The innermost `lower_for` ends in an *expression* (the body
+                // value), not a statement, so nothing above emitted a check for
+                // it; without this one a raise in a single-expression body would
+                // spin the loop forever.
+                self.unwind_check();
                 self.emit_load(vplace);
-                self.b.emit(Op::LoadInt(1), 0);
+                match splace {
+                    Some(sp) => self.emit_load(sp),
+                    None => {
+                        self.b.emit(Op::LoadInt(1), 0);
+                    }
+                }
                 self.b.emit(Op::Add, 0);
                 self.emit_store(vplace);
                 self.b.emit(Op::Jump(top), 0);
                 let end_pos = self.b.current_pos();
+                self.pop_unwind_to(end_pos);
                 self.b.patch_jump(jf, end_pos);
+                if let Some(j) = j_zero {
+                    self.b.patch_jump(j, end_pos);
+                }
             }
         }
         Ok(())
@@ -625,6 +839,16 @@ impl Compiler {
             Expr::If { cond, then, els } => self.if_expr(cond, then, els.as_deref())?,
             Expr::Block(stmts) => self.block_expr(stmts)?,
             Expr::Match { scrut, arms } => self.match_expr(scrut, arms)?,
+            Expr::Try {
+                body,
+                catches,
+                finalizer,
+            } => self.try_expr(body, catches, finalizer.as_deref())?,
+            Expr::Throw { value, line } => {
+                self.expr(value)?;
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::EXC_THROW, 1), *line);
+            }
             Expr::Format { value, spec, line } => {
                 self.expr(value)?;
                 let c = self.b.add_constant(Value::str(spec.clone()));
@@ -782,7 +1006,10 @@ impl Compiler {
         for i in (0..total).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
+        // A closure body is its own unwind boundary (see `unwind_check`).
+        self.push_unwind(UnwindKind::Def);
         self.expr(&pc.body)?;
+        self.pop_unwind_to(self.b.current_pos());
         self.b.emit(Op::ReturnValue, 0);
 
         self.scope = saved_scope;
@@ -871,6 +1098,135 @@ impl Compiler {
         for je in end_jumps {
             self.b.patch_jump(je, end);
         }
+        Ok(())
+    }
+
+    /// Lower `try body [catch { case … }] [finally fin]` as a value.
+    ///
+    /// The shape, in order:
+    ///
+    /// ```text
+    ///   EXC_ENTER                 ; raises now park instead of halting
+    ///   <body>            -> res  ; unwind checks inside jump to `dispatch`
+    ///   EXC_EXIT                  ; normal exit
+    ///   Jump fin
+    /// dispatch:                   ; exceptional exit — `res` is Unit
+    ///   EXC_EXIT                  ; a raise in a handler is *not* caught here
+    ///   <catch arms>      -> res  ; each arm: EXC_MATCH, then EXC_TAKE to bind
+    /// fin:
+    ///   EXC_STASH                 ; park any still-in-flight exception …
+    ///   <finalizer>               ; … so the finalizer runs to completion …
+    ///   EXC_UNSTASH               ; … then resume unwinding it
+    ///   load res
+    /// ```
+    ///
+    /// The result travels in a synthetic local rather than on the operand stack
+    /// because the exceptional path enters at `dispatch` from an arbitrary
+    /// statement boundary inside the body, where nothing has been pushed.
+    ///
+    /// The handler arms run under their own `Try` frame targeting `fin`, so an
+    /// exception thrown *by* a handler still runs the `finally` before
+    /// propagating — the JVM's ordering.
+    fn try_expr(
+        &mut self,
+        body: &[Stmt],
+        catches: &[MatchArm],
+        finalizer: Option<&[Stmt]>,
+    ) -> Result<(), String> {
+        self.try_counter += 1;
+        let res = self.declare_place(&format!(" try_{}", self.try_counter));
+
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_ENTER, 0), 0);
+        self.b.emit(Op::Pop, 0);
+
+        self.push_unwind(UnwindKind::Try);
+        self.block_expr(body)?;
+        self.emit_store(res);
+        // The body's own trailing expression has no statement after it, so emit
+        // the check here — a raise in the last expression must still dispatch.
+        self.unwind_check();
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_EXIT, 0), 0);
+        self.b.emit(Op::Pop, 0);
+        let j_normal = self.b.emit(Op::Jump(0), 0);
+
+        let dispatch = self.b.current_pos();
+        self.pop_unwind_to(dispatch);
+        self.b.emit(Op::LoadUndef, 0);
+        self.emit_store(res);
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_EXIT, 0), 0);
+        self.b.emit(Op::Pop, 0);
+
+        self.push_unwind(UnwindKind::Try);
+        let mut handled_jumps = Vec::new();
+        for arm in catches {
+            let ty = catch_type_name(&arm.pat)?;
+            let c = self.b.add_constant(Value::str(ty.to_string()));
+            self.b.emit(Op::LoadConst(c), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::EXC_MATCH, 1), 0);
+            let j_type = self.b.emit(Op::JumpIfFalse(0), 0);
+            // The type matched. Consume the exception *before* the guard runs:
+            // while one is in flight every side-effecting builtin is suppressed,
+            // so a guard like `if e.getMessage.length > 1` would read `null`
+            // instead of dispatching. Keep a copy in a temporary so a guard that
+            // rejects the arm can put it back.
+            self.obj_counter += 1;
+            let held = self.declare_place(&format!(" exc_{}", self.obj_counter));
+            self.b.emit(Op::CallBuiltin(crate::host::EXC_TAKE, 0), 0);
+            self.emit_store(held);
+            if let Some(name) = catch_binding(&arm.pat) {
+                let p = self.declare_place(name);
+                self.emit_load(held);
+                self.emit_store(p);
+            }
+            let j_guard = match &arm.guard {
+                Some(g) => {
+                    self.expr(g)?;
+                    Some(self.b.emit(Op::JumpIfFalse(0), 0))
+                }
+                None => None,
+            };
+            self.block_expr(&arm.body)?;
+            self.emit_store(res);
+            self.unwind_check();
+            handled_jumps.push(self.b.emit(Op::Jump(0), 0));
+            // Guard rejected the arm: re-arm the exception and fall through to
+            // the next one, which must still see it.
+            if let Some(jg) = j_guard {
+                let at = self.b.current_pos();
+                self.b.patch_jump(jg, at);
+                self.emit_load(held);
+                self.b.emit(Op::CallBuiltin(crate::host::EXC_RESTORE, 1), 0);
+                self.b.emit(Op::Pop, 0);
+            }
+            let next = self.b.current_pos();
+            self.b.patch_jump(j_type, next);
+        }
+        // Falling off the last arm leaves the exception in flight: it is
+        // unhandled here and keeps unwinding after the `finally` runs.
+
+        let fin = self.b.current_pos();
+        self.pop_unwind_to(fin);
+        for j in handled_jumps {
+            self.b.patch_jump(j, fin);
+        }
+        self.b.patch_jump(j_normal, fin);
+
+        if let Some(f) = finalizer {
+            self.b.emit(Op::CallBuiltin(crate::host::EXC_STASH, 0), 0);
+            self.b.emit(Op::Pop, 0);
+            // A raise inside the finalizer jumps straight to `EXC_UNSTASH`,
+            // which keeps the *new* exception and discards the parked one —
+            // exactly the JVM rule, and it stops the stash from leaking.
+            self.push_unwind(UnwindKind::Try);
+            for s in f {
+                self.stmt(s)?;
+            }
+            let unstash = self.b.current_pos();
+            self.pop_unwind_to(unstash);
+            self.b.emit(Op::CallBuiltin(crate::host::EXC_UNSTASH, 0), 0);
+            self.b.emit(Op::Pop, 0);
+        }
+        self.emit_load(res);
         Ok(())
     }
 
@@ -1121,6 +1477,7 @@ impl Compiler {
                 self.b.emit(compound_op(op), 0);
             }
         }
+        self.unwind_check_dropping(1);
         self.b.emit(Op::SetVar(g), 0);
         Ok(())
     }
@@ -1128,6 +1485,15 @@ impl Compiler {
     /// Lower `new Class(args)` / a `case class` companion `apply` — both invoke
     /// the class's `Class$new` constructor subroutine, which builds the record.
     fn construct(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        // `new RuntimeException("…")` and friends: built-in throwables have no
+        // user `class` declaration, so they construct through the host rather
+        // than a `Class$new` subroutine. A user class of the same name wins —
+        // shadowing a JDK name is legal Scala.
+        if !self.classes.contains_key(name) {
+            if let Some(fqn) = crate::host::throwable_fqn(name) {
+                return self.construct_throwable(name, fqn, args, line);
+            }
+        }
         let arity = match self.classes.get(name) {
             Some(meta) => meta.arity,
             None => return Err(format!("scalars: not found: type {name} (line {line})")),
@@ -1144,6 +1510,49 @@ impl Compiler {
         let nidx = self.b.add_name(&ctor_name(name));
         self.b.emit(Op::Call(nidx, args.len() as u8), line);
         Ok(())
+    }
+
+    /// Lower `new <BuiltinThrowable>([message])` to the [`EXC_NEW`] builtin.
+    /// The JVM's `Throwable` constructors this models are the no-arg one (whose
+    /// `getMessage` is `null`) and the single-`String` one.
+    ///
+    /// [`EXC_NEW`]: crate::host::EXC_NEW
+    fn construct_throwable(
+        &mut self,
+        name: &str,
+        fqn: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<(), String> {
+        if args.len() > 1 {
+            return Err(format!(
+                "scalars: {name} takes 0 or 1 constructor argument(s), found {} (line {line})",
+                args.len()
+            ));
+        }
+        let c = self.b.add_constant(Value::str(fqn.to_string()));
+        self.b.emit(Op::LoadConst(c), line);
+        match args.first() {
+            Some(a) => self.expr(a)?,
+            None => {
+                self.b.emit(Op::LoadUndef, line);
+            }
+        }
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_NEW, 2), line);
+        Ok(())
+    }
+
+    /// Emit "construct a built-in throwable and raise it", leaving nothing on
+    /// the stack. Used for runtime checks the compiler plants itself (the range
+    /// step-zero guard) rather than for a user's `throw`.
+    fn emit_throwable(&mut self, fqn: &str, msg: &str) {
+        let c = self.b.add_constant(Value::str(fqn.to_string()));
+        self.b.emit(Op::LoadConst(c), 0);
+        let m = self.b.add_constant(Value::str(msg.to_string()));
+        self.b.emit(Op::LoadConst(m), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_NEW, 2), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_THROW, 1), 0);
+        self.b.emit(Op::Pop, 0);
     }
 
     /// Lower `recv.copy(updates)` — clone `recv`'s record with the named
@@ -1394,7 +1803,9 @@ impl Compiler {
         }
         let saved_class = self.current_class.take();
         self.current_class = Some((cd.name.clone(), cd.field_names.iter().cloned().collect()));
+        self.push_unwind(UnwindKind::Def);
         self.tail(&m.body)?;
+        self.pop_unwind_to(self.b.current_pos());
         self.b.emit(Op::Return, 0);
         self.current_class = saved_class;
 
@@ -1425,7 +1836,9 @@ impl Compiler {
         }
         let saved_obj = self.current_object.take();
         self.current_object = Some(od.name.clone());
+        self.push_unwind(UnwindKind::Def);
         self.tail(&m.body)?;
+        self.pop_unwind_to(self.b.current_pos());
         self.b.emit(Op::Return, 0);
         self.current_object = saved_obj;
 
@@ -1619,7 +2032,9 @@ impl Compiler {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
 
+        self.push_unwind(UnwindKind::Def);
         self.tail(&f.body)?;
+        self.pop_unwind_to(self.b.current_pos());
         // A body that returned on every path never reaches here; one that fell
         // through (e.g. ends in a loop) returns `Unit`.
         self.b.emit(Op::Return, 0);
@@ -1755,6 +2170,16 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
 
 fn expr_has_ffi(e: &Expr) -> bool {
     match e {
+        Expr::Try {
+            body,
+            catches,
+            finalizer,
+        } => {
+            body_has_ffi(body)
+                || catches.iter().any(|a| body_has_ffi(&a.body))
+                || finalizer.as_deref().is_some_and(body_has_ffi)
+        }
+        Expr::Throw { value, .. } => expr_has_ffi(value),
         Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
         Expr::Method { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
         Expr::New { args, .. } => args.iter().any(expr_has_ffi),
@@ -1790,12 +2215,132 @@ fn expr_has_ffi(e: &Expr) -> bool {
     }
 }
 
-/// True if a `for` enumerator (generator bounds / guard) evaluates an FFI call.
+/// True if a `for` enumerator (generator bounds / step / guard) evaluates an
+/// FFI call.
 fn enum_has_ffi(e: &ForEnum) -> bool {
     match e {
-        ForEnum::Gen { start, end, .. } => expr_has_ffi(start) || expr_has_ffi(end),
+        ForEnum::Gen {
+            start, end, step, ..
+        } => expr_has_ffi(start) || expr_has_ffi(end) || step.as_ref().is_some_and(expr_has_ffi),
         ForEnum::GenColl { coll, .. } => expr_has_ffi(coll),
         ForEnum::Guard(c) => expr_has_ffi(c),
+    }
+}
+
+/// The caught type of a `catch` arm's pattern. A bare `case e =>` / `case _ =>`
+/// catches everything, which is `Throwable` — Scala infers exactly that.
+fn catch_type_name(p: &Pattern) -> Result<&str, String> {
+    match p {
+        Pattern::Typed { ty, .. } => Ok(ty),
+        Pattern::Bind(_) | Pattern::Wildcard => Ok("Throwable"),
+        _ => Err(
+            "scalars: only `case e: Type`, `case _: Type`, `case e` and `case _` are supported in `catch`"
+                .to_string(),
+        ),
+    }
+}
+
+/// The name a `catch` arm binds the caught exception to, if any.
+fn catch_binding(p: &Pattern) -> Option<&str> {
+    match p {
+        Pattern::Typed { name, .. } if name != "_" => Some(name),
+        Pattern::Bind(name) => Some(name),
+        _ => None,
+    }
+}
+
+/// True if a statement list contains a `try` anywhere (including inside nested
+/// expressions), which is what arms the per-statement unwind checks.
+fn body_has_try(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        StmtKind::Local { init, .. } => init.as_ref().is_some_and(expr_has_try),
+        StmtKind::Assign { value, .. } => expr_has_try(value),
+        StmtKind::Expr(e) => expr_has_try(e),
+        StmtKind::If { cond, then, els } => {
+            expr_has_try(cond) || body_has_try(then) || body_has_try(els)
+        }
+        StmtKind::While { cond, body } => expr_has_try(cond) || body_has_try(body),
+        StmtKind::Return(e) => e.as_ref().is_some_and(expr_has_try),
+    })
+}
+
+/// True if an expression tree contains a `try`.
+fn expr_has_try(e: &Expr) -> bool {
+    match e {
+        Expr::Try { .. } => true,
+        Expr::Throw { value, .. } => expr_has_try(value),
+        Expr::Unary { rhs, .. } => expr_has_try(rhs),
+        Expr::Binary { lhs, rhs, .. } => expr_has_try(lhs) || expr_has_try(rhs),
+        Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_try),
+        Expr::Call { args, .. } | Expr::New { args, .. } => args.iter().any(expr_has_try),
+        Expr::Method { recv, args, .. } => expr_has_try(recv) || args.iter().any(expr_has_try),
+        Expr::Copy { recv, updates, .. } => {
+            expr_has_try(recv) || updates.iter().any(|(_, v)| expr_has_try(v))
+        }
+        Expr::If { cond, then, els } => {
+            expr_has_try(cond) || expr_has_try(then) || els.as_deref().is_some_and(expr_has_try)
+        }
+        Expr::Block(stmts) => body_has_try(stmts),
+        Expr::Match { scrut, arms } => {
+            expr_has_try(scrut)
+                || arms
+                    .iter()
+                    .any(|a| a.guard.as_ref().is_some_and(expr_has_try) || body_has_try(&a.body))
+        }
+        Expr::Format { value, .. } => expr_has_try(value),
+        Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
+            enums.iter().any(enum_has_try) || expr_has_try(body)
+        }
+        Expr::Lambda { body, .. } => expr_has_try(body),
+        Expr::Tuple(elems) | Expr::Collection { elems, .. } => elems.iter().any(expr_has_try),
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Placeholder
+        | Expr::Var(_) => false,
+    }
+}
+
+/// True if a `for` enumerator's bounds / step / guard contain a `try`.
+fn enum_has_try(e: &ForEnum) -> bool {
+    match e {
+        ForEnum::Gen {
+            start, end, step, ..
+        } => expr_has_try(start) || expr_has_try(end) || step.as_ref().is_some_and(expr_has_try),
+        ForEnum::GenColl { coll, .. } => expr_has_try(coll),
+        ForEnum::Guard(c) => expr_has_try(c),
+    }
+}
+
+/// The compile-time value of a `by` step, when it is a (possibly negated)
+/// integer literal. A known-sign step lets [`Compiler::lower_for`] emit a single
+/// static bound test instead of branching on the sign every iteration — the
+/// overwhelmingly common case (`by 2`, `by -1`). A literal `0` deliberately
+/// returns `None`: it has no valid direction and is rejected at runtime by the
+/// emitted step-zero guard, matching Scala's
+/// `IllegalArgumentException: step cannot be 0.`
+fn const_step(step: Option<&Expr>) -> Option<i64> {
+    match step? {
+        Expr::Int(n) if *n != 0 => Some(*n),
+        Expr::Unary { op: UnOp::Neg, rhs } => match &**rhs {
+            Expr::Int(n) if *n != 0 => Some(-*n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The bound test of a range loop: `i < end` / `i <= end` ascending, `i > end` /
+/// `i >= end` descending. Scala's `Range` flips the comparison with the step's
+/// sign, so `10 to 1 by -3` counts down instead of yielding nothing.
+fn range_test(inclusive: bool, descending: bool) -> Op {
+    match (inclusive, descending) {
+        (false, false) => Op::NumLt,
+        (true, false) => Op::NumLe,
+        (false, true) => Op::NumGt,
+        (true, true) => Op::NumGe,
     }
 }
 
@@ -1845,11 +2390,19 @@ fn gen_source(e: &ForEnum) -> (String, Expr) {
             start,
             end,
             inclusive,
+            step,
         } => (
             name.clone(),
             Expr::Call {
                 name: RANGE_LIST_CALL.to_string(),
-                args: vec![start.clone(), end.clone(), Expr::Bool(*inclusive)],
+                // An absent `by` materializes with the implicit step of 1, so
+                // the host builtin has a single 4-argument shape.
+                args: vec![
+                    start.clone(),
+                    end.clone(),
+                    Expr::Bool(*inclusive),
+                    step.clone().unwrap_or(Expr::Int(1)),
+                ],
                 line: 0,
             },
         ),
@@ -1941,6 +2494,26 @@ fn fv_block(
 fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     match e {
         Expr::Var(name) => fv_note(name, bound, out, seen),
+        Expr::Try {
+            body,
+            catches,
+            finalizer,
+        } => {
+            fv_block(body, bound, out, seen);
+            for a in catches {
+                // The caught exception's binding is local to its arm.
+                let mut b = bound.clone();
+                pattern_binds(&a.pat, &mut b);
+                if let Some(g) = &a.guard {
+                    fv_expr(g, &b, out, seen);
+                }
+                fv_block(&a.body, &b, out, seen);
+            }
+            if let Some(f) = finalizer {
+                fv_block(f, bound, out, seen);
+            }
+        }
+        Expr::Throw { value, .. } => fv_expr(value, bound, out, seen),
         Expr::Unary { rhs, .. } => fv_expr(rhs, bound, out, seen),
         Expr::Binary { lhs, rhs, .. } => {
             fv_expr(lhs, bound, out, seen);
@@ -2002,10 +2575,19 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
             for en in enums {
                 match en {
                     ForEnum::Gen {
-                        name, start, end, ..
+                        name,
+                        start,
+                        end,
+                        step,
+                        ..
                     } => {
                         fv_expr(start, &b, out, seen);
                         fv_expr(end, &b, out, seen);
+                        // The `by` step is evaluated in the *enclosing* scope,
+                        // before the loop variable is bound.
+                        if let Some(s) = step {
+                            fv_expr(s, &b, out, seen);
+                        }
                         b.insert(name.clone());
                     }
                     ForEnum::GenColl { name, coll } => {

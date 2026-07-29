@@ -14,3 +14,21 @@ object T extends App { var s = 0; for (a <- 0 until 3) { for (b <- 0 until 2) { 
 object T extends App { val x = 9; val y = 4; println("q=" + x / y + " r=" + x % y) }	q=2 r=1\n
 object T extends App { var p = 1; for (i <- 1 to 6) { p = p * i }; println(p) }	720\n
 object M { def main(args: Array[String]): Unit = { println("from main"); println(40 + 2) } }	from main\n42\n
+object T extends App { for (i <- 0 until 10 by 3) print(i + " "); println(); for (i <- 10 to 1 by -3) print(i + " "); println() }	0 3 6 9 \n10 7 4 1 \n
+object T extends App { for (i <- 0 until 5 by 7) print(i); println("|"); for (i <- 5 until 0 by 1) print(i); println("|") }	0|\n|\n
+object T extends App { val k = -2; for (i <- 8 to 0 by k) print(i + ","); println(); println((for (i <- 1 to 9 by 4) yield i * 2).mkString(",")) }	8,6,4,2,0,\n2,10,18\n
+object T extends App { for (i <- 0 until 6 by 2; j <- 0 until 4 by 3) print(s"$i$j "); println(); for (i <- 0 until 9 by 2 if i % 3 == 0) print(i + " "); println() }	00 03 20 23 40 43 \n0 6 \n
+object T extends App { try { for (i <- 1 to 5 by 0) println(i) } catch { case e: IllegalArgumentException => println(e.getMessage) } }	step cannot be 0.\n
+object T extends App { try { println(1 / 0) } catch { case e: ArithmeticException => println("A:" + e.getMessage) } finally { println("fin") } }	A:/ by zero\nfin\n
+object T extends App { try { throw new IllegalArgumentException("bad") } catch { case e: Exception => println(e.toString) } }	java.lang.IllegalArgumentException: bad\n
+object T extends App { try { try { throw new NumberFormatException("nf") } catch { case e: IllegalStateException => println("no") } finally { println("innerFin") } } catch { case e: Throwable => println("outer:" + e.getMessage) } }	innerFin\nouter:nf\n
+object T extends App { println(try { 10 / 2 } catch { case _: Throwable => -1 }); println(try { 10 / 0 } catch { case _: Throwable => -1 }) }	5\n-1\n
+object T extends App { try { throw new RuntimeException("abc") } catch { case e: RuntimeException if e.getMessage.length > 5 => println("long"); case e: RuntimeException => println("short:" + e.getMessage) } }	short:abc\n
+object T extends App { def lo(x: Int): Int = 100 / x; def hi(x: Int): Int = lo(x) + 1; try { println(hi(0)) } catch { case e: ArithmeticException => println("deep:" + e.getMessage) }; println(hi(5)) }	deep:/ by zero\n21\n
+object T extends App { try { for (i <- 0 to 5) { println(i); if (i == 2) throw new RuntimeException("stop") } } catch { case e: Exception => println("L:" + e.getMessage) } }	0\n1\n2\nL:stop\n
+object T extends App { val xs = List(1, 2, 0, 4); try { println(xs.map(v => 12 / v)) } catch { case e: ArithmeticException => println("map:" + e.getMessage) }; println(xs.map(v => v * 2)) }	map:/ by zero\nList(2, 4, 0, 8)\n
+object T extends App { try { println("before"); throw new RuntimeException("x"); println("after") } catch { case _: Throwable => println("caught") } }	before\ncaught\n
+object T extends App { def g(): Int = try { 1 } finally { println("gfin") }; println(g()); println(new RuntimeException().getMessage); println(new RuntimeException().toString) }	gfin\n1\nnull\njava.lang.RuntimeException\n
+object T extends App { try { "zz".toInt } catch { case e: Throwable => println(e.toString) }; try { "ab".charAt(9) } catch { case e: Throwable => println(e.toString) }; try { List(1,2,3,4)(99) } catch { case e: Throwable => println(e.toString) } }	java.lang.NumberFormatException: For input string: "zz"\njava.lang.StringIndexOutOfBoundsException: Index 9 out of bounds for length 2\njava.lang.IndexOutOfBoundsException: 99\n
+object T extends App { println(1.0 / 0.0); println(-1.0 / 0.0); println(0.0 / 0.0); println((0.0 / 0.0).isNaN); println(1.0 / -0.0); println(5 / 0.0) }	Infinity\n-Infinity\nNaN\ntrue\n-Infinity\nInfinity\n
+object T extends App { def pick(b: Boolean): Int = if (b) 7 else throw new RuntimeException("nope"); println(pick(true)); try { println(pick(false)) } catch { case e: RuntimeException => println("pick:" + e.getMessage) } }	7\npick:nope\n

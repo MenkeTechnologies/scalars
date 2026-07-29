@@ -1024,3 +1024,238 @@ fn for_yield_range_led_generator_is_a_vector() {
     assert!(ok);
     assert_eq!(out, "Vector(1a, 1b, 2a, 2b, 3a, 3b)\n");
 }
+
+// ── `by`-step ranges ────────────────────────────────────────────────────────
+
+#[test]
+fn range_by_step_ascends_and_descends() {
+    // A negative step flips the bound test; getting that wrong yields either an
+    // empty range or a non-terminating loop.
+    let (out, ok) = run(&wrap(
+        "for (i <- 0 until 10 by 3) print(i + \" \")\nprintln()\nfor (i <- 10 to 1 by -3) print(i + \" \")\nprintln()",
+    ));
+    assert!(ok);
+    assert_eq!(out, "0 3 6 9 \n10 7 4 1 \n");
+}
+
+#[test]
+fn range_by_step_overshooting_bound_yields_one_or_zero_elements() {
+    // `0 until 5 by 7` stops after the first element; `5 until 0 by 1` is empty
+    // because the step is positive but the range descends.
+    let (out, ok) = run(&wrap(
+        "for (i <- 0 until 5 by 7) print(i)\nprintln(\"|\")\nfor (i <- 5 until 0 by 1) print(i)\nprintln(\"|\")",
+    ));
+    assert!(ok);
+    assert_eq!(out, "0|\n|\n");
+}
+
+#[test]
+fn range_by_step_from_a_runtime_value_picks_direction_at_runtime() {
+    // A non-literal step compiles to the sign-branching bound test, a different
+    // lowering from the literal (compile-time direction) case.
+    let (out, ok) = run(&wrap(
+        "val k = -2\nfor (i <- 8 to 0 by k) print(i + \",\")\nprintln()",
+    ));
+    assert!(ok);
+    assert_eq!(out, "8,6,4,2,0,\n");
+}
+
+#[test]
+fn range_by_step_works_in_yield_and_nested_generators() {
+    let (out, ok) = run(&wrap(
+        "println((for (i <- 1 to 9 by 4) yield i * 2).mkString(\",\"))\nfor (i <- 0 until 6 by 2; j <- 0 until 4 by 3) print(s\"$i$j \")\nprintln()",
+    ));
+    assert!(ok);
+    assert_eq!(out, "2,10,18\n00 03 20 23 40 43 \n");
+}
+
+#[test]
+fn range_by_zero_step_throws_illegal_argument() {
+    let (out, ok) = run(&wrap(
+        "try { for (i <- 1 to 5 by 0) println(i) } catch { case e: IllegalArgumentException => println(e.getMessage) }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "step cannot be 0.\n");
+}
+
+// ── `try` / `catch` / `finally` / `throw` ───────────────────────────────────
+
+#[test]
+fn catch_intercepts_a_runtime_exception_and_finally_runs() {
+    let (out, ok) = run(&wrap(
+        "try { println(1 / 0) } catch { case e: ArithmeticException => println(\"A:\" + e.getMessage) } finally { println(\"fin\") }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "A:/ by zero\nfin\n");
+}
+
+#[test]
+fn catch_matches_a_supertype_of_the_thrown_exception() {
+    // `IllegalArgumentException` reaches `Exception` through `RuntimeException`;
+    // this is the throwable-hierarchy walk, not an exact-name test.
+    let (out, ok) = run(&wrap(
+        "try { throw new IllegalArgumentException(\"bad\") } catch { case e: Exception => println(e.toString) }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "java.lang.IllegalArgumentException: bad\n");
+}
+
+#[test]
+fn unmatched_catch_rethrows_to_the_enclosing_try_after_finally() {
+    // The inner handler's type does not match, so the exception keeps unwinding
+    // — but the inner `finally` still runs first, before the outer `catch`.
+    let (out, ok) = run(&wrap(
+        "try { try { throw new NumberFormatException(\"nf\") } catch { case e: IllegalStateException => println(\"no\") } finally { println(\"innerFin\") } } catch { case e: Throwable => println(\"outer:\" + e.getMessage) }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "innerFin\nouter:nf\n");
+}
+
+#[test]
+fn try_is_an_expression_whose_value_comes_from_either_path() {
+    let (out, ok) = run(&wrap(
+        "println(try { 10 / 2 } catch { case _: Throwable => -1 })\nprintln(try { 10 / 0 } catch { case _: Throwable => -1 })",
+    ));
+    assert!(ok);
+    assert_eq!(out, "5\n-1\n");
+}
+
+#[test]
+fn a_catch_guard_reads_the_bound_exception_and_falls_through_when_false() {
+    // The guard must see a real binding: while an exception is in flight the
+    // host suppresses method dispatch, so a naive lowering reads `null` here and
+    // silently takes the wrong arm.
+    let (out, ok) = run(&wrap(
+        "try { throw new RuntimeException(\"abc\") } catch { case e: RuntimeException if e.getMessage.length > 5 => println(\"long\"); case e: RuntimeException => println(\"short:\" + e.getMessage) }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "short:abc\n");
+}
+
+#[test]
+fn an_exception_unwinds_through_two_def_frames() {
+    let (out, ok) = run(&wrap(
+        "def lo(x: Int): Int = 100 / x\ndef hi(x: Int): Int = lo(x) + 1\ntry { println(hi(0)) } catch { case e: ArithmeticException => println(\"deep:\" + e.getMessage) }\nprintln(hi(5))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "deep:/ by zero\n21\n");
+}
+
+#[test]
+fn an_exception_abandons_the_remaining_loop_iterations() {
+    let (out, ok) = run(&wrap(
+        "try { for (i <- 0 to 5) { println(i); if (i == 2) throw new RuntimeException(\"stop\") } } catch { case e: Exception => println(\"L:\" + e.getMessage) }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "0\n1\n2\nL:stop\n");
+}
+
+#[test]
+fn an_exception_inside_a_lambda_reaches_the_enclosing_catch() {
+    // `map` re-enters the VM to run the lambda, so the raise has to survive a
+    // host-driven nested invocation.
+    let (out, ok) = run(&wrap(
+        "val xs = List(1, 2, 0, 4)\ntry { println(xs.map(v => 12 / v)) } catch { case e: ArithmeticException => println(\"map:\" + e.getMessage) }\nprintln(xs.map(v => v * 2))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "map:/ by zero\nList(2, 4, 0, 8)\n");
+}
+
+#[test]
+fn no_output_escapes_between_a_raise_and_its_handler() {
+    // Statements after the raise in the same `try` body must not run at all.
+    let (out, ok) = run(&wrap(
+        "try { println(\"before\"); throw new RuntimeException(\"x\"); println(\"after\") } catch { case _: Throwable => println(\"caught\") }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "before\ncaught\n");
+}
+
+#[test]
+fn finally_runs_on_the_normal_path_before_the_value_is_used() {
+    let (out, ok) = run(&wrap(
+        "def g(): Int = try { 1 } finally { println(\"gfin\") }\nprintln(g())",
+    ));
+    assert!(ok);
+    assert_eq!(out, "gfin\n1\n");
+}
+
+#[test]
+fn no_arg_throwable_has_a_null_message() {
+    // `Throwable.toString` drops the `: message` suffix when the message is null.
+    let (out, ok) = run(&wrap(
+        "println(new RuntimeException().getMessage)\nprintln(new RuntimeException().toString)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "null\njava.lang.RuntimeException\n");
+}
+
+#[test]
+fn library_exceptions_carry_their_jdk_messages() {
+    let (out, ok) = run(&wrap(
+        "try { \"zz\".toInt } catch { case e: Throwable => println(e.toString) }\ntry { \"ab\".charAt(9) } catch { case e: Throwable => println(e.toString) }\ntry { List(1,2,3,4)(99) } catch { case e: Throwable => println(e.toString) }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "java.lang.NumberFormatException: For input string: \"zz\"\n\
+         java.lang.StringIndexOutOfBoundsException: Index 9 out of bounds for length 2\n\
+         java.lang.IndexOutOfBoundsException: 99\n"
+    );
+}
+
+#[test]
+fn an_uncaught_throw_stops_the_run_with_a_failing_status() {
+    // Output before the raise is kept; nothing after it runs.
+    let (out, ok) = run(&wrap(
+        "println(\"a\")\ntry { println(\"t\") } catch { case e: NumberFormatException => println(\"c\") }\nthrow new IllegalStateException(\"uncaught\")\nprintln(\"never\")",
+    ));
+    assert!(!ok);
+    assert_eq!(out, "a\nt\n");
+}
+
+#[test]
+fn throw_is_an_expression_usable_in_operand_position() {
+    let (out, ok) = run(&wrap(
+        "def pick(b: Boolean): Int = if (b) 7 else throw new RuntimeException(\"nope\")\nprintln(pick(true))\ntry { println(pick(false)) } catch { case e: RuntimeException => println(\"pick:\" + e.getMessage) }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "7\npick:nope\n");
+}
+
+#[test]
+fn a_try_without_catch_or_finally_is_rejected() {
+    let (out, ok) = run(&wrap("try { println(1) }"));
+    assert!(!ok);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn a_raise_does_not_commit_garbage_to_a_var_the_handler_reads() {
+    // The assignment's value expression raises part-way through. Without a check
+    // *before* the store, `acc` would be `null` when the handler runs and
+    // `acc += 100` would fail with a `+`-on-null type error instead of printing.
+    let (out, ok) = run(&wrap(
+        "var acc = 7\ntry { acc += 10 / 0 } catch { case _: ArithmeticException => acc += 100 }\nprintln(acc)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "107\n");
+}
+
+#[test]
+fn an_exception_in_a_finally_replaces_the_one_it_was_unwinding() {
+    let (out, ok) = run(&wrap(
+        "try { try { throw new RuntimeException(\"orig\") } finally { throw new IllegalStateException(\"fromFinally\") } } catch { case e: Throwable => println(e.getMessage) }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "fromFinally\n");
+}
+
+#[test]
+fn catch_arms_are_tried_in_order_and_a_failing_guard_falls_through() {
+    let (out, ok) = run(&wrap(
+        "try { throw new RuntimeException(\"q\") } catch { case e: RuntimeException if e.getMessage == \"zzz\" => println(\"g1\"); case e: RuntimeException if e.getMessage == \"q\" => println(\"g2\"); case e: RuntimeException => println(\"g3\") }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "g2\n");
+}

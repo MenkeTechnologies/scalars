@@ -103,26 +103,48 @@ println(i)   // =&gt; 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-10">
           <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>new</code></h3>
-          <p>instance-construction keyword (reserved; instantiation lands in a later slice)</p>
-          <pre><code class="lang-scala">new T()   // reserved</code></pre>
+          <p>construct an instance: a user `class`/`case class`, or a built-in throwable</p>
+          <pre><code class="lang-scala">class P(val n: Int)
+println(new P(2).n)   // =&gt; 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-11">
           <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>return</code></h3>
-          <p>early return from a method (reserved; slice-1 `main` bodies fall off the end)</p>
-          <pre><code class="lang-scala">return x   // reserved</code></pre>
+          <p>early return from a `def`, exiting before the body's last expression</p>
+          <pre><code class="lang-scala">def f(x: Int): Int = { if (x &lt; 0) return 0; x * 2 }
+println(f(-1))   // =&gt; 0</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-12">
-          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>true</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>try</code></h3>
+          <p>run a body with handlers: `try { .. } catch { case e: T =&gt; .. } finally { .. }`; its value is the body's, or the matching handler's</p>
+          <pre><code class="lang-scala">println(try { 1 / 0 } catch { case _: ArithmeticException =&gt; -1 })   // =&gt; -1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-13">
+          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>catch</code></h3>
+          <p>the handler block of a `try`; arms are `case e: Type [if guard] =&gt; ..` and match the JVM throwable hierarchy</p>
+          <pre><code class="lang-scala">try { "z".toInt } catch { case e: NumberFormatException =&gt; println(e.getMessage) }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-14">
+          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>finally</code></h3>
+          <p>a block that runs on both the normal and the exceptional exit of a `try`, before the exception continues unwinding</p>
+          <pre><code class="lang-scala">try { println(1) } finally { println("done") }   // =&gt; 1 done</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-15">
+          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>throw</code></h3>
+          <p>raise an exception; an expression (type `Nothing`), so it may appear in operand position</p>
+          <pre><code class="lang-scala">def pick(b: Boolean): Int = if (b) 7 else throw new RuntimeException("no")</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-16">
+          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>true</code></h3>
           <p>the Boolean true literal</p>
           <pre><code class="lang-scala">println(true &amp;&amp; false)   // =&gt; false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-13">
-          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>false</code></h3>
+        <article class="doc-entry" id="doc-keyword-17">
+          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>false</code></h3>
           <p>the Boolean false literal</p>
           <pre><code class="lang-scala">println(false || true)   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-14">
-          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>null</code></h3>
+        <article class="doc-entry" id="doc-keyword-18">
+          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>null</code></h3>
           <p>the null reference literal; prints as `null`</p>
           <pre><code class="lang-scala">val x = null
 println(x)   // =&gt; null</code></pre>
@@ -142,23 +164,28 @@ println(x)   // =&gt; null</code></pre>
           <pre><code class="lang-scala">for (i &lt;- 1 to 3) print(i)   // =&gt; 123</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-3">
-          <h3><a class="doc-anchor" href="#doc-contextual-3">#</a> <code>App</code></h3>
+          <h3><a class="doc-anchor" href="#doc-contextual-3">#</a> <code>by</code></h3>
+          <p>range step in a `for`: `a until b by s`; a negative step counts down, and a zero step throws `IllegalArgumentException`</p>
+          <pre><code class="lang-scala">for (i &lt;- 10 to 1 by -3) print(i + " ")   // =&gt; 10 7 4 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-4">
+          <h3><a class="doc-anchor" href="#doc-contextual-4">#</a> <code>App</code></h3>
           <p>the mixin whose object body scalars runs directly as the program</p>
           <pre><code class="lang-scala">object T extends App { println("hi") }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-4">
-          <h3><a class="doc-anchor" href="#doc-contextual-4">#</a> <code>main</code></h3>
+        <article class="doc-entry" id="doc-contextual-5">
+          <h3><a class="doc-anchor" href="#doc-contextual-5">#</a> <code>main</code></h3>
           <p>the entry method scalars runs: `def main(args: Array[String]): Unit`</p>
           <pre><code class="lang-scala">def main(args: Array[String]): Unit = { println(0) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-5">
-          <h3><a class="doc-anchor" href="#doc-contextual-5">#</a> <code>package</code></h3>
+        <article class="doc-entry" id="doc-contextual-6">
+          <h3><a class="doc-anchor" href="#doc-contextual-6">#</a> <code>package</code></h3>
           <p>a package prologue line; scalars skips it and runs the object entry</p>
           <pre><code class="lang-scala">package demo
 object T extends App { println(1) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-6">
-          <h3><a class="doc-anchor" href="#doc-contextual-6">#</a> <code>import</code></h3>
+        <article class="doc-entry" id="doc-contextual-7">
+          <h3><a class="doc-anchor" href="#doc-contextual-7">#</a> <code>import</code></h3>
           <p>an import prologue line; skipped in slice 1</p>
           <pre><code class="lang-scala">import scala.math._
 object T extends App { println(1) }</code></pre>

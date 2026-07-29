@@ -804,17 +804,21 @@ impl Parser {
                 }
             };
             let end = self.expression()?;
-            if matches!(self.peek(), Tok::Ident(w) if w == "by") {
-                return Err(format!(
-                    "scalars: `by` step in `for` ranges is not supported yet (line {})",
-                    self.line()
-                ));
-            }
+            // `by step` is an optional trailing clause on a range generator. It
+            // is lexed as a plain identifier (Scala spells it as an infix method
+            // on `Range`, not a keyword), so match it by spelling.
+            let step = if matches!(self.peek(), Tok::Ident(w) if w == "by") {
+                self.advance();
+                Some(self.expression()?)
+            } else {
+                None
+            };
             out.push(ForEnum::Gen {
                 name,
                 start,
                 end,
                 inclusive,
+                step,
             });
             // Trailing `if` guards bind to the generator just parsed.
             while self.is(&Tok::If) {
@@ -1098,6 +1102,17 @@ impl Parser {
             Tok::If => self.if_expr(),
             // `for (...) yield …` / `for (...) …` in expression position.
             Tok::For => self.for_comprehension(),
+            // `try`/`throw` are expressions in Scala (a `try` has a value; a
+            // `throw` has type `Nothing`), so they are primaries.
+            Tok::Try => self.try_expr(),
+            Tok::Throw => {
+                let line = self.line();
+                self.advance();
+                Ok(Expr::Throw {
+                    value: Box::new(self.expression()?),
+                    line,
+                })
+            }
             // An interpolated string `s"…"` / `f"…"` / `raw"…"` desugars to a
             // concatenation of its literal parts and (formatted) splices.
             Tok::InterpStr {
@@ -1272,6 +1287,72 @@ impl Parser {
             then: Box::new(then),
             els,
         })
+    }
+
+    /// `try body [catch { case … }] [finally body]` as a value-producing
+    /// expression.
+    ///
+    /// The body and finalizer are parsed as *statement lists* (not
+    /// [`branch_expr`](Self::branch_expr)) because a `try` block is usually
+    /// several statements; a brace-less one-expression form (`try f() catch …`)
+    /// is wrapped into a one-statement list so both shapes lower identically.
+    /// Scala requires at least one of `catch`/`finally`, and so does this.
+    fn try_expr(&mut self) -> Result<Expr, String> {
+        let line = self.line();
+        self.eat(&Tok::Try)?;
+        let body = self.braced_or_single()?;
+        // A line break may precede `catch`/`finally` (the lexer suppresses the
+        // separator, but tolerate an explicit one as `if_expr` does for `else`).
+        let save = self.pos;
+        self.skip_seps();
+        let catches = if self.is(&Tok::Catch) {
+            self.advance();
+            self.skip_seps();
+            self.catch_arms()?
+        } else {
+            self.pos = save;
+            Vec::new()
+        };
+        let save = self.pos;
+        self.skip_seps();
+        let finalizer = if self.is(&Tok::Finally) {
+            self.advance();
+            Some(self.braced_or_single()?)
+        } else {
+            self.pos = save;
+            None
+        };
+        if catches.is_empty() && finalizer.is_none() {
+            return Err(format!(
+                "scalars: `try` requires a `catch` or a `finally` (line {line})"
+            ));
+        }
+        Ok(Expr::Try {
+            body,
+            catches,
+            finalizer,
+        })
+    }
+
+    /// The `{ case … }` arms of a `catch`. Scala also allows a brace-less
+    /// single-expression handler function, which is not modeled; the `{ case … }`
+    /// form is what real code writes.
+    fn catch_arms(&mut self) -> Result<Vec<MatchArm>, String> {
+        self.eat(&Tok::LBrace)?;
+        self.skip_seps();
+        let mut arms = Vec::new();
+        while self.is(&Tok::Case) {
+            arms.push(self.match_arm()?);
+            self.skip_seps();
+        }
+        self.eat(&Tok::RBrace)?;
+        if arms.is_empty() {
+            return Err(format!(
+                "scalars: `catch` requires at least one `case` (line {})",
+                self.line()
+            ));
+        }
+        Ok(arms)
     }
 
     /// An `if`/`match`-branch expression: a `{ … }` block (parsed to an

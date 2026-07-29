@@ -118,18 +118,21 @@ pub enum StmtKind {
     Return(Option<Expr>),
 }
 
-/// One enumerator of a `for` comprehension: a range generator or an `if` guard.
-/// (Collection generators are not modeled — scalars has no `List`/`Vector`
-/// literal and no `map`/`flatMap` yet; only integer ranges are iterable.)
+/// One enumerator of a `for` comprehension: a range generator, a collection
+/// generator, or an `if` guard.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ForEnum {
-    /// `name <- start until|to end` — an integer range generator (step 1).
-    /// `inclusive` is `true` for `to`, `false` for `until`.
+    /// `name <- start until|to end [by step]` — an integer range generator.
+    /// `inclusive` is `true` for `to`, `false` for `until`. `step` is `None` for
+    /// the implicit step of 1; a `by` clause carries an arbitrary expression, so
+    /// the loop's direction (whether the bound test is `<`/`<=` or `>`/`>=`) can
+    /// only be decided at runtime unless the step is a literal.
     Gen {
         name: String,
         start: Expr,
         end: Expr,
         inclusive: bool,
+        step: Option<Expr>,
     },
     /// `name <- collExpr` — a collection generator (a `List`/`Map`/etc. source),
     /// desugared to `.map`/`.flatMap`/`.withFilter` (see [`crate::compiler`]).
@@ -234,6 +237,26 @@ pub enum Expr {
     Match {
         scrut: Box<Expr>,
         arms: Vec<MatchArm>,
+    },
+    /// `try { body } [catch { case … }] [finally { fin }]` in expression
+    /// position. Scala's `try` is value-producing (`val r = try f() catch { case
+    /// _ => 0 }`), so it lives here rather than in [`StmtKind`]; a `try` used as
+    /// a statement is a `StmtKind::Expr` wrapping this.
+    ///
+    /// `catches` reuses the [`MatchArm`] shape because a Scala catch block *is*
+    /// a pattern match on the thrown value — the same `case p if g => body`
+    /// grammar, matched against the exception instead of a scrutinee expression.
+    Try {
+        body: Vec<Stmt>,
+        catches: Vec<MatchArm>,
+        finalizer: Option<Vec<Stmt>>,
+    },
+    /// `throw e` — raise `e` as an exception. Scala types `throw` as `Nothing`,
+    /// which conforms to every type, so it is an expression and may appear in
+    /// operand position (`val x = if (bad) throw new Exception("…") else v`).
+    Throw {
+        value: Box<Expr>,
+        line: u32,
     },
     /// An `f"…"`-interpolator formatted splice: format `value` with the Java
     /// `Formatter` spec `spec` (`%d`, `%.2f`, `%-8s`, …). Produced only by the

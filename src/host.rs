@@ -104,10 +104,53 @@ pub const MAKE_TUPLE: u16 = 718;
 /// Builtin id for `::` cons. The stack holds the head value (deepest) and the
 /// tail `List` on top; `argc` is 2. Returns a new `List` with `head` prepended.
 pub const LIST_CONS: u16 = 719;
-/// Builtin id for materializing an integer range as a `List` (a range generator
-/// inside a desugared collection for-comprehension). The stack holds `start`,
-/// `end`, and an `inclusive` `Bool` (top); `argc` is 3. Step is 1.
+/// Builtin id for materializing an integer range as a `Vector` (a range
+/// generator inside a desugared collection for-comprehension). The stack holds
+/// `start`, `end`, an `inclusive` `Bool`, and the `by` step (top); `argc` is 4.
 pub const RANGE_LIST: u16 = 720;
+
+// ── exception builtins (`try`/`catch`/`finally`/`throw`) ────────────────────
+//
+// See the `Exception unwinding` section below for the protocol these implement.
+
+/// Builtin id for constructing a built-in throwable (`new RuntimeException(m)`).
+/// The stack holds the fully-qualified class name (deepest) and the message
+/// (top; `Undef` for the no-arg constructor); `argc` is 2.
+pub const EXC_NEW: u16 = 721;
+/// Builtin id for `throw e`. Pops the thrown value and makes it the in-flight
+/// exception; halts the run when no `try` is dynamically active.
+pub const EXC_THROW: u16 = 722;
+/// Builtin id for the unwind check the compiler emits after each statement:
+/// takes no arguments and returns a `Bool` — `true` while an exception is in
+/// flight.
+pub const EXC_PENDING: u16 = 723;
+/// Builtin id for a `catch` clause type test. Pops the caught type's simple name
+/// and returns a `Bool` for whether the in-flight exception is an instance of
+/// it (walking the JVM throwable hierarchy); `argc` is 1. Does not consume the
+/// exception — the arm binds it with [`EXC_TAKE`] only after matching.
+pub const EXC_MATCH: u16 = 724;
+/// Builtin id for consuming the in-flight exception once a `catch` arm matched:
+/// returns it and clears the in-flight slot, so the handler body runs normally.
+pub const EXC_TAKE: u16 = 725;
+/// Builtin id for entering a `try` region (increments the dynamic try depth, so
+/// [`fault`] raises instead of halting).
+pub const EXC_ENTER: u16 = 726;
+/// Builtin id for leaving a `try` region (decrements the dynamic try depth).
+pub const EXC_EXIT: u16 = 727;
+/// Builtin id for parking the in-flight exception across a `finally` body, so
+/// the finalizer's own statements are not immediately unwound.
+pub const EXC_STASH: u16 = 728;
+/// Builtin id for restoring the exception parked by [`EXC_STASH`]. An exception
+/// raised *by* the finalizer wins over the parked one, matching Scala/the JVM.
+pub const EXC_UNSTASH: u16 = 729;
+/// Builtin id for turning an uncaught in-flight exception into the terminal
+/// error that stops the run (the top-level arm of the unwind check).
+pub const EXC_ABORT: u16 = 730;
+/// Builtin id for putting an exception back in flight after a `catch` arm's
+/// guard rejected it, so the remaining arms (and the enclosing `try`) still see
+/// it. Unlike [`EXC_THROW`] this never halts — the value came from an arm that
+/// had already caught it.
+pub const EXC_RESTORE: u16 = 731;
 
 thread_local! {
     /// Set by a runtime fault raised inside a builtin (an FFI compile/dispatch
@@ -121,8 +164,22 @@ pub fn take_error() -> Option<String> {
     FFI_ERROR.with(|e| e.borrow_mut().take())
 }
 
+/// Stop the run with `msg`, or — when a `try` is dynamically active and `msg`
+/// names a JVM/Scala throwable — raise it as a catchable exception instead.
+///
+/// Every runtime error this host can raise flows through here, so routing the
+/// throwable ones into [`raise`] is what makes `1 / 0` and `"x".toInt`
+/// catchable without touching each call site. A *frontend-internal* fault (one
+/// whose message is not a `java.…`/`scala.…` throwable) always halts: it is a
+/// scalars bug, not a Scala exception, and swallowing it in a `catch` would hide
+/// it.
 fn fault(vm: &mut VM, msg: impl Into<String>) -> Value {
-    FFI_ERROR.with(|e| *e.borrow_mut() = Some(msg.into()));
+    let msg = msg.into();
+    let bare = msg.strip_prefix("scalars: ").unwrap_or(&msg);
+    if let Some(exc) = throwable_from_message(bare) {
+        return raise(vm, exc);
+    }
+    FFI_ERROR.with(|e| *e.borrow_mut() = Some(msg));
     vm.request_halt();
     Value::Undef
 }
@@ -152,6 +209,345 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_TUPLE, b_make_tuple);
     vm.register_builtin(LIST_CONS, b_list_cons);
     vm.register_builtin(RANGE_LIST, b_range_list);
+    vm.register_builtin(EXC_NEW, b_exc_new);
+    vm.register_builtin(EXC_THROW, b_exc_throw);
+    vm.register_builtin(EXC_PENDING, b_exc_pending);
+    vm.register_builtin(EXC_MATCH, b_exc_match);
+    vm.register_builtin(EXC_TAKE, b_exc_take);
+    vm.register_builtin(EXC_ENTER, b_exc_enter);
+    vm.register_builtin(EXC_EXIT, b_exc_exit);
+    vm.register_builtin(EXC_STASH, b_exc_stash);
+    vm.register_builtin(EXC_UNSTASH, b_exc_unstash);
+    vm.register_builtin(EXC_ABORT, b_exc_abort);
+    vm.register_builtin(EXC_RESTORE, b_exc_restore);
+}
+
+// ── Exception unwinding ─────────────────────────────────────────────────────
+//
+// fusevm has no unwind opcode and scalars lowers `def`s to fusevm's *native*
+// `Op::Call` frames, so a thrown exception cannot longjmp out of a frame the way
+// a sub-chunk-interpreting frontend can. `try` is therefore implemented as a
+// cooperative two-part protocol:
+//
+//   * **Runtime half (here).** A raise parks the exception in [`PENDING`]
+//     instead of halting, provided a `try` is dynamically active ([`TRY_DEPTH`]
+//     > 0). Every builtin with an observable side effect (printing, dispatch,
+//     division) short-circuits while [`unwinding`] holds, so no output escapes
+//     between the raise and its handler.
+//   * **Compile-time half (`crate::compiler`).** When the program contains a
+//     `try` at all, the compiler emits an `EXC_PENDING` test after every
+//     statement; the innermost enclosing construct decides where a `true`
+//     answer jumps — out of a loop, out of a `def` frame, into a `catch`
+//     dispatch, or into the terminal abort at top level.
+//
+// The consequence is that unwinding is *statement-granular*: a raise mid-way
+// through one statement finishes evaluating that statement's remaining operands
+// (on garbage values, with side-effecting builtins suppressed) before control
+// reaches the handler. A program with no `try` pays nothing — the checks are not
+// emitted and a fault halts exactly as it did before.
+
+thread_local! {
+    /// The exception currently unwinding, if any.
+    static PENDING: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// How many `try` regions are dynamically active. Zero means a raise is
+    /// uncatchable and halts the run immediately.
+    static TRY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Exceptions parked across `finally` bodies (one entry per nested `finally`
+    /// currently running).
+    static STASH: RefCell<Vec<Option<Value>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Clear all exception state. Called by the runner before each program run so
+/// one run's in-flight exception cannot leak into the next (the library
+/// `run_str` path reuses the thread).
+pub fn reset_exceptions() {
+    PENDING.with(|p| *p.borrow_mut() = None);
+    TRY_DEPTH.with(|d| d.set(0));
+    STASH.with(|s| s.borrow_mut().clear());
+}
+
+/// True while an exception is in flight and has not yet reached its handler.
+/// Side-effecting builtins check this and become no-ops so nothing is printed
+/// (and nothing further faults) during the walk out to the `catch`.
+fn unwinding() -> bool {
+    PENDING.with(|p| p.borrow().is_some())
+}
+
+/// Make `exc` the in-flight exception. Inside a `try` this parks it for the
+/// compiler-emitted unwind checks; outside one it is uncatchable and halts the
+/// run with the JVM-style `class: message` text.
+///
+/// An exception raised *while already unwinding* is dropped: the first one wins,
+/// matching the JVM (a second throw during unwinding cannot occur, since the
+/// suppressed builtins never run).
+fn raise(vm: &mut VM, exc: Value) -> Value {
+    if unwinding() {
+        return Value::Undef;
+    }
+    if TRY_DEPTH.with(|d| d.get()) > 0 {
+        PENDING.with(|p| *p.borrow_mut() = Some(exc));
+        return Value::Undef;
+    }
+    FFI_ERROR.with(|e| *e.borrow_mut() = Some(scala_str(&exc)));
+    vm.request_halt();
+    Value::Undef
+}
+
+/// Parse a `java.lang.Xxx: message` fault string into a throwable object, or
+/// `None` when the message is a frontend-internal error rather than a Scala
+/// exception.
+///
+/// The recognizer is deliberately narrow — a fully-qualified `java.`/`scala.`
+/// name whose last segment ends in `Exception` or `Error` — so a scalars bug
+/// ("`::` right operand is not a List") can never be silently swallowed by a
+/// user's `catch`.
+fn throwable_from_message(s: &str) -> Option<Value> {
+    let (fqn, msg) = match s.split_once(": ") {
+        Some((f, m)) => (f, Some(m)),
+        None => (s, None),
+    };
+    let last = fqn.rsplit('.').next()?;
+    let qualified = fqn.starts_with("java.") || fqn.starts_with("scala.");
+    if !qualified || !(last.ends_with("Exception") || last.ends_with("Error")) {
+        return None;
+    }
+    Some(new_throwable(fqn, msg))
+}
+
+/// Allocate a built-in throwable with the fully-qualified class name `fqn`.
+fn new_throwable(fqn: &str, msg: Option<&str>) -> Value {
+    heap_push(HeapVal::Exc(ExcObj {
+        class: Arc::from(fqn),
+        msg: msg.map(Arc::from),
+    }))
+}
+
+/// The simple names of the built-in throwables scalars can construct or raise,
+/// each mapped to its fully-qualified JVM name. `new X(…)` for a name in this
+/// table lowers to [`EXC_NEW`] instead of a user-class constructor.
+///
+/// This is a table rather than a `java.lang.` prefix rule because the package
+/// differs per class (`java.util.NoSuchElementException`, `scala.MatchError`)
+/// and the package is observable through `toString`.
+pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
+    ("Throwable", "java.lang.Throwable"),
+    ("Exception", "java.lang.Exception"),
+    ("Error", "java.lang.Error"),
+    ("RuntimeException", "java.lang.RuntimeException"),
+    ("ArithmeticException", "java.lang.ArithmeticException"),
+    (
+        "IllegalArgumentException",
+        "java.lang.IllegalArgumentException",
+    ),
+    ("IllegalStateException", "java.lang.IllegalStateException"),
+    ("NumberFormatException", "java.lang.NumberFormatException"),
+    (
+        "IndexOutOfBoundsException",
+        "java.lang.IndexOutOfBoundsException",
+    ),
+    (
+        "StringIndexOutOfBoundsException",
+        "java.lang.StringIndexOutOfBoundsException",
+    ),
+    (
+        "ArrayIndexOutOfBoundsException",
+        "java.lang.ArrayIndexOutOfBoundsException",
+    ),
+    ("NullPointerException", "java.lang.NullPointerException"),
+    ("ClassCastException", "java.lang.ClassCastException"),
+    (
+        "UnsupportedOperationException",
+        "java.lang.UnsupportedOperationException",
+    ),
+    ("NoSuchElementException", "java.util.NoSuchElementException"),
+    ("MatchError", "scala.MatchError"),
+];
+
+/// The JVM throwable hierarchy scalars models, as `(class, superclass)` simple
+/// names. `catch { case e: T }` matches when the thrown class is `T` or reaches
+/// `T` by walking this chain — that is what makes `case e: Exception` catch an
+/// `IllegalArgumentException`.
+const THROWABLE_PARENTS: &[(&str, &str)] = &[
+    ("Error", "Throwable"),
+    ("Exception", "Throwable"),
+    ("RuntimeException", "Exception"),
+    ("InterruptedException", "Exception"),
+    ("ArithmeticException", "RuntimeException"),
+    ("IllegalArgumentException", "RuntimeException"),
+    ("IllegalStateException", "RuntimeException"),
+    ("NumberFormatException", "IllegalArgumentException"),
+    ("IndexOutOfBoundsException", "RuntimeException"),
+    (
+        "StringIndexOutOfBoundsException",
+        "IndexOutOfBoundsException",
+    ),
+    (
+        "ArrayIndexOutOfBoundsException",
+        "IndexOutOfBoundsException",
+    ),
+    ("NullPointerException", "RuntimeException"),
+    ("ClassCastException", "RuntimeException"),
+    ("UnsupportedOperationException", "RuntimeException"),
+    ("NoSuchElementException", "RuntimeException"),
+    ("MatchError", "RuntimeException"),
+];
+
+/// The fully-qualified name of a built-in throwable's simple name.
+pub fn throwable_fqn(simple: &str) -> Option<&'static str> {
+    BUILTIN_THROWABLES
+        .iter()
+        .find(|(s, _)| *s == simple)
+        .map(|(_, f)| *f)
+}
+
+/// Whether a thrown class (simple name) is an instance of the caught type
+/// `want`, by walking [`THROWABLE_PARENTS`]. The chain is short and fixed, so a
+/// linear walk beats any index.
+fn throwable_is_a(thrown: &str, want: &str) -> bool {
+    let mut cur = thrown;
+    loop {
+        if cur == want {
+            return true;
+        }
+        match THROWABLE_PARENTS.iter().find(|(c, _)| *c == cur) {
+            Some((_, parent)) => cur = parent,
+            None => return false,
+        }
+    }
+}
+
+/// A built-in throwable instance behind a [`HeapVal::Exc`]. Kept separate from
+/// [`ScalaObj`] because a throwable has no ordered field record and renders as
+/// `fqn` / `fqn: message`, not `Class@hex`.
+#[derive(Clone)]
+struct ExcObj {
+    /// The fully-qualified class name (`java.lang.RuntimeException`).
+    class: Arc<str>,
+    /// The constructor message, or `None` for the no-arg constructor (whose
+    /// `getMessage` is Scala `null`).
+    msg: Option<Arc<str>>,
+}
+
+/// Clone the throwable behind `v`, if it is one.
+fn as_exc(v: &Value) -> Option<ExcObj> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Exc(e)) => Some(e.clone()),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// A throwable's `toString`: `fqn` alone when the message is `null`, else
+/// `fqn: message` (`java.lang.Throwable.toString`).
+fn exc_to_string(e: &ExcObj) -> String {
+    match &e.msg {
+        Some(m) => format!("{}: {m}", e.class),
+        None => e.class.to_string(),
+    }
+}
+
+/// The runtime class name used for `catch` matching: a built-in throwable's
+/// simple name, or a user class's own name (a user object thrown directly).
+fn thrown_class(v: &Value) -> Option<String> {
+    if let Some(e) = as_exc(v) {
+        return Some(e.class.rsplit('.').next().unwrap_or(&e.class).to_string());
+    }
+    with_obj(v, |o| o.class.to_string())
+}
+
+/// `EXC_NEW` builtin — see [`EXC_NEW`].
+fn b_exc_new(vm: &mut VM, _argc: u8) -> Value {
+    let msg = vm.pop();
+    let class = vm.pop().as_str_cow().into_owned();
+    let msg = match msg {
+        Value::Undef => None,
+        other => Some(scala_str(&other)),
+    };
+    new_throwable(&class, msg.as_deref())
+}
+
+/// `EXC_THROW` builtin — see [`EXC_THROW`].
+fn b_exc_throw(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    raise(vm, v)
+}
+
+/// `EXC_PENDING` builtin — see [`EXC_PENDING`].
+fn b_exc_pending(_vm: &mut VM, _argc: u8) -> Value {
+    Value::Bool(unwinding())
+}
+
+/// `EXC_MATCH` builtin — see [`EXC_MATCH`].
+fn b_exc_match(vm: &mut VM, _argc: u8) -> Value {
+    let want = vm.pop().as_str_cow().into_owned();
+    let thrown = PENDING.with(|p| p.borrow().as_ref().and_then(thrown_class));
+    Value::Bool(match thrown {
+        // `case e: Throwable` (and a bare `case e`, which the compiler lowers to
+        // the same test) catches everything, including a thrown user object that
+        // is outside the modeled hierarchy.
+        Some(_) if want == "Throwable" => true,
+        Some(c) => throwable_is_a(&c, &want),
+        None => false,
+    })
+}
+
+/// `EXC_RESTORE` builtin — see [`EXC_RESTORE`].
+fn b_exc_restore(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    PENDING.with(|p| *p.borrow_mut() = Some(v));
+    Value::Undef
+}
+
+/// `EXC_TAKE` builtin — see [`EXC_TAKE`].
+fn b_exc_take(_vm: &mut VM, _argc: u8) -> Value {
+    PENDING
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or(Value::Undef)
+}
+
+/// `EXC_ENTER` builtin — see [`EXC_ENTER`].
+fn b_exc_enter(_vm: &mut VM, _argc: u8) -> Value {
+    TRY_DEPTH.with(|d| d.set(d.get() + 1));
+    Value::Undef
+}
+
+/// `EXC_EXIT` builtin — see [`EXC_EXIT`].
+fn b_exc_exit(_vm: &mut VM, _argc: u8) -> Value {
+    TRY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    Value::Undef
+}
+
+/// `EXC_STASH` builtin — see [`EXC_STASH`].
+fn b_exc_stash(_vm: &mut VM, _argc: u8) -> Value {
+    let parked = PENDING.with(|p| p.borrow_mut().take());
+    STASH.with(|s| s.borrow_mut().push(parked));
+    Value::Undef
+}
+
+/// `EXC_UNSTASH` builtin — see [`EXC_UNSTASH`].
+fn b_exc_unstash(_vm: &mut VM, _argc: u8) -> Value {
+    let parked = STASH.with(|s| s.borrow_mut().pop()).flatten();
+    // A `finally` body that threw leaves its own exception in flight; the JVM
+    // discards the original in that case, so only restore when nothing is set.
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.is_none() {
+            *p = parked;
+        }
+    });
+    Value::Undef
+}
+
+/// `EXC_ABORT` builtin — see [`EXC_ABORT`].
+fn b_exc_abort(vm: &mut VM, _argc: u8) -> Value {
+    if let Some(exc) = PENDING.with(|p| p.borrow_mut().take()) {
+        FFI_ERROR.with(|e| *e.borrow_mut() = Some(scala_str(&exc)));
+    }
+    vm.request_halt();
+    Value::Undef
 }
 
 // ── Host-side object heap ───────────────────────────────────────────────────
@@ -182,6 +578,9 @@ enum HeapVal {
     Tuple(Vec<Value>),
     /// A first-class function value (lambda) — see [`Closure`].
     Closure(Closure),
+    /// A built-in throwable (`new RuntimeException("…")`, or one raised by the
+    /// runtime itself) — see [`ExcObj`].
+    Exc(ExcObj),
 }
 
 /// The rendered prefix of a [`HeapVal::Seq`].
@@ -406,6 +805,11 @@ fn b_obj_set(vm: &mut VM, _argc: u8) -> Value {
     let val = vm.pop();
     let name = vm.pop().as_str_cow().into_owned();
     let recv = vm.pop();
+    // Suppressed while unwinding, so a raise mid-assignment cannot commit
+    // garbage to a live field that a handler would then read.
+    if unwinding() {
+        return Value::Undef;
+    }
     if let Value::Obj(id) = recv {
         HEAP.with(|h| {
             if let Some(HeapVal::Record(o)) = h.borrow_mut().get_mut(id as usize) {
@@ -492,14 +896,39 @@ fn b_list_cons(vm: &mut VM, _argc: u8) -> Value {
     heap_push(HeapVal::Seq(SeqKind::List, items))
 }
 
-/// `RANGE_LIST` builtin — materialize `[start .. end]` (inclusive when the top
-/// `Bool` is `true`) as a step-1 `List`.
+/// `RANGE_LIST` builtin — materialize `start until|to end by step` as a
+/// `Vector`. The stack holds `start`, `end`, the `inclusive` `Bool`, then the
+/// step (on top; `1` when the source had no `by` clause).
+///
+/// The walk is written as an explicit `while` rather than a Rust `step_by`
+/// because Scala's step may be negative, which `Iterator::step_by` cannot
+/// express. A zero step is a Scala `IllegalArgumentException`, raised here so
+/// the materializing path (a range feeding a collection generator) reports it
+/// identically to the counted-loop path's compile-time guard.
 fn b_range_list(vm: &mut VM, _argc: u8) -> Value {
+    let step = vm.pop().to_int();
     let inclusive = matches!(vm.pop(), Value::Bool(true));
     let end = vm.pop().to_int();
     let start = vm.pop().to_int();
-    let last = if inclusive { end } else { end - 1 };
-    let items = (start..=last).map(Value::int).collect();
+    if step == 0 {
+        return fault(vm, "java.lang.IllegalArgumentException: step cannot be 0.");
+    }
+    let mut items = Vec::new();
+    let mut i = start;
+    while if step > 0 {
+        if inclusive {
+            i <= end
+        } else {
+            i < end
+        }
+    } else if inclusive {
+        i >= end
+    } else {
+        i > end
+    } {
+        items.push(Value::int(i));
+        i += step;
+    }
     // A `Range`'s `map`/`flatMap` yields an `IndexedSeq` (`Vector`); model the
     // materialized range as a `Vector` so a range-led comprehension renders as
     // Scala's `Vector(...)`, not `List(...)`.
@@ -538,6 +967,11 @@ fn b_apply(vm: &mut VM, argc: u8) -> Value {
     }
     args.reverse();
     let recv = vm.pop();
+    // Suppressed while unwinding: `recv` is garbage, so calling it would fault
+    // again and displace the in-flight exception.
+    if unwinding() {
+        return Value::Undef;
+    }
     match apply_value(vm, &recv, &args) {
         Ok(v) => v,
         Err(e) => fault(vm, e),
@@ -580,12 +1014,13 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
 }
 
 /// Read element `i` of a list/tuple, or an out-of-bounds error.
+///
+/// The message is the bare index, matching `scala.collection.LinearSeqOps.apply`
+/// — verified against the reference toolchain, and observable now that
+/// `catch { case e => e.getMessage }` can read it.
 fn list_index(items: &[Value], i: i64) -> Result<Value, String> {
     if i < 0 || i as usize >= items.len() {
-        Err(format!(
-            "scalars: java.lang.IndexOutOfBoundsException: {i} (length {})",
-            items.len()
-        ))
+        Err(format!("scalars: java.lang.IndexOutOfBoundsException: {i}"))
     } else {
         Ok(items[i as usize].clone())
     }
@@ -716,6 +1151,7 @@ fn obj_to_string(v: &Value) -> String {
                 format!("({inner})")
             }
             Some(HeapVal::Closure(c)) => format!("<function{}>", c.params),
+            Some(HeapVal::Exc(e)) => exc_to_string(e),
             None => "null".to_string(),
         }
     })
@@ -847,6 +1283,12 @@ fn b_istype(vm: &mut VM, _argc: u8) -> Value {
 /// with the boxed class name Scala reports (`java.lang.Integer`, …).
 fn b_matcherr(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
+    // A `match` whose scrutinee is the garbage left by a raise falls through
+    // every arm; that is not a real `MatchError`, so stay quiet and let the
+    // in-flight exception reach its handler.
+    if unwinding() {
+        return Value::Undef;
+    }
     let class = match &v {
         Value::Int(_) => "java.lang.Integer",
         Value::Float(_) => "java.lang.Double",
@@ -1053,6 +1495,30 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
         _ => recv,
     };
 
+    // Suppressed while unwinding: the receiver and arguments are garbage left by
+    // the raise, and dispatching them would fault a second time (see the
+    // `Exception unwinding` section). Args are already popped, so the stack
+    // stays balanced.
+    if unwinding() {
+        return Value::Undef;
+    }
+
+    // `java.lang.Throwable`'s observable surface. Handled before the collection
+    // and pure dispatchers because a throwable is neither.
+    if let Some(e) = as_exc(&recv) {
+        return match name.as_str() {
+            "getMessage" | "getLocalizedMessage" => match &e.msg {
+                Some(m) => Value::str(m.to_string()),
+                None => Value::Undef,
+            },
+            "toString" => Value::str(exc_to_string(&e)),
+            _ => fault(
+                vm,
+                format!("scalars: value {name} is not a member of {}", e.class),
+            ),
+        };
+    }
+
     // A heap collection/tuple/closure may need to run a closure body mid-method
     // (`map`, `filter`, `foldLeft`, …), so those dispatch through the vm-aware
     // path; everything else stays on the pure dispatcher.
@@ -1092,6 +1558,7 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 HeapVal::Tuple(_) => 2,
                 HeapVal::Closure(_) => 3,
                 HeapVal::Record(_) => 4,
+                HeapVal::Exc(_) => 5,
             })
         })
     } else {
@@ -1395,8 +1862,9 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             let i = args[0].to_int();
             let chars: Vec<char> = s.chars().collect();
             if i < 0 || i as usize >= chars.len() {
+                // `java.lang.String.charAt`'s exact JDK message.
                 Err(format!(
-                    "scalars: java.lang.StringIndexOutOfBoundsException: index {i}, length {}",
+                    "scalars: java.lang.StringIndexOutOfBoundsException: Index {i} out of bounds for length {}",
                     chars.len()
                 ))
             } else {
@@ -1426,8 +1894,9 @@ fn substring(s: &str, begin: i64, end: i64) -> Result<Value, String> {
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i64;
     if begin < 0 || end > len || begin > end {
+        // `java.lang.String.substring`'s exact JDK message (a half-open range).
         return Err(format!(
-            "scalars: java.lang.StringIndexOutOfBoundsException: begin {begin}, end {end}, length {len}"
+            "scalars: java.lang.StringIndexOutOfBoundsException: Range [{begin}, {end}) out of bounds for length {len}"
         ));
     }
     Ok(Value::str(
@@ -1531,6 +2000,11 @@ fn b_ffi_call(vm: &mut VM, argc: u8) -> Value {
 fn b_div(vm: &mut VM, _argc: u8) -> Value {
     let b = vm.stack.pop().unwrap_or(Value::Undef);
     let a = vm.stack.pop().unwrap_or(Value::Undef);
+    // Suppressed while unwinding, so a `0` left by a raise cannot masquerade as
+    // a second division-by-zero and displace the real exception.
+    if unwinding() {
+        return Value::Undef;
+    }
     match (&a, &b) {
         (Value::Int(x), Value::Int(y)) => {
             if *y == 0 {
@@ -1563,6 +2037,12 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool) -> Value {
         vals.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     vals.reverse();
+    // Suppressed while unwinding: a `println` between a raise and its `catch`
+    // must not reach the terminal, and its argument is garbage anyway. The pops
+    // above already ran, so the stack is balanced (see `Exception unwinding`).
+    if unwinding() {
+        return Value::Undef;
+    }
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     for v in &vals {
@@ -1657,6 +2137,12 @@ fn format_double(f: f64) -> String {
 /// value comparisons against strings; all-numeric arithmetic never reaches here
 /// (it stays on the native fast path and the JIT).
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    // Suppressed while unwinding: an operand is the `Undef` a raise left behind,
+    // and Scala 3's strict `+`/comparison rules would reject it as a type error,
+    // displacing the real exception (see `Exception unwinding`).
+    if unwinding() {
+        return Ok(Value::Undef);
+    }
     match op {
         // Scala 3 `+` on a mixed operand. Unlike Scala 2, there is NO universal
         // `any2stringadd`, so `+` is defined only two ways when a non-numeric

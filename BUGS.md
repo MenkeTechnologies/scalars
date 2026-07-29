@@ -49,12 +49,21 @@ never silently mis-run.
   ignored.
 - **The wider standard library.** `math`, `scala.io`, `scala.collection.*`, and
   the many `String`/numeric methods beyond the wired subset above.
-- **`if`/`else` as an expression in operand position.** `val r = if (c) a else b`
-  is rejected; a tail `if`/`else` as a whole `def` body is supported.
-- **`by` step in ranges** — `for (i <- a until|to b)` runs with step 1 only.
-- **`do/while`, `try`/`catch`/`finally`, `throw` (user-raised).**
+- **`Range` as a first-class value.** `a to b` / `a until b by s` exists only as
+  a `for` generator; `(1 to 10 by 3).mkString("-")` is not modeled.
+- **Block-local `def` scoping.** Every `def` is hoisted into one flat table keyed
+  by name, so two `def`s of the same name in different blocks collide (the first
+  one wins) instead of shadowing. Distinct names work; this is why the parity
+  fuzzer suffixes the `def` names it generates.
+- **`case NonFatal(e)` and other extractor patterns in `catch`.** Only
+  `case e: Type`, `case _: Type`, `case e` and `case _` arms are modeled.
+- **User exception classes inside the hierarchy.** `class MyErr(m: String)
+  extends Exception` can be thrown and caught *by its own name*, but `extends` is
+  not modeled, so `case e: Exception` will not catch it.
 - **By-name params, `given`/`using`, generics, `@main` (Scala 3 annotation
   entry).**
+- **`do/while` is not a gap.** Scala 3 removed it from the language and the
+  reference compiler rejects it, so scalars does not implement it either.
 
 ## Modeled with a documented simplification
 
@@ -74,9 +83,12 @@ never silently mis-run.
   case (`7 / 2 == 3`, `7 / 2.0 == 3.5`), and floating `/0.0` yields `Infinity` as
   Scala does.
 - **Integer division by zero throws** `java.lang.ArithmeticException: / by zero`,
-  matching Scala/the JVM `idiv` trap. Since there is no `try`/`catch` yet, the
-  uncaught throw aborts the program with that message on stderr. Floating `/0.0`
-  is `Infinity` (not an exception), also matching Scala.
+  matching Scala/the JVM `idiv` trap. It is catchable (see the exception section
+  above); an *uncaught* one aborts the program with
+  `scalars: java.lang.ArithmeticException: / by zero` on stderr and exit status
+  1, where `scala` prints a JVM stack trace — the message is faithful, the trace
+  is not modeled. Floating `/0.0` is `Infinity` (not an exception), also matching
+  Scala.
 - **Uninitialized bindings are unbound** rather than rejected; reading one before
   assignment yields `null` instead of a compile error.
 - **`object … extends App` runs the object body directly.** Statements run in
@@ -98,3 +110,40 @@ construction site bakes the class name + ordered field names into the bytecode,
 so no runtime class registry is needed; instance-method calls resolve by a
 runtime class-tag dispatch chain the compiler emits from compile-time class
 knowledge.
+
+## Exception unwinding: how it works, and what it costs
+
+fusevm has no unwind opcode, and scalars lowers `def`s to fusevm's **native**
+`Op::Call` frames — so a raise cannot longjmp out of a frame the way a
+sub-chunk-interpreting frontend can. `try` is instead a cooperative protocol
+split across the host and the compiler:
+
+* **Runtime half (`src/host.rs`).** A raise parks the exception in a
+  thread-local `PENDING` slot instead of halting, provided a `try` is
+  dynamically active (`TRY_DEPTH > 0`). Every builtin with an observable side
+  effect — `println`/`print`, `/`, method dispatch, closure application, the
+  `MatchError` fall-through, the numeric hook — short-circuits while an
+  exception is in flight, so nothing is printed and nothing faults a second time
+  between the raise and its handler.
+* **Compile-time half (`src/compiler.rs`).** When the program contains a `try`
+  anywhere, an `EXC_PENDING` test is emitted after every statement. The
+  innermost enclosing construct decides where a `true` answer jumps: out of a
+  loop, out of a `def` frame (`ReturnValue Unit`), into a `catch` dispatch, or —
+  at top level — into the terminal abort. Binding stores (`val`/`var` init,
+  assignment, and object-`val` update) get their check *before* the store and
+  drop the computed value, so a raise part-way through an initializer never
+  commits garbage to a binding a handler could read.
+
+Two consequences worth stating plainly:
+
+- **Unwinding is statement-granular.** A raise part-way through one statement
+  finishes evaluating that statement's remaining operands before control reaches
+  the handler. Those evaluations run on garbage values with the side-effecting
+  builtins suppressed, so they are unobservable in the cases the test suite and
+  the `exc` fuzzer mode cover — but it is a real approximation, not exact JVM
+  semantics.
+- **A program with no `try` pays nothing.** The checks are not emitted at all,
+  and a fault halts the run exactly as it did before exceptions existed.
+
+`case NonFatal(e)`, exception chaining (`getCause`, `initCause`,
+`addSuppressed`), stack traces, and `Try`/`Success`/`Failure` are not modeled.

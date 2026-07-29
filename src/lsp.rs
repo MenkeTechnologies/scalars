@@ -94,14 +94,38 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "new",
         "Keyword",
-        "instance-construction keyword (reserved; instantiation lands in a later slice)",
-        "new T()   // reserved",
+        "construct an instance: a user `class`/`case class`, or a built-in throwable",
+        "class P(val n: Int)\nprintln(new P(2).n)   // => 2",
     ),
     (
         "return",
         "Keyword",
-        "early return from a method (reserved; slice-1 `main` bodies fall off the end)",
-        "return x   // reserved",
+        "early return from a `def`, exiting before the body's last expression",
+        "def f(x: Int): Int = { if (x < 0) return 0; x * 2 }\nprintln(f(-1))   // => 0",
+    ),
+    (
+        "try",
+        "Keyword",
+        "run a body with handlers: `try { .. } catch { case e: T => .. } finally { .. }`; its value is the body's, or the matching handler's",
+        "println(try { 1 / 0 } catch { case _: ArithmeticException => -1 })   // => -1",
+    ),
+    (
+        "catch",
+        "Keyword",
+        "the handler block of a `try`; arms are `case e: Type [if guard] => ..` and match the JVM throwable hierarchy",
+        "try { \"z\".toInt } catch { case e: NumberFormatException => println(e.getMessage) }",
+    ),
+    (
+        "finally",
+        "Keyword",
+        "a block that runs on both the normal and the exceptional exit of a `try`, before the exception continues unwinding",
+        "try { println(1) } finally { println(\"done\") }   // => 1 done",
+    ),
+    (
+        "throw",
+        "Keyword",
+        "raise an exception; an expression (type `Nothing`), so it may appear in operand position",
+        "def pick(b: Boolean): Int = if (b) 7 else throw new RuntimeException(\"no\")",
     ),
     (
         "true",
@@ -133,6 +157,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "Contextual",
         "inclusive range bound in a `for`: `a to b` iterates a..b",
         "for (i <- 1 to 3) print(i)   // => 123",
+    ),
+    (
+        "by",
+        "Contextual",
+        "range step in a `for`: `a until b by s`; a negative step counts down, and a zero step throws `IllegalArgumentException`",
+        "for (i <- 10 to 1 by -3) print(i + \" \")   // => 10 7 4 1",
     ),
     (
         "App",
