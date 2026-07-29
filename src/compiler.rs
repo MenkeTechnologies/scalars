@@ -66,9 +66,12 @@ struct Compiler {
     /// Singleton `object` metadata (`name → members`), for static member
     /// dispatch (`Registry.greet(x)` / `Registry.name`).
     objects: HashMap<String, ObjMeta>,
-    /// Method name → the classes that define a `def` of that name, for the
-    /// runtime instance-method dispatch chain (`recv.m(...)`).
-    method_index: HashMap<String, Vec<String>>,
+    /// Method name → `(runtime class tag, defining type)` pairs, for the runtime
+    /// instance-method dispatch chain (`recv.m(...)`). The tag is the concrete
+    /// class of the receiver; the defining type owns the `Owner$method`
+    /// subroutine the call lands in, which differs whenever the method is
+    /// inherited.
+    method_index: HashMap<String, Vec<(String, String)>>,
     /// `Some((name, fields))` while compiling a class method: the enclosing
     /// class's name and field-name set, so a bare identifier naming a field
     /// resolves to `this.field` and a bare sibling-method call to `this.m(...)`.
@@ -136,23 +139,64 @@ struct PendingClosure {
 
 /// Compile-time class shape.
 struct ClassMeta {
-    /// Instance fields in declared order (constructor params then body fields).
+    /// Instance fields in record order: this class's own constructor parameters
+    /// first (so a `case class`'s derived members read the right prefix), then
+    /// the fields inherited from its linearized supertypes, then its own body
+    /// `val`/`var`s. Names appearing twice collapse to one field.
     field_names: Vec<String>,
-    /// Primary-constructor arity (the `new`/`apply` argument count — the leading
-    /// prefix of `field_names`).
+    /// Primary-constructor arity (the `new`/`apply`/`unapply` argument count —
+    /// the leading prefix of `field_names`).
     arity: usize,
     /// `case class` → structural semantics + companion `apply`/`unapply`/`copy`.
     is_case: bool,
+    /// `trait` → no constructor is emitted and it cannot be instantiated.
+    is_trait: bool,
+    /// The linearization *excluding* this type: supertypes nearest first.
+    supers: Vec<String>,
+    /// Every method name an instance of this type responds to, own and
+    /// inherited (abstract declarations included — they are dispatched, not
+    /// called directly).
+    responds: HashSet<String>,
+    /// The method names this type *implements* itself — the `Owner$method`
+    /// subroutines it owns, which is what `super.m` resolves against.
+    own_methods: HashSet<String>,
 }
 
 /// Compile-time singleton-object shape.
 struct ObjMeta {
     /// `val`/`var` member names (accessed as the `Name.val` global).
     vals: HashSet<String>,
-    /// `def` member names (dispatched to the `Name$method` subroutine).
+    /// `def` member names, own and inherited (dispatched to the owning type's
+    /// `Owner$method` subroutine).
     methods: HashSet<String>,
     /// `case object` → structural semantics (so two `None`s compare equal).
     is_case: bool,
+    /// The linearization excluding the object itself.
+    supers: Vec<String>,
+}
+
+/// Scala-style linearization of `name`: the type itself, then its supertypes
+/// right-to-left, each recursively, keeping the first occurrence of a repeat.
+/// This is the resolution order for `extends P with T1 with T2` (`T2`, `T1`,
+/// `P`) — the full C3 rule differs only for diamond hierarchies, which this
+/// frontend does not model.
+fn linearize(name: &str, parents: &HashMap<&str, &[String]>) -> Vec<String> {
+    fn go(name: &str, parents: &HashMap<&str, &[String]>, out: &mut Vec<String>, depth: u32) {
+        // A cyclic `extends` would otherwise recurse forever; the depth cap
+        // makes a malformed hierarchy terminate instead of blowing the stack.
+        if depth > 64 || out.iter().any(|x| x == name) {
+            return;
+        }
+        out.push(name.to_string());
+        if let Some(ps) = parents.get(name) {
+            for p in ps.iter().rev() {
+                go(p, parents, out, depth + 1);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(name, parents, &mut out, 0);
+    out
 }
 
 /// A function body's local slot map (see [`Compiler::scope`]).
@@ -205,24 +249,64 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         objects.push(builtin_none());
     }
 
-    // Index class shapes and the method → defining-classes map.
+    // Linearize the declared types, then index class shapes with their inherited
+    // fields and the method → (runtime tag, defining type) dispatch table.
+    let parents: HashMap<&str, &[String]> = classes
+        .iter()
+        .map(|c| (c.name.as_str(), c.parents.as_slice()))
+        .chain(
+            objects
+                .iter()
+                .map(|o| (o.name.as_str(), o.parents.as_slice())),
+        )
+        .collect();
+    let lin: HashMap<String, Vec<String>> = parents
+        .keys()
+        .map(|n| (n.to_string(), linearize(n, &parents)))
+        .collect();
+    let by_name: HashMap<&str, &ClassDecl> = classes.iter().map(|c| (c.name.as_str(), c)).collect();
+
     let mut class_meta = HashMap::new();
-    let mut method_index: HashMap<String, Vec<String>> = HashMap::new();
     for cd in &classes {
+        let mro = &lin[&cd.name];
+        let mut field_names = cd.params.clone();
+        // Inherited fields, base-most first, then this class's body fields.
+        for anc in mro.iter().skip(1).rev() {
+            if let Some(p) = by_name.get(anc.as_str()) {
+                for f in &p.field_names {
+                    if !field_names.contains(f) {
+                        field_names.push(f.clone());
+                    }
+                }
+            }
+        }
+        for f in &cd.field_names {
+            if !field_names.contains(f) {
+                field_names.push(f.clone());
+            }
+        }
+        let responds = mro
+            .iter()
+            .filter_map(|a| by_name.get(a.as_str()))
+            .flat_map(|p| p.methods.iter().map(|m| m.name.clone()))
+            .collect();
         class_meta.insert(
             cd.name.clone(),
             ClassMeta {
-                field_names: cd.field_names.clone(),
+                field_names,
                 arity: cd.params.len(),
                 is_case: cd.is_case,
+                is_trait: cd.is_trait,
+                supers: mro[1..].to_vec(),
+                responds,
+                own_methods: cd
+                    .methods
+                    .iter()
+                    .filter(|m| !m.is_abstract)
+                    .map(|m| m.name.clone())
+                    .collect(),
             },
         );
-        for m in &cd.methods {
-            method_index
-                .entry(m.name.clone())
-                .or_default()
-                .push(cd.name.clone());
-        }
     }
     // Index singleton objects.
     let mut obj_meta = HashMap::new();
@@ -235,15 +319,60 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 _ => None,
             })
             .collect();
-        let methods = od.methods.iter().map(|m| m.name.clone()).collect();
+        // A singleton's own `def`s only: `object X extends T` inherits T's
+        // *type* (so `case x: T` and `case X =>` work) but not its method
+        // bodies, which would need a `this` record the object model does not
+        // build (see `BUGS.md`).
+        let methods: HashSet<String> = od.methods.iter().map(|m| m.name.clone()).collect();
         obj_meta.insert(
             od.name.clone(),
             ObjMeta {
                 vals,
                 methods,
                 is_case: od.is_case,
+                supers: lin[&od.name][1..].to_vec(),
             },
         );
+    }
+
+    // Runtime method table: for every *instantiable* type, the subroutine that
+    // owns each method it responds to. A method declared once and never
+    // inherited keeps a single entry, so the emitted dispatch is what it was.
+    let mut method_index: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for tag in lin.keys() {
+        // Traits are never a runtime tag: only their concrete subtypes are.
+        if by_name.get(tag.as_str()).is_some_and(|c| c.is_trait) {
+            continue;
+        }
+        // A singleton dispatches only its own `def`s (see `obj_meta` above).
+        if let Some(o) = objects.iter().find(|o| &o.name == tag) {
+            for m in &o.methods {
+                method_index
+                    .entry(m.name.clone())
+                    .or_default()
+                    .push((tag.clone(), tag.clone()));
+            }
+            continue;
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for owner in &lin[tag] {
+            let Some(od) = by_name.get(owner.as_str()) else {
+                continue;
+            };
+            for m in &od.methods {
+                // An abstract declaration still *reserves* the name, so a
+                // subtype's override is not shadowed by a later supertype.
+                if seen.insert(&m.name) && !m.is_abstract {
+                    method_index
+                        .entry(m.name.clone())
+                        .or_default()
+                        .push((tag.clone(), owner.clone()));
+                }
+            }
+        }
+    }
+    for v in method_index.values_mut() {
+        v.sort();
     }
 
     let mut c = Compiler {
@@ -278,6 +407,27 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         try_counter: 0,
     };
 
+    // Publish each declared type's supertypes + constructor arity to the runtime
+    // before anything runs: `case s: Shape` and the derived `case class` members
+    // both need shape the flat record cannot carry. Emitted only when the
+    // program declares a supertype anywhere, so a hierarchy-free program keeps
+    // the bytecode it had.
+    let needs_types = classes
+        .iter()
+        .any(|cd| !cd.parents.is_empty() || cd.is_trait || cd.params.len() != cd.field_names.len())
+        || objects.iter().any(|o| !o.parents.is_empty());
+    if needs_types {
+        for cd in &classes {
+            let meta = &c.classes[&cd.name];
+            let (supers, arity) = (meta.supers.join(","), meta.arity);
+            c.emit_type_reg(&cd.name, &supers, arity);
+        }
+        for od in &objects {
+            let supers = c.objects[&od.name].supers.join(",");
+            c.emit_type_reg(&od.name, &supers, 0);
+        }
+    }
+
     // Singleton-object `val`s initialize once before `main` (into `Name.val`
     // globals). Scala inits objects lazily; eager pre-init is a documented
     // simplification that is observably identical for pure val bodies.
@@ -306,9 +456,15 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             c.function_body(func)?;
         }
         for cd in &classes {
-            c.class_constructor(cd)?;
+            // A trait has no constructor — only the concrete methods a mixing
+            // class dispatches into.
+            if !cd.is_trait {
+                c.class_constructor(cd, &by_name)?;
+            }
             for m in &cd.methods {
-                c.class_method(cd, m)?;
+                if !m.is_abstract {
+                    c.class_method(cd, m)?;
+                }
             }
         }
         for od in &objects {
@@ -331,6 +487,9 @@ fn builtin_some() -> ClassDecl {
     ClassDecl {
         name: "Some".to_string(),
         is_case: true,
+        is_trait: false,
+        parents: Vec::new(),
+        super_args: Vec::new(),
         params: vec!["value".to_string()],
         body: Vec::new(),
         field_names: vec!["value".to_string()],
@@ -344,6 +503,7 @@ fn builtin_none() -> ObjectDecl {
     ObjectDecl {
         name: "None".to_string(),
         is_case: true,
+        parents: Vec::new(),
         body: Vec::new(),
         methods: Vec::new(),
     }
@@ -554,6 +714,13 @@ impl Compiler {
             }
             StmtKind::If { cond, then, els } => self.if_stmt(cond, then, els),
             StmtKind::While { cond, body } => self.while_stmt(cond, body),
+            // `crate::resolve` hoists every block-local `def` into
+            // `Program::functions` and deletes the statement, so one surviving
+            // here means that pass was skipped.
+            StmtKind::DefDecl(f) => Err(format!(
+                "scalars: internal: unresolved local def `{}`",
+                f.name
+            )),
         }
     }
 
@@ -912,6 +1079,7 @@ impl Compiler {
         let id = match ctor {
             "List" => crate::host::MAKE_LIST,
             "Map" => crate::host::MAKE_MAP,
+            "Array" => crate::host::MAKE_ARRAY,
             _ => return Err(format!("scalars: unknown collection constructor `{ctor}`")),
         };
         self.b.emit(Op::CallBuiltin(id, elems.len() as u8), 0);
@@ -1272,8 +1440,10 @@ impl Compiler {
                 fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
             }
             Pattern::Constructor { name, elems } => {
+                // Scala's derived `unapply` exposes the primary-constructor
+                // parameters only — the leading prefix of the record.
                 let fields = match self.classes.get(name) {
-                    Some(meta) => meta.field_names.clone(),
+                    Some(meta) => meta.field_names[..meta.arity].to_vec(),
                     None => {
                         return Err(format!("scalars: not found: constructor pattern `{name}`"))
                     }
@@ -1348,11 +1518,17 @@ impl Compiler {
                 return Ok(());
             }
             if self.class_defines_method(&cname, name) {
-                let this = self.resolve_place("this");
-                self.emit_load(this);
-                let nidx = self.b.add_name(&method_sub_name(&cname, name));
-                self.b.emit(Op::Call(nidx, 1), 0);
-                return Ok(());
+                // Virtual: a subtype may override this member, so the receiver's
+                // runtime tag decides (the single-implementation case collapses
+                // back to a direct call in `dispatch_instance_method`).
+                let targets = self.method_index.get(name).cloned().unwrap_or_default();
+                return self.dispatch_instance_method(
+                    &Expr::Var("this".to_string()),
+                    name,
+                    &[],
+                    &targets,
+                    0,
+                );
             }
         }
         // Inside an object method / val-init: a bare `val` is the `Name.val`
@@ -1402,11 +1578,68 @@ impl Compiler {
         Ok(())
     }
 
-    /// Whether class `cname` declares a `def` named `method`.
+    /// Whether an instance of `cname` responds to `method` — declared by the
+    /// class/trait itself or inherited from its linearization.
     fn class_defines_method(&self, cname: &str, method: &str) -> bool {
-        self.method_index
-            .get(method)
-            .is_some_and(|cs| cs.iter().any(|c| c == cname))
+        self.classes
+            .get(cname)
+            .is_some_and(|m| m.responds.contains(method))
+    }
+
+    /// The type that owns `cname`'s implementation of `method` (the subroutine
+    /// `Owner$method` a call on a `cname` instance lands in).
+    fn method_owner(&self, cname: &str, method: &str) -> Option<String> {
+        self.method_index.get(method).and_then(|v| {
+            v.iter()
+                .find(|(tag, _)| tag == cname)
+                .map(|(_, owner)| owner.clone())
+        })
+    }
+
+    /// The type owning a singleton's implementation of `method`. Falls back to
+    /// the object itself so a plain `object`'s `def` keeps its `Name$m` name.
+    fn object_method_owner(&self, obj: &str, method: &str) -> String {
+        self.method_owner(obj, method)
+            .unwrap_or_else(|| obj.to_string())
+    }
+
+    /// Lower `super.m(args)` inside a class/trait method: resolve `m` in the
+    /// enclosing type's linearization *after* the type itself and call that
+    /// implementation directly with the current `this`.
+    fn super_call(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        let Some((cname, _)) = self.current_class.clone() else {
+            return Err(format!("scalars: `super` outside a class (line {line})"));
+        };
+        let supers = match self.classes.get(&cname) {
+            Some(m) => m.supers.clone(),
+            None => Vec::new(),
+        };
+        // The first supertype that owns an implementation of `m`.
+        let owner = supers
+            .iter()
+            .find(|s| self.type_declares_method(s, name))
+            .cloned()
+            .ok_or_else(|| {
+                format!("scalars: no supertype of {cname} defines `{name}` (line {line})")
+            })?;
+        let this = self.resolve_place("this");
+        self.emit_load(this);
+        for a in args {
+            self.expr(a)?;
+        }
+        let nidx = self.b.add_name(&method_sub_name(&owner, name));
+        self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
+        Ok(())
+    }
+
+    /// Whether type `ty` itself implements `method`. `super` resolves against
+    /// the declarations, not the dispatch table: the table is keyed by concrete
+    /// tag, and a trait whose method every subtype re-inherits never appears in
+    /// it as an owner.
+    fn type_declares_method(&self, ty: &str, method: &str) -> bool {
+        self.classes
+            .get(ty)
+            .is_some_and(|m| m.own_methods.contains(method))
     }
 
     /// Emit a read of `this.field` (the receiver is the `this` slot).
@@ -1495,6 +1728,11 @@ impl Compiler {
             }
         }
         let arity = match self.classes.get(name) {
+            Some(meta) if meta.is_trait => {
+                return Err(format!(
+                    "scalars: trait {name} is abstract; it cannot be instantiated (line {line})"
+                ))
+            }
             Some(meta) => meta.arity,
             None => return Err(format!("scalars: not found: type {name} (line {line})")),
         };
@@ -1540,6 +1778,19 @@ impl Compiler {
         }
         self.b.emit(Op::CallBuiltin(crate::host::EXC_NEW, 2), line);
         Ok(())
+    }
+
+    /// Emit one [`crate::host::TYPE_REG`] call: publish a declared type's
+    /// supertype list and primary-constructor arity to the runtime. Leaves
+    /// nothing on the stack.
+    fn emit_type_reg(&mut self, name: &str, supers_csv: &str, arity: usize) {
+        let n = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(n), 0);
+        let s = self.b.add_constant(Value::str(supers_csv.to_string()));
+        self.b.emit(Op::LoadConst(s), 0);
+        self.b.emit(Op::LoadInt(arity as i64), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::TYPE_REG, 3), 0);
+        self.b.emit(Op::Pop, 0);
     }
 
     /// Emit "construct a built-in throwable and raise it", leaving nothing on
@@ -1592,6 +1843,25 @@ impl Compiler {
     /// 3. **Fallback** — the universal `SMETHOD` builtin (String/Int/Double
     ///    stdlib and host-heap field/`toString`/`hashCode`/`equals` access).
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        // `super.m(args)` — skip this class in the linearization and call the
+        // nearest supertype that defines `m` (a static call, as the JVM's
+        // `invokespecial` is).
+        if matches!(recv, Expr::Var(v) if v == "super") {
+            return self.super_call(name, args, line);
+        }
+        // `x.isInstanceOf[T]` is the runtime type test the parser captured the
+        // type name for; `x.asInstanceOf[T]` is a static assertion with no
+        // runtime effect on a dynamically typed value model (see `BUGS.md`).
+        match (name, args) {
+            ("isInstanceOf", [ty @ Expr::Str(_)]) => {
+                self.expr(recv)?;
+                self.expr(ty)?;
+                self.b.emit(Op::CallBuiltin(crate::host::SISTYPE, 2), line);
+                return Ok(());
+            }
+            ("asInstanceOf", [Expr::Str(_)]) => return self.expr(recv),
+            _ => {}
+        }
         if let Expr::Var(obj) = recv {
             let member = self
                 .objects
@@ -1602,7 +1872,8 @@ impl Compiler {
                     for a in args {
                         self.expr(a)?;
                     }
-                    let nidx = self.b.add_name(&method_sub_name(obj, name));
+                    let owner = self.object_method_owner(obj, name);
+                    let nidx = self.b.add_name(&method_sub_name(&owner, name));
                     self.b.emit(Op::Call(nidx, args.len() as u8), line);
                     return Ok(());
                 }
@@ -1615,6 +1886,47 @@ impl Compiler {
         }
         if let Some(classes) = self.method_index.get(name).cloned() {
             return self.dispatch_instance_method(recv, name, args, &classes, line);
+        }
+        // `scala.math.<member>` / `math.<member>` / `Math.<member>` — the JDK
+        // math module, which is a value namespace rather than a receiver.
+        if let Some(java) = math_module(recv) {
+            for a in args {
+                self.expr(a)?;
+            }
+            // `java.lang.Math` and `scala.math` are not the same namespace:
+            // `Math.signum(5)` widens to `1.0` (the JDK has no `int` overload)
+            // where `math.signum(5)` is `1`. The spelling travels with the name.
+            let member = if java {
+                format!("java.{name}")
+            } else {
+                name.to_string()
+            };
+            let nc = self.b.add_constant(Value::str(member));
+            self.b.emit(Op::LoadConst(nc), line);
+            self.b.emit(
+                Op::CallBuiltin(crate::host::SMATH, args.len() as u8 + 1),
+                line,
+            );
+            return Ok(());
+        }
+        // `a to b` / `a until b` — build a first-class `Range`. A `by` step then
+        // rebuilds it through the host (see `crate::host`), so `(1 to 9 by 2)`
+        // is one range value rather than a chain of collections.
+        if (name == "to" || name == "until") && args.len() == 1 {
+            self.expr(recv)?;
+            self.expr(&args[0])?;
+            self.b.emit(
+                if name == "to" {
+                    Op::LoadTrue
+                } else {
+                    Op::LoadFalse
+                },
+                line,
+            );
+            self.b.emit(Op::LoadInt(1), line);
+            self.b
+                .emit(Op::CallBuiltin(crate::host::MAKE_RANGE, 4), line);
+            return Ok(());
         }
         self.emit_smethod(recv, name, args, line)
     }
@@ -1650,9 +1962,24 @@ impl Compiler {
         recv: &Expr,
         name: &str,
         args: &[Expr],
-        classes: &[String],
+        classes: &[(String, String)],
         line: u32,
     ) -> Result<(), String> {
+        // A single implementation and a receiver already known to be that class
+        // needs no tag test: call it directly.
+        if let [(tag, owner)] = classes {
+            if matches!(recv, Expr::Var(v) if v == "this")
+                && self.current_class.as_ref().is_some_and(|(c, _)| c == tag)
+            {
+                self.expr(recv)?;
+                for a in args {
+                    self.expr(a)?;
+                }
+                let nidx = self.b.add_name(&method_sub_name(owner, name));
+                self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
+                return Ok(());
+            }
+        }
         self.expr(recv)?;
         self.obj_counter += 1;
         let n = self.obj_counter;
@@ -1665,9 +1992,9 @@ impl Compiler {
         self.emit_store(cls);
 
         let mut end_jumps = Vec::new();
-        for class in classes {
+        for (tag, owner) in classes {
             self.emit_load(cls);
-            let cc = self.b.add_constant(Value::str(class.clone()));
+            let cc = self.b.add_constant(Value::str(tag.clone()));
             self.b.emit(Op::LoadConst(cc), line);
             self.b.emit(Op::NumEq, line);
             let jf = self.b.emit(Op::JumpIfFalse(0), line);
@@ -1675,7 +2002,7 @@ impl Compiler {
             for a in args {
                 self.expr(a)?;
             }
-            let nidx = self.b.add_name(&method_sub_name(class, name));
+            let nidx = self.b.add_name(&method_sub_name(owner, name));
             self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
             end_jumps.push(self.b.emit(Op::Jump(0), line));
             let next = self.b.current_pos();
@@ -1725,7 +2052,11 @@ impl Compiler {
     /// Emit a class's `Class$new` constructor subroutine: bind the constructor
     /// params to slots, run the body (evaluating `val`/`var` field initializers
     /// into their slots), then assemble the ordered record via [`OBJ_NEW`].
-    fn class_constructor(&mut self, cd: &ClassDecl) -> Result<(), String> {
+    fn class_constructor(
+        &mut self,
+        cd: &ClassDecl,
+        by_name: &HashMap<&str, &ClassDecl>,
+    ) -> Result<(), String> {
         let nidx = self.b.add_name(&ctor_name(&cd.name));
         let ip = self.b.current_pos();
         self.b.add_sub_entry(nidx, ip);
@@ -1743,18 +2074,43 @@ impl Compiler {
         for i in (0..cd.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
+        // Supertype initialization, in Scala's order: every `extends P(args)`
+        // argument list is evaluated first, walking *up* the superclass chain
+        // (each level's arguments are written in terms of the level below it),
+        // and only then do the constructor bodies run base-most first, so a
+        // class body can read the fields its supertypes just initialized.
+        let mut level = cd;
+        while let Some(parent) = level.parents.first().and_then(|p| by_name.get(p.as_str())) {
+            for (name, arg) in parent.params.iter().zip(&level.super_args) {
+                self.expr(arg)?;
+                let place = self.declare_place(name);
+                self.emit_store(place);
+                self.vals.insert(name.clone(), true);
+            }
+            level = parent;
+        }
+        let supers: Vec<String> = self.classes[&cd.name].supers.clone();
+        for anc in supers.iter().rev() {
+            let Some(p) = by_name.get(anc.as_str()) else {
+                continue;
+            };
+            for s in &p.body {
+                self.stmt(s)?;
+            }
+        }
         for s in &cd.body {
             self.stmt(s)?;
         }
-        // Assemble the record: field values (in declared order), then the class
+        // Assemble the record: field values (in record order), then the class
         // name, the field-name CSV, and the `is_case` flag.
-        for f in &cd.field_names {
+        let field_names = self.classes[&cd.name].field_names.clone();
+        for f in &field_names {
             let place = self.resolve_place(f);
             self.emit_load(place);
         }
         let cn = self.b.add_constant(Value::str(cd.name.clone()));
         self.b.emit(Op::LoadConst(cn), 0);
-        let csv = self.b.add_constant(Value::str(cd.field_names.join(",")));
+        let csv = self.b.add_constant(Value::str(field_names.join(",")));
         self.b.emit(Op::LoadConst(csv), 0);
         self.b.emit(
             if cd.is_case {
@@ -1767,7 +2123,7 @@ impl Compiler {
         // A `class`/`case class` is not a singleton object.
         self.b.emit(Op::LoadFalse, 0);
         self.b.emit(
-            Op::CallBuiltin(crate::host::OBJ_NEW, cd.field_names.len() as u8 + 4),
+            Op::CallBuiltin(crate::host::OBJ_NEW, field_names.len() as u8 + 4),
             0,
         );
         self.b.emit(Op::ReturnValue, 0);
@@ -1802,7 +2158,14 @@ impl Compiler {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
         let saved_class = self.current_class.take();
-        self.current_class = Some((cd.name.clone(), cd.field_names.iter().cloned().collect()));
+        // The field set is the *flattened* one, so a method inherited into a
+        // subclass and a trait method alike see every field the instance holds.
+        let fields = self
+            .classes
+            .get(&cd.name)
+            .map(|m| m.field_names.iter().cloned().collect())
+            .unwrap_or_default();
+        self.current_class = Some((cd.name.clone(), fields));
         self.push_unwind(UnwindKind::Def);
         self.tail(&m.body)?;
         self.pop_unwind_to(self.b.current_pos());
@@ -1867,6 +2230,15 @@ impl Compiler {
                 .emit(Op::CallBuiltin(crate::host::RANGE_LIST, 3), line);
             return Ok(());
         }
+        // `new Array[T](n)` — the length and the element-type name.
+        if name == crate::parser::NEW_ARRAY {
+            for a in args {
+                self.expr(a)?;
+            }
+            self.b
+                .emit(Op::CallBuiltin(crate::host::ARRAY_FILL, 2), line);
+            return Ok(());
+        }
         if name == RUST_COMPILE {
             // Only the base64 body (first arg) is needed; the line arg is dropped.
             if let Some(body) = args.first() {
@@ -1887,14 +2259,14 @@ impl Compiler {
         // An unqualified method call inside a class method (`m(x)` == `this.m(x)`).
         if let Some((cname, _)) = self.current_class.clone() {
             if self.class_defines_method(&cname, name) {
-                let this = self.resolve_place("this");
-                self.emit_load(this);
-                for a in args {
-                    self.expr(a)?;
-                }
-                let nidx = self.b.add_name(&method_sub_name(&cname, name));
-                self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
-                return Ok(());
+                let targets = self.method_index.get(name).cloned().unwrap_or_default();
+                return self.dispatch_instance_method(
+                    &Expr::Var("this".to_string()),
+                    name,
+                    args,
+                    &targets,
+                    line,
+                );
             }
         }
         // An unqualified method call inside an object method (`m(x)` == `Obj.m(x)`).
@@ -2165,6 +2537,8 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         }
         StmtKind::While { cond, body } => expr_has_ffi(cond) || body_has_ffi(body),
         StmtKind::Return(e) => e.as_ref().is_some_and(expr_has_ffi),
+        // Lifted into `Program::functions` before compiling, and scanned there.
+        StmtKind::DefDecl(_) => false,
     })
 }
 
@@ -2261,6 +2635,8 @@ fn body_has_try(stmts: &[Stmt]) -> bool {
         }
         StmtKind::While { cond, body } => expr_has_try(cond) || body_has_try(body),
         StmtKind::Return(e) => e.as_ref().is_some_and(expr_has_try),
+        // Lifted into `Program::functions` before compiling, and scanned there.
+        StmtKind::DefDecl(_) => false,
     })
 }
 
@@ -2345,6 +2721,35 @@ fn range_test(inclusive: bool, descending: bool) -> Op {
 }
 
 // ── for-comprehension desugaring (collection generators) ────────────────────
+
+/// Whether `e` names a math module — `math`/`scala.math` or `Math`/
+/// `java.lang.Math` — and which of the two. These are namespaces, not values, so
+/// a member access on one lowers to the math builtin rather than to receiver
+/// dispatch. `Some(true)` is the `java.lang.Math` spelling.
+fn math_module(e: &Expr) -> Option<bool> {
+    match e {
+        Expr::Var(n) if n == "math" => Some(false),
+        Expr::Var(n) if n == "Math" => Some(true),
+        Expr::Method {
+            recv, name, args, ..
+        } if args.is_empty() => {
+            if name == "math" && matches!(&**recv, Expr::Var(p) if p == "scala") {
+                Some(false)
+            } else if name == "Math" && is_java_lang(recv) {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether `e` is the `java.lang` package prefix.
+fn is_java_lang(e: &Expr) -> bool {
+    matches!(e, Expr::Method { recv, name, args, .. }
+        if name == "lang" && args.is_empty() && matches!(&**recv, Expr::Var(p) if p == "java"))
+}
 
 /// Whether an enumerator is a collection generator (`x <- List(…)`).
 fn is_coll_gen(e: &ForEnum) -> bool {
@@ -2485,6 +2890,8 @@ fn fv_block(
                     fv_expr(e, &b, out, seen);
                 }
             }
+            // Lifted into `Program::functions` before compiling.
+            StmtKind::DefDecl(_) => {}
         }
     }
 }

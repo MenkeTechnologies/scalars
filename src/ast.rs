@@ -38,6 +38,15 @@ pub struct Program {
 pub struct ClassDecl {
     pub name: String,
     pub is_case: bool,
+    /// `true` for a `trait`: no constructor is emitted and its fields are
+    /// contributed by whichever class mixes it in.
+    pub is_trait: bool,
+    /// `extends P with T1 with T2` — the direct supertypes in source order.
+    /// Method lookup walks them right-to-left after this class itself.
+    pub parents: Vec<String>,
+    /// The superclass constructor arguments of `extends P(a, b)`. Empty for a
+    /// trait parent or a parameterless superclass.
+    pub super_args: Vec<Expr>,
     /// Primary-constructor parameter names, in order. All are instance fields
     /// (the runtime is dynamically typed, so the `val`/`var`/private distinction
     /// is not enforced — a documented simplification).
@@ -62,6 +71,9 @@ pub struct ClassDecl {
 pub struct ObjectDecl {
     pub name: String,
     pub is_case: bool,
+    /// `extends P with T …` — the singleton's supertypes, so `case o: Shape`
+    /// matches it and its inherited methods dispatch.
+    pub parents: Vec<String>,
     /// `val`/`var` declarations (initialized once before `main`) and side effects.
     pub body: Vec<Stmt>,
     pub methods: Vec<Func>,
@@ -75,6 +87,10 @@ pub struct Func {
     pub name: String,
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
+    /// `true` for a declaration with no `= body` (`def area: Double` in a
+    /// trait). No subroutine is emitted; a call dispatches to whichever subtype
+    /// implements it.
+    pub is_abstract: bool,
 }
 
 /// A Scala statement with its 1-based source line (used by `scala --dap` to emit
@@ -116,6 +132,13 @@ pub enum StmtKind {
     While { cond: Expr, body: Vec<Stmt> },
     /// `return expr` / bare `return` — an early exit from the enclosing `def`.
     Return(Option<Expr>),
+    /// A `def` declared inside a statement block (`def f(x: Int) = …` in a method
+    /// body, an `if` branch, a bare `{ … }`, …). It is *not* executable: the
+    /// [`crate::resolve`] pass gives it a unique global name, lambda-lifts its
+    /// captured enclosing locals into extra parameters, hoists it into
+    /// [`Program::functions`], and deletes the statement. The compiler therefore
+    /// never sees this variant.
+    DefDecl(Func),
 }
 
 /// One enumerator of a `for` comprehension: a range generator, a collection

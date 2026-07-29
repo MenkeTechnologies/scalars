@@ -1259,3 +1259,232 @@ fn catch_arms_are_tried_in_order_and_a_failing_guard_falls_through() {
     assert!(ok);
     assert_eq!(out, "g2\n");
 }
+
+// ── block-local `def` scoping (crate::resolve) ──────────────────────────────
+
+#[test]
+fn same_named_local_defs_in_sibling_methods_do_not_collide() {
+    // The regression this pass exists for: hoisting every `def` into one flat
+    // table keyed by name kept only the first `h`, so `b()` silently returned
+    // `a()`'s answer (6) instead of 103 — a wrong answer, not an error.
+    let (out, ok) = run(&wrap(
+        "def a(): Int = { def h(x: Int): Int = x * 2; h(3) }\n\
+         def b(): Int = { def h(x: Int): Int = x + 100; h(3) }\n\
+         println(a() + \",\" + b())",
+    ));
+    assert!(ok);
+    assert_eq!(out, "6,103\n");
+}
+
+#[test]
+fn an_inner_block_def_shadows_an_outer_one_and_the_outer_returns_after() {
+    let (out, ok) = run(&wrap(
+        "def f(x: Int): Int = x + 1\nprintln(f(2))\n\
+         val r = { def f(x: Int): Int = x * 10; f(2) }\nprintln(r)\nprintln(f(2))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "3\n20\n3\n");
+}
+
+#[test]
+fn a_val_shadows_a_local_def_of_the_same_name_after_its_block() {
+    // The lifted `def` must not steal the global slot the `val` occupies, or
+    // the trailing `g` reads a function value instead of 5.
+    let (out, ok) = run(&wrap(
+        "val g = 5\nval q = { def g(x: Int): Int = x; g(7) }\nprintln(q + \"/\" + g)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "7/5\n");
+}
+
+#[test]
+fn a_local_def_captures_the_enclosing_methods_locals() {
+    let (out, ok) = run(&wrap(
+        "def s(n: Int): Int = { val k = 3\ndef go(i: Int, acc: Int): Int = if (i > n) acc else go(i + 1, acc + i * k)\ngo(1, 0) }\nprintln(s(5))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "45\n");
+}
+
+#[test]
+fn mutually_recursive_local_defs_share_a_capture() {
+    // `ev` and `od` reference each other (so the block's `def`s must be bound
+    // before either body is walked) and both capture `t` from the frame above.
+    let (out, ok) = run(&wrap(
+        "def p(n: Int): String = { val t = \"t\"\n\
+         def ev(k: Int): String = if (k == 0) t + \"E\" else od(k - 1)\n\
+         def od(k: Int): String = if (k == 0) t + \"O\" else ev(k - 1)\nev(n) }\n\
+         println(p(4) + \" \" + p(7))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "tE tO\n");
+}
+
+#[test]
+fn a_capturing_local_def_used_as_a_function_value_still_gets_its_capture() {
+    let (out, ok) = run(&wrap(
+        "def m(xs: List[Int]): List[Int] = { val k = 3; def f(x: Int): Int = x * k; xs.map(f) }\nprintln(m(List(1, 2, 3)))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(3, 6, 9)\n");
+}
+
+#[test]
+fn assigning_to_a_captured_binding_is_rejected_not_silently_lost() {
+    // A capture travels by value, so a write inside the lifted body could not
+    // reach the enclosing frame. Reject it rather than drop it.
+    let (out, ok) = run(&wrap(
+        "def f(): Int = { var k = 0; def bump(): Unit = { k += 1 }; bump(); k }\nprintln(f())",
+    ));
+    assert!(!ok);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn a_brace_block_is_an_expression_in_value_position() {
+    let (out, ok) = run(&wrap(
+        "println(3 match { case x => { x + 10 } })\nval z = { val a = 2; a * 3 }\nprintln(z)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "13\n6\n");
+}
+
+// ── traits, inheritance, virtual dispatch ───────────────────────────────────
+
+#[test]
+fn a_trait_method_dispatches_to_each_subclasss_override() {
+    let (out, ok) = run(
+        "trait S { def area: Int; def name: String = \"s\"; def show: String = name + \"=\" + area }\n\
+         class C(val r: Int) extends S { def area: Int = r * r; override def name: String = \"c\" }\n\
+         class D(val w: Int) extends S { def area: Int = w + w }\n\
+         object T extends App { val xs: List[S] = List(new C(3), new D(4)); xs.foreach(x => println(x.show)) }",
+    );
+    assert!(ok);
+    assert_eq!(out, "c=9\ns=8\n");
+}
+
+#[test]
+fn a_three_level_class_chain_forwards_constructor_args_and_super() {
+    let (out, ok) = run(
+        "class A(val n: String) { def speak: String = \"...\"; def intro: String = n + \":\" + speak }\n\
+         class B(m: String) extends A(m) { override def speak: String = \"woof\" }\n\
+         class E(m: String) extends B(m) { override def speak: String = super.speak + \"!\" }\n\
+         object T extends App { val xs: List[A] = List(new A(\"g\"), new B(\"r\"), new E(\"p\")); xs.foreach(x => println(x.intro)) }",
+    );
+    assert!(ok);
+    assert_eq!(out, "g:...\nr:woof\np:woof!\n");
+}
+
+#[test]
+fn a_case_classs_derived_members_see_the_constructor_prefix_only() {
+    // `z` is a body `val`, not a primary-constructor parameter, so it appears
+    // in neither `toString` nor the extractor's arity.
+    let (out, ok) = run(
+        "case class P(x: Int, y: Int) { val z = x + y }\n\
+         object T extends App { val p = P(1, 2); println(p); println(p.z); println(p == P(1, 2)); p match { case P(i, j) => println(i * j) } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "P(1,2)\n3\ntrue\n2\n");
+}
+
+#[test]
+fn a_typed_pattern_matches_a_user_class_and_its_supertypes() {
+    let (out, ok) = run(
+        "trait Shape; class Circle(val r: Int) extends Shape; case class Sq(s: Int) extends Shape\n\
+         object T extends App { val xs: List[Any] = List(new Circle(1), Sq(2), 3)\n\
+         for (x <- xs) x match { case c: Circle => println(\"C\" + c.r); case s: Sq => println(\"S\" + s.s); case i: Int => println(\"I\" + i) }\n\
+         println(new Circle(1).isInstanceOf[Shape]) }",
+    );
+    assert!(ok);
+    assert_eq!(out, "C1\nS2\nI3\ntrue\n");
+}
+
+#[test]
+fn a_mixin_override_can_call_super_into_the_trait_it_refines() {
+    let (out, ok) = run(
+        "trait G { val pre: String; def greet(n: String): String = pre + n }\n\
+         trait L extends G { override def greet(n: String): String = super.greet(n).toUpperCase }\n\
+         class R extends G with L { val pre = \"yo \" }\n\
+         object T extends App { println(new R().greet(\"ann\")) }",
+    );
+    assert!(ok);
+    assert_eq!(out, "YO ANN\n");
+}
+
+#[test]
+fn a_trait_cannot_be_instantiated() {
+    let (out, ok) = run("trait S { def f: Int = 1 }\nobject T extends App { println(new S().f) }");
+    assert!(!ok);
+    assert_eq!(out, "");
+}
+
+// ── Range as a value, Array, scala.math ─────────────────────────────────────
+
+#[test]
+fn a_range_is_a_value_with_scalas_tostring() {
+    let (out, ok) = run(&wrap(
+        "println(1 to 5); println(1 until 5); println(1 to 10 by 3); println(10 to 1 by -2); println(5 to 1)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Range 1 to 5\nRange 1 until 5\nRange 1 to 10 by 3\ninexact Range 10 to 1 by -2\nempty Range 5 to 1\n"
+    );
+}
+
+#[test]
+fn range_sequence_ops_match_scalas_result_types() {
+    // `map`/`filter` on a `Range` yield a `Vector`; `reverse` yields a `Range`.
+    let (out, ok) = run(&wrap(
+        "val r = 1 to 5\nprintln(r.sum + \"/\" + r.length)\nprintln(r.toList)\nprintln(r.map(_ * 2))\nprintln(r.reverse)\nprintln(r.filter(_ % 2 == 0))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "15/5\nList(1, 2, 3, 4, 5)\nVector(2, 4, 6, 8, 10)\nRange 5 to 1 by -1\nVector(2, 4)\n"
+    );
+}
+
+#[test]
+fn an_array_is_mutable_through_indexed_assignment() {
+    let (out, ok) = run(&wrap(
+        "val a = Array(1, 2, 3)\nprintln(a.length + \":\" + a(0))\na(1) = 9\nprintln(a.mkString(\",\"))\nprintln(a.map(_ * 2).mkString(\",\"))\nprintln(a.sum)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "3:1\n1,9,3\n2,18,6\n13\n");
+}
+
+#[test]
+fn new_array_fills_with_the_element_types_zero() {
+    let (out, ok) = run(&wrap(
+        "println(new Array[Int](3).mkString(\"|\"))\nprintln(new Array[Double](2).mkString(\"|\"))\nprintln(new Array[Boolean](2).mkString(\"|\"))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "0|0|0\n0.0|0.0\nfalse|false\n");
+}
+
+#[test]
+fn a_list_is_immutable_so_it_has_no_update() {
+    let (out, ok) = run(&wrap("val xs = List(1, 2, 3)\nxs(1) = 9\nprintln(xs)"));
+    assert!(!ok);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn math_members_keep_scalas_int_and_double_overloads_apart() {
+    let (out, ok) = run(&wrap(
+        "println(math.abs(-4) + \" \" + math.abs(-3.5))\nprintln(math.max(2, 7) + \" \" + math.min(2.5, 1.5))\nprintln(math.round(2.5) + \" \" + math.round(-2.5))\nprintln(math.signum(-5) + \" \" + Math.signum(5))",
+    ));
+    assert!(ok);
+    // `java.lang.Math` has no `signum(int)`, so `Math.signum(5)` widens to 1.0.
+    assert_eq!(out, "4 3.5\n7 1.5\n3 -2\n-1 1.0\n");
+}
+
+#[test]
+fn math_is_reachable_under_every_spelling() {
+    let (out, ok) = run(&wrap(
+        "println(math.sqrt(16.0))\nprintln(scala.math.pow(2.0, 10.0))\nprintln(Math.hypot(3.0, 4.0))\nprintln(math.Pi)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "4.0\n1024.0\n5.0\n3.141592653589793\n");
+}

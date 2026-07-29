@@ -46,7 +46,7 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "def",
         "Keyword",
-        "define a method; scalars locates and runs `def main(args: Array[String])`",
+        "define a method; scalars locates and runs `def main(args: Array[String])`. A `def` inside a block is scoped to that block and may shadow an outer one",
         "object T { def main(args: Array[String]): Unit = { println(1) } }",
     ),
     (
@@ -88,8 +88,14 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "extends",
         "Keyword",
-        "name a parent; `extends App` makes the object body the program entry point",
-        "object T extends App { println(\"run\") }",
+        "name a supertype: its fields and concrete methods are inherited, and its constructor takes the `extends P(args)` arguments. `extends App` instead makes the object body the program entry point",
+        "class A(val n: Int)\nclass B(m: Int) extends A(m)\nprintln(new B(2).n)   // => 2",
+    ),
+    (
+        "trait",
+        "Keyword",
+        "declare an abstract type to mix in: abstract members (`def f: Int`, `val x: String`) plus concrete ones. Cannot be instantiated",
+        "trait S { def area: Int; def show: String = \"a=\" + area }\nclass C(r: Int) extends S { def area = r * r }\nprintln(new C(3).show)   // => a=9",
     ),
     (
         "new",
@@ -147,22 +153,58 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     ),
     // ── Contextual (parser-recognized in position) ──
     (
+        "with",
+        "Contextual",
+        "mix another supertype into a `class`/`trait`: `extends P with T1 with T2`. Method lookup is self, then the parents right-to-left",
+        "trait L { def tag = \"L\" }\nclass R extends L\nprintln(new R().tag)   // => L",
+    ),
+    (
+        "override",
+        "Contextual",
+        "replace a supertype's concrete member; the call dispatches on the receiver's runtime class",
+        "class A { def f = 1 }\nclass B extends A { override def f = 2 }\nval a: A = new B()\nprintln(a.f)   // => 2",
+    ),
+    (
+        "super",
+        "Contextual",
+        "call the supertype's implementation of a member, skipping this type in the linearization",
+        "class A { def f = \"a\" }\nclass B extends A { override def f = super.f + \"b\" }\nprintln(new B().f)   // => ab",
+    ),
+    (
+        "isInstanceOf",
+        "Contextual",
+        "runtime type test against the registered class hierarchy; the same test `case x: T =>` performs",
+        "trait S; class C extends S\nprintln(new C().isInstanceOf[S])   // => true",
+    ),
+    (
         "until",
         "Contextual",
-        "exclusive range bound in a `for`: `a until b` iterates a..b-1",
+        "exclusive range bound: `a until b` is the values a..b-1, as a `for` generator or as a first-class `Range`",
         "for (i <- 0 until 3) print(i)   // => 012",
     ),
     (
         "to",
         "Contextual",
-        "inclusive range bound in a `for`: `a to b` iterates a..b",
-        "for (i <- 1 to 3) print(i)   // => 123",
+        "inclusive range bound: `a to b` is the values a..b, as a `for` generator or as a first-class `Range`",
+        "println((1 to 3).sum)   // => 6",
     ),
     (
         "by",
         "Contextual",
-        "range step in a `for`: `a until b by s`; a negative step counts down, and a zero step throws `IllegalArgumentException`",
+        "range step: `a until b by s`; a negative step counts down, and a zero step throws `IllegalArgumentException`",
         "for (i <- 10 to 1 by -3) print(i + \" \")   // => 10 7 4 1",
+    ),
+    (
+        "Array",
+        "Contextual",
+        "the mutable sequence: `Array(a, b)`, `new Array[T](n)` (zero-filled), `a(i)` reads and `a(i) = v` writes",
+        "val a = Array(1, 2, 3)\na(1) = 9\nprintln(a.mkString(\",\"))   // => 1,9,3",
+    ),
+    (
+        "math",
+        "Contextual",
+        "the `scala.math` module (also spelled `scala.math`, `Math`, `java.lang.Math`): `abs`, `min`/`max`, `sqrt`, `pow`, `floor`/`ceil`/`round`, the trig family, `Pi`, `E`",
+        "println(math.sqrt(16.0))   // => 4.0",
     ),
     (
         "App",

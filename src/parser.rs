@@ -12,6 +12,10 @@
 use crate::ast::*;
 use crate::lexer::{Tok, Token};
 
+/// The synthetic call `new Array[T](n)` desugars to; lowered by
+/// [`crate::compiler`] to the zero-filling array builtin.
+pub const NEW_ARRAY: &str = "$new_array";
+
 /// Parse Scala `src` into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
     let tokens = crate::lexer::lex(src)?;
@@ -22,7 +26,11 @@ pub fn parse(src: &str) -> Result<Program, String> {
         classes: Vec::new(),
         objects: Vec::new(),
     };
-    p.program()
+    let mut prog = p.program()?;
+    // Block-local `def`s are still statements at this point; scope, uniquely
+    // rename, and lambda-lift them into the flat namespace the compiler wants.
+    crate::resolve::resolve(&mut prog)?;
+    Ok(prog)
 }
 
 struct Parser {
@@ -145,14 +153,10 @@ impl Parser {
                     }
                     TopObject::Singleton(obj) => self.objects.push(obj),
                 }
-            } else if matches!(self.peek(), Tok::Ident(w) if w == "class") {
-                let c = self.class_decl(is_case)?;
+            } else if matches!(self.peek(), Tok::Ident(w) if w == "class" || w == "trait") {
+                let is_trait = matches!(self.peek(), Tok::Ident(w) if w == "trait");
+                let c = self.class_decl(is_case, is_trait)?;
                 self.classes.push(c);
-            } else if matches!(self.peek(), Tok::Ident(w) if w == "trait") {
-                // Traits are not modeled yet; skip the declaration body.
-                self.advance();
-                let _ = self.ident();
-                self.skip_member()?;
             } else if !self.is(&Tok::Eof) {
                 return Err(format!(
                     "scalars: expected a top-level `object`/`class` declaration, found {} on line {}",
@@ -183,16 +187,20 @@ impl Parser {
     fn object_decl(&mut self, is_case: bool) -> Result<TopObject, String> {
         self.eat(&Tok::Object)?;
         let name = self.ident()?;
-        // `extends Parent with Trait …` — note whether `App` is a parent.
-        let mut app_mode = false;
-        if self.is(&Tok::Extends) {
-            self.advance();
-            while !self.is(&Tok::LBrace) && !self.is(&Tok::Eof) {
-                if matches!(self.peek(), Tok::Ident(w) if w == "App") {
-                    app_mode = true;
-                }
-                self.advance();
-            }
+        // `extends Parent with Trait …`. `App` selects the run-the-body entry
+        // form; any other supertype list is a mixin on the singleton.
+        let (parents, _) = self.parents_clause()?;
+        let app_mode = parents.iter().any(|p| p == "App");
+        // A bodyless singleton (`case object Red extends Color`) is the ADT
+        // idiom and has no braces at all.
+        if !self.is(&Tok::LBrace) {
+            return Ok(TopObject::Singleton(ObjectDecl {
+                name,
+                is_case,
+                parents,
+                body: Vec::new(),
+                methods: Vec::new(),
+            }));
         }
         self.eat(&Tok::LBrace)?;
 
@@ -209,6 +217,7 @@ impl Parser {
         let mut main = None;
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+            self.skip_member_modifiers();
             if self.is(&Tok::Def) {
                 if let Some(m) = self.try_main()? {
                     main = Some(m);
@@ -233,6 +242,7 @@ impl Parser {
             Ok(TopObject::Singleton(ObjectDecl {
                 name,
                 is_case,
+                parents,
                 body,
                 methods: defs,
             }))
@@ -243,8 +253,8 @@ impl Parser {
     /// The primary constructor's parameters become instance fields; the class
     /// body's `val`/`var` declarations become further fields (initialized by the
     /// constructor) and its `def`s become methods.
-    fn class_decl(&mut self, is_case: bool) -> Result<ClassDecl, String> {
-        self.advance(); // `class`
+    fn class_decl(&mut self, is_case: bool, is_trait: bool) -> Result<ClassDecl, String> {
+        self.advance(); // `class` / `trait`
         let name = self.ident()?;
         // Optional `[T, …]` type-parameter clause.
         if self.is(&Tok::LBracket) {
@@ -280,17 +290,8 @@ impl Parser {
             }
             self.eat(&Tok::RParen)?;
         }
-        // Optional `extends …` clause — consumed and ignored (no inheritance).
-        if self.is(&Tok::Extends) {
-            self.advance();
-            while !self.is(&Tok::LBrace)
-                && !self.is(&Tok::Newline)
-                && !self.is(&Tok::Semi)
-                && !self.is(&Tok::Eof)
-            {
-                self.advance();
-            }
-        }
+        // `extends Parent[(args)] [with T]*`.
+        let (parents, super_args) = self.parents_clause()?;
         // Class body (optional). `def`s → methods; `val`/`var` → fields + ctor
         // statements; anything else → a constructor side-effect statement.
         let mut body = Vec::new();
@@ -300,14 +301,25 @@ impl Parser {
             self.advance();
             self.skip_seps();
             while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+                self.skip_member_modifiers();
                 if self.is(&Tok::Def) {
                     methods.push(self.parse_def()?);
                 } else {
                     let st = self.statement()?;
-                    if let StmtKind::Local { name, .. } = &st.kind {
-                        field_names.push(name.clone());
+                    match &st.kind {
+                        // An initializer-less `val` in a trait is an abstract
+                        // member: it names a field the mixing class must supply,
+                        // so it joins `field_names` but contributes no
+                        // constructor statement.
+                        StmtKind::Local {
+                            name, init: None, ..
+                        } if is_trait => field_names.push(name.clone()),
+                        StmtKind::Local { name, .. } => {
+                            field_names.push(name.clone());
+                            body.push(st);
+                        }
+                        _ => body.push(st),
                     }
-                    body.push(st);
                 }
                 self.skip_seps();
             }
@@ -316,11 +328,63 @@ impl Parser {
         Ok(ClassDecl {
             name,
             is_case,
+            is_trait,
+            parents,
+            super_args,
             params,
             body,
             field_names,
             methods,
         })
+    }
+
+    /// An `extends P[(args)] [with T]*` clause: the supertype names in source
+    /// order plus the superclass constructor arguments (empty when absent).
+    fn parents_clause(&mut self) -> Result<(Vec<String>, Vec<Expr>), String> {
+        let mut parents = Vec::new();
+        let mut super_args = Vec::new();
+        if !self.is(&Tok::Extends) {
+            return Ok((parents, super_args));
+        }
+        self.advance();
+        loop {
+            self.skip_seps();
+            let p = self.ident()?;
+            if self.is(&Tok::LBracket) {
+                self.skip_bracket_group();
+            }
+            // Only the first parent (the superclass) may take arguments.
+            if self.is(&Tok::LParen) {
+                let args = self.arg_list()?;
+                if parents.is_empty() {
+                    super_args = args;
+                }
+            }
+            parents.push(p);
+            if matches!(self.peek(), Tok::Ident(w) if w == "with") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok((parents, super_args))
+    }
+
+    /// Skip the member modifiers that may precede a `def`/`val`/`var` inside a
+    /// `class`/`trait`/`object` body. They carry no runtime meaning here (the
+    /// runtime is dynamically typed and every member is reachable).
+    fn skip_member_modifiers(&mut self) {
+        while matches!(self.peek(), Tok::Ident(w)
+            if w == "override"
+                || w == "private"
+                || w == "protected"
+                || w == "final"
+                || w == "abstract"
+                || w == "implicit"
+                || w == "lazy")
+        {
+            self.advance();
+        }
     }
 
     /// Consume a `[ … ]` group, balancing nested brackets. The cursor is on `[`.
@@ -391,6 +455,15 @@ impl Parser {
             self.advance();
             self.type_ref()?;
         }
+        // No `= body` — an abstract declaration (`def area: Double` in a trait).
+        if !self.is(&Tok::Assign) {
+            return Ok(Func {
+                name,
+                params,
+                body: Vec::new(),
+                is_abstract: true,
+            });
+        }
         self.eat(&Tok::Assign)?;
         self.skip_seps();
         let body = if self.is(&Tok::LBrace) {
@@ -399,7 +472,12 @@ impl Parser {
         } else {
             vec![self.statement()?]
         };
-        Ok(Func { name, params, body })
+        Ok(Func {
+            name,
+            params,
+            body,
+            is_abstract: false,
+        })
     }
 
     /// If the cursor is at `def main(…) [: Type] = <body>`, parse the body and
@@ -492,18 +570,15 @@ impl Parser {
     }
 
     /// Parse a `{ ... }` body already past the opening brace; consumes the `}`.
-    /// A nested `def` is hoisted into `self.funcs` (slice-1 has a flat function
-    /// namespace) rather than becoming a statement.
+    /// A nested `def` stays *in place* as a [`StmtKind::DefDecl`] so the
+    /// [`crate::resolve`] pass can see which block declared it; that pass hoists
+    /// it (uniquely renamed, with its captures lambda-lifted into parameters)
+    /// into the flat function namespace the compiler consumes.
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
         let mut out = Vec::new();
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-            if self.is(&Tok::Def) {
-                let f = self.parse_def()?;
-                self.funcs.push(f);
-            } else {
-                out.push(self.statement()?);
-            }
+            out.push(self.statement()?);
             self.skip_seps();
         }
         self.eat(&Tok::RBrace)?;
@@ -533,6 +608,9 @@ impl Parser {
 
     fn statement_kind(&mut self) -> Result<StmtKind, String> {
         match self.peek() {
+            // A block-local `def`. Kept in place (rather than hoisted here) so
+            // `crate::resolve` can scope it to the block that declared it.
+            Tok::Def => Ok(StmtKind::DefDecl(self.parse_def()?)),
             Tok::If => self.if_stmt(),
             Tok::While => self.while_stmt(),
             // A `for` in statement position is the comprehension expression run
@@ -542,14 +620,10 @@ impl Parser {
             Tok::Return => self.return_stmt(),
             Tok::LBrace => {
                 self.advance();
-                // A bare block: flatten into a single synthetic if-true. Slice 1
-                // has no lexical scopes, so inlining is behavior-preserving.
-                let body = self.block()?;
-                Ok(StmtKind::If {
-                    cond: Expr::Bool(true),
-                    then: body,
-                    els: vec![],
-                })
+                // A bare block is Scala's block *expression*: its value is its
+                // last statement's, which matters when it is the trailing
+                // statement of a `match` arm or a method body.
+                Ok(StmtKind::Expr(Expr::Block(self.block()?)))
             }
             _ => self.simple_statement(),
         }
@@ -699,7 +773,31 @@ impl Parser {
                 return Ok(StmtKind::Assign { name, op, value });
             }
         }
-        Ok(StmtKind::Expr(self.expression()?))
+        let e = self.expression()?;
+        // `a(i) = v` — Scala's element-assignment sugar for `a.update(i, v)`.
+        // The indexing form reaches here either as a bare call (`a(i)`, from
+        // `primary`) or as an `apply` on a computed receiver (`xs.head(i)`).
+        if self.is(&Tok::Assign) {
+            let (recv, mut args, line) = match e {
+                Expr::Call { name, args, line } => (Expr::Var(name), args, line),
+                Expr::Method {
+                    recv,
+                    ref name,
+                    ref args,
+                    line,
+                } if name == "apply" => (*recv.clone(), args.clone(), line),
+                other => return Ok(StmtKind::Expr(other)),
+            };
+            self.advance();
+            args.push(self.expression()?);
+            return Ok(StmtKind::Expr(Expr::Method {
+                recv: Box::new(recv),
+                name: "update".to_string(),
+                args,
+                line,
+            }));
+        }
+        Ok(StmtKind::Expr(e))
     }
 
     fn if_stmt(&mut self) -> Result<StmtKind, String> {
@@ -774,52 +872,21 @@ impl Parser {
             self.skip_seps();
             let name = self.ident()?;
             self.eat(&Tok::LArrow)?;
-            let start = self.expression()?;
-            // `a until b` / `a to b` is a range generator; anything else is a
-            // collection generator (`x <- List(…)`), desugared to `.map`/`.flatMap`.
-            let inclusive = match self.peek().clone() {
-                Tok::Ident(w) if w == "until" => {
-                    self.advance();
-                    false
-                }
-                Tok::Ident(w) if w == "to" => {
-                    self.advance();
-                    true
-                }
-                _ => {
-                    out.push(ForEnum::GenColl { name, coll: start });
-                    // Trailing `if` guards bind to the generator just parsed.
-                    while self.is(&Tok::If) {
-                        self.advance();
-                        out.push(ForEnum::Guard(self.expression()?));
-                    }
-                    if self.is(&Tok::Semi) {
-                        self.skip_seps();
-                        if self.is(&Tok::RParen) {
-                            break;
-                        }
-                        continue;
-                    }
-                    break;
-                }
-            };
-            let end = self.expression()?;
-            // `by step` is an optional trailing clause on a range generator. It
-            // is lexed as a plain identifier (Scala spells it as an infix method
-            // on `Range`, not a keyword), so match it by spelling.
-            let step = if matches!(self.peek(), Tok::Ident(w) if w == "by") {
-                self.advance();
-                Some(self.expression()?)
-            } else {
-                None
-            };
-            out.push(ForEnum::Gen {
-                name,
-                start,
-                end,
-                inclusive,
-                step,
-            });
+            // `expression` already parses `a to b [by s]` as an infix range, so
+            // a generator source is recognized by *shape*: a literal range keeps
+            // the counted-loop lowering, anything else is a collection generator
+            // desugared to `.map`/`.flatMap`.
+            let src = self.expression()?;
+            match as_range(&src) {
+                Some((start, end, inclusive, step)) => out.push(ForEnum::Gen {
+                    name,
+                    start,
+                    end,
+                    inclusive,
+                    step,
+                }),
+                None => out.push(ForEnum::GenColl { name, coll: src }),
+            }
             // Trailing `if` guards bind to the generator just parsed.
             while self.is(&Tok::If) {
                 self.advance();
@@ -848,6 +915,31 @@ impl Parser {
         // `match` binds looser than every binary operator (`a + b match { … }`
         // matches on the sum), so it wraps the fully-parsed binary expression.
         let mut e = self.binary(0)?;
+        // `a to b`, `a until b`, `… by s` — Scala spells these as infix methods
+        // on `Int`/`Range`, and an alphabetic operator binds looser than every
+        // symbolic one, so `1 to n - 1` is `1 to (n - 1)`.
+        if matches!(self.peek(), Tok::Ident(w) if w == "to" || w == "until") {
+            let line = self.line();
+            let name = self.ident()?;
+            let end = self.binary(0)?;
+            e = Expr::Method {
+                recv: Box::new(e),
+                name,
+                args: vec![end],
+                line,
+            };
+            while matches!(self.peek(), Tok::Ident(w) if w == "by") {
+                let line = self.line();
+                self.advance();
+                let step = self.binary(0)?;
+                e = Expr::Method {
+                    recv: Box::new(e),
+                    name: "by".to_string(),
+                    args: vec![step],
+                    line,
+                };
+            }
+        }
         // `a -> b` — the tuple-pair sugar (binds looser than every binary op).
         if self.is(&Tok::RArrow) {
             self.advance();
@@ -1005,6 +1097,21 @@ impl Parser {
                 };
                 continue;
             }
+            // `x.isInstanceOf[T]` / `x.asInstanceOf[T]` — the *only* methods
+            // whose type argument is load-bearing, so it is captured (as a
+            // string argument) instead of skipped.
+            if (name == "isInstanceOf" || name == "asInstanceOf") && self.is(&Tok::LBracket) {
+                self.advance();
+                let ty = self.type_ref()?;
+                self.eat(&Tok::RBracket)?;
+                e = Expr::Method {
+                    recv: Box::new(e),
+                    name,
+                    args: vec![Expr::Str(ty)],
+                    line,
+                };
+                continue;
+            }
             // Optional `[T]` type arguments on a method (`xs.map[Int](f)`).
             if self.is(&Tok::LBracket) {
                 self.skip_bracket_group();
@@ -1096,6 +1203,12 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Null)
             }
+            // A brace block in value position: `val q = { s1; s2; last }`. Its
+            // value is the last statement's (Scala's block expression).
+            Tok::LBrace => {
+                self.advance();
+                Ok(Expr::Block(self.block()?))
+            }
             // `new Class(args)` — construct a host-heap instance.
             Tok::New => self.new_expr(),
             // `if` in expression position: `val r = if (c) a else b`.
@@ -1174,8 +1287,8 @@ impl Parser {
                     self.skip_bracket_group();
                 }
                 if self.is(&Tok::LParen) {
-                    // `List(...)` / `Map(...)` collection literals.
-                    if name == "List" || name == "Map" {
+                    // `List(...)` / `Map(...)` / `Array(...)` collection literals.
+                    if name == "List" || name == "Map" || name == "Array" {
                         let elems = self.arg_list()?;
                         return Ok(Expr::Collection { ctor: name, elems });
                     }
@@ -1218,14 +1331,31 @@ impl Parser {
         self.eat(&Tok::New)?;
         let line = self.line();
         let name = self.ident()?;
+        // `new Array[T](n)` is the one `new` whose type argument is
+        // load-bearing: it picks the zero value the array is filled with.
+        let mut elem_ty = None;
         if self.is(&Tok::LBracket) {
-            self.skip_bracket_group();
+            if name == "Array" {
+                self.advance();
+                elem_ty = Some(self.type_ref()?);
+                self.eat(&Tok::RBracket)?;
+            } else {
+                self.skip_bracket_group();
+            }
         }
-        let args = if self.is(&Tok::LParen) {
+        let mut args = if self.is(&Tok::LParen) {
             self.arg_list()?
         } else {
             Vec::new()
         };
+        if let Some(ty) = elem_ty {
+            args.push(Expr::Str(ty));
+            return Ok(Expr::Call {
+                name: NEW_ARRAY.to_string(),
+                args,
+                line,
+            });
+        }
         Ok(Expr::New { name, args, line })
     }
 
@@ -1623,6 +1753,26 @@ fn replace_placeholders(e: &mut Expr, n: &mut usize) {
         // (Scala's placeholder scope is the enclosing expression), and the other
         // arms carry no sub-expressions.
         _ => {}
+    }
+}
+
+/// Destructure an infix range expression (`a to b`, `a until b by s`) into the
+/// generator form a `for` lowers to a counted loop. Anything else is `None` — a
+/// collection generator, or a `Range` value that stays a value.
+fn as_range(e: &Expr) -> Option<(Expr, Expr, bool, Option<Expr>)> {
+    match e {
+        Expr::Method {
+            recv, name, args, ..
+        } if name == "by" && args.len() == 1 => {
+            let (start, end, inclusive, _) = as_range(recv)?;
+            Some((start, end, inclusive, Some(args[0].clone())))
+        }
+        Expr::Method {
+            recv, name, args, ..
+        } if (name == "to" || name == "until") && args.len() == 1 => {
+            Some(((**recv).clone(), args[0].clone(), name == "to", None))
+        }
+        _ => None,
     }
 }
 

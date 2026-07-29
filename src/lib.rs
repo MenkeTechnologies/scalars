@@ -15,6 +15,7 @@ pub mod host;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod resolve;
 pub mod rust_ffi;
 
 pub use banner::version_banner;
@@ -39,6 +40,7 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
     vm.enable_tracing_jit();
     host::reset_heap(); // start each run with an empty object arena
+    host::reset_types(); // and with an empty declared-type registry
     host::reset_exceptions(); // and with no exception left in flight
     let _ = host::take_error(); // clear any stale FFI fault from a prior run
     let res = vm.run();
@@ -82,6 +84,7 @@ fn run_chunk_debug(chunk: fusevm::Chunk) -> Result<Value, String> {
     vm.register_builtin(host::DBG_LINE, dbg_line_builtin);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
     host::reset_heap(); // start each run with an empty object arena
+    host::reset_types(); // and with an empty declared-type registry
     host::reset_exceptions(); // and with no exception left in flight
     match vm.run() {
         VMResult::Ok(v) => Ok(v),

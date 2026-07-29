@@ -71,23 +71,28 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
-  against a live `scala` across thirteen generators (39,000+ probes clean).
+  against a live `scala` across eighteen generators (39,000+ probes clean, plus
+  8,000+ across the five generators added for this wave).
 
 This is an early slice: programs with an entry point (`def main`, or an
 `extends App` body) plus sibling `class`/`object` declarations, using `val`/`var`
 bindings (with `val` immutability enforced), arithmetic, `if`/`while`, the Scala
 range `for` (with a `by` step), `try`/`catch`/`finally`/`throw`, and
 `println`/`print`. User-defined `def`s — parameters, recursion,
-mutual recursion, `return`, and a tail `if`/`else` result — compile to fusevm's
-native call frames, and postfix `.` dispatch wires a core `String`/`Int`/`Double`
-method slice. A host-side object model (`class`/`object`/`case class`, `new`,
-fields, `this`, method dispatch, structural `equals`/`hashCode`/`toString`,
-`copy`, `apply`/`unapply`, constructor patterns, built-in `Option`) rides
-fusevm's `Value::Obj` handle. First-class functions (`x => …`, `(a, b) => …`,
-block bodies, `_` placeholders, capture of the enclosing frame) and the immutable
-`List`/`Map` collections (`.map`/`.filter`/`.flatMap`/`.foldLeft`/…, `::`,
-indexing, `k -> v`, collection `for … yield` comprehensions) are modeled host-side
-too. The wider standard library is the next wave (see [`BUGS.md`](BUGS.md)).
+mutual recursion, `return`, a tail `if`/`else` result, and true block-local
+scoping (an inner `def` shadows an outer one; enclosing locals are lambda-lifted
+into parameters) — compile to fusevm's native call frames, and postfix `.`
+dispatch wires a core `String`/`Int`/`Double` method slice. A host-side object
+model (`class`/`object`/`case class`, `trait`, `extends`/`with`, `override`,
+`super`, virtual dispatch, `new`, fields, `this`, structural
+`equals`/`hashCode`/`toString`, `copy`, `apply`/`unapply`, constructor patterns,
+`isInstanceOf`, built-in `Option`) rides fusevm's `Value::Obj` handle.
+First-class functions (`x => …`, `(a, b) => …`, block bodies, `_` placeholders,
+capture of the enclosing frame), the immutable `List`/`Map` collections
+(`.map`/`.filter`/`.flatMap`/`.foldLeft`/…, `::`, indexing, `k -> v`, collection
+`for … yield` comprehensions), mutable `Array`, first-class `Range` values and
+`scala.math` are modeled host-side too. The wider standard library is the next
+wave (see [`BUGS.md`](BUGS.md)).
 Nothing is faked — an unsupported construct is a parse error or an honest runtime
 throw, not a silent mis-run.
 
@@ -172,7 +177,10 @@ Implemented and checked against the reference `scala`:
   parameters bind to per-call frame slots, so recursion and mutual recursion are
   correct; the body's last expression (including a tail `if`/`else`) is the
   result; `return e` / bare `return` exit early; a zero-parameter `def` is
-  callable paren-less.
+  callable paren-less. A `def` declared inside a block is scoped to that block:
+  two blocks may each declare `def f`, an inner one shadows an outer one, and
+  the enclosing-frame locals a local `def` reads are lambda-lifted into extra
+  parameters every call site passes (`src/resolve.rs`).
 - **Expressions** — integer / floating / string / char / boolean / `null`
   literals; the binary operators `+ - * / %`, `== != < > <= >=`, `&& ||`
   (short-circuiting); unary `-` and `!`; parenthesised grouping; Scala's `+`
@@ -188,9 +196,12 @@ Implemented and checked against the reference `scala`:
   zero`, `NumberFormatException: For input string: "zz"`, `scala.MatchError`);
   `new RuntimeException("…")` and the other built-in throwables construct
   without a user `class`, and expose `getMessage`/`toString`.
-- **`by`-step ranges** — `for (i <- a until|to b by s)`, with `s` a literal or a
-  runtime value and either sign; a zero step throws `IllegalArgumentException`
-  as Scala's `Range` does.
+- **Ranges** — `a to b`, `a until b`, `… by s` as first-class values with
+  Scala's `Range.toString` (`Range 1 to 10 by 3`, and the `empty `/`inexact `
+  prefixes), `sum`/`length`/`map`/`filter`/`toList`/`reverse`/`mkString`/…; used
+  as a `for` generator they still compile to a counted loop, with `s` a literal
+  or a runtime value of either sign, and a zero step throwing
+  `IllegalArgumentException` as Scala's `Range` does.
 - **String interpolation** — `s"…"` with `$id` and `${expr}` splices, `f"…"`
   with Java-`Formatter` specs (`%d`, `%.2f`, `%-5s`, `%05d`, `%x`, `%b`, …), and
   `raw"…"` (escapes stay literal).
@@ -203,9 +214,18 @@ Implemented and checked against the reference `scala`:
   `this`, in-place `var`-field mutation, and instance-method dispatch; `object`
   singletons (static `def`s, `Name.val` members); and `case class` with an
   ordered-field `toString` (`Point(1,2)`), structural `equals`/`hashCode`,
-  `copy(field = …)`, companion `apply` (no `new`) and `unapply`. Built-in
+  `copy(field = …)`, companion `apply` (no `new`) and `unapply` — all four over
+  the primary-constructor parameters only, as Scala derives them. Built-in
   `Option` (`Some(v)` / `None`). All of it rides a host-side object heap behind
   fusevm's `Value::Obj` handle (`src/host.rs`) — no fusevm changes, no JVM.
+- **Traits and inheritance** — `trait T { def f: Int; def g = … }` with abstract
+  and concrete members, `class C(x) extends P(x) with T1 with T2`, `override
+  def`, `super.m(…)`, and virtual dispatch off the receiver's runtime class tag
+  (a `List[Shape]` of mixed subclasses dispatches correctly). Constructor
+  arguments thread up the whole superclass chain, supertype bodies run base-most
+  first, `sealed trait` + `case class`/`case object` ADTs match by constructor
+  pattern, and `x.isInstanceOf[T]` / `case x: T =>` consult the registered
+  hierarchy.
 - **First-class functions** — lambdas (`x => e`, `(a, b) => e`, block bodies
   `x => { … }`, `Int => Int` function-type annotations) and the `_`-placeholder
   form (`_ + 1`, `_ * 2`, `_ + _`). A lambda captures its enclosing frame, so it
@@ -219,7 +239,14 @@ Implemented and checked against the reference `scala`:
   `.reduce`/`.sum`/`.mkString`/`.exists`/`.forall`/`.count`) and immutable `Map`
   (`Map(k -> v)`, `.apply`/`.get`/`.contains`/`.keys`/`.values`/`.size`/`getOrElse`,
   `+`), plus `a -> b` tuple pairs. Insertion-ordered, byte-faithful `toString`
-  (`List(1, 2, 3)`, `Map(a -> 1, b -> 2)`).
+  (`List(1, 2, 3)`, `Map(a -> 1, b -> 2)`). Mutable `Array` too — `Array(a, b)`,
+  `new Array[T](n)` (zero-filled per `T`), `a(i)` reads and `a(i) = v` writes.
+- **`scala.math`** — `abs`, `signum`, `min`/`max`, `round`/`floor`/`ceil`/`rint`,
+  `sqrt`/`cbrt`/`exp`/`log`/`log10`/`pow`/`hypot`, the trig family, `atan2`,
+  `toRadians`/`toDegrees`, `Pi`, `E`, under the `math`, `scala.math`, `Math` and
+  `java.lang.Math` spellings. Integral overloads stay integral, and the two
+  namespaces are kept apart where the JDK lacks an overload (`Math.signum(5)` is
+  `1.0`, `math.signum(5)` is `1`).
 - **Method dispatch** — postfix `.` on core values: `String` (`length`,
   `toUpperCase`/`toLowerCase`, `trim`, `reverse`, `substring`, `charAt`,
   `contains`/`startsWith`/`endsWith`, `toInt`/`toDouble`, …), `Int`/`Double`
@@ -294,9 +321,14 @@ literal / wildcard / variable / typed / guarded / **constructor** patterns; a
 `Vector`; a **host-side object model** — `class`/`object`/`case class`,
 `new`, fields, `this`, method dispatch, structural `equals`/`hashCode`,
 `toString`, `copy`, companion `apply`/`unapply`, and built-in `Option`; `by`
-steps on range comprehensions; and **exceptions** —
+steps on range comprehensions; **exceptions** —
 `try`/`catch`/`finally`/`throw` with JVM-hierarchy handler matching, over a
-statement-granular unwind protocol that needs no fusevm changes.
+statement-granular unwind protocol that needs no fusevm changes;
+**block-local `def` scoping** with lambda-lifted captures (`src/resolve.rs`);
+**traits and inheritance** — `trait`, `extends`/`with`, `override`, `super`,
+virtual dispatch, inherited fields and constructor-argument threading, and
+`isInstanceOf`/typed patterns over the registered hierarchy; and **`Array`,
+first-class `Range` values and `scala.math`**.
 
 ### Differential parity fuzzer
 
@@ -305,20 +337,24 @@ deterministic-output Scala programs — each packing many probes to amortize the
 reference toolchain's JVM startup — biased toward the historically weak areas of
 a from-scratch frontend (`Int`-vs-`Double` division, `+` concatenation rules,
 structural `==`, `Double.toString` notation, range `for`, `by` steps, IEEE
-division by zero, and `try`/`catch`) and diffs `scala <file>` against this
-frontend, shrinking any divergence to the offending probe. Individual generators
-run with `--mode <name>` (`step`, `ieee`, `exc`, …). It needs a real `scala` on
+division by zero, `try`/`catch`, block-local `def` scoping, traits and virtual
+dispatch, `Range` values, `Array`, and the `scala.math` overload split) and diffs
+`scala <file>` against this frontend, shrinking any divergence to the offending
+probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
+`localdef`, `oop`, `range`, `array`, `math`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
-`Boolean/null + String` gaps, and the `catch`-guard binding bug fixed in this
-release; 39,000+ probes now run clean.
+`Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
+release — the block-expression-in-value-position gap and the
+`Math.signum` vs. `math.signum` overload split. 39,000+ probes ran clean before
+this wave, and 8,000+ more across its five new generators.
 
 Next waves, in priority order:
 
-1. **More collections** — `Array`/`Seq`/`Vector`/`Set` literals and mutable
-   collections, on the same host heap the immutable `List`/`Map` already ride.
-2. **Traits / inheritance / generics** for the wider type system, and the
-   broader standard library (`math`, `scala.io`, `scala.collection.*`).
+1. **More collections** — `Seq`/`Vector`/`Set` literals and the `mutable.*`
+   family, on the same host heap `List`/`Map`/`Array` already ride.
+2. **Generics** for the wider type system, general infix method syntax, and the
+   broader standard library (`scala.io`, `scala.collection.*`).
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

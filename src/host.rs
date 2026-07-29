@@ -18,6 +18,7 @@
 use fusevm::{Frame, NumOp, VMResult, Value, VM};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -151,6 +152,81 @@ pub const EXC_ABORT: u16 = 730;
 /// it. Unlike [`EXC_THROW`] this never halts — the value came from an arm that
 /// had already caught it.
 pub const EXC_RESTORE: u16 = 731;
+/// Builtin id for registering one declared type's shape, emitted once per
+/// `class`/`trait`/`object` before `main`. Pops the primary-constructor arity,
+/// the comma-separated *linearized* supertype names, and the type name.
+///
+/// The runtime needs two things the flat record cannot carry: which supertypes
+/// an instance conforms to (`case s: Shape`, `x.isInstanceOf`), and how many of
+/// a `case class`'s fields came from its primary constructor — Scala's derived
+/// `toString`/`equals`/`hashCode` cover exactly those, not the extra `val`s the
+/// body declares.
+pub const TYPE_REG: u16 = 732;
+/// Builtin id for an `Array(a, b, c)` literal: pops `argc` elements and returns
+/// the mutable array handle.
+pub const MAKE_ARRAY: u16 = 733;
+/// Builtin id for `new Array[T](n)`: pops the element-type name and the length,
+/// and returns an array of `T`'s zero value (`0`, `0.0`, `false`, `null`).
+pub const ARRAY_FILL: u16 = 734;
+/// Builtin id for a first-class `Range`: pops the step, the `inclusive` flag,
+/// the end and the start, and returns the range handle.
+pub const MAKE_RANGE: u16 = 735;
+/// Builtin id for a `scala.math` (`java.lang.Math`) member: pops the member
+/// name and, beneath it, its arguments — the same shape as [`SMETHOD`].
+pub const SMATH: u16 = 736;
+
+thread_local! {
+    /// `type name → (linearized supertypes, primary-constructor arity)`,
+    /// populated by [`TYPE_REG`] at the start of every run.
+    static TYPES: RefCell<HashMap<String, TypeInfo>> = RefCell::new(HashMap::new());
+}
+
+/// One registered type's runtime shape (see [`TYPE_REG`]).
+struct TypeInfo {
+    /// Every supertype, nearest first, excluding the type itself.
+    supers: Vec<String>,
+    /// Primary-constructor field count — the prefix of `fields` that Scala's
+    /// derived `case class` members operate on.
+    ctor_arity: usize,
+}
+
+/// Clear the declared-type registry. Called by the runner before each program.
+pub fn reset_types() {
+    TYPES.with(|t| t.borrow_mut().clear());
+}
+
+/// `TYPE_REG` builtin — see [`TYPE_REG`]. Returns `Unit`.
+fn b_type_reg(vm: &mut VM, _argc: u8) -> Value {
+    let ctor_arity = vm.pop().to_int().max(0) as usize;
+    let supers_csv = vm.pop().as_str_cow().into_owned();
+    let name = vm.pop().as_str_cow().into_owned();
+    let supers = if supers_csv.is_empty() {
+        Vec::new()
+    } else {
+        supers_csv.split(',').map(|s| s.to_string()).collect()
+    };
+    TYPES.with(|t| t.borrow_mut().insert(name, TypeInfo { supers, ctor_arity }));
+    Value::Undef
+}
+
+/// Whether `class` is `ty` or declares it as a supertype.
+fn class_conforms(class: &str, ty: &str) -> bool {
+    class == ty
+        || TYPES.with(|t| {
+            t.borrow()
+                .get(class)
+                .is_some_and(|i| i.supers.iter().any(|s| s == ty))
+        })
+}
+
+/// How many of `class`'s fields Scala's derived `case class` members see. An
+/// unregistered class (a built-in like `Some`) exposes all `total` of them.
+fn ctor_arity(class: &str, total: usize) -> usize {
+    TYPES
+        .with(|t| t.borrow().get(class).map(|i| i.ctor_arity))
+        .unwrap_or(total)
+        .min(total)
+}
 
 thread_local! {
     /// Set by a runtime fault raised inside a builtin (an FFI compile/dispatch
@@ -220,6 +296,11 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(EXC_UNSTASH, b_exc_unstash);
     vm.register_builtin(EXC_ABORT, b_exc_abort);
     vm.register_builtin(EXC_RESTORE, b_exc_restore);
+    vm.register_builtin(TYPE_REG, b_type_reg);
+    vm.register_builtin(MAKE_ARRAY, b_make_array);
+    vm.register_builtin(ARRAY_FILL, b_array_fill);
+    vm.register_builtin(MAKE_RANGE, b_make_range);
+    vm.register_builtin(SMATH, b_math);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -590,6 +671,17 @@ enum SeqKind {
     Vector,
     Set,
     Iterable,
+    /// A mutable `Array`: the only sequence kind that answers `update`.
+    Array,
+    /// An integer `Range` as a first-class value. Its elements are materialized
+    /// like any other sequence; the bounds are kept because `Range.toString`
+    /// prints them (`Range 1 to 10 by 3`) rather than the elements.
+    Range {
+        start: i64,
+        end: i64,
+        inclusive: bool,
+        step: i64,
+    },
 }
 
 impl SeqKind {
@@ -599,8 +691,72 @@ impl SeqKind {
             SeqKind::Vector => "Vector",
             SeqKind::Set => "Set",
             SeqKind::Iterable => "Iterable",
+            SeqKind::Array => "Array",
+            SeqKind::Range { .. } => "Range",
         }
     }
+
+    /// The collection a transforming op (`map`, `filter`, …) produces. A `Range`
+    /// is a view over consecutive integers, so mapping one yields a `Vector` —
+    /// exactly as Scala's `IndexedSeq` result does.
+    fn derived(self) -> SeqKind {
+        match self {
+            SeqKind::Range { .. } => SeqKind::Vector,
+            other => other,
+        }
+    }
+}
+
+/// Scala's `Range.toString`, ported: the bounds and step, prefixed `empty ` when
+/// no element is produced and `inexact ` when the step steps over `end`.
+fn range_to_string(start: i64, end: i64, inclusive: bool, step: i64, is_empty: bool) -> String {
+    let preposition = if inclusive { "to" } else { "until" };
+    let stepped = if step == 1 {
+        String::new()
+    } else {
+        format!(" by {step}")
+    };
+    let exact = step != 0 && (end - start) % step == 0;
+    let prefix = if is_empty {
+        "empty "
+    } else if !exact {
+        "inexact "
+    } else {
+        ""
+    };
+    format!("{prefix}Range {start} {preposition} {end}{stepped}")
+}
+
+/// Materialize the elements of `start until|to end by step`, capped so a range
+/// that would exhaust memory fails loudly instead of hanging.
+fn range_items(start: i64, end: i64, inclusive: bool, step: i64) -> Result<Vec<Value>, String> {
+    if step == 0 {
+        return Err("scalars: java.lang.IllegalArgumentException: step cannot be 0.".into());
+    }
+    const CAP: usize = 8_000_000;
+    let mut out = Vec::new();
+    let mut i = start;
+    while if step > 0 {
+        if inclusive {
+            i <= end
+        } else {
+            i < end
+        }
+    } else if inclusive {
+        i >= end
+    } else {
+        i > end
+    } {
+        out.push(Value::int(i));
+        if out.len() > CAP {
+            return Err("scalars: java.lang.OutOfMemoryError: Range too large".into());
+        }
+        match i.checked_add(step) {
+            Some(n) => i = n,
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 /// A first-class function value. `name_idx` is the closure body's name-pool index
@@ -1123,8 +1279,11 @@ fn obj_to_string(v: &Value) -> String {
                     // A `case object` prints as its bare name (`None`), not `None()`.
                     o.class.to_string()
                 } else if o.is_case {
-                    let inner = o
-                        .fields
+                    // Scala's derived `toString` renders the primary-constructor
+                    // parameters only — a `val` declared in the body is not part
+                    // of it.
+                    let n = ctor_arity(&o.class, o.fields.len());
+                    let inner = o.fields[..n]
                         .iter()
                         .map(|(_, val)| scala_str(val))
                         .collect::<Vec<_>>()
@@ -1134,6 +1293,15 @@ fn obj_to_string(v: &Value) -> String {
                     format!("{}@{:x}", o.class, id)
                 }
             }
+            Some(HeapVal::Seq(
+                SeqKind::Range {
+                    start,
+                    end,
+                    inclusive,
+                    step,
+                },
+                items,
+            )) => range_to_string(*start, *end, *inclusive, *step, items.is_empty()),
             Some(HeapVal::Seq(kind, items)) => {
                 let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(", ");
                 format!("{}({inner})", kind.label())
@@ -1165,7 +1333,9 @@ fn obj_hash(class: &str, is_case: bool, fields: &[(Arc<str>, Value)], v: &Value)
     let mut h = DefaultHasher::new();
     if is_case {
         class.hash(&mut h);
-        for (_, val) in fields {
+        // Same primary-constructor prefix `equals` uses, so the
+        // equal-implies-equal contract holds.
+        for (_, val) in &fields[..ctor_arity(class, fields.len())] {
             hash_value(val, &mut h);
         }
     } else if let Value::Obj(id) = v {
@@ -1210,14 +1380,16 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
             match (oa, ob) {
                 (HeapVal::Record(oa), HeapVal::Record(ob)) => {
                     // Plain classes already failed the identity check above.
+                    // Scala's derived `equals` compares the primary-constructor
+                    // parameters only.
+                    let n = ctor_arity(&oa.class, oa.fields.len());
                     oa.is_case
                         && ob.is_case
                         && oa.class == ob.class
                         && oa.fields.len() == ob.fields.len()
-                        && oa
-                            .fields
+                        && oa.fields[..n]
                             .iter()
-                            .zip(&ob.fields)
+                            .zip(&ob.fields[..n])
                             .all(|((_, x), (_, y))| value_eq(x, y))
                 }
                 // Two sequences/tuples are equal element-by-element (a `List`
@@ -1312,7 +1484,9 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Double" | "Float" => matches!(v, Value::Float(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
         "Any" | "AnyRef" | "AnyVal" | "Object" => true,
-        _ => false,
+        // A user instance conforms to its own class and to every supertype the
+        // compiler registered for it (`case c: Shape` on a `Circle`).
+        _ => with_obj(v, |o| class_conforms(&o.class, ty)).unwrap_or(false),
     }
 }
 
@@ -1590,8 +1764,89 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
     // A transforming op keeps the receiver's collection kind (`List.map` → `List`,
     // a range-derived `Vector.map` → `Vector`).
-    let same = |v: Vec<Value>| new_seq(kind, v);
+    let same = |v: Vec<Value>| new_seq(kind.derived(), v);
     match (name, args.len()) {
+        // `Range.reverse` is another `Range`, walked the other way.
+        ("reverse", 0) if matches!(kind, SeqKind::Range { .. }) => {
+            let SeqKind::Range { step, .. } = kind else {
+                unreachable!("just matched a range")
+            };
+            match (items.first(), items.last()) {
+                (Some(a), Some(b)) => Ok(new_seq(
+                    SeqKind::Range {
+                        start: b.to_int(),
+                        end: a.to_int(),
+                        inclusive: true,
+                        step: -step,
+                    },
+                    items.iter().rev().cloned().collect(),
+                )),
+                _ => Ok(new_seq(kind, Vec::new())),
+            }
+        }
+        // `(a to b) by s` — rebuild the range with a new step.
+        ("by", 1) => {
+            let SeqKind::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } = kind
+            else {
+                return Err(no_such_method(recv, name));
+            };
+            let step = args[0].to_int();
+            let items = range_items(start, end, inclusive, step)?;
+            Ok(new_seq(
+                SeqKind::Range {
+                    start,
+                    end,
+                    inclusive,
+                    step,
+                },
+                items,
+            ))
+        }
+        // In-place element assignment (`a(i) = v`), the desugar target of
+        // `Array.update`. Only an `Array` is mutable in Scala.
+        ("update", 2) => {
+            if !matches!(kind, SeqKind::Array) {
+                return Err(no_such_method(recv, name));
+            }
+            let i = args[0].to_int();
+            if i < 0 || i as usize >= items.len() {
+                return Err(format!(
+                    "scalars: java.lang.ArrayIndexOutOfBoundsException: Index {i} out of bounds for length {}",
+                    items.len()
+                ));
+            }
+            if let Value::Obj(id) = recv {
+                HEAP.with(|h| {
+                    if let Some(HeapVal::Seq(_, xs)) = h.borrow_mut().get_mut(*id as usize) {
+                        xs[i as usize] = args[1].clone();
+                    }
+                });
+            }
+            Ok(Value::Undef)
+        }
+        ("min", 0) | ("max", 0) => {
+            if items.is_empty() {
+                return Err(format!(
+                    "scalars: java.lang.UnsupportedOperationException: empty.{name}"
+                ));
+            }
+            let want_max = name == "max";
+            let mut best = items[0].clone();
+            for it in &items[1..] {
+                let gt = it.to_float() > best.to_float();
+                if gt == want_max {
+                    best = it.clone();
+                }
+            }
+            Ok(best)
+        }
+        ("toArray", 0) => Ok(new_seq(SeqKind::Array, items)),
+        ("toVector", 0) => Ok(new_seq(SeqKind::Vector, items)),
         ("length" | "size", 0) => Ok(Value::int(items.len() as i64)),
         ("isEmpty", 0) => Ok(Value::bool(items.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!items.is_empty())),
@@ -1789,6 +2044,133 @@ fn seq_sum(items: &[Value]) -> Value {
         Value::int(items.iter().map(|v| v.to_int()).sum())
     } else {
         Value::float(items.iter().map(|v| v.to_float()).sum())
+    }
+}
+
+/// `MAKE_ARRAY` builtin — pop `argc` elements (deepest first) into a mutable
+/// `Array`.
+fn b_make_array(vm: &mut VM, argc: u8) -> Value {
+    let mut items = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        items.push(vm.pop());
+    }
+    items.reverse();
+    new_seq(SeqKind::Array, items)
+}
+
+/// `ARRAY_FILL` builtin — pop the element-type name and the length; return an
+/// array of that type's Scala zero value.
+fn b_array_fill(vm: &mut VM, _argc: u8) -> Value {
+    let ty = vm.pop().as_str_cow().into_owned();
+    let n = vm.pop().to_int();
+    if n < 0 {
+        return fault(vm, "scalars: java.lang.NegativeArraySizeException");
+    }
+    let zero = match ty.as_str() {
+        "Int" | "Long" | "Short" | "Byte" | "Char" => Value::int(0),
+        "Double" | "Float" => Value::float(0.0),
+        "Boolean" => Value::bool(false),
+        _ => Value::Undef,
+    };
+    new_seq(SeqKind::Array, vec![zero; n as usize])
+}
+
+/// `MAKE_RANGE` builtin — pop the step, `inclusive`, end and start; return the
+/// materialized range.
+fn b_make_range(vm: &mut VM, _argc: u8) -> Value {
+    let step = vm.pop().to_int();
+    let inclusive = matches!(vm.pop(), Value::Bool(true));
+    let end = vm.pop().to_int();
+    let start = vm.pop().to_int();
+    match range_items(start, end, inclusive, step) {
+        Ok(items) => new_seq(
+            SeqKind::Range {
+                start,
+                end,
+                inclusive,
+                step,
+            },
+            items,
+        ),
+        Err(e) => fault(vm, e),
+    }
+}
+
+/// `SMATH` builtin — pop the member name, then its arguments; evaluate the
+/// `scala.math` member.
+fn b_math(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().as_str_cow().into_owned();
+    let n = (argc as usize).saturating_sub(1);
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    match math_member(&name, &args) {
+        Ok(v) => v,
+        Err(e) => fault(vm, e),
+    }
+}
+
+/// `scala.math` / `java.lang.Math` members. Integer-preserving where Scala's
+/// overloads are (`abs`/`min`/`max`/`signum` on two `Int`s stay `Int`); every
+/// other member is the `Double` overload, as the JDK defines it.
+fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
+    // `java.lang.Math` has no `signum(int)` overload, so an integral argument
+    // widens there (`Math.signum(5)` is `1.0`) but not in `scala.math`.
+    let (java, name) = match name.strip_prefix("java.") {
+        Some(n) => (true, n),
+        None => (false, name),
+    };
+    let ints = args.iter().all(|a| matches!(a, Value::Int(_))) && !(java && name == "signum");
+    let f = |i: usize| args[i].to_float();
+    match (name, args.len()) {
+        ("Pi" | "PI", 0) => Ok(Value::float(std::f64::consts::PI)),
+        ("E", 0) => Ok(Value::float(std::f64::consts::E)),
+        ("abs", 1) if ints => Ok(Value::int(args[0].to_int().abs())),
+        ("abs", 1) => Ok(Value::float(f(0).abs())),
+        ("signum", 1) if ints => Ok(Value::int(args[0].to_int().signum())),
+        ("signum", 1) => Ok(Value::float(if f(0) == 0.0 { f(0) } else { f(0).signum() })),
+        ("max", 2) if ints => Ok(Value::int(args[0].to_int().max(args[1].to_int()))),
+        ("max", 2) => Ok(Value::float(f(0).max(f(1)))),
+        ("min", 2) if ints => Ok(Value::int(args[0].to_int().min(args[1].to_int()))),
+        ("min", 2) => Ok(Value::float(f(0).min(f(1)))),
+        // `Math.round` is "floor(x + 0.5)", which is NOT `f64::round`
+        // (`round(-2.5)` is `-2` on the JVM, `-3` in Rust).
+        ("round", 1) => Ok(Value::int((f(0) + 0.5).floor() as i64)),
+        ("floor", 1) => Ok(Value::float(f(0).floor())),
+        ("ceil", 1) => Ok(Value::float(f(0).ceil())),
+        ("rint", 1) => Ok(Value::float(round_half_even(f(0)))),
+        ("sqrt", 1) => Ok(Value::float(f(0).sqrt())),
+        ("cbrt", 1) => Ok(Value::float(f(0).cbrt())),
+        ("exp", 1) => Ok(Value::float(f(0).exp())),
+        ("log", 1) => Ok(Value::float(f(0).ln())),
+        ("log10", 1) => Ok(Value::float(f(0).log10())),
+        ("pow", 2) => Ok(Value::float(f(0).powf(f(1)))),
+        ("hypot", 2) => Ok(Value::float(f(0).hypot(f(1)))),
+        ("sin", 1) => Ok(Value::float(f(0).sin())),
+        ("cos", 1) => Ok(Value::float(f(0).cos())),
+        ("tan", 1) => Ok(Value::float(f(0).tan())),
+        ("asin", 1) => Ok(Value::float(f(0).asin())),
+        ("acos", 1) => Ok(Value::float(f(0).acos())),
+        ("atan", 1) => Ok(Value::float(f(0).atan())),
+        ("atan2", 2) => Ok(Value::float(f(0).atan2(f(1)))),
+        ("toRadians", 1) => Ok(Value::float(f(0).to_radians())),
+        ("toDegrees", 1) => Ok(Value::float(f(0).to_degrees())),
+        _ => Err(format!(
+            "scalars: value {name} is not a member of scala.math"
+        )),
+    }
+}
+
+/// IEEE round-half-to-even, which is what `Math.rint` does (and `f64::round`
+/// does not).
+fn round_half_even(x: f64) -> f64 {
+    let r = x.round();
+    if (x - x.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
+        r - x.signum()
+    } else {
+        r
     }
 }
 

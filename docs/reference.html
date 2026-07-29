@@ -58,7 +58,7 @@
         </article>
         <article class="doc-entry" id="doc-keyword-2">
           <h3><a class="doc-anchor" href="#doc-keyword-2">#</a> <code>def</code></h3>
-          <p>define a method; scalars locates and runs `def main(args: Array[String])`</p>
+          <p>define a method; scalars locates and runs `def main(args: Array[String])`. A `def` inside a block is scoped to that block and may shadow an outer one</p>
           <pre><code class="lang-scala">object T { def main(args: Array[String]): Unit = { println(1) } }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-3">
@@ -98,53 +98,62 @@ println(i)   // =&gt; 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-9">
           <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>extends</code></h3>
-          <p>name a parent; `extends App` makes the object body the program entry point</p>
-          <pre><code class="lang-scala">object T extends App { println("run") }</code></pre>
+          <p>name a supertype: its fields and concrete methods are inherited, and its constructor takes the `extends P(args)` arguments. `extends App` instead makes the object body the program entry point</p>
+          <pre><code class="lang-scala">class A(val n: Int)
+class B(m: Int) extends A(m)
+println(new B(2).n)   // =&gt; 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-10">
-          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>new</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>trait</code></h3>
+          <p>declare an abstract type to mix in: abstract members (`def f: Int`, `val x: String`) plus concrete ones. Cannot be instantiated</p>
+          <pre><code class="lang-scala">trait S { def area: Int; def show: String = "a=" + area }
+class C(r: Int) extends S { def area = r * r }
+println(new C(3).show)   // =&gt; a=9</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-11">
+          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>new</code></h3>
           <p>construct an instance: a user `class`/`case class`, or a built-in throwable</p>
           <pre><code class="lang-scala">class P(val n: Int)
 println(new P(2).n)   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-11">
-          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>return</code></h3>
+        <article class="doc-entry" id="doc-keyword-12">
+          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>return</code></h3>
           <p>early return from a `def`, exiting before the body's last expression</p>
           <pre><code class="lang-scala">def f(x: Int): Int = { if (x &lt; 0) return 0; x * 2 }
 println(f(-1))   // =&gt; 0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-12">
-          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>try</code></h3>
+        <article class="doc-entry" id="doc-keyword-13">
+          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>try</code></h3>
           <p>run a body with handlers: `try { .. } catch { case e: T =&gt; .. } finally { .. }`; its value is the body's, or the matching handler's</p>
           <pre><code class="lang-scala">println(try { 1 / 0 } catch { case _: ArithmeticException =&gt; -1 })   // =&gt; -1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-13">
-          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>catch</code></h3>
+        <article class="doc-entry" id="doc-keyword-14">
+          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>catch</code></h3>
           <p>the handler block of a `try`; arms are `case e: Type [if guard] =&gt; ..` and match the JVM throwable hierarchy</p>
           <pre><code class="lang-scala">try { "z".toInt } catch { case e: NumberFormatException =&gt; println(e.getMessage) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-14">
-          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>finally</code></h3>
+        <article class="doc-entry" id="doc-keyword-15">
+          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>finally</code></h3>
           <p>a block that runs on both the normal and the exceptional exit of a `try`, before the exception continues unwinding</p>
           <pre><code class="lang-scala">try { println(1) } finally { println("done") }   // =&gt; 1 done</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-15">
-          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>throw</code></h3>
+        <article class="doc-entry" id="doc-keyword-16">
+          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>throw</code></h3>
           <p>raise an exception; an expression (type `Nothing`), so it may appear in operand position</p>
           <pre><code class="lang-scala">def pick(b: Boolean): Int = if (b) 7 else throw new RuntimeException("no")</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-16">
-          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>true</code></h3>
+        <article class="doc-entry" id="doc-keyword-17">
+          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>true</code></h3>
           <p>the Boolean true literal</p>
           <pre><code class="lang-scala">println(true &amp;&amp; false)   // =&gt; false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-17">
-          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>false</code></h3>
+        <article class="doc-entry" id="doc-keyword-18">
+          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>false</code></h3>
           <p>the Boolean false literal</p>
           <pre><code class="lang-scala">println(false || true)   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-18">
-          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>null</code></h3>
+        <article class="doc-entry" id="doc-keyword-19">
+          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>null</code></h3>
           <p>the null reference literal; prints as `null`</p>
           <pre><code class="lang-scala">val x = null
 println(x)   // =&gt; null</code></pre>
@@ -154,38 +163,78 @@ println(x)   // =&gt; null</code></pre>
       <section class="tutorial-section" id="ch-contextual">
         <h2>Contextual</h2>
         <article class="doc-entry" id="doc-contextual-1">
-          <h3><a class="doc-anchor" href="#doc-contextual-1">#</a> <code>until</code></h3>
-          <p>exclusive range bound in a `for`: `a until b` iterates a..b-1</p>
-          <pre><code class="lang-scala">for (i &lt;- 0 until 3) print(i)   // =&gt; 012</code></pre>
+          <h3><a class="doc-anchor" href="#doc-contextual-1">#</a> <code>with</code></h3>
+          <p>mix another supertype into a `class`/`trait`: `extends P with T1 with T2`. Method lookup is self, then the parents right-to-left</p>
+          <pre><code class="lang-scala">trait L { def tag = "L" }
+class R extends L
+println(new R().tag)   // =&gt; L</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-2">
-          <h3><a class="doc-anchor" href="#doc-contextual-2">#</a> <code>to</code></h3>
-          <p>inclusive range bound in a `for`: `a to b` iterates a..b</p>
-          <pre><code class="lang-scala">for (i &lt;- 1 to 3) print(i)   // =&gt; 123</code></pre>
+          <h3><a class="doc-anchor" href="#doc-contextual-2">#</a> <code>override</code></h3>
+          <p>replace a supertype's concrete member; the call dispatches on the receiver's runtime class</p>
+          <pre><code class="lang-scala">class A { def f = 1 }
+class B extends A { override def f = 2 }
+val a: A = new B()
+println(a.f)   // =&gt; 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-3">
-          <h3><a class="doc-anchor" href="#doc-contextual-3">#</a> <code>by</code></h3>
-          <p>range step in a `for`: `a until b by s`; a negative step counts down, and a zero step throws `IllegalArgumentException`</p>
-          <pre><code class="lang-scala">for (i &lt;- 10 to 1 by -3) print(i + " ")   // =&gt; 10 7 4 1</code></pre>
+          <h3><a class="doc-anchor" href="#doc-contextual-3">#</a> <code>super</code></h3>
+          <p>call the supertype's implementation of a member, skipping this type in the linearization</p>
+          <pre><code class="lang-scala">class A { def f = "a" }
+class B extends A { override def f = super.f + "b" }
+println(new B().f)   // =&gt; ab</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-4">
-          <h3><a class="doc-anchor" href="#doc-contextual-4">#</a> <code>App</code></h3>
+          <h3><a class="doc-anchor" href="#doc-contextual-4">#</a> <code>isInstanceOf</code></h3>
+          <p>runtime type test against the registered class hierarchy; the same test `case x: T =&gt;` performs</p>
+          <pre><code class="lang-scala">trait S; class C extends S
+println(new C().isInstanceOf[S])   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-5">
+          <h3><a class="doc-anchor" href="#doc-contextual-5">#</a> <code>until</code></h3>
+          <p>exclusive range bound: `a until b` is the values a..b-1, as a `for` generator or as a first-class `Range`</p>
+          <pre><code class="lang-scala">for (i &lt;- 0 until 3) print(i)   // =&gt; 012</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-6">
+          <h3><a class="doc-anchor" href="#doc-contextual-6">#</a> <code>to</code></h3>
+          <p>inclusive range bound: `a to b` is the values a..b, as a `for` generator or as a first-class `Range`</p>
+          <pre><code class="lang-scala">println((1 to 3).sum)   // =&gt; 6</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-7">
+          <h3><a class="doc-anchor" href="#doc-contextual-7">#</a> <code>by</code></h3>
+          <p>range step: `a until b by s`; a negative step counts down, and a zero step throws `IllegalArgumentException`</p>
+          <pre><code class="lang-scala">for (i &lt;- 10 to 1 by -3) print(i + " ")   // =&gt; 10 7 4 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-8">
+          <h3><a class="doc-anchor" href="#doc-contextual-8">#</a> <code>Array</code></h3>
+          <p>the mutable sequence: `Array(a, b)`, `new Array[T](n)` (zero-filled), `a(i)` reads and `a(i) = v` writes</p>
+          <pre><code class="lang-scala">val a = Array(1, 2, 3)
+a(1) = 9
+println(a.mkString(","))   // =&gt; 1,9,3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-9">
+          <h3><a class="doc-anchor" href="#doc-contextual-9">#</a> <code>math</code></h3>
+          <p>the `scala.math` module (also spelled `scala.math`, `Math`, `java.lang.Math`): `abs`, `min`/`max`, `sqrt`, `pow`, `floor`/`ceil`/`round`, the trig family, `Pi`, `E`</p>
+          <pre><code class="lang-scala">println(math.sqrt(16.0))   // =&gt; 4.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-10">
+          <h3><a class="doc-anchor" href="#doc-contextual-10">#</a> <code>App</code></h3>
           <p>the mixin whose object body scalars runs directly as the program</p>
           <pre><code class="lang-scala">object T extends App { println("hi") }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-5">
-          <h3><a class="doc-anchor" href="#doc-contextual-5">#</a> <code>main</code></h3>
+        <article class="doc-entry" id="doc-contextual-11">
+          <h3><a class="doc-anchor" href="#doc-contextual-11">#</a> <code>main</code></h3>
           <p>the entry method scalars runs: `def main(args: Array[String]): Unit`</p>
           <pre><code class="lang-scala">def main(args: Array[String]): Unit = { println(0) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-6">
-          <h3><a class="doc-anchor" href="#doc-contextual-6">#</a> <code>package</code></h3>
+        <article class="doc-entry" id="doc-contextual-12">
+          <h3><a class="doc-anchor" href="#doc-contextual-12">#</a> <code>package</code></h3>
           <p>a package prologue line; scalars skips it and runs the object entry</p>
           <pre><code class="lang-scala">package demo
 object T extends App { println(1) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-7">
-          <h3><a class="doc-anchor" href="#doc-contextual-7">#</a> <code>import</code></h3>
+        <article class="doc-entry" id="doc-contextual-13">
+          <h3><a class="doc-anchor" href="#doc-contextual-13">#</a> <code>import</code></h3>
           <p>an import prologue line; skipped in slice 1</p>
           <pre><code class="lang-scala">import scala.math._
 object T extends App { println(1) }</code></pre>

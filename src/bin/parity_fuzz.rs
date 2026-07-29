@@ -17,9 +17,11 @@
 //! `+` string-concatenation coercion, structural `==`/`!=`, `Double.toString`
 //! notation (the decimal/scientific threshold), the range `for` (including `by`
 //! steps and their sign-dependent bound test), IEEE division by zero
-//! (`x/0.0 == Infinity`, `0.0/0.0 == NaN`), and `try`/`catch`/`finally`/`throw`
-//! unwinding. Pure random bytes only produce mutual parse errors that agree on
-//! both sides and teach nothing.
+//! (`x/0.0 == Infinity`, `0.0/0.0 == NaN`), `try`/`catch`/`finally`/`throw`
+//! unwinding, block-local `def` scoping and capture, trait/class inheritance
+//! and virtual dispatch, `Range` values, `Array` mutation, and the `scala.math`
+//! vs. `java.lang.Math` overload split. Pure random bytes only produce mutual
+//! parse errors that agree on both sides and teach nothing.
 //!
 //! Scope + determinism invariants (mirroring the node-js/pythonrs harnesses):
 //!   * Only constructs scalars actually implements are emitted — an unsupported
@@ -32,9 +34,12 @@
 //!     division/modulo by zero (divisors are non-zero outside the `exc` mode,
 //!     where a `try` makes the throw catchable and therefore comparable).
 //!     Generating a gap would only reproduce a `BUGS.md` entry.
-//!   * Probe-local `def` names carry a per-probe suffix: scalars hoists every
-//!     `def` into one flat table, so two probes declaring the same name would
-//!     collide — a documented gap, not a parity signal.
+//!   * Probes that declare top-level types suffix every name with a per-probe
+//!     id, so two probes in one program cannot collide. The `localdef` mode is
+//!     the deliberate exception: it REUSES one `def` name at different nesting
+//!     depths, because block-local shadowing is exactly what it probes.
+//!   * `Array.toString` is never printed: Scala emits the JVM identity form
+//!     (`[I@1b6d3586`), which is unreproducible by construction (`BUGS.md`).
 //!
 //! Subprocess-only: this binary never links the scalars library — it compares
 //! two `scala` processes, exactly as a user would observe them.
@@ -380,6 +385,182 @@ fn g_exc(r: &mut Rng) -> String {
     }
 }
 
+/// Block-local `def`s: shadowing across nested blocks, capture of an enclosing
+/// method's locals, and mutual recursion between two local `def`s. Unlike every
+/// other generator these deliberately REUSE one `def` name at different nesting
+/// depths — that collision is the whole point, and getting it wrong is a silent
+/// wrong answer rather than an error.
+fn g_localdef(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, &["1", "2", "3", "4"]);
+    match r.below(6) {
+        // Two sibling methods, each with a same-named local helper.
+        0 => format!(
+            "{{ def o{u}(): Int = {{ def h(x: Int): Int = x * 2; h({a}) }}; \
+               def p{u}(): Int = {{ def h(x: Int): Int = x + 100; h({a}) }}; \
+               println(o{u}() + \",\" + p{u}()) }}"
+        ),
+        // An inner block shadows an outer local `def`, then the outer is back.
+        1 => format!(
+            "{{ def f(x: Int): Int = x + 1; val r1 = f({a}); \
+               val r2 = {{ def f(x: Int): Int = x * 10; f({a}) }}; \
+               println(r1 + \"|\" + r2 + \"|\" + f({a})) }}"
+        ),
+        // Capture of an enclosing method's `val`, through recursion.
+        2 => format!(
+            "{{ def s{u}(n: Int): Int = {{ val k = {b}; def go(i: Int, acc: Int): Int = \
+               if (i > n) acc else go(i + 1, acc + i * k); go(1, 0) }}; println(s{u}(5)) }}"
+        ),
+        // Mutual recursion where both helpers capture the same enclosing `val`.
+        3 => format!(
+            "{{ def par{u}(n: Int): String = {{ val t = \"t\"; \
+               def ev(k: Int): String = if (k == 0) t + \"E\" else od(k - 1); \
+               def od(k: Int): String = if (k == 0) t + \"O\" else ev(k - 1); ev(n) }}; \
+               println(par{u}({b})) }}"
+        ),
+        // A local `def` passed as a function value (eta-expanded with captures).
+        4 => format!(
+            "{{ def m{u}(xs: List[Int]): List[Int] = {{ val k = {b}; \
+               def f(x: Int): Int = x * k; xs.map(f) }}; println(m{u}(List(1, 2, 3))) }}"
+        ),
+        // A `val` shadowing an outer local `def` name after the block ends.
+        _ => format!(
+            "{{ val g{u} = {a}; val q = {{ def g{u}(x: Int): Int = x; g{u}(7) }}; \
+               println(q + \"/\" + g{u}) }}"
+        ),
+    }
+}
+
+/// Traits, inheritance, overriding, virtual dispatch and `case class` pattern
+/// matching. Each probe contributes its own top-level declarations (uniquely
+/// suffixed) plus one body statement — see [`TOP_SEP`].
+fn g_oop(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, &["1", "2", "3", "5"]);
+    let b = pick(r, &["2", "4", "7"]);
+    match r.below(5) {
+        // A trait's concrete method calling an abstract one implemented two ways.
+        0 => format!(
+            "trait S{u} {{ def area: Int; def name: String = \"s\"; \
+               def show: String = name + \"=\" + area }}\n\
+             class C{u}(val r: Int) extends S{u} {{ def area: Int = r * r; \
+               override def name: String = \"c\" }}\n\
+             class D{u}(val w: Int) extends S{u} {{ def area: Int = w + w }}\n\
+             {sep}{{ val xs: List[S{u}] = List(new C{u}({a}), new D{u}({b})); \
+               xs.foreach(x => println(x.show)) }}"
+        ),
+        // A three-level class chain with `super` and a forwarded constructor arg.
+        1 => format!(
+            "class A{u}(val n: String) {{ def speak: String = \"...\"; \
+               def intro: String = n + \":\" + speak }}\n\
+             class B{u}(m: String) extends A{u}(m) {{ override def speak: String = \"woof\" }}\n\
+             class E{u}(m: String) extends B{u}(m) {{ override def speak: String = super.speak + \"!\" }}\n\
+             {sep}{{ val xs: List[A{u}] = List(new A{u}(\"g\"), new B{u}(\"r\"), new E{u}(\"p\")); \
+               xs.foreach(x => println(x.intro)) }}"
+        ),
+        // A `case class` with an extra body `val`: toString/equals/unapply all
+        // see the primary-constructor prefix only.
+        2 => format!(
+            "case class P{u}(x: Int, y: Int) {{ val z = x + y }}\n\
+             {sep}{{ val p = P{u}({a}, {b}); println(p); println(p.z); \
+               println(p == P{u}({a}, {b})); println(p.copy(y = 9)); \
+               p match {{ case P{u}(i, j) => println(i * j) }} }}"
+        ),
+        // A sealed-trait ADT evaluated by pattern match, plus a typed pattern.
+        3 => format!(
+            "sealed trait X{u}\n\
+             case class N{u}(v: Int) extends X{u}\n\
+             case class Ad{u}(l: X{u}, rr: X{u}) extends X{u}\n\
+             case object Z{u} extends X{u}\n\
+             {sep}{{ def ev(e: X{u}): Int = e match {{ case Z{u} => 0; \
+               case N{u}(v) => v; case Ad{u}(l, rr) => ev(l) + ev(rr) }}; \
+               val t = Ad{u}(N{u}({a}), Ad{u}(N{u}({b}), Z{u})); println(ev(t)); println(t); \
+               println(t.isInstanceOf[X{u}]); println(Z{u}) }}"
+        ),
+        // A mixin whose override calls `super`, over a trait-declared field.
+        _ => format!(
+            "trait G{u} {{ val pre: String; def greet(n: String): String = pre + n }}\n\
+             trait L{u} extends G{u} {{ override def greet(n: String): String = \
+               super.greet(n).toUpperCase }}\n\
+             class Q{u} extends G{u} {{ val pre = \"hi \" }}\n\
+             class R{u} extends G{u} with L{u} {{ val pre = \"yo \" }}\n\
+             {sep}{{ println(new Q{u}().greet(\"bob\")); println(new R{u}().greet(\"ann\")); \
+               val g: G{u} = new R{u}(); println(g.pre) }}"
+        ),
+    }
+}
+
+/// `Range` as a first-class value: its `toString` (including the `empty `/
+/// `inexact ` prefixes), the sequence operations over it, and the `by` step.
+fn g_range(r: &mut Rng) -> String {
+    let lo = r.below(8) as i64;
+    let hi = r.below(12) as i64;
+    let step = *pick(r, &["1", "2", "3", "-1", "-2", "4"]);
+    let bound = if r.below(2) == 0 { "until" } else { "to" };
+    match r.below(6) {
+        0 => format!("println({lo} {bound} {hi})"),
+        1 => format!("println({lo} {bound} {hi} by {step})"),
+        2 => format!("println(({lo} {bound} {hi}).mkString(\",\"))"),
+        3 => format!(
+            "{{ val r = {lo} {bound} {hi}; println(r.length + \"/\" + r.sum + \"/\" + r.isEmpty) }}"
+        ),
+        4 => format!("println(({lo} {bound} {hi}).map(_ * 2))"),
+        _ => format!(
+            "println(({lo} {bound} {hi}).toList); println(({lo} {bound} {hi}).filter(_ % 2 == 0))"
+        ),
+    }
+}
+
+/// `Array`: construction, indexed read/write, and the sequence operations.
+/// A bare `println(array)` is never generated — Scala prints the JVM identity
+/// form (`[I@1b6d3586`), which no reimplementation can reproduce (`BUGS.md`).
+fn g_array(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let c = pick(r, INTS);
+    let n = 1 + r.below(4);
+    match r.below(5) {
+        0 => format!("{{ val a = Array({a}, {b}, {c}); println(a.length + \":\" + a(1)) }}"),
+        1 => format!("{{ val a = Array({a}, {b}, {c}); a(1) = {a}; println(a.mkString(\",\")) }}"),
+        2 => format!("{{ val a = new Array[Int]({n}); println(a.mkString(\"|\")) }}"),
+        3 => format!(
+            "{{ val a = Array({a}, {b}, {c}); println(a.map(_ * 2).mkString(\",\") + \
+               \" \" + a.sum + \" \" + a.reverse.mkString(\"\")) }}"
+        ),
+        _ => format!(
+            "{{ val a = Array({a}, {b}, {c}); println(a.toList); \
+               println(\"c=\" + a.contains({b}) + \",\" + a.isEmpty) }}"
+        ),
+    }
+}
+
+/// `scala.math` members, over both the `Int` and the `Double` overloads (Scala
+/// keeps `abs`/`min`/`max`/`signum` integral for integral arguments).
+fn g_math(r: &mut Rng) -> String {
+    let i = pick(r, INTS);
+    let j = pick(r, INTS);
+    let d = pick(
+        r,
+        &[
+            "0.5", "1.5", "2.5", "-2.5", "3.0", "16.0", "0.25", "-0.0", "10.0",
+        ],
+    );
+    let e = pick(r, &["2.0", "3.0", "-1.5", "0.5"]);
+    let module = *pick(r, &["math", "scala.math", "Math"]);
+    match r.below(8) {
+        0 => format!("println({module}.abs({i}) + \" \" + {module}.abs({d}))"),
+        1 => format!("println({module}.max({i}, {j}) + \" \" + {module}.min({d}, {e}))"),
+        2 => format!("println({module}.sqrt({}) + \" \" + {module}.cbrt(27.0))", d.trim_start_matches('-')),
+        3 => format!("println({module}.pow({e}, 2.0) + \" \" + {module}.hypot(3.0, 4.0))"),
+        4 => format!("println({module}.floor({d}) + \" \" + {module}.ceil({d}) + \" \" + {module}.round({d}))"),
+        5 => format!("println({module}.signum({i}) + \" \" + {module}.signum({d}))"),
+        6 => "println(math.Pi + \" \" + math.E)".to_string(),
+        _ => format!("println({module}.exp(0.0) + \" \" + {module}.log(1.0) + \" \" + {module}.log10(100.0))"),
+    }
+}
+
 fn g_mixed(r: &mut Rng) -> String {
     let x = pick(r, INTS);
     let y = pick(r, DIVS);
@@ -404,6 +585,11 @@ enum Mode {
     Step,
     Ieee,
     Exc,
+    LocalDef,
+    Oop,
+    Range,
+    Array,
+    Math,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -422,6 +608,11 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Step => "step",
         Mode::Ieee => "ieee",
         Mode::Exc => "exc",
+        Mode::LocalDef => "localdef",
+        Mode::Oop => "oop",
+        Mode::Range => "range",
+        Mode::Array => "array",
+        Mode::Math => "math",
     }
 }
 
@@ -441,6 +632,11 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "step" => Mode::Step,
         "ieee" => Mode::Ieee,
         "exc" => Mode::Exc,
+        "localdef" => Mode::LocalDef,
+        "oop" => Mode::Oop,
+        "range" => Mode::Range,
+        "array" => Mode::Array,
+        "math" => Mode::Math,
         _ => return None,
     })
 }
@@ -459,6 +655,11 @@ const CONCRETE: &[Mode] = &[
     Mode::Step,
     Mode::Ieee,
     Mode::Exc,
+    Mode::LocalDef,
+    Mode::Oop,
+    Mode::Range,
+    Mode::Array,
+    Mode::Math,
 ];
 
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
@@ -481,6 +682,11 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Step => g_step(r),
         Mode::Ieee => g_ieee(r),
         Mode::Exc => g_exc(r),
+        Mode::LocalDef => g_localdef(r),
+        Mode::Oop => g_oop(r),
+        Mode::Range => g_range(r),
+        Mode::Array => g_array(r),
+        Mode::Math => g_math(r),
         Mode::All => unreachable!(),
     }
 }
@@ -491,15 +697,28 @@ fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
     (0..n).map(|_| gen_probe(r, mode)).collect()
 }
 
+/// Separator inside a probe that carries its own top-level declarations: the
+/// text before it is emitted *outside* the entry object (a `trait`/`class` can
+/// only be declared at the top level), the text after it is the body statement.
+const TOP_SEP: &str = "//@TOP@";
+
 fn build_program(probes: &[String]) -> String {
-    let mut s = String::from("object T extends App {\n");
+    let mut top = String::new();
+    let mut body = String::new();
     for p in probes {
-        s.push_str("  ");
-        s.push_str(p);
-        s.push('\n');
+        let (decls, stmt) = match p.split_once(TOP_SEP) {
+            Some((d, s)) => (Some(d), s),
+            None => (None, p.as_str()),
+        };
+        if let Some(d) = decls {
+            top.push_str(d.trim_end());
+            top.push('\n');
+        }
+        body.push_str("  ");
+        body.push_str(stmt);
+        body.push('\n');
     }
-    s.push_str("}\n");
-    s
+    format!("{top}object T extends App {{\n{body}}}\n")
 }
 
 // ───────────────────────── process invocation ──────────────────────────────
