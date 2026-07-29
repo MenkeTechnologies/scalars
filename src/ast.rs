@@ -311,6 +311,14 @@ pub enum Expr {
     Lambda {
         params: Vec<String>,
         body: Box<Expr>,
+        /// `true` for a `{ case … }` literal, which is Scala's `PartialFunction`
+        /// literal: besides `apply` it answers `isDefinedAt`, so `collect` can
+        /// skip an element no arm matches instead of raising `MatchError`. The
+        /// compiler emits a **second** subroutine for such a lambda — the same
+        /// patterns and guards with every arm body replaced by `true` and a
+        /// trailing `case _ => false` — and stores its name index alongside the
+        /// `apply` body in the closure handle.
+        partial: bool,
     },
     /// An underscore placeholder (`_`) in an argument expression. The enclosing
     /// argument is rewritten into a [`Expr::Lambda`] whose synthetic parameters

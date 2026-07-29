@@ -83,10 +83,11 @@ pub const OBJ_COPY: u16 = 712;
 /// field-name `Str`, and the new value on top; `argc` is 3. Returns `Unit`.
 pub const OBJ_SET: u16 = 713;
 /// Builtin id for building a first-class function value (a lambda). The stack
-/// holds the closure body's name-pool index and its parameter count (two
-/// integers), then the captured upvalue values (deepest first); `argc` is
-/// capture-count + 2. Registers a heap `Closure` and returns its `Value::Obj`
-/// handle (invoked later via `invoke_closure`).
+/// holds the closure body's name-pool index, its parameter count, and whether
+/// its result is always a pair literal (three integers), then the captured
+/// upvalue values (deepest first); `argc` is capture-count + 3. Registers a heap
+/// `Closure` and returns its `Value::Obj` handle (invoked later via
+/// `invoke_closure`).
 pub const MAKE_CLOSURE: u16 = 714;
 /// Builtin id for `apply` on a heap value — the universal `receiver(args)`
 /// dispatch. The stack holds the receiver (deepest) and the `argc` args on top.
@@ -181,6 +182,12 @@ pub const MAKE_VECTOR: u16 = 737;
 /// Builtin id for a `Set(...)` literal: pops `argc` elements and returns the set
 /// handle (duplicates dropped; five or more elements make a `HashSet`).
 pub const MAKE_SET: u16 = 738;
+/// Builtin id for a `PartialFunction` literal (`{ case … }`) — [`MAKE_CLOSURE`]
+/// with one extra leading operand. The stack holds the `apply` body's name-pool
+/// index, the parameter count, the pair-result flag, the `isDefinedAt` body's
+/// name-pool index, then the captured upvalues; `argc` is capture-count + 4. Both
+/// bodies share the parameter/capture layout, so one capture list serves them.
+pub const MAKE_PARTIAL: u16 = 739;
 
 thread_local! {
     /// `type name → (linearized supertypes, primary-constructor arity)`,
@@ -286,6 +293,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(OBJ_COPY, b_obj_copy);
     vm.register_builtin(OBJ_SET, b_obj_set);
     vm.register_builtin(MAKE_CLOSURE, b_make_closure);
+    vm.register_builtin(MAKE_PARTIAL, b_make_partial);
     vm.register_builtin(APPLY, b_apply);
     vm.register_builtin(MAKE_LIST, b_make_list);
     vm.register_builtin(MAKE_MAP, b_make_map);
@@ -669,6 +677,9 @@ enum HeapVal {
     Tuple(Vec<Value>),
     /// A first-class function value (lambda) — see [`Closure`].
     Closure(Closure),
+    /// A function value built at run time out of other function values rather
+    /// than from a compiled body — see [`DerivedFn`].
+    Derived(DerivedFn),
     /// A built-in throwable (`new RuntimeException("…")`, or one raised by the
     /// runtime itself) — see [`ExcObj`].
     Exc(ExcObj),
@@ -730,6 +741,10 @@ fn derive_seq(kind: SeqKind, items: Vec<Value>) -> Value {
     match kind {
         SeqKind::Set(rep) => new_set(rep, items),
         SeqKind::Range { .. } => new_seq(SeqKind::Vector, items),
+        // `immutable.Iterable`'s own factory is `List`, so mapping a `Map`'s
+        // `values` view answers `List(…)` where the view itself printed
+        // `Iterable(…)`.
+        SeqKind::Iterable => new_seq(SeqKind::List, items),
         other => new_seq(other, items),
     }
 }
@@ -796,6 +811,32 @@ struct Closure {
     name_idx: u16,
     params: u8,
     captures: Vec<Value>,
+    /// For a `{ case … }` literal (Scala's `PartialFunction`), the name-pool
+    /// index of the derived `isDefinedAt` body — the same patterns and guards
+    /// answering `true`/`false` (see [`crate::compiler`]). `None` for a plain
+    /// `x => e` lambda, which is total: defined at every argument.
+    defined_idx: Option<u16>,
+    /// Whether every value the body can answer is a pair literal, decided at
+    /// compile time (see `compiler::yields_pairs`). Consulted only when a
+    /// `Map.map`/`Map.collect` produced **no** results, where the run-time shape
+    /// of the results cannot pick the builder.
+    pair_body: bool,
+}
+
+/// A function value composed from other function values. There is no compiled
+/// body to point at, so the combination is stored and re-played on each call —
+/// which is also what makes `isDefinedAt` exact for a composed partial function
+/// (`(pf1 orElse pf2).isDefinedAt` is either operand's, never an arm body).
+#[derive(Clone)]
+enum DerivedFn {
+    /// `pf.lift` — `x => if (pf.isDefinedAt(x)) Some(pf(x)) else None`. Total.
+    Lift(Value),
+    /// `pf1 orElse pf2` — defined where either is, `pf1` winning.
+    OrElse(Value, Value),
+    /// `f andThen g` — `x => g(f(x))`.
+    AndThen(Value, Value),
+    /// `f compose g` — `x => f(g(x))`.
+    Compose(Value, Value),
 }
 
 /// A live Scala class instance behind a [`HeapVal::Record`].
@@ -919,6 +960,32 @@ fn as_closure(v: &Value) -> Option<Closure> {
     }
 }
 
+/// The composed function `v` points at, if it is one (see [`DerivedFn`]).
+fn as_derived(v: &Value) -> Option<DerivedFn> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Derived(d)) => Some(d.clone()),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Whether `v` is any function value — a compiled lambda or a composed one.
+fn is_function(v: &Value) -> bool {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| {
+            matches!(
+                h.borrow().get(*id as usize),
+                Some(HeapVal::Closure(_) | HeapVal::Derived(_))
+            )
+        })
+    } else {
+        false
+    }
+}
+
 /// `OBJ_NEW` builtin — see [`OBJ_NEW`]. Pops `is_case`, the field-name CSV, the
 /// class name, then the field values (deepest first), and allocates the record.
 fn b_obj_new(vm: &mut VM, _argc: u8) -> Value {
@@ -1024,22 +1091,39 @@ fn b_obj_set(vm: &mut VM, _argc: u8) -> Value {
 
 // ── Closures, collections, tuples ──────────────────────────────────────────
 
-/// `MAKE_CLOSURE` builtin — pop the capture count (`argc - 2`), then the
-/// parameter count and body name index, then the captured upvalue values
-/// (deepest first). Registers a heap [`Closure`] and returns its handle.
+/// `MAKE_CLOSURE` builtin — pop the capture count (`argc - 3`), then the
+/// pair-result flag, the parameter count and the body name index, then the
+/// captured upvalue values (deepest first). Registers a heap [`Closure`] and
+/// returns its handle.
 fn b_make_closure(vm: &mut VM, argc: u8) -> Value {
-    let ncap = (argc as usize).saturating_sub(2);
+    make_closure(vm, argc, false)
+}
+
+/// `MAKE_PARTIAL` builtin — [`b_make_closure`] with the extra `isDefinedAt`
+/// name index popped between the parameter count and the captures.
+fn b_make_partial(vm: &mut VM, argc: u8) -> Value {
+    make_closure(vm, argc, true)
+}
+
+/// Shared body of [`b_make_closure`] / [`b_make_partial`].
+fn make_closure(vm: &mut VM, argc: u8, partial: bool) -> Value {
+    let fixed = if partial { 4 } else { 3 };
+    let ncap = (argc as usize).saturating_sub(fixed);
     let mut captures = Vec::with_capacity(ncap);
     for _ in 0..ncap {
         captures.push(vm.pop());
     }
     captures.reverse();
+    let defined_idx = partial.then(|| vm.pop().to_int() as u16);
+    let pair_body = vm.pop().to_int() != 0;
     let params = vm.pop().to_int() as u8;
     let name_idx = vm.pop().to_int() as u16;
     heap_push(HeapVal::Closure(Closure {
         name_idx,
         params,
         captures,
+        defined_idx,
+        pair_body,
     }))
 }
 
@@ -1202,7 +1286,7 @@ fn b_apply(vm: &mut VM, argc: u8) -> Value {
 
 /// Dispatch `recv(args)`: closure invocation, list/tuple indexing, or map lookup.
 fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, String> {
-    if as_closure(recv).is_some() {
+    if is_function(recv) {
         return invoke_closure(vm, recv, args);
     }
     if let Value::Obj(id) = recv {
@@ -1289,10 +1373,80 @@ fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String
 /// with `null`, dropping extras), then the captured upvalues in declaration
 /// order, and run the body. The prologue pops params+captures into slots.
 fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Result<Value, String> {
+    if let Some(d) = as_derived(clo) {
+        return invoke_derived(vm, &d, args);
+    }
     let meta = as_closure(clo).ok_or_else(|| "scalars: value is not a function".to_string())?;
+    invoke_body(vm, &meta, meta.name_idx, args)
+}
+
+/// Apply a composed function value (see [`DerivedFn`]).
+fn invoke_derived(vm: &mut VM, d: &DerivedFn, args: &[Value]) -> Result<Value, String> {
+    let arg = args.first().cloned().unwrap_or(Value::Undef);
+    match d {
+        DerivedFn::Lift(pf) => {
+            if is_defined_at(vm, pf, &arg)? {
+                Ok(make_some(invoke_closure(vm, pf, args)?))
+            } else {
+                Ok(make_none())
+            }
+        }
+        DerivedFn::OrElse(a, b) => {
+            if is_defined_at(vm, a, &arg)? {
+                invoke_closure(vm, a, args)
+            } else {
+                invoke_closure(vm, b, args)
+            }
+        }
+        DerivedFn::AndThen(f, g) => {
+            let mid = invoke_closure(vm, f, args)?;
+            invoke_closure(vm, g, std::slice::from_ref(&mid))
+        }
+        DerivedFn::Compose(f, g) => {
+            let mid = invoke_closure(vm, g, args)?;
+            invoke_closure(vm, f, std::slice::from_ref(&mid))
+        }
+    }
+}
+
+/// Whether the function value `clo` is defined at `arg` — Scala's
+/// `PartialFunction.isDefinedAt`. A plain lambda is total, so it answers `true`
+/// without running anything; a `{ case … }` literal runs its derived pattern
+/// test, which evaluates the patterns and guards but never an arm body.
+fn is_defined_at(vm: &mut VM, clo: &Value, arg: &Value) -> Result<bool, String> {
+    if let Some(d) = as_derived(clo) {
+        return match &d {
+            // `lift` is total; `andThen`/`compose` are defined wherever the
+            // function they feed from is.
+            DerivedFn::Lift(_) => Ok(true),
+            DerivedFn::AndThen(f, _) | DerivedFn::Compose(_, f) => is_defined_at(vm, f, arg),
+            DerivedFn::OrElse(a, b) => Ok(is_defined_at(vm, a, arg)? || is_defined_at(vm, b, arg)?),
+        };
+    }
+    let meta = as_closure(clo).ok_or_else(|| "scalars: value is not a function".to_string())?;
+    let Some(idx) = meta.defined_idx else {
+        return Ok(true);
+    };
+    Ok(truthy(&invoke_body(
+        vm,
+        &meta,
+        idx,
+        std::slice::from_ref(arg),
+    )?))
+}
+
+/// Run one of closure `meta`'s bodies (`name_idx`) with `args`. Both a partial
+/// function's `apply` and its `isDefinedAt` share the parameter/capture layout,
+/// so the same argument marshalling serves either.
+fn invoke_body(
+    vm: &mut VM,
+    meta: &Closure,
+    name_idx: u16,
+    args: &[Value],
+) -> Result<Value, String> {
     let entry = vm
         .chunk
-        .find_sub(meta.name_idx)
+        .find_sub(name_idx)
         .ok_or_else(|| "scalars: closure body not found".to_string())?;
     let want = meta.params as usize;
     // A pattern-matching anonymous function (`{ case (a, b) => … }`) is one
@@ -1402,6 +1556,9 @@ fn obj_to_string(v: &Value) -> String {
                 format!("({inner})")
             }
             Some(HeapVal::Closure(c)) => format!("<function{}>", c.params),
+            // A composed function is always one-argument (`lift`/`orElse`/
+            // `andThen`/`compose` all build a `Function1`).
+            Some(HeapVal::Derived(_)) => "<function1>".to_string(),
             Some(HeapVal::Exc(e)) => exc_to_string(e),
             None => "null".to_string(),
         }
@@ -1963,7 +2120,13 @@ fn is_heap_collection(v: &Value) -> bool {
         HEAP.with(|h| {
             matches!(
                 h.borrow().get(*id as usize),
-                Some(HeapVal::Seq(..) | HeapVal::Map(..) | HeapVal::Tuple(_) | HeapVal::Closure(_))
+                Some(
+                    HeapVal::Seq(..)
+                        | HeapVal::Map(..)
+                        | HeapVal::Tuple(_)
+                        | HeapVal::Closure(_)
+                        | HeapVal::Derived(_)
+                )
             )
         })
     } else {
@@ -1979,7 +2142,7 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 HeapVal::Seq(..) => 0u8,
                 HeapVal::Map(..) => 1,
                 HeapVal::Tuple(_) => 2,
-                HeapVal::Closure(_) => 3,
+                HeapVal::Closure(_) | HeapVal::Derived(_) => 3,
                 HeapVal::Record(_) => 4,
                 HeapVal::Exc(_) => 5,
             })
@@ -2172,6 +2335,31 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
             }
             Ok(Value::Undef)
+        }
+        // `collect` / `collectFirst` — `filter` and `map` in one pass, driven by
+        // the partial function's `isDefinedAt` so an element no arm matches is
+        // skipped rather than raising `MatchError`. This is Scala's
+        // `applyOrElse` protocol: the arm body runs only for a defined element.
+        ("collect", 1) => {
+            let mut out = Vec::new();
+            for it in &items {
+                if is_defined_at(vm, &args[0], it)? {
+                    out.push(invoke_closure(vm, &args[0], std::slice::from_ref(it))?);
+                }
+            }
+            Ok(same(out))
+        }
+        ("collectFirst", 1) => {
+            for it in &items {
+                if is_defined_at(vm, &args[0], it)? {
+                    return Ok(make_some(invoke_closure(
+                        vm,
+                        &args[0],
+                        std::slice::from_ref(it),
+                    )?));
+                }
+            }
+            Ok(make_none())
         }
         ("exists", 1) => {
             for it in &items {
@@ -2573,9 +2761,13 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         // `m.map(f)` answers a `Map` when `f` answers pairs (Scala picks the
         // `Map` builder from the element type) and an `Iterable` otherwise.
-        ("map" | "flatMap", 1) => {
+        // `m.collect(pf)` is the same, over the entries `pf` is defined at.
+        ("map" | "flatMap" | "collect", 1) => {
             let mut out = Vec::with_capacity(pairs.len());
             for p in &pairs {
+                if name == "collect" && !is_defined_at(vm, &args[0], p)? {
+                    continue;
+                }
                 let r = invoke_closure(vm, &args[0], std::slice::from_ref(p))?;
                 if name == "flatMap" {
                     out.extend(as_seq_or_tuple(&r).unwrap_or_else(|| vec![r]));
@@ -2583,11 +2775,20 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     out.push(r);
                 }
             }
-            let all_pairs = out
-                .iter()
-                .all(|r| as_seq_or_tuple(r).is_some_and(|t| t.len() == 2));
+            // With results in hand their own shape picks the builder; with none
+            // (an empty map, or a `collect` that matched nothing) only the
+            // function's compile-time result shape can.
+            let all_pairs = if out.is_empty() {
+                as_closure(&args[0]).map_or(true, |c| c.pair_body)
+            } else {
+                out.iter()
+                    .all(|r| as_seq_or_tuple(r).is_some_and(|t| t.len() == 2))
+            };
+            // A non-pair result leaves `Map`'s builder for `immutable.Iterable`'s,
+            // which is `List` — so `m.map { case (k, v) => v }` prints `List(…)`,
+            // in the map's own (representation) order.
             if !all_pairs {
-                return Ok(new_seq(SeqKind::Iterable, out));
+                return Ok(new_seq(SeqKind::List, out));
             }
             let mut mapped: Vec<(Value, Value)> = Vec::with_capacity(out.len());
             for r in &out {
@@ -2643,9 +2844,9 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // Everything else that only reads the entries as a pair sequence is the
         // sequence implementation over `Map`'s `Tuple2` elements.
         (
-            "exists" | "forall" | "count" | "find" | "foldLeft" | "foldRight" | "fold" | "reduce"
-            | "maxBy" | "minBy" | "groupBy" | "toList" | "toSeq" | "toVector" | "toArray" | "toSet"
-            | "mkString" | "sortBy" | "unzip" | "zipWithIndex",
+            "exists" | "forall" | "count" | "find" | "collectFirst" | "foldLeft" | "foldRight"
+            | "fold" | "reduce" | "maxBy" | "minBy" | "groupBy" | "toList" | "toSeq" | "toVector"
+            | "toArray" | "toSet" | "mkString" | "sortBy" | "unzip" | "zipWithIndex",
             _,
         ) => {
             let seq = new_list(pairs);
@@ -2728,9 +2929,53 @@ fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
 
 /// Closure methods — `apply`/`call`.
 fn closure_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
-    match name {
-        "apply" | "call" => invoke_closure(vm, recv, args),
+    match (name, args.len()) {
+        ("apply" | "call", _) => invoke_closure(vm, recv, args),
+        // `PartialFunction`'s own surface. A plain lambda answers `true` from
+        // `isDefinedAt` (it is total), which is what Scala's implicit
+        // `Function1 => PartialFunction` lift does too.
+        ("isDefinedAt", 1) => Ok(Value::bool(is_defined_at(vm, recv, &args[0])?)),
+        // `applyOrElse(x, default)` — one `isDefinedAt` test, then exactly one
+        // body runs. The default is a function of the argument, as in Scala.
+        ("applyOrElse", 2) => {
+            if is_defined_at(vm, recv, &args[0])? {
+                invoke_closure(vm, recv, &args[..1])
+            } else {
+                invoke_closure(vm, &args[1], &args[..1])
+            }
+        }
+        // The combinators, which answer a new function value. The parser folds a
+        // trailing application into the same argument list (`pf.lift(x)` and
+        // `(f andThen g)(x)` arrive as one call), so an extra argument beyond
+        // the combinator's own means "build it, then apply it to that".
+        ("lift", 0..=1) => derived(vm, DerivedFn::Lift(recv.clone()), &args[0..]),
+        ("orElse", 1..=2) => derived(
+            vm,
+            DerivedFn::OrElse(recv.clone(), args[0].clone()),
+            &args[1..],
+        ),
+        ("andThen", 1..=2) => derived(
+            vm,
+            DerivedFn::AndThen(recv.clone(), args[0].clone()),
+            &args[1..],
+        ),
+        ("compose", 1..=2) => derived(
+            vm,
+            DerivedFn::Compose(recv.clone(), args[0].clone()),
+            &args[1..],
+        ),
         _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// Allocate composed function `d`, or — when the call site folded a trailing
+/// application into the same argument list — apply it to `rest` right away.
+fn derived(vm: &mut VM, d: DerivedFn, rest: &[Value]) -> Result<Value, String> {
+    let f = heap_push(HeapVal::Derived(d));
+    if rest.is_empty() {
+        Ok(f)
+    } else {
+        invoke_closure(vm, &f, rest)
     }
 }
 

@@ -1096,6 +1096,7 @@ impl Parser {
         Ok(Expr::Lambda {
             params,
             body: Box::new(body),
+            partial: false,
         })
     }
 
@@ -1290,6 +1291,7 @@ impl Parser {
             return Ok(Expr::Lambda {
                 params,
                 body: Box::new(Expr::Block(self.block()?)),
+                partial: false,
             });
         }
         Ok(Expr::Block(self.block()?))
@@ -1437,6 +1439,7 @@ impl Parser {
                             newline,
                             arg: Some(Box::new(Expr::Var("$eta".to_string()))),
                         }),
+                        partial: false,
                     });
                 }
                 let line = self.line();
@@ -1718,6 +1721,12 @@ impl Parser {
                 scrut: Box::new(Expr::Var(param)),
                 arms,
             }),
+            // Scala reads a `{ case … }` literal as a `PartialFunction` when one
+            // is expected and as a total `FunctionN` otherwise. There are no
+            // static types here, so it is always built as a partial function —
+            // which behaves as the total one everywhere else, because applying it
+            // where no arm matches still raises `MatchError`.
+            partial: true,
         })
     }
 
@@ -1924,6 +1933,7 @@ fn wrap_placeholders(e: Expr) -> Expr {
     Expr::Lambda {
         params,
         body: Box::new(body),
+        partial: false,
     }
 }
 

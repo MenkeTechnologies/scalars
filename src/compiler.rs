@@ -1053,7 +1053,11 @@ impl Compiler {
                     self.b.emit(Op::LoadUndef, 0);
                 }
             }
-            Expr::Lambda { params, body } => self.lambda(params, body)?,
+            Expr::Lambda {
+                params,
+                body,
+                partial,
+            } => self.lambda(params, body, *partial)?,
             Expr::Placeholder => {
                 return Err("scalars: `_` placeholder outside an argument".to_string())
             }
@@ -1094,7 +1098,7 @@ impl Compiler {
     /// and, at the literal site, build the runtime closure handle. Free names that
     /// resolve to an enclosing frame slot are captured by value (upvalues); free
     /// names that are globals/`def`s stay unbound and resolve at call time.
-    fn lambda(&mut self, params: &[String], body: &Expr) -> Result<(), String> {
+    fn lambda(&mut self, params: &[String], body: &Expr, partial: bool) -> Result<(), String> {
         // Upvalues: free names bound to an enclosing frame slot. At top level
         // (`scope` is `None`) a lambda captures nothing — its free names are the
         // program-global bindings, read live when the closure runs.
@@ -1122,21 +1126,48 @@ impl Compiler {
             }
         }
 
-        // Push name index, param count, then each captured value (read from the
-        // enclosing frame) so MAKE_CLOSURE stores them in the handle.
+        // A `{ case … }` literal is a `PartialFunction`: a second subroutine
+        // answers `isDefinedAt`. It re-uses the same parameter and capture
+        // layout, so the one capture list serves both bodies.
         let id = self.closures_seen;
         self.closures_seen += 1;
         let name_idx = self.b.add_name(&format!("$closure_{id}"));
+        let defined_idx = match (partial, defined_at_body(body)) {
+            (true, Some(test)) => {
+                let idx = self.b.add_name(&format!("$defined_{id}"));
+                self.pending_closures.push_back(PendingClosure {
+                    name_idx: idx,
+                    params: params.to_vec(),
+                    captures: captures.clone(),
+                    body: test,
+                    current_class: self.current_class.clone(),
+                    current_object: self.current_object.clone(),
+                });
+                Some(idx)
+            }
+            _ => None,
+        };
+
+        // Push name index, param count, the pair-result flag, then each captured
+        // value (read from the enclosing frame) so MAKE_CLOSURE stores them in
+        // the handle. A partial function pushes its `isDefinedAt` name index too,
+        // and MAKE_PARTIAL reads that one extra leading operand.
         self.b.emit(Op::LoadInt(name_idx as i64), 0);
         self.b.emit(Op::LoadInt(params.len() as i64), 0);
+        self.b.emit(Op::LoadInt(i64::from(yields_pairs(body))), 0);
+        if let Some(idx) = defined_idx {
+            self.b.emit(Op::LoadInt(idx as i64), 0);
+        }
         for cap in &captures {
             let place = self.resolve_place(cap);
             self.emit_load(place);
         }
-        self.b.emit(
-            Op::CallBuiltin(crate::host::MAKE_CLOSURE, captures.len() as u8 + 2),
-            0,
-        );
+        let (builtin, extra) = match defined_idx {
+            Some(_) => (crate::host::MAKE_PARTIAL, 4),
+            None => (crate::host::MAKE_CLOSURE, 3),
+        };
+        self.b
+            .emit(Op::CallBuiltin(builtin, captures.len() as u8 + extra), 0);
         self.pending_closures.push_back(PendingClosure {
             name_idx,
             params: params.to_vec(),
@@ -1595,7 +1626,7 @@ impl Compiler {
                 args: params.iter().map(|p| Expr::Var(p.clone())).collect(),
                 line: 0,
             };
-            return self.lambda(&params, &call);
+            return self.lambda(&params, &call, false);
         }
         let place = self.resolve_place(name);
         self.emit_load(place);
@@ -2901,6 +2932,70 @@ fn gen_source(e: &ForEnum) -> (Pattern, Expr) {
     }
 }
 
+/// Whether every value this function body can answer is a *pair literal* —
+/// `(a, b)` or the `a -> b` sugar.
+///
+/// Scala picks a `map`/`collect` result's builder from the function's **static**
+/// result type: over a `Map`, a pair result rebuilds a `Map` and anything else
+/// falls back to `immutable.Iterable`'s builder, which is `List`. The runtime
+/// can read that off the results it produced — except when there are none, where
+/// `Map[K,V]().map(f)` and a `collect` that matched nothing are indistinguishable
+/// at run time. This flag travels with the closure to decide exactly that case;
+/// with at least one result the host reads the results themselves.
+fn yields_pairs(body: &Expr) -> bool {
+    match body {
+        Expr::Tuple(elems) => elems.len() == 2,
+        Expr::Block(stmts) => match stmts.last().map(|s| &s.kind) {
+            Some(StmtKind::Expr(e)) => yields_pairs(e),
+            _ => false,
+        },
+        Expr::Match { arms, .. } => arms.iter().all(|a| match a.body.last().map(|s| &s.kind) {
+            Some(StmtKind::Expr(e)) => yields_pairs(e),
+            _ => false,
+        }),
+        Expr::If { then, els, .. } => {
+            yields_pairs(then) && els.as_ref().is_some_and(|e| yields_pairs(e))
+        }
+        _ => false,
+    }
+}
+
+/// The `isDefinedAt` body of a `{ case … }` literal, derived from its `apply`
+/// body: the same scrutinee, patterns and guards, with every arm body replaced
+/// by `true` and a trailing `case _ => false` catching the rest.
+///
+/// Deriving it rather than re-parsing means the guards have already been through
+/// [`crate::resolve`], so a guard that calls a block-local `def` or reads a
+/// captured binding resolves identically in both bodies. Only the arm *bodies*
+/// are dropped, which is exactly Scala's `applyOrElse`/`isDefinedAt` split: the
+/// result expression never runs for an element the function is not defined at.
+fn defined_at_body(body: &Expr) -> Option<Expr> {
+    let Expr::Match { scrut, arms } = body else {
+        return None;
+    };
+    let lit = |b: bool| MatchArm {
+        pat: Pattern::Wildcard,
+        guard: None,
+        body: vec![Stmt {
+            line: 0,
+            kind: StmtKind::Expr(Expr::Bool(b)),
+        }],
+    };
+    let mut tests: Vec<MatchArm> = arms
+        .iter()
+        .map(|a| MatchArm {
+            pat: a.pat.clone(),
+            guard: a.guard.clone(),
+            ..lit(true)
+        })
+        .collect();
+    tests.push(lit(false));
+    Some(Expr::Match {
+        scrut: scrut.clone(),
+        arms: tests,
+    })
+}
+
 /// Build the single-parameter function a desugared generator maps with. A plain
 /// binder is `name => body`; a destructuring one becomes the pattern-matching
 /// anonymous function `{ case pat => body }`, so `for ((k, v) <- m)` binds both.
@@ -2926,6 +3021,7 @@ fn lambda1(pat: &Pattern, body: Expr) -> Expr {
     Expr::Lambda {
         params: vec![name],
         body: Box::new(body),
+        partial: false,
     }
 }
 
@@ -3112,7 +3208,7 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
             }
             fv_expr(body, &b, out, seen);
         }
-        Expr::Lambda { params, body } => {
+        Expr::Lambda { params, body, .. } => {
             let mut b = bound.clone();
             for p in params {
                 b.insert(p.clone());

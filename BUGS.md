@@ -86,6 +86,21 @@ reported as parse/compile errors, never silently mis-run.
   four-element `HashSet` and `groupBy` is always a `HashMap`. A `case class`'s
   `hashCode` is therefore Scala's exact `MurmurHash3` value, not just a
   contract-satisfying one.
+- **Partial functions and `collect`.** A `{ case … }` literal is Scala's
+  `PartialFunction` literal, so besides `apply` it answers `isDefinedAt`: the
+  compiler emits a **second** subroutine per literal — the same patterns and
+  guards with every arm body replaced by `true` and a trailing `case _ => false`
+  — and the closure handle carries both (`src/compiler.rs`, `defined_at_body`;
+  `src/host.rs`, `MAKE_PARTIAL`). That is Scala's `applyOrElse` split: an arm
+  body never runs for an element the function is not defined at. It powers
+  `collect`/`collectFirst` on every sequence, `Set`, `Range` and `Map`, and the
+  value-level surface `isDefinedAt`, `applyOrElse`, `lift`, `orElse`, `andThen`
+  and `compose` (the last four answer a composed function value, so
+  `(a orElse b).isDefinedAt` consults both operands and never runs an arm body).
+  A literal used as a *total* function still raises `MatchError` where no arm
+  matches, matching Scala's `Function1` reading of the same literal. A
+  `PartialFunction[A, B]` annotation is a type ascription, so binding one to a
+  `val` and passing it around works.
 - **`for` comprehensions.** `yield` and the side-effecting form; range and
   collection generators; several generators (nesting through `flatMap`);
   `if` guards, trailing or standing alone; both the `for (…)` and the `for { … }`
@@ -136,10 +151,6 @@ reported as parse/compile errors, never silently mis-run.
 
 - **Mutable collections.** `scala.collection.mutable.*` — `ArrayBuffer`,
   `mutable.Map`/`Set`, `ListBuffer`. `Array` is the only mutable sequence.
-- **`collect` and partial functions.** `xs.collect { case … }` needs a function
-  that reports whether it is defined at a value; a `{ case … }` literal here is
-  a total function, so a non-matching element would raise `MatchError` rather
-  than being skipped. Not wired.
 - **Lazy views and `Iterator`.** `.view`, `.iterator`, and `LazyList`. The
   strict methods above materialize; `grouped`/`sliding` answer the `List` of
   windows rather than an `Iterator`, so `.toList`/`.foreach` on one matches but
@@ -203,6 +214,16 @@ reported as parse/compile errors, never silently mis-run.
   `==`/`equals` for the strings and booleans this frontend handles. Reference
   identity (`eq`) is not modeled.
 - **`char` literals are one-character strings**, not an integer `Char` type.
+- **An *empty* `Map.map`/`Map.collect` picks its builder from the function's
+  syntax.** Scala reads the result builder off the function's static result
+  type: a pair rebuilds a `Map`, anything else falls back to
+  `immutable.Iterable`'s builder, which is `List`. With at least one result the
+  runtime reads that off the results themselves, exactly; with none — an empty
+  map, or a `collect` no entry matched — it consults a compile-time flag that is
+  true when every value the function body can answer is a *pair literal*
+  (`compiler::yields_pairs`). A function that returns a pair some other way (a
+  call, a variable) and matches nothing therefore answers `List()` where Scala
+  answers `Map()`.
 - **`m.keys`/`m.keySet` answer the map's own order.** Scala's key view is a
   `HashMap.HashKeySet`, which prints `Set(…)` however large the map and iterates
   in the map's order; that is what is built, so a five-entry map's `keys` prints

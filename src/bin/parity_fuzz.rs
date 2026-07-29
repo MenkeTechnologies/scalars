@@ -656,6 +656,80 @@ fn g_coll(r: &mut Rng) -> String {
     }
 }
 
+/// Partial functions: `collect`/`collectFirst` over a `{ case … }` literal
+/// (whose `isDefinedAt` decides which elements survive), a `PartialFunction`
+/// bound to a `val` and used as a value, `applyOrElse`/`lift`/`orElse`, and the
+/// total-function combinators `andThen`/`compose`. Patterns straddle guards,
+/// literals, types and destructuring so the derived pattern test is exercised
+/// on every arm shape, and an element matching *no* arm is always reachable.
+fn g_partial(r: &mut Rng) -> String {
+    let n = 4 + r.below(3) as usize;
+    let xs = format!("List({})", int_elems(r, n));
+    let vs = format!("Vector({})", int_elems(r, n));
+    let ws = format!("List({})", str_elems(r, 4));
+    let lim = pick(r, &["0", "3", "-5", "10"]);
+    match r.below(14) {
+        0 => format!("println({xs}.collect {{ case x if x > {lim} => x * 2 }})"),
+        1 => format!("println({vs}.collect {{ case x if x % 2 == 0 => x }})"),
+        2 => format!("println({xs}.collectFirst {{ case x if x > {lim} => x + 1 }})"),
+        3 => format!("println({ws}.collect {{ case s if s.length > 1 => s.toUpperCase }})"),
+        4 => println_all(&[
+            format!("{xs}.collect {{ case x if x < {lim} => x }}"),
+            format!("{xs}.collectFirst {{ case x if x < {lim} => x }}"),
+        ]),
+        5 => format!(
+            "{{ val pf: PartialFunction[Int, Int] = {{ case x if x > {lim} => x * 3 }}; \
+             println({xs}.collect(pf)); println(pf.isDefinedAt({lim})); \
+             println(pf.applyOrElse({lim}, (i: Int) => -i)) }}"
+        ),
+        6 => format!(
+            "{{ val pf: PartialFunction[Int, String] = {{ case 0 => \"zero\"; case x if x < 0 => \"neg\" }}; \
+             println({xs}.map(pf.lift)); println({xs}.collect(pf)) }}"
+        ),
+        7 => format!(
+            "{{ val a: PartialFunction[Int, String] = {{ case x if x > {lim} => \"hi:\" + x }}; \
+             val b: PartialFunction[Int, String] = {{ case x => \"lo:\" + x }}; \
+             println({xs}.collect(a orElse b)); println((a orElse b)({lim})) }}"
+        ),
+        8 => format!(
+            "{{ val f = (x: Int) => x + {lim}; val g = (y: Int) => y * 2; \
+             println({xs}.map(f andThen g)); println({xs}.map(f compose g)) }}"
+        ),
+        // A heterogeneous list: the arm's type pattern is the whole filter.
+        9 => format!(
+            "{{ val any: List[Any] = List(1, \"s\", 2.5, true, {}); \
+             println(any.collect {{ case i: Int => i * 2 }}); \
+             println(any.collect {{ case s: String => s + \"!\" }}); \
+             println(any.collectFirst {{ case d: Double => d }}) }}",
+            pick(r, INTS)
+        ),
+        // `Option` and tuple constructor patterns.
+        10 => format!(
+            "println(List(Some({}), None, Some({})).collect {{ case Some(v) => v }})",
+            pick(r, INTS),
+            pick(r, INTS)
+        ),
+        11 => format!(
+            "println({xs}.zipWithIndex.collect {{ case (x, i) if i % 2 == 0 => x }})"
+        ),
+        // A guard reading an enclosing binding, so the derived pattern test has
+        // to capture it exactly as the `apply` body does.
+        12 => format!(
+            "{{ val k = {lim}; val m = 2; println({xs}.collect {{ case x if x > k => x * m }}) }}"
+        ),
+        _ => format!(
+            "{{ val m = Map({}); println(m.collect {{ case (k, v) if v > {lim} => k }}); \
+             println(m.collect {{ case (k, v) if v > {lim} => k -> v }}) }}",
+            int_elems(r, 4)
+                .split(", ")
+                .enumerate()
+                .map(|(i, e)| format!("\"k{i}\" -> {e}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// `Set`/`Map`, whose printed order is the *representation's* order: up to four
 /// entries a `Set1`..`Set4` / `Map1`..`Map4` keeps insertion order, and beyond
 /// that a CHAMP `HashSet`/`HashMap` prints in trie order. Sizes straddle the
@@ -787,6 +861,7 @@ enum Mode {
     Coll,
     HashColl,
     Infix,
+    Partial,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -813,6 +888,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Coll => "coll",
         Mode::HashColl => "hashcoll",
         Mode::Infix => "infix",
+        Mode::Partial => "partial",
     }
 }
 
@@ -840,6 +916,7 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "coll" => Mode::Coll,
         "hashcoll" => Mode::HashColl,
         "infix" => Mode::Infix,
+        "partial" => Mode::Partial,
         _ => return None,
     })
 }
@@ -866,6 +943,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Coll,
     Mode::HashColl,
     Mode::Infix,
+    Mode::Partial,
 ];
 
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
@@ -896,6 +974,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Coll => g_coll(r),
         Mode::HashColl => g_hashcoll(r),
         Mode::Infix => g_infix(r),
+        Mode::Partial => g_partial(r),
         Mode::All => unreachable!(),
     }
 }

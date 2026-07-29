@@ -576,7 +576,7 @@ impl Resolver {
                 self.pop_scope();
                 Ok(())
             }
-            Expr::Lambda { params, body } => {
+            Expr::Lambda { params, body, .. } => {
                 // A lambda body is its own frame: the compiler captures its free
                 // enclosing locals as upvalues, so a `def` nested inside it that
                 // reads one gets the value threaded through the lambda.
@@ -754,6 +754,7 @@ fn cs_expr(e: &mut Expr, sigs: &HashMap<String, Sig>) {
                     Expr::Lambda {
                         params: sig.params.clone(),
                         body: Box::new(call),
+                        partial: false,
                     }
                 };
             }

@@ -89,7 +89,8 @@ model (`class`/`object`/`case class`, `trait`, `extends`/`with`, `override`,
 `equals`/`hashCode`/`toString`, `copy`, `apply`/`unapply`, constructor patterns,
 `isInstanceOf`, built-in `Option`) rides fusevm's `Value::Obj` handle.
 First-class functions (`x => …`, `(a, b) => …`, block bodies, `_` placeholders,
-capture of the enclosing frame, `{ case … }` pattern-matching literals), the
+capture of the enclosing frame, `{ case … }` partial-function literals with a
+real `isDefinedAt` behind `collect`/`collectFirst`/`lift`/`orElse`), the
 immutable collections `List`/`Seq`/`Vector`/`Set`/`Map` (the full combinator set,
 `::`, indexing, `k -> v`, `for … yield` comprehensions, and Scala's own
 `HashSet`/`HashMap` trie ordering past four entries), mutable `Array`,
@@ -374,8 +375,7 @@ Next waves, in priority order:
 
 1. **Mutable collections** — the `scala.collection.mutable.*` family, on the same
    host heap the immutable ones already ride.
-2. **Lazy views and `Iterator`** — `.view`, `.iterator`, `LazyList`, and the
-   partial-function `collect`.
+2. **Lazy views and `Iterator`** — `.view`, `.iterator` and `LazyList`.
 3. **The broader standard library** — `scala.io`, `scala.collection.*` as a
    namespace, and user `Ordering`s.
 

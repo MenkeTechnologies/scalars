@@ -1703,3 +1703,59 @@ fn type_parameters_are_erased_but_never_rejected() {
     assert!(ok);
     assert_eq!(out, "3\n6\nPair(a,1)\nhi\n<z>\nMap(a -> List(1, 2))\n");
 }
+
+// ── partial functions (`{ case … }` as a PartialFunction) ──────────────────
+
+#[test]
+fn collect_skips_elements_no_arm_matches_and_never_runs_their_body() {
+    // The `seen` counter is the load-bearing assertion: `isDefinedAt` must
+    // evaluate the pattern and guard only, so two of four elements increment it
+    // and a bare `isDefinedAt` call increments nothing.
+    let (out, ok) = run(
+        "object T extends App {\n  var seen = 0\n  val pf: PartialFunction[Int, Int] = { case x if x > 2 => seen += 1; x * 10 }\n  println(List(1, 2, 3, 4).collect(pf))\n  println(seen)\n  println(List(1, 2, 3, 4).collectFirst { case x if x > 2 => x })\n  println(List(1, 2).collectFirst { case x if x > 9 => x })\n  println(pf.isDefinedAt(1))\n  println(pf.isDefinedAt(3))\n  println(seen)\n}",
+    );
+    assert!(ok);
+    assert_eq!(out, "List(30, 40)\n2\nSome(3)\nNone\nfalse\ntrue\n2\n");
+}
+
+#[test]
+fn partial_functions_compose_through_orelse_lift_andthen_and_compose() {
+    let (out, ok) = run(
+        "object T extends App {\n  val a: PartialFunction[Int, String] = { case 1 => \"one\" }\n  val b: PartialFunction[Int, String] = { case x if x > 5 => \"big\" }\n  val both = a orElse b\n  println(List(1, 3, 7).map(both.lift))\n  println(both.applyOrElse(3, (i: Int) => \"?\" + i))\n  val f = (x: Int) => x + 1\n  println(List(1, 2).map(f andThen ((y: Int) => y * 3)))\n  println(List(1, 2).map(f compose ((y: Int) => y * 3)))\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(Some(one), None, Some(big))\n?3\nList(6, 9)\nList(4, 7)\n"
+    );
+}
+
+#[test]
+fn collect_matches_type_constructor_and_guard_patterns() {
+    // A derived collection keeps the receiver's representation, so the six-element
+    // `Set` stays a CHAMP `HashSet` and prints in trie order.
+    let (out, ok) = run(
+        "case class P(x: Int, y: Int)\nobject T extends App {\n  val any: List[Any] = List(1, \"hi\", 2.5, true)\n  println(any.collect { case s: String => s.toUpperCase })\n  println(any.collectFirst { case d: Double => d })\n  println(List(P(1, 2), P(5, 6)).collect { case P(a, b) if a < 3 => a + b })\n  println(List(Some(1), None, Some(3)).collect { case Some(v) => v })\n  println(Set(1, 2, 3, 4, 5, 6).collect { case x if x % 2 == 0 => x })\n  println((1 to 6).collect { case x if x % 3 == 0 => x })\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(HI)\nSome(2.5)\nList(3)\nList(1, 3)\nHashSet(6, 2, 4)\nVector(3, 6)\n"
+    );
+}
+
+#[test]
+fn map_collect_picks_its_builder_from_the_result_shape_even_when_empty() {
+    // Scala reads the builder off the function's static result type: a pair
+    // rebuilds a `Map`, anything else falls back to `immutable.Iterable`'s
+    // builder, which is `List`. With no surviving entry the run-time results
+    // cannot say which, so the compile-time result shape decides.
+    let (out, ok) = run(
+        "object T extends App {\n  val m = Map(\"a\" -> 1, \"b\" -> 2, \"c\" -> 3)\n  println(m.collect { case (k, v) if v > 1 => k })\n  println(m.collect { case (k, v) if v > 1 => k -> v * 10 })\n  println(m.collect { case (k, v) if v > 9 => k })\n  println(m.collect { case (k, v) if v > 9 => k -> v })\n  println(m.collectFirst { case (k, v) if v > 1 => k })\n  println(m.map { case (k, v) => v })\n  println(m.values.map(_ * 2))\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(b, c)\nMap(b -> 20, c -> 30)\nList()\nMap()\nSome(b)\nList(1, 2, 3)\nList(2, 4, 6)\n"
+    );
+}
