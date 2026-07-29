@@ -57,8 +57,11 @@ For a shorter quick\-reference page see
 The program text is a single
 .B .scala
 file named as the first non\-option argument.  Arguments after the file
-are collected but not yet exposed to the program (slice 1 ignores
-.BR argv ).
+are collected but not yet exposed to the program (the
+.B args
+parameter of
+.B main
+is parsed and ignored).
 .TP
 .B \-\-dump\-tokens
 Print the lexer token stream and exit.
@@ -82,9 +85,15 @@ Print the version banner and exit.
 Print the option grammar and exit.
 .SH "2.  LANGUAGE SLICE"
 .SS Entry object
-A compilation unit is a single
-.BR object .
-scalars finds the entry point two ways:
+A compilation unit declares an entry
+.BR object ,
+optionally alongside top\-level
+.BR class ,
+.BR "case class" ,
+.B object
+and
+.B trait
+declarations.  scalars finds the entry point two ways:
 .B object Name extends App { <body> }
 runs
 .B <body>
@@ -92,7 +101,7 @@ directly, and
 .B object Name { ... def main(args: Array[String]): Unit = { <body> } ... }
 runs its
 .BR main .
-Other members are skipped.  Optional
+Optional
 .BR package / import
 prologue lines are tolerated and ignored.
 .SS Statements
@@ -105,38 +114,65 @@ annotation), assignment and compound assignment
 .BR -= ,
 .BR *= ,
 .BR /= ,
-.BR %= ),
+.BR %= ,
+and the growable\-collection
+.BR ++= / --= ),
 .B if (cond) { .. } else { .. }
 ,
 .B while (cond) { .. }
 ,
-the range
-.B for (name <- start until|to end) { .. }
-comprehension in statement position, and
+.B for
+in every form (range and collection generators, several generators,
+.B if
+guards, destructuring binders, and
+.BR yield ),
+.BR def
+declarations \(em including block\-local ones \(em
+.BR return ,
+.BR try / catch / finally ,
+.BR throw ,
+and
 .BR println / print .
 Statements are separated by inferred line breaks or explicit
 .BR ; .
 .SS Expressions
-Integer, floating, string, char (as a one\-char string), boolean, and
+Integer, floating, string (including
+.BR s / f
+interpolation), char (as a one\-char string), boolean, and
 .B null
 literals; variable reads; unary
 .BR - / ! ;
-and the binary operators below with precedence climbing.
+.B if
+and block expressions;
+.BR match
+with literal, binder, typed, tuple, constructor and stable\-identifier
+patterns;
+.B new
+construction and method / field access; function literals
+.RB ( "x => e" ,
+.BR "{ case ... }" ,
+.B _
+placeholders); tuples; and the collection literals.
 .SS Operators
 .B + - * / %
 (arithmetic),
 .B == != < > <= >=
 (comparison),
 .B && ||
-(short\-circuiting boolean).
+(short\-circuiting boolean),
+.B :: ++ :+ +: ->
+(collection), and general infix method syntax \(em
+.B a m b
+is
+.B a.m(b)
+for any single\-argument method.
 .SS Newline inference
 The hand\-written lexer emits a statement\-separator line break only where
 the previous token can end a statement, the next can begin one, and the
 cursor is not inside
 .BR (...) / [...] .
 .SH "3.  VALUE MODEL"
-Slice\-1 scalars runs on the fusevm value model directly, with no object
-heap of its own yet:
+Scalars maps the primitives straight onto the fusevm value model:
 .BR Int
 as a native integer,
 .BR Double
@@ -148,9 +184,19 @@ as a VM string, and the
 .B null
 literal as
 .BR Value::Undef .
-Locals are addressed by name through
-.BR GetVar / SetVar
-in a single entry frame with no lexical scopes.
+Everything with structure \(em class and
+.B case class
+instances, collections, tuples, function values and throwables \(em lives
+in a frontend\-owned object heap behind fusevm's opaque
+.B Value::Obj
+handle, so no fusevm change was needed to carry them.  Top\-level bindings
+are addressed by name through
+.BR GetVar / SetVar ;
+a
+.B def
+body and a function literal each get a native
+.B Op::Call
+frame whose parameters, captured upvalues and locals are frame slots.
 .SH "4.  NUMERIC SEMANTICS"
 .SS Division
 fusevm's native division always floats, but Scala's
@@ -161,7 +207,7 @@ truncates for two
 and floats when either operand is a
 .B Double
 .RB ( "7 / 2.0 == 3.5" ).
-Because slice 1 carries no static types, the choice is made at runtime by
+Because scalars carries no static types, the choice is made at runtime by
 a type\-dispatching
 .B SDIV
 builtin.  Integer division by zero yields
@@ -272,7 +318,7 @@ events, so
 .BR println / print
 never corrupt the JSON protocol channel.
 .SH "9.  ENVIRONMENT"
-scalars reads no environment variables of its own in the current slice.
+scalars reads no environment variables of its own.
 The shared fusevm JIT / disk\-cache honor their own variables.
 .SH "10. EXIT STATUS"
 .TP
@@ -330,29 +376,55 @@ scala --dap
 .fi
 .RE
 .SH "13. GAPS"
-.B scalars
-is an early slice.  Documented gaps (see
+Documented gaps (see
 .B BUGS.md
-in the source tree):
+in the source tree for the full ledger):
 .IP \[bu] 2
-User\-defined methods, classes, traits, and the collection library are not
-yet carried; a member call
-.RB ( x.foo() )
-or field access is a parse error.
+Lazy views and iterators \(em
+.BR .view ,
+.BR .iterator ,
+and
+.BR LazyList .
+.BR grouped / sliding
+answer the
+.B List
+of windows rather than an
+.BR Iterator .
 .IP \[bu] 2
-Integer division / modulo by zero yields
-.B null
-rather than throwing
-.BR ArithmeticException .
+Sorting by a user
+.BR Ordering ,
+and
+.BR Ordered / Comparable
+on a user class.  The built\-in ordering covers numbers,
+.BR String ,
+.BR Boolean
+and tuples of those.
 .IP \[bu] 2
-.BR val
-reassignment is not rejected (no immutability enforcement yet).
+The insertion\-ordered
+.BR LinkedHashSet / LinkedHashMap ,
+and the rest of
+.BR scala.collection.mutable
+.RB ( Queue ,
+.BR Stack ,
+.BR ArrayDeque ).
+They are an unresolved name rather than an alias onto the hash\-table
+forms, whose order differs.
 .IP \[bu] 2
-.B return ,
-.B for ... yield ,
-and the
-.B by
-range step are not yet supported.
+The symbolic operators
+.BR /: ,
+.BR :\e ,
+and user\-defined symbolic method names.
+.IP \[bu] 2
+The wider standard library \(em
+.BR scala.io ,
+.B scala.collection
+as a namespace, and the
+.BR String /numeric
+methods beyond the wired subset.
+.IP \[bu] 2
+Types are parsed but not checked, and
+.B Int
+arithmetic uses 64\-bit semantics rather than wrapping at 32 bits.
 .SH SEE ALSO
 .BR scala (1),
 .BR awkrsall (1),

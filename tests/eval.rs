@@ -1759,3 +1759,153 @@ fn map_collect_picks_its_builder_from_the_result_shape_even_when_empty() {
         "List(b, c)\nMap(b -> 20, c -> 30)\nList()\nMap()\nSome(b)\nList(1, 2, 3)\nList(2, 4, 6)\n"
     );
 }
+
+// ── mutable collections ───────────────────────────────────────────────────
+
+#[test]
+fn buffers_grow_shrink_and_keep_their_own_prefix() {
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  val b = mutable.ListBuffer(3, 1, 2)\n  b += 4; b ++= List(5, 6); b -= 1\n  println(b); println(b.size); println(b.toList); println(b.sorted); println(b.map(_ * 2))\n  b(0) = 99; println(b)\n  val a = mutable.ArrayBuffer[Int]()\n  a += 1; a.append(2); a.prepend(0)\n  println(a); println(a.remove(0)); println(a)\n  a.insert(1, 9); println(a)\n  a.clear(); println(a); println(a.isEmpty)\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "ListBuffer(3, 2, 4, 5, 6)\n5\nList(3, 2, 4, 5, 6)\nListBuffer(2, 3, 4, 5, 6)\nListBuffer(6, 4, 8, 10, 12)\nListBuffer(99, 2, 4, 5, 6)\nArrayBuffer(0, 1, 2)\n0\nArrayBuffer(1, 2)\nArrayBuffer(1, 9, 2)\nArrayBuffer()\ntrue\n"
+    );
+}
+
+#[test]
+fn a_mutable_hashset_prints_in_its_tables_order_not_insertion_order() {
+    // Every line here is a *different* table length, which is what the order
+    // turns on: `HashSet.from` sizes the table from the argument count, `add`
+    // doubles it at three quarters full, and the bucket is
+    // `(h ^ (h >>> 16)) & (len - 1)` with each bucket sorted by that hash. The
+    // seventeen-element line is the one that has grown past its initial table.
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  println(mutable.Set(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))\n  println(mutable.Set(-7, 42, 3, -1, 100, 0))\n  println(mutable.Set(\"apple\", \"banana\", \"cherry\", \"date\"))\n  println(mutable.Set(100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700))\n  println(mutable.Set(5, 3, 1) ++ List(9, 7))\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "HashSet(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)\nHashSet(-1, 0, 3, 100, -7, 42)\nHashSet(banana, date, cherry, apple)\nHashSet(800, 1600, 100, 900, 1700, 200, 1000, 300, 1100, 400, 1200, 500, 1300, 600, 1400, 700, 1500)\nHashSet(1, 3, 5, 7, 9)\n"
+    );
+}
+
+#[test]
+fn mutable_set_and_map_mutators_answer_what_scala_answers() {
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  val s = mutable.Set(1, 2)\n  println(s.add(3)); println(s.add(3)); println(s.remove(1)); println(s.remove(99)); println(s)\n  s += 5; println(s)\n  s --= List(2); println(s)\n  val m = mutable.Map(1 -> \"a\")\n  println(m.put(2, \"b\")); println(m.put(2, \"c\")); println(m.remove(1)); println(m)\n  m.update(3, \"z\"); println(m)\n  println(m.getOrElseUpdate(9, \"n\")); println(m)\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true\nfalse\ntrue\nfalse\nHashSet(2, 3)\nHashSet(2, 3, 5)\nHashSet(3, 5)\nNone\nSome(b)\nSome(a)\nHashMap(2 -> c)\nHashMap(2 -> c, 3 -> z)\nn\nHashMap(9 -> n, 2 -> c, 3 -> z)\n"
+    );
+}
+
+#[test]
+fn plus_equals_picks_the_growable_method_or_arithmetic_at_run_time() {
+    // Scala chooses statically from the receiver's type; there are no static
+    // types here, so a program that builds a mutable collection anywhere emits
+    // a run-time test. `n += 5` and `s += "b"` must still be arithmetic and
+    // concatenation, and a `var`-held buffer must still mutate in place.
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  var b = mutable.ListBuffer(1, 2)\n  b += 3; println(b)\n  var n = 0; n += 5; n -= 2; println(n)\n  var s = \"a\"; s += \"b\"; println(s)\n  val lb = mutable.ListBuffer[Int]()\n  for (i <- 1 to 4) lb += i * i\n  println(lb); println(lb.foldLeft(0)(_ + _))\n  val c = mutable.Map[String, Int]()\n  for (w <- List(\"a\", \"b\", \"a\", \"c\", \"a\")) c(w) = c.getOrElse(w, 0) + 1\n  println(c); println(c.toList.sorted)\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "ListBuffer(1, 2, 3)\n3\nab\nListBuffer(1, 4, 9, 16)\n30\nHashMap(a -> 3, b -> 1, c -> 1)\nList((a,3), (b,1), (c,1))\n"
+    );
+}
+
+// ── MurmurHash3 seq/set/map hashes ────────────────────────────────────────
+
+#[test]
+fn collections_hash_with_scalas_own_murmurhash3_values() {
+    // Every number here is the reference `scala`'s. The first four agreeing is
+    // the point of `MurmurHash3.seqHash`: an ordered hash with the `Seq` seed,
+    // reached through three different loops in the library but one value, with
+    // the arithmetic-progression case that makes a `Range` hash as its
+    // elements. A `Set`/`Map` hashes symmetrically instead, so the mutable and
+    // immutable ones agree too.
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  println(List(1, 2, 3).hashCode)\n  println(Vector(1, 2, 3).hashCode)\n  println((1 to 3).hashCode)\n  println(mutable.ListBuffer(1, 2, 3).hashCode)\n  println(List(1, 5, 2).hashCode)\n  println(List[Int]().hashCode)\n  println(List(7).hashCode)\n  println(Set(1, 2, 3).hashCode)\n  println(mutable.Set(1, 2, 3).hashCode)\n  println(Map(\"a\" -> 1, \"b\" -> 2).hashCode)\n  println(Set[Int]().hashCode)\n  println(Map[String, Int]().hashCode)\n  println(List(List(1), List(2)).hashCode)\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "1836368899\n1836368899\n1836368899\n1836368899\n759968518\n473519988\n-2080959496\n1510543636\n1510543636\n2006323191\n835491922\n-1609326920\n-1127282338\n"
+    );
+}
+
+#[test]
+fn a_hashed_set_or_map_keyed_by_a_collection_prints_in_trie_order() {
+    // Before the seq/set/map hashes were ported these fell back to insertion
+    // order, because the CHAMP trie's position needs the key's JVM hash.
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  println(Set(List(1), List(2), List(3), List(4), List(5)))\n  println(Map(List(1) -> \"a\", List(2) -> \"b\", List(3) -> \"c\", List(4) -> \"d\", List(5) -> \"e\"))\n  println(Set((1, 2), (3, 4), (5, 6), (7, 8), (9, 10)))\n  println(Set(Set(1), Set(2), Set(3), Set(4), Set(5)))\n  println(mutable.Set(List(1), List(2), List(3), List(4), List(5)))\n  println(List(List(1), List(2), List(3), List(4), List(5)).groupBy(_.head % 2))\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "HashSet(List(1), List(3), List(5), List(4), List(2))\nHashMap(List(1) -> a, List(3) -> c, List(5) -> e, List(4) -> d, List(2) -> b)\nHashSet((5,6), (3,4), (7,8), (1,2), (9,10))\nHashSet(Set(2), Set(5), Set(3), Set(4), Set(1))\nHashSet(List(5), List(1), List(2), List(4), List(3))\nHashMap(0 -> List(List(2), List(4)), 1 -> List(List(1), List(3), List(5)))\n"
+    );
+}
+
+// ── bitwise / shift operators ─────────────────────────────────────────────
+
+#[test]
+fn bitwise_and_shift_operators_evaluate_at_int_width() {
+    // `1 << 33 == 2` and `1 << 31 == Int.MinValue` are the observable part of
+    // Scala's 32-bit `Int`: the shift distance masks to five bits and the
+    // result wraps, which a 64-bit shift would not do.
+    let (out, ok) = run(&wrap(
+        "println(6 & 3); println(6 | 3); println(6 ^ 3); println(~(6))\nprintln(1 << 4); println(-16 >> 2); println(-16 >>> 2)\nprintln(1 << 33); println(1 << 31); println(255 & 0x0F); println(0x1F)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "2\n7\n5\n-7\n16\n-4\n1073741820\n2\n-2147483648\n15\n31\n"
+    );
+}
+
+#[test]
+fn bitwise_operator_precedence_follows_the_sls_first_character_table() {
+    // `|` binds loosest, then `^`, then `&` — which is also where `&&`/`||`
+    // get their precedence — and every arithmetic operator binds tighter than
+    // a shift, so `1 << 2 + 1` is `1 << 3`.
+    let (out, ok) = run(&wrap(
+        "println(5 & 3 | 2); println(1 << 2 + 1); println(3 + 1 & 6); println(1 | 0 ^ 3 & 2)\nprintln(true & false); println(true | false); println(true ^ true)\nprintln(Set(1, 2, 3) & Set(2, 3, 4)); println(Set(1, 2) | Set(3)); println(Set(1, 2, 3) &~ Set(2))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "3\n8\n4\n3\nfalse\ntrue\nfalse\nSet(2, 3)\nSet(1, 2, 3)\nSet(1, 3)\n"
+    );
+}
+
+#[test]
+fn a_prefix_minus_on_a_numeric_literal_is_part_of_the_literal() {
+    // Scala reads `-3.abs` as `(-3).abs`, so the sign is what the postfix chain
+    // applies to; a non-literal receiver keeps the unary reading, so `-x.abs`
+    // stays `-(x.abs)`.
+    let (out, ok) = run(&wrap(
+        "println(-3.abs); println(-3.0.abs); val x = 3; println(-x.abs); println(-3.toString); println(1 - 3.abs); println(-3.max(1))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "3\n3.0\n-3\n-3\n-2\n1\n");
+}
+
+#[test]
+fn an_import_line_does_not_swallow_a_following_case_class() {
+    // Newline inference emits no statement separator before `case`, so the
+    // prologue skip has to stop at a declaration keyword as well as at a line
+    // end — otherwise the whole `case class` line was consumed as part of the
+    // import and every use of it failed with "not found".
+    let (out, ok) = run(
+        "import scala.collection.mutable\ncase class Q(x: Int)\nobject T extends App { println(Q(1)); println(Q(1) == Q(1)) }",
+    );
+    assert!(ok);
+    assert_eq!(out, "Q(1)\ntrue\n");
+}

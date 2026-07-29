@@ -1,6 +1,7 @@
 //! A recursive-descent parser with precedence-climbing for expressions.
 //!
-//! Grammar (slice 1): a compilation unit is `object Name { ... }`. scalars
+//! Grammar: a compilation unit is an entry `object Name { ... }`, optionally
+//! alongside top-level `class`/`case class`/`object`/`trait` declarations. scalars
 //! locates the entry point two ways: an `object Name extends App { <body> }`
 //! runs `<body>` directly, and an `object Name { ... def main(args: …) = { <body> }
 //! ... }` runs its `main`. Other members are skipped so an object that also
@@ -105,7 +106,17 @@ impl Parser {
         loop {
             match self.peek() {
                 Tok::Ident(w) if w == "package" || w == "import" => {
-                    while !self.is(&Tok::Newline) && !self.is(&Tok::Semi) && !self.is(&Tok::Eof) {
+                    self.advance();
+                    // Consume to the end of the line — or to the first token
+                    // that can only start a declaration. Newline inference does
+                    // not emit a separator before `case`, so an
+                    // `import …` line followed by a `case class` would
+                    // otherwise swallow the declaration whole.
+                    while !self.is(&Tok::Newline)
+                        && !self.is(&Tok::Semi)
+                        && !self.is(&Tok::Eof)
+                        && !self.at_declaration_start()
+                    {
                         self.advance();
                     }
                     self.skip_seps();
@@ -121,13 +132,8 @@ impl Parser {
                 break;
             }
             // Leading modifiers/annotations (`final`, `sealed`, `abstract`, …)
-            // arrive as bare idents; skip to the declaration keyword. `case`,
-            // `object`, and the `class` ident all stop the skip.
-            while !self.is(&Tok::Eof)
-                && !self.is(&Tok::Object)
-                && !self.is(&Tok::Case)
-                && !matches!(self.peek(), Tok::Ident(w) if w == "class" || w == "trait")
-            {
+            // arrive as bare idents; skip to the declaration keyword.
+            while !self.is(&Tok::Eof) && !self.at_declaration_start() {
                 self.advance();
             }
             if self.is(&Tok::Eof) {
@@ -498,7 +504,7 @@ impl Parser {
             return Ok(None);
         }
         self.eat(&Tok::LParen)?;
-        // skip the parameter list — slice 1 ignores argv
+        // skip the parameter list — `args` is parsed and ignored
         let mut depth = 1;
         while depth > 0 && !self.is(&Tok::Eof) {
             match self.advance() {
@@ -765,8 +771,22 @@ impl Parser {
     /// Assignment (`x = e`, `x += e`) or a bare expression statement.
     fn simple_statement(&mut self) -> Result<StmtKind, String> {
         if let Tok::Ident(name) = self.peek().clone() {
-            let next = &self.toks[self.pos + 1].kind;
-            if let Some(op) = assign_op(next) {
+            let next = self.toks[self.pos + 1].kind.clone();
+            // `xs ++= ys` / `xs --= ys` have no arithmetic reading at all: they
+            // are the growable-collection methods, so they lower as calls.
+            if let Tok::OpAssign(op) = next {
+                let line = self.line();
+                self.advance(); // name
+                self.advance(); // op
+                let value = self.expression()?;
+                return Ok(StmtKind::Expr(Expr::Method {
+                    recv: Box::new(Expr::Var(name)),
+                    name: op,
+                    args: vec![value],
+                    line,
+                }));
+            }
+            if let Some(op) = assign_op(&next) {
                 self.advance(); // name
                 self.advance(); // op
                 let value = self.expression()?;
@@ -1186,15 +1206,41 @@ impl Parser {
         match self.peek() {
             Tok::Minus => {
                 self.advance();
-                Ok(Expr::Unary {
-                    op: UnOp::Neg,
-                    rhs: Box::new(self.unary()?),
-                })
+                // Scala folds a prefix `-` into a numeric *literal*, so the
+                // sign is part of the value a postfix chain then applies to:
+                // `-3.abs` is `(-3).abs`, which is `3`, where `-x.abs` is
+                // `-(x.abs)`. Nothing else about `-` changes.
+                let negated = match self.peek().clone() {
+                    Tok::Int(n) => {
+                        self.advance();
+                        Some(Expr::Int(-n))
+                    }
+                    Tok::Float(f) => {
+                        self.advance();
+                        Some(Expr::Float(-f))
+                    }
+                    _ => None,
+                };
+                match negated {
+                    Some(lit) => self.postfix_from(lit),
+                    None => Ok(Expr::Unary {
+                        op: UnOp::Neg,
+                        rhs: Box::new(self.unary()?),
+                    }),
+                }
             }
             Tok::Not => {
                 self.advance();
                 Ok(Expr::Unary {
                     op: UnOp::Not,
+                    rhs: Box::new(self.unary()?),
+                })
+            }
+            // `~x` — the bitwise complement, Scala's `Int.unary_~`.
+            Tok::Tilde => {
+                self.advance();
+                Ok(Expr::Unary {
+                    op: UnOp::Complement,
                     rhs: Box::new(self.unary()?),
                 })
             }
@@ -1206,7 +1252,14 @@ impl Parser {
     /// A paren-less member (`s.length`, `n.toString`) is a zero-argument call;
     /// chains left-associatively (`s.trim.length`).
     fn postfix(&mut self) -> Result<Expr, String> {
-        let mut e = self.primary()?;
+        let e = self.primary()?;
+        self.postfix_from(e)
+    }
+
+    /// The postfix chain of [`Self::postfix`], applied to an already-parsed
+    /// receiver (a negated numeric literal comes in this way).
+    fn postfix_from(&mut self, e: Expr) -> Result<Expr, String> {
+        let mut e = e;
         while self.is(&Tok::Dot) {
             self.advance(); // `.`
             let line = self.line();
@@ -1273,6 +1326,15 @@ impl Parser {
             };
         }
         Ok(e)
+    }
+
+    /// Whether the cursor is on a token that can only begin a top-level
+    /// declaration: `case` (of `case class`/`case object`), `object`, or the
+    /// `class`/`trait` soft keywords.
+    fn at_declaration_start(&self) -> bool {
+        self.is(&Tok::Object)
+            || self.is(&Tok::Case)
+            || matches!(self.peek(), Tok::Ident(w) if w == "class" || w == "trait")
     }
 
     /// A `{ … }` group standing in for a method's single argument: either the
@@ -1450,12 +1512,23 @@ impl Parser {
                 }
                 if self.is(&Tok::LParen) {
                     // `List(...)` / `Map(...)` / `Array(...)` collection literals.
+                    // `ListBuffer`/`ArrayBuffer`/`Buffer` are the mutable names
+                    // that can only mean the mutable collection, so they work
+                    // unqualified (imports are skipped, not tracked). `Set` and
+                    // `Map` stay immutable — see `BUGS.md`.
                     if matches!(
                         name.as_str(),
                         "List" | "Map" | "Array" | "Seq" | "Vector" | "Set" | "IndexedSeq"
                     ) {
                         let elems = self.arg_list()?;
                         return Ok(Expr::Collection { ctor: name, elems });
+                    }
+                    if let Some(ctor) = mutable_buffer_ctor(&name) {
+                        let elems = self.arg_list()?;
+                        return Ok(Expr::Collection {
+                            ctor: ctor.to_string(),
+                            elems,
+                        });
                     }
                     return self.call(name, line);
                 }
@@ -1495,7 +1568,17 @@ impl Parser {
     fn new_expr(&mut self) -> Result<Expr, String> {
         self.eat(&Tok::New)?;
         let line = self.line();
-        let name = self.ident()?;
+        let mut name = self.ident()?;
+        // A package-qualified `new scala.collection.mutable.ListBuffer[Int]`:
+        // consume the prefix and keep the type's own name. Only a prefix this
+        // frontend recognizes is accepted, so an unknown one still fails on the
+        // type rather than silently dropping the qualification.
+        let mut mutable_qualified = false;
+        while self.is(&Tok::Dot) && MUTABLE_PREFIXES.contains(&name.as_str()) {
+            mutable_qualified = true;
+            self.advance();
+            name = self.ident()?;
+        }
         // `new Array[T](n)` is the one `new` whose type argument is
         // load-bearing: it picks the zero value the array is filled with.
         let mut elem_ty = None;
@@ -1519,6 +1602,20 @@ impl Parser {
                 name: NEW_ARRAY.to_string(),
                 args,
                 line,
+            });
+        }
+        // `new ListBuffer[Int]()` builds the same empty buffer the factory does.
+        // `new mutable.HashSet[Int]` likewise, but only when qualified — a bare
+        // `new Set` is not a Scala constructor and stays an error.
+        let ctor = match name.as_str() {
+            "Set" | "HashSet" if mutable_qualified => Some("mutable.Set"),
+            "Map" | "HashMap" if mutable_qualified => Some("mutable.Map"),
+            other => mutable_buffer_ctor(other),
+        };
+        if let Some(ctor) = ctor {
+            return Ok(Expr::Collection {
+                ctor: ctor.to_string(),
+                elems: args,
             });
         }
         Ok(Expr::New { name, args, line })
@@ -2022,32 +2119,67 @@ fn assign_op(t: &Tok) -> Option<AssignOp> {
 /// `::` just below `+`/`-` — and an operator whose name ends in `:` is
 /// right-associative.
 fn symbolic_op(sym: &str) -> (u8, bool) {
-    let bp = match sym.chars().next() {
-        Some('+' | '-') => 6,
-        Some(':') => 5,
-        _ => 7,
-    };
-    (bp, sym.ends_with(':'))
+    (first_char_prec(sym.chars().next()), sym.ends_with(':'))
+}
+
+/// The SLS operator-precedence table, keyed by an operator's first character
+/// (lowest binding first):
+///
+/// ```text
+///   |  ^  &  = !  < >  :  + -  * / %  (anything else)
+/// ```
+///
+/// `&&` and `||` are not special-cased in Scala either — they take their
+/// precedence from `&` and `|` like any other symbolic name, which is what makes
+/// `a | b && c` read as `a | (b && c)`.
+fn first_char_prec(c: Option<char>) -> u8 {
+    match c {
+        Some('|') => 1,
+        Some('^') => 2,
+        Some('&') => 3,
+        Some('=' | '!') => 4,
+        Some('<' | '>') => 5,
+        Some(':') => 6,
+        Some('+' | '-') => 7,
+        Some('*' | '/' | '%') => 8,
+        _ => 9,
+    }
 }
 
 fn binop(t: &Tok) -> Option<(BinOp, u8)> {
     Some(match t {
         Tok::OrOr => (BinOp::Or, 1),
-        Tok::AndAnd => (BinOp::And, 2),
-        Tok::EqEq => (BinOp::Eq, 3),
-        Tok::NotEq => (BinOp::Ne, 3),
-        Tok::Lt => (BinOp::Lt, 4),
-        Tok::Gt => (BinOp::Gt, 4),
-        Tok::Le => (BinOp::Le, 4),
-        Tok::Ge => (BinOp::Ge, 4),
+        Tok::AndAnd => (BinOp::And, 3),
+        Tok::EqEq => (BinOp::Eq, 4),
+        Tok::NotEq => (BinOp::Ne, 4),
+        Tok::Lt => (BinOp::Lt, 5),
+        Tok::Gt => (BinOp::Gt, 5),
+        Tok::Le => (BinOp::Le, 5),
+        Tok::Ge => (BinOp::Ge, 5),
         // `::` (cons) — Scala's `:`-family precedence sits just below `+`/`-`
         // and is right-associative (handled in `binary`).
-        Tok::ColonColon => (BinOp::Cons, 5),
-        Tok::Plus => (BinOp::Add, 6),
-        Tok::Minus => (BinOp::Sub, 6),
-        Tok::Star => (BinOp::Mul, 7),
-        Tok::Slash => (BinOp::Div, 7),
-        Tok::Percent => (BinOp::Mod, 7),
+        Tok::ColonColon => (BinOp::Cons, 6),
+        Tok::Plus => (BinOp::Add, 7),
+        Tok::Minus => (BinOp::Sub, 7),
+        Tok::Star => (BinOp::Mul, 8),
+        Tok::Slash => (BinOp::Div, 8),
+        Tok::Percent => (BinOp::Mod, 8),
+        _ => return None,
+    })
+}
+
+/// The collection constructor an *unqualified* mutable name selects. Only the
+/// names that cannot also mean an immutable collection are listed: imports are
+/// skipped rather than tracked, so a bare `Set`/`Map` must keep meaning the
+/// immutable one (see `BUGS.md`).
+/// The package-path segments a `new scala.collection.mutable.X` may be spelled
+/// through. `new` takes a type name, so the prefix is consumed and discarded.
+const MUTABLE_PREFIXES: &[&str] = &["scala", "collection", "mutable"];
+
+fn mutable_buffer_ctor(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "ListBuffer" => "ListBuffer",
+        "ArrayBuffer" | "Buffer" => "ArrayBuffer",
         _ => return None,
     })
 }

@@ -1,9 +1,12 @@
 //! The scalars host: builtin registration, Scala value formatting, and the
 //! strict numeric hook.
 //!
-//! scalars keeps no object heap of its own yet (slice 1 runs on the fusevm value
-//! model directly). Two places need Scala semantics that fusevm's default
-//! awk/shell flavour does not provide:
+//! The primitives ride the fusevm value model directly; everything with
+//! structure — class and `case class` instances, collections, tuples, function
+//! values, throwables — lives in the frontend-owned object heap behind fusevm's
+//! opaque `Value::Obj` handle (see the `HeapVal` arena below). Two places also
+//! need Scala semantics that fusevm's default awk/shell flavour does not
+//! provide:
 //!
 //! 1. **Printing.** fusevm's native `PrintLn` renders values shell-style
 //!    (`true`→`1`, `3.0`→`3`). Predef's `println`/`print` instead lower to a
@@ -188,6 +191,21 @@ pub const MAKE_SET: u16 = 738;
 /// name-pool index, then the captured upvalues; `argc` is capture-count + 4. Both
 /// bodies share the parameter/capture layout, so one capture list serves them.
 pub const MAKE_PARTIAL: u16 = 739;
+/// Builtin id for a `mutable.ListBuffer(...)` literal: pops `argc` elements.
+pub const MAKE_LISTBUFFER: u16 = 740;
+/// Builtin id for a `mutable.ArrayBuffer(...)` literal: pops `argc` elements.
+pub const MAKE_ARRAYBUFFER: u16 = 741;
+/// Builtin id for a `mutable.Set(...)` literal: pops `argc` elements into a
+/// `mutable.HashSet` sized as `HashSet.from` would size it for `argc` inputs.
+pub const MAKE_MUTSET: u16 = 742;
+/// Builtin id for a `mutable.Map(...)` literal: pops `argc` `Tuple2` pairs into
+/// a `mutable.HashMap`, sized as `HashMap.from` would.
+pub const MAKE_MUTMAP: u16 = 743;
+/// Builtin id for the run-time half of `x += e` / `x -= e`: pops one value and
+/// answers whether it is a collection that mutates in place. `true` sends the
+/// compiler-emitted branch to `x.+=(e)`, `false` to `x = x + e` — Scala makes
+/// that choice statically from whether the receiver's type has a `+=` method.
+pub const IS_GROWABLE: u16 = 744;
 
 thread_local! {
     /// `type name → (linearized supertypes, primary-constructor arity)`,
@@ -318,6 +336,11 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SMATH, b_math);
     vm.register_builtin(MAKE_VECTOR, b_make_vector);
     vm.register_builtin(MAKE_SET, b_make_set);
+    vm.register_builtin(MAKE_LISTBUFFER, b_make_listbuffer);
+    vm.register_builtin(MAKE_ARRAYBUFFER, b_make_arraybuffer);
+    vm.register_builtin(MAKE_MUTSET, b_make_mutset);
+    vm.register_builtin(MAKE_MUTMAP, b_make_mutmap);
+    vm.register_builtin(IS_GROWABLE, b_is_growable);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -695,6 +718,13 @@ enum HeapVal {
 enum HashRep {
     Small,
     Hashed,
+    /// A `scala.collection.mutable.HashSet`/`HashMap` — a flat, separately
+    /// chained hash table, nothing like the immutable CHAMP trie. It prints
+    /// `HashSet(…)`/`HashMap(…)` at every size, and its iteration order is
+    /// bucket index ascending then, within a bucket, improved hash ascending.
+    /// The table length rides along because the order depends on it and it grows
+    /// with the collection (see [`mut_ordered`]).
+    Mutable(u32),
 }
 
 /// The rendered prefix of a [`HeapVal::Seq`].
@@ -702,11 +732,17 @@ enum HashRep {
 enum SeqKind {
     List,
     Vector,
-    /// An immutable `Set` — `Set1`..`Set4` or a CHAMP `HashSet` (see [`HashRep`]).
+    /// A `Set` — immutable `Set1`..`Set4` / CHAMP `HashSet`, or a mutable
+    /// `HashSet` (see [`HashRep`]).
     Set(HashRep),
     Iterable,
     /// A mutable `Array`: the only sequence kind that answers `update`.
     Array,
+    /// `scala.collection.mutable.ListBuffer` — a growable sequence.
+    ListBuffer,
+    /// `scala.collection.mutable.ArrayBuffer` (also `Buffer`/`Seq` under the
+    /// mutable namespace) — a growable indexed sequence.
+    ArrayBuffer,
     /// An integer `Range` as a first-class value. Its elements are materialized
     /// like any other sequence; the bounds are kept because `Range.toString`
     /// prints them (`Range 1 to 10 by 3`) rather than the elements.
@@ -724,11 +760,30 @@ impl SeqKind {
             SeqKind::List => "List",
             SeqKind::Vector => "Vector",
             SeqKind::Set(HashRep::Small) => "Set",
-            SeqKind::Set(HashRep::Hashed) => "HashSet",
+            SeqKind::Set(HashRep::Hashed | HashRep::Mutable(_)) => "HashSet",
             SeqKind::Iterable => "Iterable",
             SeqKind::Array => "Array",
+            SeqKind::ListBuffer => "ListBuffer",
+            SeqKind::ArrayBuffer => "ArrayBuffer",
             SeqKind::Range { .. } => "Range",
         }
+    }
+
+    /// Whether this kind is mutated in place (`a(i) = v`, `+=`, `clear()`).
+    fn is_mutable(self) -> bool {
+        matches!(
+            self,
+            SeqKind::Array
+                | SeqKind::ListBuffer
+                | SeqKind::ArrayBuffer
+                | SeqKind::Set(HashRep::Mutable(_))
+        )
+    }
+
+    /// Whether this kind is a growable buffer (`+=`, `append`, `remove`) — an
+    /// `Array` is mutable but fixed-length, so it is not one.
+    fn is_buffer(self) -> bool {
+        matches!(self, SeqKind::ListBuffer | SeqKind::ArrayBuffer)
     }
 }
 
@@ -1148,6 +1203,43 @@ fn b_make_set(vm: &mut VM, argc: u8) -> Value {
     new_set(HashRep::Small, pop_n(vm, argc))
 }
 
+/// `MAKE_LISTBUFFER` / `MAKE_ARRAYBUFFER` builtins — pop `argc` elements into a
+/// growable buffer.
+fn b_make_listbuffer(vm: &mut VM, argc: u8) -> Value {
+    new_seq(SeqKind::ListBuffer, pop_n(vm, argc))
+}
+
+fn b_make_arraybuffer(vm: &mut VM, argc: u8) -> Value {
+    new_seq(SeqKind::ArrayBuffer, pop_n(vm, argc))
+}
+
+/// `MAKE_MUTSET` builtin — pop `argc` elements into a `mutable.HashSet` whose
+/// table starts where `HashSet.from` would put it for `argc` inputs.
+fn b_make_mutset(vm: &mut VM, argc: u8) -> Value {
+    mut_set_from(mut_initial_len(argc as usize), pop_n(vm, argc))
+}
+
+/// `MAKE_MUTMAP` builtin — the `mutable.HashMap` counterpart.
+fn b_make_mutmap(vm: &mut VM, argc: u8) -> Value {
+    let pairs = pop_n(vm, argc);
+    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
+    for p in &pairs {
+        match as_seq_or_tuple(p) {
+            Some(t) if t.len() == 2 => entries.push((t[0].clone(), t[1].clone())),
+            _ => return fault(vm, "scalars: Map(...) expects `key -> value` pairs"),
+        }
+    }
+    mut_map_from(mut_initial_len(argc as usize), entries)
+}
+
+/// `IS_GROWABLE` builtin — whether the popped value mutates in place.
+fn b_is_growable(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    let mutable_seq = seq_kind_items(&v).is_some_and(|(k, _)| k.is_mutable());
+    let mutable_map = matches!(map_rep_entries(&v), Some((HashRep::Mutable(_), _)));
+    Value::bool(mutable_seq || mutable_map)
+}
+
 /// Pop `argc` stack values into source order (the deepest is the first element).
 fn pop_n(vm: &mut VM, argc: u8) -> Vec<Value> {
     let mut items = Vec::with_capacity(argc as usize);
@@ -1544,10 +1636,9 @@ fn obj_to_string(v: &Value) -> String {
                     .map(|(k, val)| format!("{} -> {}", scala_str(k), scala_str(val)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let label = if *rep == HashRep::Hashed {
-                    "HashMap"
-                } else {
-                    "Map"
+                let label = match rep {
+                    HashRep::Hashed | HashRep::Mutable(_) => "HashMap",
+                    HashRep::Small => "Map",
                 };
                 format!("{label}({inner})")
             }
@@ -1625,13 +1716,75 @@ fn mm_mix(hash: i32, data: i32) -> i32 {
 
 /// `MurmurHash3.finalizeHash` — the length mixed in, then avalanched.
 fn mm_finalize(hash: i32, length: i32) -> i32 {
-    let mut h = (hash ^ length) as u32;
+    mm_avalanche(hash ^ length)
+}
+
+/// `MurmurHash3.avalanche`.
+fn mm_avalanche(hash: i32) -> i32 {
+    let mut h = hash as u32;
     h ^= h >> 16;
     h = h.wrapping_mul(0x85eb_ca6b);
     h ^= h >> 13;
     h = h.wrapping_mul(0xc2b2_ae35);
     h ^= h >> 16;
     h as i32
+}
+
+/// `MurmurHash3.orderedHash` — the hash every `Seq` uses, with the `Seq` seed.
+///
+/// Scala reaches this value through three different loops (`indexedSeqHash` for
+/// an `IndexedSeq`, `listHash` for a `List`, `orderedHash` for anything else),
+/// but all three compute the same number: each mixes every element in order and
+/// then, when the elements form an arithmetic progression with a non-zero step,
+/// substitutes `rangeHash(first, step, last)` so a `Range` and the `Vector` of
+/// the same numbers agree. One implementation therefore serves them all.
+fn ordered_hash(elems: &[Value], seed: i32) -> Option<i32> {
+    let hs: Vec<i32> = elems.iter().map(scala_hash).collect::<Option<_>>()?;
+    match hs.len() {
+        0 => Some(mm_finalize(seed, 0)),
+        1 => Some(mm_finalize(mm_mix(seed, hs[0]), 1)),
+        _ => {
+            let mut h = mm_mix(seed, hs[0]);
+            let h0 = h;
+            let mut prev = hs[1];
+            let range_diff = prev.wrapping_sub(hs[0]);
+            let mut i = 2;
+            while i < hs.len() {
+                h = mm_mix(h, prev);
+                let hash = hs[i];
+                // Not a progression (or a zero step): fall back to mixing the
+                // rest element by element.
+                if range_diff != hash.wrapping_sub(prev) || range_diff == 0 {
+                    h = mm_mix(h, hash);
+                    for &rest in &hs[i + 1..] {
+                        h = mm_mix(h, rest);
+                    }
+                    return Some(mm_finalize(h, hs.len() as i32));
+                }
+                prev = hash;
+                i += 1;
+            }
+            // `rangeHash(first, step, last, seed)`.
+            Some(mm_avalanche(mm_mix(mm_mix(h0, range_diff), prev)))
+        }
+    }
+}
+
+/// `MurmurHash3.unorderedHash` — symmetric in its arguments, which is what a
+/// `Set`'s and a `Map`'s hash need (their iteration order is an implementation
+/// detail, but equal collections must hash equal).
+fn unordered_hash(hashes: &[i32], seed: i32) -> i32 {
+    let (mut a, mut b) = (0i32, 0i32);
+    let mut c = 1i32;
+    for &h in hashes {
+        a = a.wrapping_add(h);
+        b ^= h;
+        c = c.wrapping_mul(h | 1);
+    }
+    let mut h = mm_mix(seed, a);
+    h = mm_mix(h, b);
+    h = mm_mix_last(h, c);
+    mm_finalize(h, hashes.len() as i32)
 }
 
 /// `MurmurHash3.productHash` — the seed, the `productPrefix` hash, then every
@@ -1675,6 +1828,26 @@ fn scala_hash(v: &Value) -> Option<i32> {
                         o.fields[..n].iter().map(|(_, val)| val.clone()).collect();
                     product_hash(&o.class, &elems)
                 }
+                // A `Set` hashes symmetrically, every other sequence in order —
+                // which is why `List(1,2,3)`, `Vector(1,2,3)`, `1 to 3` and
+                // `ListBuffer(1,2,3)` all hash alike. An `Array` is the one
+                // exception: it keeps the JVM's identity hash, which no
+                // reimplementation can reproduce.
+                HeapVal::Seq(SeqKind::Array | SeqKind::Iterable, _) => None,
+                HeapVal::Seq(SeqKind::Set(_), items) => {
+                    let hs: Vec<i32> = items.iter().map(scala_hash).collect::<Option<_>>()?;
+                    Some(unordered_hash(&hs, string_hash("Set")))
+                }
+                HeapVal::Seq(_, items) => ordered_hash(&items, string_hash("Seq")),
+                // `mapHash`: each entry hashed as the `Tuple2` it is, then
+                // combined symmetrically.
+                HeapVal::Map(_, entries) => {
+                    let hs: Vec<i32> = entries
+                        .iter()
+                        .map(|(k, v)| product_hash("Tuple2", &[k.clone(), v.clone()]))
+                        .collect::<Option<_>>()?;
+                    Some(unordered_hash(&hs, string_hash("Map")))
+                }
                 _ => None,
             }
         }
@@ -1689,6 +1862,129 @@ fn improve(hcode: i32) -> u32 {
     h ^= h >> 14;
     h = h.wrapping_add(h << 4);
     h ^ (h >> 10)
+}
+
+// ── mutable HashSet/HashMap: the flat table's order ────────────────────────
+//
+// `scala.collection.mutable.HashSet`/`HashMap` are one algorithm (their sources
+// differ only in what a node carries), ported here from
+// `src/library/scala/collection/mutable/HashSet.scala`:
+//
+//   * `improveHash(h) = h ^ (h >>> 16)`, and the bucket is `hash & (len - 1)`.
+//   * Every bucket is kept sorted by **improved hash ascending**; `addElem`
+//     walks past equal hashes, so equal-hash elements keep insertion order.
+//   * `add` grows (doubling) when `contentSize + 1 >= threshold`, *before*
+//     inserting — so an add that turns out to be a duplicate can still grow the
+//     table. `threshold = (len * 0.75).toInt`.
+//   * `growTable` splits each bucket into a low and a high sublist in order, so
+//     growing never disturbs the relative order within a bucket.
+//   * Iteration walks table indices ascending, each chain front to back.
+//   * Removal never shrinks the table.
+//
+// The last two points are why elements can be *stored* in iteration order and
+// re-sorted after every change: a stable sort by (bucket, improved hash) over
+// the previous iteration order reproduces the table exactly, because equal-hash
+// elements are adjacent in one bucket and keep their relative order under both
+// growth and re-sorting.
+
+/// `mutable.HashSet.defaultInitialCapacity`.
+const MUT_INITIAL_CAPACITY: i64 = 16;
+/// `mutable.HashSet.defaultLoadFactor`.
+const MUT_LOAD_FACTOR: f64 = 0.75;
+
+/// `mutable.HashSet.improveHash`. Unrelated to the immutable [`improve`].
+fn mut_improve(hcode: i32) -> i32 {
+    hcode ^ ((hcode as u32) >> 16) as i32
+}
+
+/// `mutable.HashSet.tableSizeFor`: `(highestOneBit(max(capacity - 1, 4)) * 2)`,
+/// capped at `1 << 30`.
+fn mut_table_size_for(capacity: i64) -> usize {
+    let c = (capacity - 1).max(4) as u64;
+    let highest_one_bit = 1u64 << (63 - c.leading_zeros());
+    (highest_one_bit * 2).min(1 << 30) as usize
+}
+
+/// `mutable.HashSet.newThreshold`.
+fn mut_threshold(len: usize) -> usize {
+    (len as f64 * MUT_LOAD_FACTOR) as usize
+}
+
+/// The table length `mutable.HashSet.from`/`HashMap.from` start at for a factory
+/// call of `n` arguments (`cap = ((n + 1) / 0.75).toInt`, or the default 16 when
+/// the source's size is unknown).
+fn mut_initial_len(n: usize) -> usize {
+    let cap = if n > 0 {
+        ((n as f64 + 1.0) / MUT_LOAD_FACTOR) as i64
+    } else {
+        MUT_INITIAL_CAPACITY
+    };
+    mut_table_size_for(cap)
+}
+
+/// Replay `add`'s grow-then-insert over `adds` attempted insertions into a table
+/// of length `len` already holding `have` elements, `new_count` of which the
+/// insertions actually add. Answers the resulting table length.
+///
+/// Growth is checked once per *attempted* add — a duplicate still triggers it —
+/// so the caller passes both counts.
+fn mut_grown(mut len: usize, mut have: usize, adds: &[bool]) -> usize {
+    let mut threshold = mut_threshold(len);
+    for &is_new in adds {
+        if have + 1 >= threshold {
+            len *= 2;
+            threshold = mut_threshold(len);
+        }
+        if is_new {
+            have += 1;
+        }
+    }
+    len
+}
+
+/// `Growable.sizeHint`: grow to fit `n` incoming elements when `n` is known.
+/// A `List` does not know its size (`knownSize` is -1 unless empty), so a
+/// `++=` from one never hints — which is observable, because the hint can pick
+/// a different table length than the one growth would have reached.
+fn mut_size_hint(len: usize, n: Option<usize>) -> usize {
+    match n {
+        Some(n) => {
+            let target = mut_table_size_for(((n as f64 + 1.0) / MUT_LOAD_FACTOR) as i64);
+            len.max(target)
+        }
+        None => len,
+    }
+}
+
+/// `IterableOnce.knownSize` for a heap collection: `-1` (here `None`) for a
+/// `List`, whose size is not known without walking it, and the length for every
+/// kind that stores one.
+fn known_size(v: &Value) -> Option<usize> {
+    if let Some((kind, items)) = seq_kind_items(v) {
+        return match kind {
+            SeqKind::List if !items.is_empty() => None,
+            _ => Some(items.len()),
+        };
+    }
+    as_map(v).map(|m| m.len())
+}
+
+/// The order a mutable hash table iterates `items`: bucket index ascending,
+/// then improved hash ascending, ties keeping their current order. `None` when
+/// any key is unhashable, which leaves the caller's insertion order alone.
+fn mut_ordered<T: Clone>(items: &[T], len: usize, key: impl Fn(&T) -> Value) -> Option<Vec<T>> {
+    let mut keyed: Vec<(usize, i32, usize)> = Vec::with_capacity(items.len());
+    for (i, it) in items.iter().enumerate() {
+        let h = mut_improve(scala_hash(&key(it))?);
+        keyed.push(((h as u32 as usize) & (len - 1), h, i));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    Some(
+        keyed
+            .into_iter()
+            .map(|(_, _, i)| items[i].clone())
+            .collect(),
+    )
 }
 
 /// The order a CHAMP trie iterates `hashes`, as a permutation of their indices.
@@ -2161,6 +2457,18 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
     if (name == "equals" || name == "==") && args.len() == 1 {
         return Ok(Value::bool(obj_eq(recv, &args[0])));
     }
+    // A collection's `hashCode` is its `MurmurHash3` seq/set/map hash; an
+    // `Array` and a function value keep the JVM identity hash, which is not
+    // reproducible, so the handle stands in for it (see `BUGS.md`).
+    if name == "hashCode" && args.is_empty() {
+        return Ok(Value::int(match scala_hash(recv) {
+            Some(h) => i64::from(h),
+            None => match recv {
+                Value::Obj(id) => i64::from(*id),
+                _ => 0,
+            },
+        }));
+    }
     match heap_kind(recv) {
         Some(0) => seq_method(vm, recv, name, args),
         Some(1) => map_method(vm, recv, name, args),
@@ -2170,6 +2478,314 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
     }
 }
 
+/// Replace the contents (and kind) of the mutable sequence `recv` points at.
+fn set_seq_items(recv: &Value, kind: SeqKind, items: Vec<Value>) {
+    if let Value::Obj(id) = recv {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Seq(k, xs)) = h.borrow_mut().get_mut(*id as usize) {
+                *k = kind;
+                *xs = items;
+            }
+        });
+    }
+}
+
+/// The elements a `+=`-style argument contributes: one value for the `One`
+/// forms, the argument's elements for the `All` forms.
+fn spread(v: &Value, all: bool) -> Vec<Value> {
+    if all {
+        as_seq_or_tuple(v)
+            .or_else(|| as_map(v).map(|m| m.into_iter().map(new_pair_of).collect()))
+            .unwrap_or_else(|| vec![v.clone()])
+    } else {
+        vec![v.clone()]
+    }
+}
+
+/// A `(k, v)` entry as a `Tuple2` value.
+fn new_pair_of((k, v): (Value, Value)) -> Value {
+    heap_push(HeapVal::Tuple(vec![k, v]))
+}
+
+/// Add `adds` to the `mutable.HashSet` behind `recv`, replaying the table growth
+/// `add` would have done and re-sorting into the table's iteration order.
+fn mut_set_add(recv: &Value, len: usize, items: &[Value], adds: &[Value], hint: Option<usize>) {
+    let mut cur = items.to_vec();
+    let mut flags = Vec::with_capacity(adds.len());
+    for a in adds {
+        let is_new = !cur.iter().any(|u| value_eq(u, a));
+        flags.push(is_new);
+        if is_new {
+            cur.push(a.clone());
+        }
+    }
+    let len = mut_grown(mut_size_hint(len, hint), items.len(), &flags);
+    let ordered = mut_ordered(&cur, len, Clone::clone).unwrap_or(cur);
+    set_seq_items(recv, SeqKind::Set(HashRep::Mutable(len as u32)), ordered);
+}
+
+/// In-place mutation of a mutable sequence (`Array`, `ListBuffer`,
+/// `ArrayBuffer`, `mutable.Set`). `None` means the name is not a mutation, so
+/// the caller falls through to the shared read-only implementation.
+fn mut_seq_method(
+    recv: &Value,
+    kind: SeqKind,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let set_len = match kind {
+        SeqKind::Set(HashRep::Mutable(n)) => Some(n as usize),
+        _ => None,
+    };
+    let is_set = set_len.is_some();
+    let buffer = kind.is_buffer();
+    let me = || Ok(recv.clone());
+    // Whether `args[0]` is a collection of elements (`++=`) or one element.
+    let all = matches!(
+        name,
+        "++=" | "addAll" | "appendAll" | "prependAll" | "--=" | "subtractAll"
+    );
+
+    match (name, args.len()) {
+        // Additions. `+=`/`++=` answer the receiver; `add` answers whether the
+        // element was absent.
+        ("+=" | "++=" | "addOne" | "addAll" | "append" | "appendAll" | "add", 1)
+            if is_set || buffer =>
+        {
+            let adds = spread(&args[0], all);
+            if let Some(len) = set_len {
+                let absent = !items.iter().any(|u| value_eq(u, &args[0]));
+                let hint = all.then(|| known_size(&args[0])).flatten();
+                mut_set_add(recv, len, items, &adds, hint);
+                return Some(if name == "add" {
+                    Ok(Value::bool(absent))
+                } else {
+                    me()
+                });
+            }
+            let mut out = items.to_vec();
+            out.extend(adds);
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
+        ("+=:" | "prepend" | "prependAll", 1) if buffer => {
+            let mut out = spread(&args[0], all);
+            out.extend_from_slice(items);
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
+        // Removals. A table never shrinks and the surviving elements keep their
+        // order, so a removal is a filter over the stored order.
+        ("-=" | "--=" | "subtractOne" | "subtractAll" | "remove", 1) if is_set => {
+            let drop = spread(&args[0], all);
+            let present = items.iter().any(|u| value_eq(u, &args[0]));
+            let kept: Vec<Value> = items
+                .iter()
+                .filter(|it| !drop.iter().any(|d| value_eq(d, it)))
+                .cloned()
+                .collect();
+            set_seq_items(recv, kind, kept);
+            Some(if name == "remove" {
+                Ok(Value::bool(present))
+            } else {
+                me()
+            })
+        }
+        ("-=" | "--=" | "subtractOne" | "subtractAll", 1) if buffer => {
+            // A buffer drops only the FIRST occurrence of each value.
+            let mut out = items.to_vec();
+            for d in spread(&args[0], all) {
+                if let Some(i) = out.iter().position(|x| value_eq(x, &d)) {
+                    out.remove(i);
+                }
+            }
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
+        // `remove(i)` answers the element it took out.
+        ("remove", 1) if buffer => {
+            let i = args[0].to_int();
+            if i < 0 || i as usize >= items.len() {
+                return Some(Err(index_out_of_bounds(i, items.len())));
+            }
+            let mut out = items.to_vec();
+            let gone = out.remove(i as usize);
+            set_seq_items(recv, kind, out);
+            Some(Ok(gone))
+        }
+        ("insert", 2) | ("insertAll", 2) if buffer => {
+            let i = args[0].to_int();
+            if i < 0 || i as usize > items.len() {
+                return Some(Err(index_out_of_bounds(i, items.len())));
+            }
+            let mut out = items.to_vec();
+            let ins = spread(&args[1], name == "insertAll");
+            out.splice(i as usize..i as usize, ins);
+            set_seq_items(recv, kind, out);
+            Some(Ok(Value::Undef))
+        }
+        ("clear", 0) => {
+            // Clearing does not reset the table (`java.util.Arrays.fill`), so a
+            // mutable set keeps the length it grew to.
+            set_seq_items(recv, kind, Vec::new());
+            Some(Ok(Value::Undef))
+        }
+        _ => None,
+    }
+}
+
+/// Replace the contents (and table length) of the `mutable.Map` behind `recv`.
+fn set_map_entries(recv: &Value, len: usize, entries: Vec<(Value, Value)>) {
+    let ordered = mut_ordered(&entries, len, |(k, _)| k.clone()).unwrap_or(entries);
+    if let Value::Obj(id) = recv {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Map(rep, m)) = h.borrow_mut().get_mut(*id as usize) {
+                *rep = HashRep::Mutable(len as u32);
+                *m = ordered;
+            }
+        });
+    }
+}
+
+/// Put `adds` into the `mutable.HashMap` behind `recv`, replaying `put0`'s
+/// growth. Answers the value a repeated key displaced, for `put`.
+fn mut_map_put(
+    recv: &Value,
+    len: usize,
+    entries: &[(Value, Value)],
+    adds: &[(Value, Value)],
+    hint: Option<usize>,
+) -> Option<Value> {
+    let mut cur = entries.to_vec();
+    let mut flags = Vec::with_capacity(adds.len());
+    let mut displaced = None;
+    for (k, v) in adds {
+        match cur.iter_mut().find(|(ek, _)| value_eq(ek, k)) {
+            Some(slot) => {
+                displaced = Some(slot.1.clone());
+                slot.1 = v.clone();
+                flags.push(false);
+            }
+            None => {
+                cur.push((k.clone(), v.clone()));
+                flags.push(true);
+            }
+        }
+    }
+    let len = mut_grown(mut_size_hint(len, hint), entries.len(), &flags);
+    set_map_entries(recv, len, cur);
+    displaced
+}
+
+/// In-place mutation of a `mutable.Map`. `None` falls through to the shared
+/// read-only implementation.
+fn mut_map_method(
+    recv: &Value,
+    len: usize,
+    entries: &[(Value, Value)],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    /// A `+=`/`++=` argument as `(key, value)` entries.
+    fn as_entries(v: &Value, all: bool) -> Option<Vec<(Value, Value)>> {
+        if !all {
+            let t = as_seq_or_tuple(v)?;
+            return (t.len() == 2).then(|| vec![(t[0].clone(), t[1].clone())]);
+        }
+        if let Some(m) = as_map(v) {
+            return Some(m);
+        }
+        as_seq_or_tuple(v)?
+            .iter()
+            .map(|p| match as_seq_or_tuple(p) {
+                Some(t) if t.len() == 2 => Some((t[0].clone(), t[1].clone())),
+                _ => None,
+            })
+            .collect()
+    }
+    let all = matches!(name, "++=" | "addAll" | "--=" | "subtractAll");
+    let me = || Ok(recv.clone());
+
+    match (name, args.len()) {
+        ("+=" | "++=" | "addOne" | "addAll", 1) => match as_entries(&args[0], all) {
+            Some(adds) => {
+                mut_map_put(
+                    recv,
+                    len,
+                    entries,
+                    &adds,
+                    all.then(|| known_size(&args[0])).flatten(),
+                );
+                Some(me())
+            }
+            None => Some(Err("scalars: Map `+=` expects `key -> value` pairs".into())),
+        },
+        ("update", 2) => {
+            mut_map_put(
+                recv,
+                len,
+                entries,
+                &[(args[0].clone(), args[1].clone())],
+                None,
+            );
+            Some(Ok(Value::Undef))
+        }
+        ("put", 2) => {
+            let old = mut_map_put(
+                recv,
+                len,
+                entries,
+                &[(args[0].clone(), args[1].clone())],
+                None,
+            );
+            Some(Ok(opt(old)))
+        }
+        ("getOrElseUpdate", 2) => match map_get(entries, &args[0]) {
+            Some(v) => Some(Ok(v)),
+            None => {
+                mut_map_put(
+                    recv,
+                    len,
+                    entries,
+                    &[(args[0].clone(), args[1].clone())],
+                    None,
+                );
+                Some(Ok(args[1].clone()))
+            }
+        },
+        // Removals keep the table length and the surviving order.
+        ("-=" | "--=" | "subtractOne" | "subtractAll" | "remove", 1) => {
+            let drop: Vec<Value> = if all {
+                as_seq_or_tuple(&args[0]).unwrap_or_else(|| vec![args[0].clone()])
+            } else {
+                vec![args[0].clone()]
+            };
+            let old = map_get(entries, &args[0]);
+            let kept: Vec<(Value, Value)> = entries
+                .iter()
+                .filter(|(k, _)| !drop.iter().any(|d| value_eq(d, k)))
+                .cloned()
+                .collect();
+            set_map_entries(recv, len, kept);
+            Some(if name == "remove" { Ok(opt(old)) } else { me() })
+        }
+        ("clear", 0) => {
+            set_map_entries(recv, len, Vec::new());
+            Some(Ok(Value::Undef))
+        }
+        _ => None,
+    }
+}
+
+/// The JDK's out-of-bounds message for an indexed sequence write.
+fn index_out_of_bounds(i: i64, len: usize) -> String {
+    format!(
+        "scalars: java.lang.IndexOutOfBoundsException: {i} is out of bounds (min 0, max {})",
+        len.saturating_sub(1)
+    )
+}
+
 /// `Seq` (`List`/`Set`/`Iterable`) methods — a faithful subset. Closure-taking
 /// ops run their function argument through [`invoke_closure`].
 fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -2177,6 +2793,14 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // A transforming op keeps the receiver's collection kind (`List.map` → `List`,
     // a range-derived `Vector.map` → `Vector`).
     let same = |v: Vec<Value>| derive_seq(kind, v);
+    // In-place mutation (`+=`, `clear()`, …) — before the pure paths, because
+    // several names (`+`, `-`, `++`) mean "mutate me" on a mutable receiver and
+    // "build a new one" on an immutable one.
+    if kind.is_mutable() {
+        if let Some(r) = mut_seq_method(recv, kind, &items, name, args) {
+            return r;
+        }
+    }
     // The pure slice/reorder methods first — they share one body.
     if let Some(out) = seq_slice_method(&items, name, args) {
         return Ok(same(out));
@@ -2226,7 +2850,10 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // In-place element assignment (`a(i) = v`), the desugar target of
         // `Array.update`. Only an `Array` is mutable in Scala.
         ("update", 2) => {
-            if !matches!(kind, SeqKind::Array) {
+            if !matches!(
+                kind,
+                SeqKind::Array | SeqKind::ListBuffer | SeqKind::ArrayBuffer
+            ) {
                 return Err(no_such_method(recv, name));
             }
             let i = args[0].to_int();
@@ -2651,12 +3278,12 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             Ok(new_pair(same(yes), same(no)))
         }
         // Set algebra. `+`/`-` also reach here through the numeric hook.
-        ("union" | "++" | "concat", 1) => {
+        ("union" | "++" | "concat" | "|", 1) => {
             let mut out = items.clone();
             out.extend(as_seq_or_tuple(&args[0]).unwrap_or_default());
             Ok(same(out))
         }
-        ("intersect", 1) => {
+        ("intersect" | "&", 1) => {
             let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
             Ok(same(
                 items
@@ -2666,7 +3293,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     .collect(),
             ))
         }
-        ("diff" | "--" | "removedAll", 1) => {
+        ("diff" | "--" | "removedAll" | "&~", 1) => {
             let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
             Ok(same(
                 items
@@ -2728,6 +3355,13 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         .iter()
         .map(|(k, v)| new_pair(k.clone(), v.clone()))
         .collect();
+    // In-place mutation, before the pure paths: on a `mutable.Map` the names
+    // `+`/`-`/`++` still build a new map, but `+=`/`-=`/`update`/`put` mutate.
+    if let HashRep::Mutable(len) = rep {
+        if let Some(r) = mut_map_method(recv, len as usize, &entries, name, args) {
+            return r;
+        }
+    }
     match (name, args.len()) {
         ("updated", 2) | ("+", 1) => {
             let mut out = entries.clone();
@@ -3258,6 +3892,11 @@ fn new_seq(kind: SeqKind, items: Vec<Value>) -> Value {
 /// representation upgraded to a `HashSet` when `rep` already was one or the
 /// result exceeds four elements, and a `HashSet`'s elements put in trie order.
 fn new_set(rep: HashRep, items: Vec<Value>) -> Value {
+    // A mutable receiver derives through a fresh `HashSet.newBuilder`, which
+    // starts at the default capacity however large the receiver was.
+    if matches!(rep, HashRep::Mutable(_)) {
+        return mut_set_from(mut_table_size_for(MUT_INITIAL_CAPACITY), items);
+    }
     let mut uniq: Vec<Value> = Vec::with_capacity(items.len());
     for it in items {
         if !uniq.iter().any(|u| value_eq(u, &it)) {
@@ -3273,9 +3912,49 @@ fn new_set(rep: HashRep, items: Vec<Value>) -> Value {
     heap_push(HeapVal::Seq(SeqKind::Set(rep), uniq))
 }
 
+/// Build a `mutable.HashSet` by inserting `items` into a table of length
+/// `len`, replaying the growth the real `add` would have done.
+fn mut_set_from(len: usize, items: Vec<Value>) -> Value {
+    let mut uniq: Vec<Value> = Vec::with_capacity(items.len());
+    let mut adds = Vec::with_capacity(items.len());
+    for it in items {
+        let is_new = !uniq.iter().any(|u| value_eq(u, &it));
+        adds.push(is_new);
+        if is_new {
+            uniq.push(it);
+        }
+    }
+    let len = mut_grown(len, 0, &adds);
+    heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Mutable(len as u32)), {
+        mut_ordered(&uniq, len, Clone::clone).unwrap_or(uniq)
+    }))
+}
+
+/// Build a `mutable.HashMap` the same way, keyed by each entry's key. A repeated
+/// key keeps its first position and takes the last value, as `put0` does.
+fn mut_map_from(len: usize, entries: Vec<(Value, Value)>) -> Value {
+    let mut uniq: Vec<(Value, Value)> = Vec::with_capacity(entries.len());
+    let mut adds = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        let existing = uniq.iter_mut().find(|(ek, _)| value_eq(ek, &k));
+        adds.push(existing.is_none());
+        match existing {
+            Some(slot) => slot.1 = v,
+            None => uniq.push((k, v)),
+        }
+    }
+    let len = mut_grown(len, 0, &adds);
+    heap_push(HeapVal::Map(HashRep::Mutable(len as u32), {
+        mut_ordered(&uniq, len, |(k, _)| k.clone()).unwrap_or(uniq)
+    }))
+}
+
 /// Build an immutable `Map` from already-deduplicated `entries` — the `Set`
 /// treatment of [`new_set`], keyed by the entry key.
 fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
+    if matches!(rep, HashRep::Mutable(_)) {
+        return mut_map_from(mut_table_size_for(MUT_INITIAL_CAPACITY), entries);
+    }
     let mut entries = entries;
     let rep = hash_rep(rep, entries.len());
     if rep == HashRep::Hashed {
@@ -3288,6 +3967,8 @@ fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
 
 /// The representation an immutable `Set`/`Map` of `len` entries derived from a
 /// `rep` receiver has: hashed once it was hashed or has outgrown `Set4`/`Map4`.
+/// A mutable receiver stays mutable — [`new_set`]/[`new_map`] intercept it
+/// before this is reached.
 fn hash_rep(rep: HashRep, len: usize) -> HashRep {
     if rep == HashRep::Hashed || len > 4 {
         HashRep::Hashed
@@ -3328,6 +4009,7 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         Value::Str(s) => string_method(s, name, args),
         Value::Int(n) => int_method(*n, name, args),
         Value::Float(f) => double_method(*f, name, args),
+        Value::Bool(b) => bool_method(*b, name, args),
         Value::Obj(_) => obj_method(recv, name, args),
         _ => Err(no_such_method(recv, name)),
     }
@@ -3420,7 +4102,37 @@ fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("abs" | "toDouble" | "toFloat" | "toInt" | "toLong" | "max" | "min", _) => {
             Err(format!("scalars: Int.{name}: wrong number of arguments"))
         }
+        // The bitwise and shift operators. Scala evaluates these at `Int` width
+        // — `1 << 33` is `2`, because the shift distance is masked to five bits
+        // and the result wraps at 32 bits — so they are computed on `i32` and
+        // widened back, unlike `+`/`*` (see the 64-bit note in `BUGS.md`).
+        ("&", 1) => Ok(Value::int(n & args[0].to_int())),
+        ("|", 1) => Ok(Value::int(n | args[0].to_int())),
+        ("^", 1) => Ok(Value::int(n ^ args[0].to_int())),
+        ("unary_~", 0) => Ok(Value::int(!(n as i32) as i64)),
+        ("<<", 1) => Ok(Value::int(i64::from(
+            (n as i32).wrapping_shl(args[0].to_int() as u32 & 31),
+        ))),
+        (">>", 1) => Ok(Value::int(i64::from(
+            (n as i32).wrapping_shr(args[0].to_int() as u32 & 31),
+        ))),
+        (">>>", 1) => Ok(Value::int(i64::from(
+            (n as u32).wrapping_shr(args[0].to_int() as u32 & 31) as i32,
+        ))),
         _ => Err(no_such_method(&Value::int(n), name)),
+    }
+}
+
+/// `Boolean`'s non-short-circuiting operators, which Scala spells with the
+/// single-character names (`&`, `|`, `^`) alongside `&&`/`||`.
+fn bool_method(b: bool, name: &str, args: &[Value]) -> Result<Value, String> {
+    let rhs = || matches!(args.first(), Some(Value::Bool(true)));
+    match (name, args.len()) {
+        ("&", 1) => Ok(Value::bool(b & rhs())),
+        ("|", 1) => Ok(Value::bool(b | rhs())),
+        ("^", 1) => Ok(Value::bool(b ^ rhs())),
+        ("unary_!", 0) => Ok(Value::bool(!b)),
+        _ => Err(no_such_method(&Value::bool(b), name)),
     }
 }
 
@@ -3488,14 +4200,14 @@ fn b_ffi_call(vm: &mut VM, argc: u8) -> Value {
 
 /// Scala `/` builtin. fusevm's native `Op::Div` is *always* floating (`7 / 2`
 /// would be `3.5`), but Scala's `/` truncates when both operands are `Int`
-/// (`7 / 2 == 3`) and only floats when an operand is a `Double`. Because slice 1
+/// (`7 / 2 == 3`) and only floats when an operand is a `Double`. Because scalars
 /// carries no static types, the choice is made at runtime here: both `Int` →
 /// truncating integer division (toward zero, like Scala/Java); otherwise a
 /// double divide (so `7 / 2.0 == 3.5`, `1.0 / 0.0 == Infinity`).
 ///
 /// Integer division by zero throws `java.lang.ArithmeticException: / by zero` in
-/// Scala (a JVM `idiv`/`irem` trap). slice 1 has no `try`/`catch`, so an
-/// uncaught throw halts the VM with that exact message parked for the runner
+/// Scala (a JVM `idiv`/`irem` trap). It is catchable; an *uncaught* one halts
+/// the VM with that exact message parked for the runner
 /// (surfaced as `scalars: java.lang.ArithmeticException: / by zero`), matching an
 /// uncaught exception aborting `scala`. A `wrapping_div` avoids the
 /// `i64::MIN / -1` overflow panic. Floating-point `/ 0.0` is NOT an error in
@@ -3520,7 +4232,7 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
     }
 }
 
-/// Predef `println` builtin: pop `argc` values (0 or 1 in slice 1), print them
+/// Predef `println` builtin: pop `argc` values (0 or 1), print them
 /// Scala-formatted followed by a newline, and return `Unit`/`null`.
 fn b_println(vm: &mut VM, argc: u8) -> Value {
     print_args(vm, argc, true)
@@ -3636,7 +4348,7 @@ fn format_double(f: f64) -> String {
 }
 
 /// Strict numeric hook: fusevm calls this only for an operation with a
-/// non-numeric operand. In slice 1 that is Scala's `String` `+` overload plus
+/// non-numeric operand. That is Scala's `String` `+` overload plus
 /// value comparisons against strings; all-numeric arithmetic never reaches here
 /// (it stays on the native fast path and the JIT).
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {

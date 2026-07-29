@@ -89,6 +89,11 @@ pub enum Tok {
     Op(String),
     // operators
     Assign,
+    /// `~` — the unary bitwise complement.
+    Tilde,
+    /// A symbolic compound assignment that is a method call, not arithmetic:
+    /// `++=` and `--=` on a growable collection.
+    OpAssign(String),
     PlusAssign,
     MinusAssign,
     StarAssign,
@@ -288,6 +293,33 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 
         // numbers (int or float)
         if c.is_ascii_digit() {
+            // Hexadecimal (`0x1F`) — the one radix Scala 3 still accepts. It
+            // parses as an `Int`, so the value is read at 32 bits and sign-
+            // extended, making `0xFFFFFFFF` the `-1` Scala reads it as.
+            if c == '0'
+                && i + 2 < bytes.len()
+                && matches!(bytes[i + 1], b'x' | b'X')
+                && (bytes[i + 2] as char).is_ascii_hexdigit()
+            {
+                let start = i + 2;
+                i = start;
+                while i < bytes.len() && (bytes[i] as char).is_ascii_hexdigit() {
+                    i += 1;
+                }
+                let text = &src[start..i];
+                if i < bytes.len() && matches!(bytes[i], b'L' | b'l') {
+                    i += 1;
+                }
+                let v = u64::from_str_radix(text, 16)
+                    .map_err(|_| format!("scalars: bad hex literal `{text}` on line {line}"))?;
+                let v = if text.len() <= 8 {
+                    i64::from(v as u32 as i32)
+                } else {
+                    v as i64
+                };
+                push!(Tok::Int(v), line);
+                continue;
+            }
             let start = i;
             let mut is_float = false;
             while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
@@ -372,7 +404,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // char literals — modeled as a one-char string (slice 1)
+        // char literals — modeled as a one-char string
         if c == '\'' {
             i += 1;
             let ch = if bytes[i] == b'\\' {
@@ -399,48 +431,64 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         } else {
             ""
         };
-        let (kind, adv) = match two {
-            "<-" => (Tok::LArrow, 2),
-            "=>" => (Tok::FatArrow, 2),
-            "->" => (Tok::RArrow, 2),
-            "::" => (Tok::ColonColon, 2),
-            "++" | "--" | ":+" | "+:" => (Tok::Op(two.to_string()), 2),
-            "+=" => (Tok::PlusAssign, 2),
-            "-=" => (Tok::MinusAssign, 2),
-            "*=" => (Tok::StarAssign, 2),
-            "/=" => (Tok::SlashAssign, 2),
-            "%=" => (Tok::PercentAssign, 2),
-            "==" => (Tok::EqEq, 2),
-            "!=" => (Tok::NotEq, 2),
-            "<=" => (Tok::Le, 2),
-            ">=" => (Tok::Ge, 2),
-            "&&" => (Tok::AndAnd, 2),
-            "||" => (Tok::OrOr, 2),
-            _ => match c {
-                '{' => (Tok::LBrace, 1),
-                '}' => (Tok::RBrace, 1),
-                '(' => (Tok::LParen, 1),
-                ')' => (Tok::RParen, 1),
-                '[' => (Tok::LBracket, 1),
-                ']' => (Tok::RBracket, 1),
-                ';' => (Tok::Semi, 1),
-                ',' => (Tok::Comma, 1),
-                '.' => (Tok::Dot, 1),
-                ':' => (Tok::Colon, 1),
-                '=' => (Tok::Assign, 1),
-                '+' => (Tok::Plus, 1),
-                '-' => (Tok::Minus, 1),
-                '*' => (Tok::Star, 1),
-                '/' => (Tok::Slash, 1),
-                '%' => (Tok::Percent, 1),
-                '<' => (Tok::Lt, 1),
-                '>' => (Tok::Gt, 1),
-                '!' => (Tok::Not, 1),
-                other => {
-                    return Err(format!(
-                        "scalars: unexpected character `{other}` on line {line}"
-                    ))
-                }
+        let three = if i + 2 < bytes.len() {
+            &src[i..i + 3]
+        } else {
+            ""
+        };
+        let (kind, adv) = match three {
+            // The growable-collection bulk operators. Longest match first: `++=`
+            // would otherwise lex as `++` then `=`.
+            "++=" | "--=" => (Tok::OpAssign(three.to_string()), 3),
+            // `>>>` — the logical right shift, longest match before `>>`.
+            ">>>" => (Tok::Op(three.to_string()), 3),
+            _ => match two {
+                "<-" => (Tok::LArrow, 2),
+                "=>" => (Tok::FatArrow, 2),
+                "->" => (Tok::RArrow, 2),
+                "::" => (Tok::ColonColon, 2),
+                "++" | "--" | ":+" | "+:" | "<<" | ">>" | "&~" => (Tok::Op(two.to_string()), 2),
+                "+=" => (Tok::PlusAssign, 2),
+                "-=" => (Tok::MinusAssign, 2),
+                "*=" => (Tok::StarAssign, 2),
+                "/=" => (Tok::SlashAssign, 2),
+                "%=" => (Tok::PercentAssign, 2),
+                "==" => (Tok::EqEq, 2),
+                "!=" => (Tok::NotEq, 2),
+                "<=" => (Tok::Le, 2),
+                ">=" => (Tok::Ge, 2),
+                "&&" => (Tok::AndAnd, 2),
+                "||" => (Tok::OrOr, 2),
+                _ => match c {
+                    '{' => (Tok::LBrace, 1),
+                    '}' => (Tok::RBrace, 1),
+                    '(' => (Tok::LParen, 1),
+                    ')' => (Tok::RParen, 1),
+                    '[' => (Tok::LBracket, 1),
+                    ']' => (Tok::RBracket, 1),
+                    ';' => (Tok::Semi, 1),
+                    ',' => (Tok::Comma, 1),
+                    '.' => (Tok::Dot, 1),
+                    ':' => (Tok::Colon, 1),
+                    '=' => (Tok::Assign, 1),
+                    // The bitwise / set operators, each an infix method call whose
+                    // SLS precedence comes from this first character.
+                    '&' | '|' | '^' => (Tok::Op(c.to_string()), 1),
+                    '~' => (Tok::Tilde, 1),
+                    '+' => (Tok::Plus, 1),
+                    '-' => (Tok::Minus, 1),
+                    '*' => (Tok::Star, 1),
+                    '/' => (Tok::Slash, 1),
+                    '%' => (Tok::Percent, 1),
+                    '<' => (Tok::Lt, 1),
+                    '>' => (Tok::Gt, 1),
+                    '!' => (Tok::Not, 1),
+                    other => {
+                        return Err(format!(
+                            "scalars: unexpected character `{other}` on line {line}"
+                        ))
+                    }
+                },
             },
         };
         push!(kind, line);

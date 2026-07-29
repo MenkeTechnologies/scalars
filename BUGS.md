@@ -74,13 +74,40 @@ reported as parse/compile errors, never silently mis-run.
   `Map` adds `apply`/`get`/`getOrElse`/`contains`/`keys`/`keySet`/`values`/
   `updated`/`removed`/`+`/`-`/`++`, and its closure-taking methods pass the
   `Tuple2` Scala does, so `m.map { case (k, v) => … }` works.
+- **Mutable collections.** `mutable.ListBuffer`, `mutable.ArrayBuffer`
+  (also `mutable.Buffer`), `mutable.Set`/`mutable.HashSet` and
+  `mutable.Map`/`mutable.HashMap`, spelled `mutable.X`,
+  `collection.mutable.X`, `scala.collection.mutable.X`, `new …[T]()`, or —
+  for `ListBuffer`/`ArrayBuffer`/`Buffer`, whose names cannot also mean an
+  immutable collection — unqualified. They ride the same host heap and answer
+  the same read combinators as the immutable ones, plus the mutators
+  `+=`/`-=`/`++=`/`--=`, `add`/`addOne`/`addAll`, `append`/`prepend`/
+  `appendAll`/`prependAll`, `insert`/`insertAll`, `remove`, `subtractOne`/
+  `subtractAll`, `clear`, and — on a `Map` — `put`, `update` (`m(k) = v`),
+  `getOrElseUpdate` and `remove`. Each prints with its own prefix
+  (`ListBuffer(…)`, `ArrayBuffer(…)`, and `HashSet(…)`/`HashMap(…)` at every
+  size), and a derived collection keeps the receiver's kind, so
+  `ListBuffer(1,2).map(_ * 2)` is a `ListBuffer`.
+- **A mutable `Set`/`Map` prints in its hash *table's* order.** Nothing like the
+  immutable CHAMP trie: `scala.collection.mutable.HashSet`/`HashMap` are a flat,
+  separately chained table, and `src/host.rs` ports it from the 2.13 sources —
+  `improveHash(h) = h ^ (h >>> 16)`, the bucket `hash & (len - 1)`, buckets kept
+  sorted by improved hash (equal hashes keeping insertion order), the
+  `tableSizeFor`/`threshold` sizing that `HashSet.from` starts from and `add`
+  doubles at three-quarters full, the `sizeHint` a `++=` applies when its source
+  knows its size, and iteration over table indices ascending. The table length
+  is therefore part of the collection's state (removal never shrinks it, and a
+  derived collection starts a fresh table at the default capacity), which is why
+  `mutable.Set(1,2,3)` and `mutable.Set(1,2,3,4,5)` order the same elements
+  differently.
 - **`Set`/`Map` print in their representation's order.** Up to four entries
   Scala's factories answer `Set1`..`Set4` / `Map1`..`Map4`, which keep insertion
   order and print `Set(…)`/`Map(…)`; beyond that they answer a CHAMP
   `HashSet`/`HashMap`, which prints `HashSet(…)`/`HashMap(…)` in *trie* order.
   Both are reproduced exactly: `src/host.rs` ports the JVM/Scala `##` hash codes
-  (`String`, `Int`/`Long`, `Statics.doubleHash`, `Boolean`, and
-  `MurmurHash3.productHash` for tuples and `case` records), the trie's `improve`
+  (`String`, `Int`/`Long`, `Statics.doubleHash`, `Boolean`,
+  `MurmurHash3.productHash` for tuples and `case` records, and its
+  `orderedHash`/`unorderedHash` for collections), the trie's `improve`
   scramble, and the depth-first order its iterator walks. A derived collection
   keeps the receiver's representation, so `Set(1,2,3,4,5).filter(_ > 1)` is a
   four-element `HashSet` and `groupBy` is always a `HashMap`. A `case class`'s
@@ -101,6 +128,13 @@ reported as parse/compile errors, never silently mis-run.
   matches, matching Scala's `Function1` reading of the same literal. A
   `PartialFunction[A, B]` annotation is a type ascription, so binding one to a
   `val` and passing it around works.
+- **The bitwise and shift operators.** `&`, `|`, `^`, `~`, `<<`, `>>` and `>>>`
+  on `Int`; `&`, `|` and `^` on `Boolean` (Scala's non-short-circuiting forms);
+  and `&`/`|`/`&~` on `Set` (intersection, union, difference). Hexadecimal
+  literals (`0x1F`) lex, read at `Int` width. Precedence follows the SLS table
+  keyed by an operator's first character — `| < ^ < & < = ! < < > < : < + - <
+  * / %` — which is also where `&&`/`||` get theirs, so `a | b && c` is
+  `a | (b && c)` and `1 << 2 + 1` is `1 << 3`.
 - **`for` comprehensions.** `yield` and the side-effecting form; range and
   collection generators; several generators (nesting through `flatMap`);
   `if` guards, trailing or standing alone; both the `for (…)` and the `for { … }`
@@ -149,8 +183,17 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **Mutable collections.** `scala.collection.mutable.*` — `ArrayBuffer`,
-  `mutable.Map`/`Set`, `ListBuffer`. `Array` is the only mutable sequence.
+- **`LinkedHashSet`/`LinkedHashMap`, and the rest of
+  `scala.collection.mutable`.** The linked forms keep insertion order rather
+  than the table's, so they are deliberately *not* aliased onto the hash-table
+  ones — they are an unresolved name, not a silent mis-run. `Queue`, `Stack`,
+  `PriorityQueue`, `ArrayDeque` and `StringBuilder` are likewise absent.
+- **An unqualified `Set`/`Map` always means the immutable one.** `import` lines
+  are skipped, not tracked, so `import scala.collection.mutable.Set` followed by
+  a bare `Set(1, 2)` builds the immutable set. Write `mutable.Set(1, 2)`.
+- **`x += e` in expression position.** `println(buf += 1)` — Scala's `+=` is an
+  expression whose value is the buffer. Here `+=` is a statement, so it is a
+  parse error rather than a mis-run. `buf += 1` on its own line works.
 - **Lazy views and `Iterator`.** `.view`, `.iterator`, and `LazyList`. The
   strict methods above materialize; `grouped`/`sliding` answer the `List` of
   windows rather than an `Iterator`, so `.toList`/`.foreach` on one matches but
@@ -159,14 +202,8 @@ reported as parse/compile errors, never silently mis-run.
   `Ordering`, and `Ordered`/`Comparable` on a user class. The built-in ordering
   covers numbers, `String`, `Boolean` and tuples of those; anything else
   compares equal, which a stable sort leaves in input order.
-- **A hashed `Set`/`Map` keyed by a collection.** The trie order needs the
-  key's JVM hash; `MurmurHash3`'s seq/set/map hashes are not ported, so a
-  `HashSet` of `List`s (or a `HashMap` keyed by one) keeps insertion order
-  instead of trie order. Keys that are numbers, `String`s, `Boolean`s, tuples or
-  `case` records are exact.
-- **Symbolic operators beyond the wired set.** `++`, `:+`, `+:`, `::`, `->` and
-  the arithmetic/comparison operators are lexed; `&`, `|`, `^`, `<<`, `--`,
-  `/:`, `:\` and user-defined symbolic method names are not.
+- **Symbolic operators beyond the wired set.** `/:`, `:\` and user-defined
+  symbolic method names.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
   namespace, and the many `String`/numeric methods beyond the wired subset
   above. The `args` parameter of `main` is parsed and ignored.
@@ -214,6 +251,11 @@ reported as parse/compile errors, never silently mis-run.
   `==`/`equals` for the strings and booleans this frontend handles. Reference
   identity (`eq`) is not modeled.
 - **`char` literals are one-character strings**, not an integer `Char` type.
+- **`~-1` parses here and does not in Scala.** Scala lexes a run of symbolic
+  characters as one operator name, so `~-1` is the undefined prefix operator
+  `~-`; this lexer takes `~` and `-1`. Write `~(-1)`. This is a case of
+  accepting more than Scala, like the unchecked types above, never of running
+  something differently.
 - **An *empty* `Map.map`/`Map.collect` picks its builder from the function's
   syntax.** Scala reads the result builder off the function's static result
   type: a pair rebuilds a `Map`, anything else falls back to
@@ -233,7 +275,11 @@ reported as parse/compile errors, never silently mis-run.
   consumption Scala programs use (`.toList`, `.foreach`, `.map`) matches;
   printing the un-consumed result does not (Scala prints `<iterator>`).
 - **Integer arithmetic uses fusevm's 64-bit semantics.** Scala `Int` 32-bit
-  overflow wrapping is not modeled (values behave like `Long`).
+  overflow wrapping is not modeled for `+`/`-`/`*` (values behave like `Long`).
+  The **bitwise** operators are the exception: `~`, `<<`, `>>` and `>>>` are
+  evaluated at `Int` width, because that is observable at ordinary magnitudes
+  (`1 << 33` is `2`, not `8589934592`) rather than only on overflow. A genuinely
+  `Long` receiver therefore shifts as an `Int` would.
 - **`/` is dispatched at runtime, not by static type.** Scala picks integer vs.
   floating division from the *static* operand types; there are no static types
   here, so the [`host::b_div`] builtin decides at runtime — both operands `Int`
@@ -253,7 +299,17 @@ reported as parse/compile errors, never silently mis-run.
   process hanging). Every observable result matches for the sizes real programs
   use; the memory profile does not.
 - **Uninitialized bindings are unbound** rather than rejected; reading one before
-  assignment yields `null` instead of a compile error.
+  assignment yields `null` instead of a compile error. The same value stands in
+  for `Unit`, so *printing* a `Unit` result — `println(xs.clear())`,
+  `println(println("x"))` — renders `null` where Scala renders `()`. Every other
+  use of a `Unit` value agrees.
+- **`x += e` chooses the growable method at run time, not from a static type.**
+  Scala calls `x.+=(e)` when the receiver's type has that method and falls back
+  to `x = x + e` otherwise. There are no static types here, so a program that
+  builds a mutable collection *anywhere* emits a one-op test
+  ([`crate::host::IS_GROWABLE`]) that picks the branch on the receiver's runtime
+  kind. A program with no mutable collection in it emits exactly the arithmetic
+  it did before, so a counted `while` loop stays JIT-trace-eligible.
 - **`object … extends App` runs the object body directly.** Statements run in
   order and any `def` members are hoisted and callable; other member kinds
   (fields, nested types) are skipped.
@@ -309,6 +365,13 @@ into `src/host.rs` to get it byte-for-byte:
    `MurmurHash3.productHash` — seed, `productPrefix` hash, each element's `##`,
    finalized with the arity — for tuples and `case` records. That last one also
    became the `case class` `hashCode`, which is now Scala's exact value.
+   A collection hashes through the rest of the `MurmurHash3` family:
+   `orderedHash` with the `Seq` seed for every sequence — which is why
+   `List(1,2,3)`, `Vector(1,2,3)`, `1 to 3` and `ListBuffer(1,2,3)` all hash
+   alike, including the arithmetic-progression case that makes a `Range` agree
+   with its elements — and `unorderedHash` with the `Set`/`Map` seed for a
+   `Set` and for a `Map`'s `Tuple2` entries. So a `HashSet` of `List`s, or a
+   `HashMap` keyed by one, prints in trie order too, at any nesting depth.
 2. **`improve`** — the trie's hash scramble.
 3. **The traversal** — five bits per level, low bits first; within a node the
    slots holding one element are emitted first in ascending slot order, then the

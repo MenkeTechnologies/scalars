@@ -231,6 +231,36 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "val m = Map(\"a\" -> 1, \"b\" -> 2)\nprintln(m.getOrElse(\"z\", 0))   // => 0",
     ),
     (
+        "mutable",
+        "Contextual",
+        "the `scala.collection.mutable` package: `mutable.ListBuffer`, `mutable.ArrayBuffer`, `mutable.Set` and `mutable.Map`, mutated with `+=`/`-=`/`++=`/`--=`. A mutable `Set`/`Map` prints `HashSet(…)`/`HashMap(…)` at every size, in its hash table's iteration order",
+        "val s = mutable.Set(1, 2, 3)\ns += 4\nprintln(s)   // => HashSet(1, 2, 3, 4)",
+    ),
+    (
+        "ListBuffer",
+        "Contextual",
+        "the growable `scala.collection.mutable` sequence: `+=`, `++=`, `-=`, `append`, `prepend`, `insert`, `remove`, `clear`, `b(i) = v`, plus every `List` combinator. A derived collection is another `ListBuffer`",
+        "val b = mutable.ListBuffer(1, 2)\nb += 3\nprintln(b)   // => ListBuffer(1, 2, 3)",
+    ),
+    (
+        "ArrayBuffer",
+        "Contextual",
+        "the growable indexed `scala.collection.mutable` sequence (`Buffer` is an alias); the same mutators and combinators as `ListBuffer`, printed `ArrayBuffer(…)`",
+        "val a = mutable.ArrayBuffer(1, 2)\na ++= List(3, 4)\nprintln(a)   // => ArrayBuffer(1, 2, 3, 4)",
+    ),
+    (
+        "PartialFunction",
+        "Contextual",
+        "a function defined only on some arguments — what a `{ case … }` literal builds. Besides `apply` it answers `isDefinedAt`, which is what `collect`/`collectFirst` use to skip a non-matching element; `applyOrElse`, `lift`, `orElse`, `andThen` and `compose` compose them",
+        "val pf: PartialFunction[Int, String] = { case 1 => \"one\" }\nprintln(pf.isDefinedAt(2))   // => false\nprintln(pf.lift(1))          // => Some(one)",
+    ),
+    (
+        "collect",
+        "Contextual",
+        "`filter` and `map` in one pass over a partial function: an element the function is not defined at is skipped instead of raising `MatchError`, and the arm body never runs for it. `collectFirst` answers the first result as an `Option`",
+        "println(List(1, 2, 3, 4).collect { case x if x % 2 == 0 => x * 10 })   // => List(20, 40)",
+    ),
+    (
         "Nil",
         "Contextual",
         "the empty `List`; the tail a `::` chain terminates with",
@@ -263,7 +293,7 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "import",
         "Contextual",
-        "an import prologue line; skipped in slice 1",
+        "an import prologue line; tolerated and ignored (imports are skipped, not tracked)",
         "import scala.math._\nobject T extends App { println(1) }",
     ),
     // ── Predef (print builtins in host.rs) ──
@@ -315,6 +345,36 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "Operator",
         "short-circuiting logical OR",
         "println(false || true)   // => true",
+    ),
+    (
+        "&",
+        "Operator",
+        "bitwise AND on `Int`, non-short-circuiting AND on `Boolean`, intersection on `Set`. It binds tighter than `^` and `|` (and `&~` is set difference)",
+        "println(6 & 3)                     // => 2\nprintln(Set(1, 2, 3) & Set(2, 3, 4))   // => Set(2, 3)",
+    ),
+    (
+        "|",
+        "Operator",
+        "bitwise OR on `Int`, non-short-circuiting OR on `Boolean`, union on `Set`. The loosest-binding symbolic operator, which is where `||` gets its precedence",
+        "println(6 | 3)   // => 7\nprintln(5 & 3 | 2)   // => 3",
+    ),
+    (
+        "^",
+        "Operator",
+        "bitwise XOR on `Int`, exclusive OR on `Boolean`. Binds between `|` and `&`",
+        "println(6 ^ 3)   // => 5",
+    ),
+    (
+        "~",
+        "Operator",
+        "bitwise complement of an `Int` (`unary_~`). Parenthesize a negative operand — Scala lexes `~-` as one operator name",
+        "println(~(6))   // => -7",
+    ),
+    (
+        "<<",
+        "Operator",
+        "left shift, evaluated at `Int` width: the distance masks to five bits and the result wraps at 32 bits, so `1 << 33` is `2`. `>>` is the arithmetic right shift and `>>>` the logical one",
+        "println(1 << 4)     // => 16\nprintln(-16 >>> 2)   // => 1073741820",
     ),
 ];
 

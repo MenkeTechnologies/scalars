@@ -656,6 +656,152 @@ fn g_coll(r: &mut Rng) -> String {
     }
 }
 
+/// `n` distinct ints chosen to exercise a mutable hash table's bucket layout:
+/// the pool spans negatives (whose improved hash flips the high bits), small
+/// values, and multiples of 16/32/64 that collide into one bucket at several
+/// table lengths. Bigger than [`int_elems`]'s pool, because the interesting
+/// element counts here run past thirty.
+fn table_ints(r: &mut Rng, n: usize) -> String {
+    let mut pool: Vec<i64> = Vec::new();
+    for i in 0..12 {
+        pool.push(i);
+        pool.push(-i - 1);
+        pool.push(i * 16);
+        pool.push(i * 32 + 3);
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n.min(pool.len()) {
+        out.push(pool.swap_remove(r.below(pool.len() as u64) as usize));
+    }
+    out.iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The bitwise / shift operators and their SLS precedence. Scala evaluates
+/// these at `Int` width — the shift distance masks to five bits and the result
+/// wraps at 32 bits — so the shift distances deliberately run past 31 and the
+/// operands past the point where a 64-bit shift would answer differently.
+/// Also covers `&`/`|`/`^` on `Boolean` (non-short-circuiting) and on `Set`,
+/// and hexadecimal literals.
+fn g_bitwise(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let c = pick(r, INTS);
+    let sh = pick(r, &["0", "1", "3", "7", "15", "31", "32", "33", "64"]);
+    let bop = pick(r, &["&", "|", "^"]);
+    let shop = pick(r, &["<<", ">>", ">>>"]);
+    let p = pick(r, BOOLS);
+    let q = pick(r, BOOLS);
+    let hex = pick(r, &["0x0F", "0xFF", "0x10", "0x7FFFFFFF", "0xFFFF", "0x1"]);
+    match r.below(10) {
+        0 => format!("println({a} {bop} {b})"),
+        1 => format!("println({a} {shop} {sh})"),
+        2 => format!("println(~({a}))"),
+        3 => println_all(&[
+            format!("{a} {bop} {b} {bop} {c}"),
+            format!("{a} & {b} | {c}"),
+            format!("{a} | {b} ^ {c}"),
+        ]),
+        // Precedence against arithmetic and comparison.
+        4 => println_all(&[
+            format!("{a} {shop} 1 + 1"),
+            format!("({a} & {b}) == {c}"),
+            format!("{a} + {b} & {c}"),
+        ]),
+        5 => format!("println({p} {bop} {q})"),
+        6 => format!("println({hex} {bop} {a}); println({hex})"),
+        7 => println_all(&[
+            format!("(1 {shop} {sh})"),
+            format!("(-1 {shop} {sh})"),
+            format!("({a} {shop} {sh})"),
+        ]),
+        8 => format!(
+            "println(Set({}) & Set({})); println(Set({}) | Set({}))",
+            int_elems(r, 3),
+            int_elems(r, 3),
+            int_elems(r, 2),
+            int_elems(r, 2)
+        ),
+        _ => println_all(&[
+            format!("{a}.abs {bop} {b}"),
+            format!("~({a} {bop} {b})"),
+            format!("{a} {bop} ~({b})"),
+        ]),
+    }
+}
+
+/// Mutable collections. `ListBuffer`/`ArrayBuffer` are insertion-ordered, so
+/// they mostly probe the mutators; a `mutable.Set`/`Map` prints in its **hash
+/// table's** order, which is a function of the table length, so element counts
+/// straddle every growth threshold (16/24/48 … after the `from` sizing) and the
+/// probes mix factory sizing, `+=` growth, `++=` (which size-hints only when the
+/// source knows its size), removal (which never shrinks the table) and the
+/// derived collections (which start a fresh table at the default capacity).
+fn g_mutable(r: &mut Rng) -> String {
+    let buf = *pick(r, &["mutable.ListBuffer", "mutable.ArrayBuffer"]);
+    let n = 3 + r.below(4) as usize;
+    let xs = format!("{buf}({})", int_elems(r, n));
+    // Sizes that straddle the table-growth boundaries.
+    let sn = 1 + r.below(34) as usize;
+    let ints = table_ints(r, sn);
+    let wn = 1 + r.below(11) as usize;
+    let strs = str_elems(r, wn);
+    let pairs = |elems: &str| {
+        elems
+            .split(", ")
+            .enumerate()
+            .map(|(i, e)| format!("{e} -> {i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let ipairs = pairs(&ints);
+    let a = pick(r, INTS);
+    match r.below(16) {
+        0 => format!("{{ val b = {xs}; b += {a}; b ++= List({}); println(b) }}", int_elems(r, 3)),
+        1 => format!("{{ val b = {xs}; b -= {a}; b += {a}; println(b); println(b.size) }}"),
+        2 => format!(
+            "{{ val b = {xs}; b.append({a}); b.prepend({a}); println(b); println(b.remove(0)); println(b) }}"
+        ),
+        3 => format!("{{ val b = {xs}; b.insert(1, {a}); println(b); b(0) = {a}; println(b) }}"),
+        4 => format!("{{ val b = {xs}; println(b.map(_ * 2)); println(b.filter(_ > 0)); println(b.sorted) }}"),
+        5 => format!("{{ val b = {xs}; println(b.toList); println(b.sum); println(b.mkString(\"|\")); println(b.reverse) }}"),
+        6 => format!("{{ val b = {xs}; b.clear(); println(b); println(b.isEmpty); b += {a}; println(b) }}"),
+        // The hash-ordered ones. Every print is the whole collection, so the
+        // table's iteration order is part of the comparison.
+        7 => format!("println(mutable.Set({ints}))"),
+        8 => format!("println(mutable.Set({strs}))"),
+        9 => format!("println(mutable.Map({ipairs}))"),
+        10 => {
+            let k = 1 + r.below(20) as usize;
+            format!(
+                "{{ val s = mutable.Set({}); s += {a}; s += {a}; println(s); s -= {a}; println(s) }}",
+                table_ints(r, k)
+            )
+        }
+        11 => format!(
+            "{{ val s = mutable.Set({}); s ++= List({}); println(s); println(s.size) }}",
+            table_ints(r, 14),
+            table_ints(r, 12)
+        ),
+        12 => format!(
+            "{{ val s = mutable.Set({}); s ++= Vector({}); println(s) }}",
+            table_ints(r, 12),
+            table_ints(r, 10)
+        ),
+        13 => format!("println(mutable.Set({ints}).map(_ * 2)); println(mutable.Set({ints}).filter(_ > 0))"),
+        14 => format!(
+            "{{ val m = mutable.Map({ipairs}); m({a}) = 99; println(m); m -= {a}; println(m); println(m.size) }}"
+        ),
+        _ => println_all(&[
+            format!("mutable.Set({ints}).size"),
+            format!("mutable.Set({ints}).toList.sorted"),
+            format!("mutable.Map({ipairs}).keys.toList.sorted"),
+        ]),
+    }
+}
+
 /// Partial functions: `collect`/`collectFirst` over a `{ case … }` literal
 /// (whose `isDefinedAt` decides which elements survive), a `PartialFunction`
 /// bound to a `val` and used as a value, `applyOrElse`/`lift`/`orElse`, and the
@@ -771,12 +917,73 @@ fn g_hashcoll(r: &mut Rng) -> String {
             format!("Map({ipairs}).size"),
             format!("Map({ipairs}).toList.length"),
         ]),
-        _ => println_all(&[
+        12 => println_all(&[
             format!("Set({ints}).sum"),
             format!("Set({ints}).size"),
             format!("Set({ints}).toList.sorted"),
         ]),
+        // Collections used as elements and as keys: the trie order then turns
+        // on `MurmurHash3`'s seq/set/map hashes, and a `Seq`'s hash has the
+        // arithmetic-progression special case (`List(1,2,3)` hashes as the
+        // range it is), so the inner element runs deliberately hit both.
+        13 => {
+            let k = 1 + r.below(7) as usize;
+            format!("println(Set({}))", nested_elems(r, k))
+        }
+        14 => {
+            let k = 1 + r.below(6) as usize;
+            format!(
+                "println(Map({}))",
+                nested_elems(r, k)
+                    .split("), ")
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let e = if e.ends_with(')') {
+                            e.to_string()
+                        } else {
+                            format!("{e})")
+                        };
+                        format!("{e} -> {i}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        15 => println_all(&[
+            format!("List({ints}).hashCode"),
+            format!("Vector({ints}).hashCode"),
+            format!("Set({ints}).hashCode"),
+            format!("Map({ipairs}).hashCode"),
+        ]),
+        _ => {
+            let (a, b) = (1 + r.below(6) as usize, 1 + r.below(6) as usize);
+            format!(
+                "println(List({}).groupBy(_.size)); println(List({}).toSet)",
+                nested_elems(r, a),
+                nested_elems(r, b)
+            )
+        }
     }
+}
+
+/// `n` distinct collection literals, for probing a hash keyed by a collection.
+/// Mixes `List`/`Vector`/`Set` and both progression and non-progression element
+/// runs, because `MurmurHash3`'s ordered hash treats them differently.
+fn nested_elems(r: &mut Rng, n: usize) -> String {
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let k = i as i64;
+        let body = match r.below(5) {
+            0 => format!("{k}"),
+            1 => format!("{k}, {}", k + 1),
+            2 => format!("{k}, {}, {}", k + 1, k + 2),
+            3 => format!("{k}, {}, {k}", k * 3 + 1),
+            _ => format!("{}, {k}", -k - 1),
+        };
+        let ctor = *pick(r, &["List", "Vector", "Set"]);
+        out.push(format!("{ctor}({body})"));
+    }
+    out.join(", ")
 }
 
 /// Infix method syntax (`a m b`) and the `for` comprehension forms: guards,
@@ -862,6 +1069,8 @@ enum Mode {
     HashColl,
     Infix,
     Partial,
+    Mutable,
+    Bitwise,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -889,6 +1098,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::HashColl => "hashcoll",
         Mode::Infix => "infix",
         Mode::Partial => "partial",
+        Mode::Mutable => "mutable",
+        Mode::Bitwise => "bitwise",
     }
 }
 
@@ -917,6 +1128,8 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "hashcoll" => Mode::HashColl,
         "infix" => Mode::Infix,
         "partial" => Mode::Partial,
+        "mutable" => Mode::Mutable,
+        "bitwise" => Mode::Bitwise,
         _ => return None,
     })
 }
@@ -944,6 +1157,8 @@ const CONCRETE: &[Mode] = &[
     Mode::HashColl,
     Mode::Infix,
     Mode::Partial,
+    Mode::Mutable,
+    Mode::Bitwise,
 ];
 
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
@@ -975,6 +1190,8 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::HashColl => g_hashcoll(r),
         Mode::Infix => g_infix(r),
         Mode::Partial => g_partial(r),
+        Mode::Mutable => g_mutable(r),
+        Mode::Bitwise => g_bitwise(r),
         Mode::All => unreachable!(),
     }
 }
@@ -1006,7 +1223,11 @@ fn build_program(probes: &[String]) -> String {
         body.push_str(stmt);
         body.push('\n');
     }
-    format!("{top}object T extends App {{\n{body}}}\n")
+    // The `mutable` prefix is in scope for every program: it costs an unused
+    // import in the modes that never mention it, and lets the `mutable` mode
+    // write the idiomatic `mutable.ListBuffer(…)` rather than the fully
+    // qualified spelling.
+    format!("import scala.collection.mutable\n{top}object T extends App {{\n{body}}}\n")
 }
 
 // ───────────────────────── process invocation ──────────────────────────────

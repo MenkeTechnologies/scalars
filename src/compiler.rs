@@ -7,9 +7,10 @@
 //! `crate::host` supplies string `+` concatenation for the mixed operands the
 //! VM's native arithmetic does not compute.
 //!
-//! Locals are addressed by name through `GetVar`/`SetVar` (slice 1 has a single
-//! entry frame with no lexical scopes), so this stays a direct, readable
-//! lowering. Scala has no `break`/`continue`, so loops need no backpatch stack;
+//! Top-level bindings are addressed by name through `GetVar`/`SetVar`, while a
+//! `def` body and a function literal each get a native `Op::Call` frame whose
+//! parameters, captured upvalues and locals are frame slots, so this stays a
+//! direct, readable lowering. Scala has no `break`/`continue`, so loops need no backpatch stack;
 //! a `for` range snapshots its upper bound into a synthetic local, matching
 //! Scala's evaluate-the-range-once semantics.
 
@@ -92,6 +93,9 @@ struct Compiler {
     /// per-statement unwind checks emitted, so an exception-free program keeps
     /// byte-identical bytecode (and its speed).
     has_try: bool,
+    /// Whether the program builds a mutable collection anywhere — see
+    /// [`body_has_mutable`].
+    has_mutable: bool,
     /// Where a pending exception unwinds to from the statement currently being
     /// compiled — innermost last. Empty means top level (abort the run).
     unwind: Vec<UnwindFrame>,
@@ -395,14 +399,10 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         closures_seen: 0,
         // Scan once up front: the unwind checks cost two ops per statement, so
         // they are emitted only for programs that can actually catch.
-        has_try: body_has_try(&prog.main)
-            || prog.functions.iter().any(|f| body_has_try(&f.body))
-            || classes
-                .iter()
-                .any(|c| body_has_try(&c.body) || c.methods.iter().any(|m| body_has_try(&m.body)))
-            || objects
-                .iter()
-                .any(|o| body_has_try(&o.body) || o.methods.iter().any(|m| body_has_try(&m.body))),
+        has_try: program_any(prog, &classes, &objects, body_has_try),
+        // Likewise for `+=`: only a program that builds a mutable collection
+        // can need the run-time growable test (see `compound_tail`).
+        has_mutable: program_any(prog, &classes, &objects, body_has_mutable),
         unwind: Vec::new(),
         try_counter: 0,
     };
@@ -632,8 +632,23 @@ impl Compiler {
                 Ok(())
             }
             StmtKind::Assign { name, op, value } => {
-                // Scala rejects reassignment to a `val` at compile time; so do we.
+                // Scala rejects reassignment to a `val` at compile time; so do
+                // we — except for `+=`/`-=`, which on a `val` can only be the
+                // growable-collection method (`val buf = ListBuffer(); buf += x`
+                // is the idiom). It lowers as that call, so a `val Int` still
+                // fails, with the "value += is not a member of Int" message.
                 if self.vals.get(name) == Some(&true) {
+                    if matches!(op, AssignOp::Add | AssignOp::Sub) {
+                        let m = if *op == AssignOp::Add { "+=" } else { "-=" };
+                        self.emit_smethod(
+                            &Expr::Var(name.clone()),
+                            m,
+                            std::slice::from_ref(value),
+                            s.line,
+                        )?;
+                        self.b.emit(Op::Pop, 0);
+                        return Ok(());
+                    }
                     return Err(format!(
                         "scalars: reassignment to val `{name}` (line {})",
                         s.line
@@ -663,23 +678,12 @@ impl Compiler {
                     }
                 }
                 let place = self.resolve_place(name);
-                match op {
-                    AssignOp::Assign => {
-                        self.expr(value)?;
-                    }
-                    AssignOp::Div => {
-                        // `x /= e` → x = x / e, through the type-dispatching
-                        // division builtin (see `binary`).
-                        self.emit_load(place);
-                        self.expr(value)?;
-                        self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0);
-                    }
-                    _ => {
-                        // `x <op>= e` → x = x <op> e
-                        self.emit_load(place);
-                        self.expr(value)?;
-                        self.b.emit(compound_op(*op), 0);
-                    }
+                // `x = e`, or `x <op>= e` → the current value then the operator.
+                if *op == AssignOp::Assign {
+                    self.expr(value)?;
+                } else {
+                    self.emit_load(place);
+                    self.compound_tail(*op, value)?;
                 }
                 self.unwind_check_dropping(1);
                 self.emit_store(place);
@@ -982,6 +986,13 @@ impl Compiler {
                     UnOp::Not => {
                         self.b.emit(Op::LogNot, 0);
                     }
+                    // `~x` is `x.unary_~`, dispatched through the host so it
+                    // reports the Scala message on a non-integral receiver.
+                    UnOp::Complement => {
+                        let nc = self.b.add_constant(Value::str("unary_~".to_string()));
+                        self.b.emit(Op::LoadConst(nc), 0);
+                        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+                    }
                 }
             }
             Expr::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs)?,
@@ -1088,6 +1099,10 @@ impl Compiler {
             "Set" => crate::host::MAKE_SET,
             "Map" => crate::host::MAKE_MAP,
             "Array" => crate::host::MAKE_ARRAY,
+            "ListBuffer" => crate::host::MAKE_LISTBUFFER,
+            "ArrayBuffer" => crate::host::MAKE_ARRAYBUFFER,
+            "mutable.Set" => crate::host::MAKE_MUTSET,
+            "mutable.Map" => crate::host::MAKE_MUTMAP,
             _ => return Err(format!("scalars: unknown collection constructor `{ctor}`")),
         };
         self.b.emit(Op::CallBuiltin(id, elems.len() as u8), 0);
@@ -1706,6 +1721,51 @@ impl Compiler {
         self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
     }
 
+    /// Finish a compound assignment whose *current value* is already on the
+    /// stack, leaving the new value there.
+    ///
+    /// Scala resolves `x += e` by preferring the `+=` **method** when the
+    /// receiver has one and falling back to `x = x + e` otherwise, which is a
+    /// static choice this frontend cannot make: a `ListBuffer` mutates in place
+    /// and answers itself, an `Int` adds. So the choice is made at run time —
+    /// [`crate::host::IS_GROWABLE`] asks the receiver, and only the taken branch
+    /// runs. A program with no mutable collection in it still emits exactly the
+    /// arithmetic it did before, because the test is only emitted for `+=`/`-=`.
+    fn compound_tail(&mut self, op: AssignOp, value: &Expr) -> Result<(), String> {
+        if !matches!(op, AssignOp::Add | AssignOp::Sub) {
+            self.expr(value)?;
+            match op {
+                AssignOp::Div => self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0),
+                _ => self.b.emit(compound_op(op), 0),
+            };
+            return Ok(());
+        }
+        // No mutable collection in the program: `+=` can only be arithmetic,
+        // so emit exactly the two ops it emitted before this feature existed.
+        if !self.has_mutable {
+            self.expr(value)?;
+            self.b.emit(compound_op(op), 0);
+            return Ok(());
+        }
+        let method = if op == AssignOp::Add { "+=" } else { "-=" };
+        self.b.emit(Op::Dup, 0);
+        self.b.emit(Op::CallBuiltin(crate::host::IS_GROWABLE, 1), 0);
+        let to_arith = self.b.emit(Op::JumpIfFalse(0), 0);
+        // Growable: `recv.+=(value)` mutates and answers the receiver.
+        self.expr(value)?;
+        let nc = self.b.add_constant(Value::str(method.to_string()));
+        self.b.emit(Op::LoadConst(nc), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 3), 0);
+        let to_end = self.b.emit(Op::Jump(0), 0);
+        let arith = self.b.current_pos();
+        self.b.patch_jump(to_arith, arith);
+        self.expr(value)?;
+        self.b.emit(compound_op(op), 0);
+        let end = self.b.current_pos();
+        self.b.patch_jump(to_end, end);
+        Ok(())
+    }
+
     /// Lower a `var` field assignment inside a method (`field <op>= e`) to an
     /// in-place [`OBJ_SET`] on `this` (a compound op reads the field first).
     fn field_assign(
@@ -1720,20 +1780,11 @@ impl Compiler {
         self.emit_load(this);
         let c = self.b.add_constant(Value::str(field.to_string()));
         self.b.emit(Op::LoadConst(c), line);
-        match op {
-            AssignOp::Assign => {
-                self.expr(value)?;
-            }
-            AssignOp::Div => {
-                self.emit_field_get_this(field);
-                self.expr(value)?;
-                self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0);
-            }
-            _ => {
-                self.emit_field_get_this(field);
-                self.expr(value)?;
-                self.b.emit(compound_op(op), 0);
-            }
+        if op == AssignOp::Assign {
+            self.expr(value)?;
+        } else {
+            self.emit_field_get_this(field);
+            self.compound_tail(op, value)?;
         }
         self.b.emit(Op::CallBuiltin(crate::host::OBJ_SET, 3), line);
         self.b.emit(Op::Pop, 0); // discard the `Unit` result
@@ -1750,20 +1801,11 @@ impl Compiler {
         value: &Expr,
     ) -> Result<(), String> {
         let g = self.b.add_name(&object_field_global(obj, name));
-        match op {
-            AssignOp::Assign => {
-                self.expr(value)?;
-            }
-            AssignOp::Div => {
-                self.b.emit(Op::GetVar(g), 0);
-                self.expr(value)?;
-                self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0);
-            }
-            _ => {
-                self.b.emit(Op::GetVar(g), 0);
-                self.expr(value)?;
-                self.b.emit(compound_op(op), 0);
-            }
+        if op == AssignOp::Assign {
+            self.expr(value)?;
+        } else {
+            self.b.emit(Op::GetVar(g), 0);
+            self.compound_tail(op, value)?;
         }
         self.unwind_check_dropping(1);
         self.b.emit(Op::SetVar(g), 0);
@@ -1941,6 +1983,14 @@ impl Compiler {
         }
         if let Some(classes) = self.method_index.get(name).cloned() {
             return self.dispatch_instance_method(recv, name, args, &classes, line);
+        }
+        // `mutable.ListBuffer(…)` / `scala.collection.mutable.Set(…)` — a
+        // package member, not a receiver method, so it lowers to the collection
+        // literal its name selects.
+        if mutable_module(recv) {
+            if let Some(ctor) = mutable_ctor(name) {
+                return self.collection(ctor, args);
+            }
         }
         // `scala.math.<member>` / `math.<member>` / `Math.<member>` — the JDK
         // math module, which is a value namespace rather than a receiver.
@@ -2265,7 +2315,8 @@ impl Compiler {
         Ok(())
     }
 
-    /// Lower a named call. Two shapes reach here (slice 1 has no user methods):
+    /// Lower a named call that is not a user `def` (those are resolved to a
+    /// direct `Op::Call` earlier). Two shapes reach here:
     ///
     /// * `__rust_compile("<b64>", line)` — the desugar target of a `rust { ... }`
     ///   block. Compile the base64 body string and hand it to the FFI-compile
@@ -2578,62 +2629,77 @@ impl Compiler {
     }
 }
 
-// ── FFI detection (does the program contain a `rust { ... }` block?) ────────
+// ── whole-program feature scans ────────────────────────────────────────────
+//
+// Three compile-time decisions are made once per program from the same walk of
+// the AST, so a program that uses none of the three features emits exactly the
+// bytecode it did before the feature existed:
+//
+//   * a `rust { … }` FFI block anywhere arms the `__rust_compile` prologue,
+//   * a `try` anywhere arms the per-statement unwind checks, and
+//   * a mutable-collection literal anywhere arms the `+=` growable test.
 
-/// True if any statement in `body` (recursively) evaluates a `__rust_compile`
-/// call — the desugar target of a `rust { ... }` block.
-fn body_has_ffi(body: &[Stmt]) -> bool {
+/// Whether any expression in `body` (recursively) satisfies `pred`.
+fn body_any(body: &[Stmt], pred: &impl Fn(&Expr) -> bool) -> bool {
     body.iter().any(|s| match &s.kind {
-        StmtKind::Local { init, .. } => init.as_ref().is_some_and(expr_has_ffi),
-        StmtKind::Assign { value, .. } => expr_has_ffi(value),
-        StmtKind::Expr(e) => expr_has_ffi(e),
+        StmtKind::Local { init, .. } => init.as_ref().is_some_and(|e| expr_any(e, pred)),
+        StmtKind::Assign { value, .. } => expr_any(value, pred),
+        StmtKind::Expr(e) => expr_any(e, pred),
         StmtKind::If { cond, then, els } => {
-            expr_has_ffi(cond) || body_has_ffi(then) || body_has_ffi(els)
+            expr_any(cond, pred) || body_any(then, pred) || body_any(els, pred)
         }
-        StmtKind::While { cond, body } => expr_has_ffi(cond) || body_has_ffi(body),
-        StmtKind::Return(e) => e.as_ref().is_some_and(expr_has_ffi),
+        StmtKind::While { cond, body } => expr_any(cond, pred) || body_any(body, pred),
+        StmtKind::Return(e) => e.as_ref().is_some_and(|e| expr_any(e, pred)),
         // Lifted into `Program::functions` before compiling, and scanned there.
         StmtKind::DefDecl(_) => false,
     })
 }
 
-fn expr_has_ffi(e: &Expr) -> bool {
+/// Whether `e` or any expression under it satisfies `pred`.
+fn expr_any(e: &Expr, pred: &impl Fn(&Expr) -> bool) -> bool {
+    if pred(e) {
+        return true;
+    }
     match e {
         Expr::Try {
             body,
             catches,
             finalizer,
         } => {
-            body_has_ffi(body)
-                || catches.iter().any(|a| body_has_ffi(&a.body))
-                || finalizer.as_deref().is_some_and(body_has_ffi)
+            body_any(body, pred)
+                || catches.iter().any(|a| body_any(&a.body, pred))
+                || finalizer.as_deref().is_some_and(|f| body_any(f, pred))
         }
-        Expr::Throw { value, .. } => expr_has_ffi(value),
-        Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
-        Expr::Method { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
-        Expr::New { args, .. } => args.iter().any(expr_has_ffi),
+        Expr::Throw { value, .. } | Expr::Format { value, .. } => expr_any(value, pred),
+        Expr::Unary { rhs, .. } => expr_any(rhs, pred),
+        Expr::Binary { lhs, rhs, .. } => expr_any(lhs, pred) || expr_any(rhs, pred),
+        Expr::Println { arg, .. } => arg.as_deref().is_some_and(|a| expr_any(a, pred)),
+        Expr::Call { args, .. } | Expr::New { args, .. } => args.iter().any(|a| expr_any(a, pred)),
+        Expr::Method { recv, args, .. } => {
+            expr_any(recv, pred) || args.iter().any(|a| expr_any(a, pred))
+        }
         Expr::Copy { recv, updates, .. } => {
-            expr_has_ffi(recv) || updates.iter().any(|(_, e)| expr_has_ffi(e))
+            expr_any(recv, pred) || updates.iter().any(|(_, v)| expr_any(v, pred))
         }
-        Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
-        Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
-        Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
         Expr::If { cond, then, els } => {
-            expr_has_ffi(cond) || expr_has_ffi(then) || els.as_deref().is_some_and(expr_has_ffi)
+            expr_any(cond, pred)
+                || expr_any(then, pred)
+                || els.as_deref().is_some_and(|x| expr_any(x, pred))
         }
-        Expr::Block(stmts) => body_has_ffi(stmts),
+        Expr::Block(stmts) => body_any(stmts, pred),
         Expr::Match { scrut, arms } => {
-            expr_has_ffi(scrut)
-                || arms
-                    .iter()
-                    .any(|a| a.guard.as_ref().is_some_and(expr_has_ffi) || body_has_ffi(&a.body))
+            expr_any(scrut, pred)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().is_some_and(|g| expr_any(g, pred)) || body_any(&a.body, pred)
+                })
         }
-        Expr::Format { value, .. } => expr_has_ffi(value),
         Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
-            enums.iter().any(enum_has_ffi) || expr_has_ffi(body)
+            enums.iter().any(|en| enum_any(en, pred)) || expr_any(body, pred)
         }
-        Expr::Lambda { body, .. } => expr_has_ffi(body),
-        Expr::Tuple(elems) | Expr::Collection { elems, .. } => elems.iter().any(expr_has_ffi),
+        Expr::Lambda { body, .. } => expr_any(body, pred),
+        Expr::Tuple(elems) | Expr::Collection { elems, .. } => {
+            elems.iter().any(|el| expr_any(el, pred))
+        }
         Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)
@@ -2644,16 +2710,70 @@ fn expr_has_ffi(e: &Expr) -> bool {
     }
 }
 
-/// True if a `for` enumerator (generator bounds / step / guard) evaluates an
-/// FFI call.
-fn enum_has_ffi(e: &ForEnum) -> bool {
+/// Whether a `for` enumerator's bounds / step / collection / guard satisfy `pred`.
+fn enum_any(e: &ForEnum, pred: &impl Fn(&Expr) -> bool) -> bool {
     match e {
         ForEnum::Gen {
             start, end, step, ..
-        } => expr_has_ffi(start) || expr_has_ffi(end) || step.as_ref().is_some_and(expr_has_ffi),
-        ForEnum::GenColl { coll, .. } => expr_has_ffi(coll),
-        ForEnum::Guard(c) => expr_has_ffi(c),
+        } => {
+            expr_any(start, pred)
+                || expr_any(end, pred)
+                || step.as_ref().is_some_and(|s| expr_any(s, pred))
+        }
+        ForEnum::GenColl { coll, .. } => expr_any(coll, pred),
+        ForEnum::Guard(c) => expr_any(c, pred),
     }
+}
+
+/// True if any statement in `body` (recursively) evaluates a `__rust_compile`
+/// call — the desugar target of a `rust { ... }` block.
+fn body_has_ffi(body: &[Stmt]) -> bool {
+    body_any(
+        body,
+        &|e| matches!(e, Expr::Call { name, .. } if name == RUST_COMPILE),
+    )
+}
+
+/// True if a statement list contains a `try` anywhere (including inside nested
+/// expressions), which is what arms the per-statement unwind checks.
+fn body_has_try(stmts: &[Stmt]) -> bool {
+    body_any(stmts, &|e| matches!(e, Expr::Try { .. }))
+}
+
+/// True if a statement list builds a mutable collection anywhere — a
+/// `ListBuffer`/`ArrayBuffer` literal (which the parser already recognizes) or a
+/// `scala.collection.mutable` factory call. Only such a program pays for the
+/// run-time `+=` dispatch test in [`Compiler::compound_tail`]; every other one
+/// keeps emitting a bare `Add`/`Sub`, so a counted loop stays trace-eligible.
+fn body_has_mutable(stmts: &[Stmt]) -> bool {
+    body_any(stmts, &|e| match e {
+        Expr::Collection { ctor, .. } => mutable_buffer_literal(ctor),
+        Expr::Method { recv, name, .. } => mutable_module(recv) && mutable_ctor(name).is_some(),
+        _ => false,
+    })
+}
+
+/// Whether `scan` answers true for any statement list in the whole program —
+/// the entry body, every hoisted `def`, and every class/object body and method.
+fn program_any(
+    prog: &Program,
+    classes: &[ClassDecl],
+    objects: &[ObjectDecl],
+    scan: fn(&[Stmt]) -> bool,
+) -> bool {
+    scan(&prog.main)
+        || prog.functions.iter().any(|f| scan(&f.body))
+        || classes
+            .iter()
+            .any(|c| scan(&c.body) || c.methods.iter().any(|m| scan(&m.body)))
+        || objects
+            .iter()
+            .any(|o| scan(&o.body) || o.methods.iter().any(|m| scan(&m.body)))
+}
+
+/// Whether a collection-literal constructor names a mutable collection.
+fn mutable_buffer_literal(ctor: &str) -> bool {
+    matches!(ctor, "ListBuffer" | "ArrayBuffer")
 }
 
 /// The caught type of a `catch` arm's pattern. A bare `case e =>` / `case _ =>`
@@ -2675,73 +2795,6 @@ fn catch_binding(p: &Pattern) -> Option<&str> {
         Pattern::Typed { name, .. } if name != "_" => Some(name),
         Pattern::Bind(name) => Some(name),
         _ => None,
-    }
-}
-
-/// True if a statement list contains a `try` anywhere (including inside nested
-/// expressions), which is what arms the per-statement unwind checks.
-fn body_has_try(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| match &s.kind {
-        StmtKind::Local { init, .. } => init.as_ref().is_some_and(expr_has_try),
-        StmtKind::Assign { value, .. } => expr_has_try(value),
-        StmtKind::Expr(e) => expr_has_try(e),
-        StmtKind::If { cond, then, els } => {
-            expr_has_try(cond) || body_has_try(then) || body_has_try(els)
-        }
-        StmtKind::While { cond, body } => expr_has_try(cond) || body_has_try(body),
-        StmtKind::Return(e) => e.as_ref().is_some_and(expr_has_try),
-        // Lifted into `Program::functions` before compiling, and scanned there.
-        StmtKind::DefDecl(_) => false,
-    })
-}
-
-/// True if an expression tree contains a `try`.
-fn expr_has_try(e: &Expr) -> bool {
-    match e {
-        Expr::Try { .. } => true,
-        Expr::Throw { value, .. } => expr_has_try(value),
-        Expr::Unary { rhs, .. } => expr_has_try(rhs),
-        Expr::Binary { lhs, rhs, .. } => expr_has_try(lhs) || expr_has_try(rhs),
-        Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_try),
-        Expr::Call { args, .. } | Expr::New { args, .. } => args.iter().any(expr_has_try),
-        Expr::Method { recv, args, .. } => expr_has_try(recv) || args.iter().any(expr_has_try),
-        Expr::Copy { recv, updates, .. } => {
-            expr_has_try(recv) || updates.iter().any(|(_, v)| expr_has_try(v))
-        }
-        Expr::If { cond, then, els } => {
-            expr_has_try(cond) || expr_has_try(then) || els.as_deref().is_some_and(expr_has_try)
-        }
-        Expr::Block(stmts) => body_has_try(stmts),
-        Expr::Match { scrut, arms } => {
-            expr_has_try(scrut)
-                || arms
-                    .iter()
-                    .any(|a| a.guard.as_ref().is_some_and(expr_has_try) || body_has_try(&a.body))
-        }
-        Expr::Format { value, .. } => expr_has_try(value),
-        Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
-            enums.iter().any(enum_has_try) || expr_has_try(body)
-        }
-        Expr::Lambda { body, .. } => expr_has_try(body),
-        Expr::Tuple(elems) | Expr::Collection { elems, .. } => elems.iter().any(expr_has_try),
-        Expr::Int(_)
-        | Expr::Float(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Null
-        | Expr::Placeholder
-        | Expr::Var(_) => false,
-    }
-}
-
-/// True if a `for` enumerator's bounds / step / guard contain a `try`.
-fn enum_has_try(e: &ForEnum) -> bool {
-    match e {
-        ForEnum::Gen {
-            start, end, step, ..
-        } => expr_has_try(start) || expr_has_try(end) || step.as_ref().is_some_and(expr_has_try),
-        ForEnum::GenColl { coll, .. } => expr_has_try(coll),
-        ForEnum::Guard(c) => expr_has_try(c),
     }
 }
 
@@ -2798,6 +2851,45 @@ fn math_module(e: &Expr) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+/// Whether `e` names the `scala.collection.mutable` package — spelled
+/// `mutable`, `collection.mutable` or `scala.collection.mutable`. A member
+/// access on one is a mutable-collection factory, not a receiver method, so
+/// `mutable.Set(1, 2)` builds a `mutable.HashSet` where a bare `Set(1, 2)`
+/// builds the immutable one.
+fn mutable_module(e: &Expr) -> bool {
+    match e {
+        Expr::Var(n) => n == "mutable",
+        Expr::Method {
+            recv, name, args, ..
+        } if args.is_empty() && name == "mutable" => match &**recv {
+            Expr::Var(p) => p == "collection",
+            Expr::Method {
+                recv, name, args, ..
+            } => {
+                args.is_empty()
+                    && name == "collection"
+                    && matches!(&**recv, Expr::Var(p) if p == "scala")
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The collection constructor a `scala.collection.mutable` member names, if it
+/// is one this frontend builds.
+fn mutable_ctor(name: &str) -> Option<&'static str> {
+    // `LinkedHashSet`/`LinkedHashMap` are deliberately absent: they keep
+    // insertion order, so mapping them onto the hash-table ones would mis-run.
+    Some(match name {
+        "ListBuffer" => "ListBuffer",
+        "ArrayBuffer" | "Buffer" => "ArrayBuffer",
+        "Set" | "HashSet" => "mutable.Set",
+        "Map" | "HashMap" => "mutable.Map",
+        _ => return None,
+    })
 }
 
 /// Whether `e` is the `java.lang` package prefix.

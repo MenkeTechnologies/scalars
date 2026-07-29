@@ -1,6 +1,6 @@
 //! Command-line parsing for the `scala` binary.
 //!
-//! Slice 1 accepts a single-file invocation plus a small set of introspection
+//! Accepts a single-file invocation plus a small set of introspection
 //! flags. The `scala` runner's full option grammar (`-classpath`, `-cp`,
 //! `-D…`, REPL) grows in later waves; unknown options error rather than being
 //! silently ignored.
@@ -10,7 +10,7 @@
 pub struct Cli {
     /// The `.scala` file to run, if any.
     pub file: Option<String>,
-    /// Program arguments after the file (become `args` — unused in slice 1).
+    /// Program arguments after the file (become `args`, which is parsed and ignored).
     pub argv: Vec<String>,
     pub show_version: bool,
     pub show_help: bool,

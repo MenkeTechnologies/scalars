@@ -240,34 +240,67 @@ println(Set(9, 3, 1, 2, 7))   // =&gt; Set(3, 1, 2) then HashSet(1, 9, 2, 7, 3)<
 println(m.getOrElse("z", 0))   // =&gt; 0</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-14">
-          <h3><a class="doc-anchor" href="#doc-contextual-14">#</a> <code>Nil</code></h3>
+          <h3><a class="doc-anchor" href="#doc-contextual-14">#</a> <code>mutable</code></h3>
+          <p>the `scala.collection.mutable` package: `mutable.ListBuffer`, `mutable.ArrayBuffer`, `mutable.Set` and `mutable.Map`, mutated with `+=`/`-=`/`++=`/`--=`. A mutable `Set`/`Map` prints `HashSet(…)`/`HashMap(…)` at every size, in its hash table's iteration order</p>
+          <pre><code class="lang-scala">val s = mutable.Set(1, 2, 3)
+s += 4
+println(s)   // =&gt; HashSet(1, 2, 3, 4)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-15">
+          <h3><a class="doc-anchor" href="#doc-contextual-15">#</a> <code>ListBuffer</code></h3>
+          <p>the growable `scala.collection.mutable` sequence: `+=`, `++=`, `-=`, `append`, `prepend`, `insert`, `remove`, `clear`, `b(i) = v`, plus every `List` combinator. A derived collection is another `ListBuffer`</p>
+          <pre><code class="lang-scala">val b = mutable.ListBuffer(1, 2)
+b += 3
+println(b)   // =&gt; ListBuffer(1, 2, 3)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-16">
+          <h3><a class="doc-anchor" href="#doc-contextual-16">#</a> <code>ArrayBuffer</code></h3>
+          <p>the growable indexed `scala.collection.mutable` sequence (`Buffer` is an alias); the same mutators and combinators as `ListBuffer`, printed `ArrayBuffer(…)`</p>
+          <pre><code class="lang-scala">val a = mutable.ArrayBuffer(1, 2)
+a ++= List(3, 4)
+println(a)   // =&gt; ArrayBuffer(1, 2, 3, 4)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-17">
+          <h3><a class="doc-anchor" href="#doc-contextual-17">#</a> <code>PartialFunction</code></h3>
+          <p>a function defined only on some arguments — what a `{ case … }` literal builds. Besides `apply` it answers `isDefinedAt`, which is what `collect`/`collectFirst` use to skip a non-matching element; `applyOrElse`, `lift`, `orElse`, `andThen` and `compose` compose them</p>
+          <pre><code class="lang-scala">val pf: PartialFunction[Int, String] = { case 1 =&gt; "one" }
+println(pf.isDefinedAt(2))   // =&gt; false
+println(pf.lift(1))          // =&gt; Some(one)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-18">
+          <h3><a class="doc-anchor" href="#doc-contextual-18">#</a> <code>collect</code></h3>
+          <p>`filter` and `map` in one pass over a partial function: an element the function is not defined at is skipped instead of raising `MatchError`, and the arm body never runs for it. `collectFirst` answers the first result as an `Option`</p>
+          <pre><code class="lang-scala">println(List(1, 2, 3, 4).collect { case x if x % 2 == 0 =&gt; x * 10 })   // =&gt; List(20, 40)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-19">
+          <h3><a class="doc-anchor" href="#doc-contextual-19">#</a> <code>Nil</code></h3>
           <p>the empty `List`; the tail a `::` chain terminates with</p>
           <pre><code class="lang-scala">println(1 :: 2 :: Nil)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-15">
-          <h3><a class="doc-anchor" href="#doc-contextual-15">#</a> <code>math</code></h3>
+        <article class="doc-entry" id="doc-contextual-20">
+          <h3><a class="doc-anchor" href="#doc-contextual-20">#</a> <code>math</code></h3>
           <p>the `scala.math` module (also spelled `scala.math`, `Math`, `java.lang.Math`): `abs`, `min`/`max`, `sqrt`, `pow`, `floor`/`ceil`/`round`, the trig family, `Pi`, `E`</p>
           <pre><code class="lang-scala">println(math.sqrt(16.0))   // =&gt; 4.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-16">
-          <h3><a class="doc-anchor" href="#doc-contextual-16">#</a> <code>App</code></h3>
+        <article class="doc-entry" id="doc-contextual-21">
+          <h3><a class="doc-anchor" href="#doc-contextual-21">#</a> <code>App</code></h3>
           <p>the mixin whose object body scalars runs directly as the program</p>
           <pre><code class="lang-scala">object T extends App { println("hi") }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-17">
-          <h3><a class="doc-anchor" href="#doc-contextual-17">#</a> <code>main</code></h3>
+        <article class="doc-entry" id="doc-contextual-22">
+          <h3><a class="doc-anchor" href="#doc-contextual-22">#</a> <code>main</code></h3>
           <p>the entry method scalars runs: `def main(args: Array[String]): Unit`</p>
           <pre><code class="lang-scala">def main(args: Array[String]): Unit = { println(0) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-18">
-          <h3><a class="doc-anchor" href="#doc-contextual-18">#</a> <code>package</code></h3>
+        <article class="doc-entry" id="doc-contextual-23">
+          <h3><a class="doc-anchor" href="#doc-contextual-23">#</a> <code>package</code></h3>
           <p>a package prologue line; scalars skips it and runs the object entry</p>
           <pre><code class="lang-scala">package demo
 object T extends App { println(1) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-19">
-          <h3><a class="doc-anchor" href="#doc-contextual-19">#</a> <code>import</code></h3>
-          <p>an import prologue line; skipped in slice 1</p>
+        <article class="doc-entry" id="doc-contextual-24">
+          <h3><a class="doc-anchor" href="#doc-contextual-24">#</a> <code>import</code></h3>
+          <p>an import prologue line; tolerated and ignored (imports are skipped, not tracked)</p>
           <pre><code class="lang-scala">import scala.math._
 object T extends App { println(1) }</code></pre>
         </article>
@@ -318,6 +351,34 @@ object T extends App { println(1) }</code></pre>
           <h3><a class="doc-anchor" href="#doc-operator-6">#</a> <code>||</code></h3>
           <p>short-circuiting logical OR</p>
           <pre><code class="lang-scala">println(false || true)   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-7">
+          <h3><a class="doc-anchor" href="#doc-operator-7">#</a> <code>&amp;</code></h3>
+          <p>bitwise AND on `Int`, non-short-circuiting AND on `Boolean`, intersection on `Set`. It binds tighter than `^` and `|` (and `&amp;~` is set difference)</p>
+          <pre><code class="lang-scala">println(6 &amp; 3)                     // =&gt; 2
+println(Set(1, 2, 3) &amp; Set(2, 3, 4))   // =&gt; Set(2, 3)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-8">
+          <h3><a class="doc-anchor" href="#doc-operator-8">#</a> <code>|</code></h3>
+          <p>bitwise OR on `Int`, non-short-circuiting OR on `Boolean`, union on `Set`. The loosest-binding symbolic operator, which is where `||` gets its precedence</p>
+          <pre><code class="lang-scala">println(6 | 3)   // =&gt; 7
+println(5 &amp; 3 | 2)   // =&gt; 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-9">
+          <h3><a class="doc-anchor" href="#doc-operator-9">#</a> <code>^</code></h3>
+          <p>bitwise XOR on `Int`, exclusive OR on `Boolean`. Binds between `|` and `&amp;`</p>
+          <pre><code class="lang-scala">println(6 ^ 3)   // =&gt; 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-10">
+          <h3><a class="doc-anchor" href="#doc-operator-10">#</a> <code>~</code></h3>
+          <p>bitwise complement of an `Int` (`unary_~`). Parenthesize a negative operand — Scala lexes `~-` as one operator name</p>
+          <pre><code class="lang-scala">println(~(6))   // =&gt; -7</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operator-11">
+          <h3><a class="doc-anchor" href="#doc-operator-11">#</a> <code>&lt;&lt;</code></h3>
+          <p>left shift, evaluated at `Int` width: the distance masks to five bits and the result wraps at 32 bits, so `1 &lt;&lt; 33` is `2`. `&gt;&gt;` is the arithmetic right shift and `&gt;&gt;&gt;` the logical one</p>
+          <pre><code class="lang-scala">println(1 &lt;&lt; 4)     // =&gt; 16
+println(-16 &gt;&gt;&gt; 2)   // =&gt; 1073741820</code></pre>
         </article>
       </section>
 

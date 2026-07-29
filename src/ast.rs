@@ -1,11 +1,10 @@
 //! The Scala AST scalars parses and lowers to fusevm bytecode.
 //!
-//! Slice 1 is a single-object, single entry-point subset: the parser accepts an
-//! `object Name { def main(args: Array[String]): Unit = { ... } }` shell (or the
-//! `object Name extends App { ... }` form, whose body runs directly) and models
-//! the statements and expressions inside the entry body. User-defined methods,
-//! fields, classes, and traits are parsed no further than the entry point today
-//! (see `BUGS.md`); the AST is shaped to grow into them.
+//! A compilation unit is one entry object — `object Name { def main(args:
+//! Array[String]): Unit = { ... } }`, or the `object Name extends App { ... }`
+//! form whose body runs directly — optionally alongside top-level `class`,
+//! `case class`, `object` and `trait` declarations, all of which are modeled
+//! here (see `BUGS.md` for what is not).
 
 /// A parsed compilation unit: the entry object name, the body of its entry
 /// point (`main`, or the `extends App` body), and the object's other `def`s.
@@ -104,10 +103,10 @@ pub struct Stmt {
 /// The kind of a Scala statement (see [`Stmt`] for the line it carries).
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
-    /// A local binding: `val x = expr`, `var y: Int = expr`. `is_val` records
-    /// immutability for diagnostics; the declared type is retained for the same
-    /// reason. The runtime is dynamically typed on the fusevm value model, so
-    /// neither gates execution yet (val-reassignment is not rejected — `BUGS.md`).
+    /// A local binding: `val x = expr`, `var y: Int = expr`. `is_val` is
+    /// enforced — the compiler rejects a plain reassignment to a `val` — while
+    /// the declared type is retained for diagnostics only, since the runtime is
+    /// dynamically typed on the fusevm value model (see `BUGS.md`).
     Local {
         is_val: bool,
         ty: Option<String>,
@@ -382,6 +381,8 @@ pub enum Pattern {
 pub enum UnOp {
     Neg,
     Not,
+    /// `~x` — the bitwise complement (`Int.unary_~`).
+    Complement,
 }
 
 /// Binary operators.

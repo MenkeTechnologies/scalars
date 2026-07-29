@@ -71,9 +71,9 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
-  against a live `scala` across twenty-one generators — 47,000+ probes clean
-  before this wave, and 14,000+ more across its three new ones (collection
-  combinators, `HashSet`/`HashMap` trie ordering, and infix syntax).
+  against a live `scala` across twenty-four generators — every probe in this
+  wave's `partial`, `mutable`, `bitwise` and extended `hashcoll` modes ran clean,
+  on top of the 61,000+ that ran clean before it.
 
 The language surface today: programs with an entry point (`def main`, or an
 `extends App` body) plus sibling `class`/`object` declarations, using `val`/`var`
@@ -93,9 +93,13 @@ capture of the enclosing frame, `{ case … }` partial-function literals with a
 real `isDefinedAt` behind `collect`/`collectFirst`/`lift`/`orElse`), the
 immutable collections `List`/`Seq`/`Vector`/`Set`/`Map` (the full combinator set,
 `::`, indexing, `k -> v`, `for … yield` comprehensions, and Scala's own
-`HashSet`/`HashMap` trie ordering past four entries), mutable `Array`,
-first-class `Range` values and `scala.math` are modeled host-side too. The wider
-standard library is the next wave (see [`BUGS.md`](BUGS.md)).
+`HashSet`/`HashMap` trie ordering past four entries — including for a set or map
+keyed by another collection, through the ported `MurmurHash3` seq/set/map
+hashes), the mutable collections
+(`ListBuffer`, `ArrayBuffer`, `mutable.Set`/`Map` with their hash table's own
+iteration order, and the `+=`/`-=`/`++=` mutators), `Array`, first-class `Range`
+values and `scala.math` are modeled host-side too. The wider standard library is
+the next wave (see [`BUGS.md`](BUGS.md)).
 Nothing is faked — an unsupported construct is a parse error or an honest runtime
 throw, not a silent mis-run.
 
@@ -251,9 +255,24 @@ Implemented and checked against the reference `scala`:
   byte-faithful, which for `Set`/`Map` means reproducing Scala's representation
   split: up to four entries the insertion-ordered `Set(…)`/`Map(…)`, beyond that
   a CHAMP `HashSet(…)`/`HashMap(…)` in trie order (the JVM hash codes, the
-  trie's `improve` scramble and its iteration order are all ported). Mutable
-  `Array` too — `Array(a, b)`, `new Array[T](n)` (zero-filled per `T`), `a(i)`
-  reads and `a(i) = v` writes.
+  `MurmurHash3` product/seq/set/map hashes, the trie's `improve` scramble and its
+  iteration order are all ported, so a set or map keyed by another *collection*
+  orders correctly too). Mutable `Array` too — `Array(a, b)`,
+  `new Array[T](n)` (zero-filled per `T`), `a(i)` reads and `a(i) = v` writes.
+- **The bitwise and shift operators** — `&`, `|`, `^`, `~`, `<<`, `>>`, `>>>` on
+  `Int` (evaluated at 32-bit `Int` width, so `1 << 33` is `2`), `&`/`|`/`^` on
+  `Boolean`, `&`/`|`/`&~` on `Set`, and hexadecimal literals. Precedence follows
+  the SLS's first-character table, which is where `&&`/`||` get theirs too.
+- **Partial functions** — a `{ case … }` literal answers `isDefinedAt` as well
+  as `apply`, which is what `collect`/`collectFirst` need to skip a
+  non-matching element; `applyOrElse`, `lift`, `orElse`, `andThen` and
+  `compose` compose function values.
+- **`scala.collection.mutable`** — `ListBuffer`, `ArrayBuffer`, `mutable.Set`
+  and `mutable.Map`, with `+=`/`-=`/`++=`/`--=`, `append`/`prepend`/`insert`/
+  `remove`/`clear`, `put`/`update`/`getOrElseUpdate`, and the same combinator
+  set. A mutable `Set`/`Map` prints in its **hash table's** order, which is a
+  different algorithm from the immutable trie and is ported from the 2.13
+  sources down to the table sizing that decides it.
 - **`scala.math`** — `abs`, `signum`, `min`/`max`, `round`/`floor`/`ceil`/`rint`,
   `sqrt`/`cbrt`/`exp`/`log`/`log10`/`pow`/`hypot`, the trig family, `atan2`,
   `toRadians`/`toDegrees`, `Pi`, `E`, under the `math`, `scala.math`, `Math` and
@@ -363,21 +382,22 @@ division by zero, `try`/`catch`, block-local `def` scoping, traits and virtual
 dispatch, `Range` values, `Array`, and the `scala.math` overload split) and diffs
 `scala <file>` against this frontend, shrinking any divergence to the offending
 probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
-`localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`, …). It needs a real `scala` on
+`localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
+`partial`, `mutable`, `bitwise`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
-release — the block-expression-in-value-position gap and the
-`Math.signum` vs. `math.signum` overload split. 47,000+ probes ran clean before
-this wave, and 14,000+ more across its three new generators.
+release — the block-expression-in-value-position gap, the
+`Math.signum` vs. `math.signum` overload split, the builder an empty
+`Map.collect` picks, and `-3.abs` reading as `-(3.abs)` instead of `(-3).abs`.
 
 Next waves, in priority order:
 
-1. **Mutable collections** — the `scala.collection.mutable.*` family, on the same
-   host heap the immutable ones already ride.
-2. **Lazy views and `Iterator`** — `.view`, `.iterator` and `LazyList`.
-3. **The broader standard library** — `scala.io`, `scala.collection.*` as a
+1. **Lazy views and `Iterator`** — `.view`, `.iterator` and `LazyList`.
+2. **The broader standard library** — `scala.io`, `scala.collection.*` as a
    namespace, and user `Ordering`s.
+3. **The rest of `scala.collection.mutable`** — the insertion-ordered
+   `LinkedHashSet`/`LinkedHashMap`, `Queue`, `Stack` and `ArrayDeque`.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

@@ -12,20 +12,21 @@ bytecode executed on a three\-tier Cranelift JIT.
 There is no bespoke VM and no JVM; execution and codegen live in fusevm,
 the same engine behind zshrs, stryke, awkrs, elisp, rubylang, and pythonrs.
 .PP
-The current tree is an early single\-object slice: it runs an
+The program text is a single
+.B .scala
+file whose entry point is an
 .B object
 that either
 .B extends App
 (its body runs directly) or declares
-.B def main(args: Array[String]): Unit
-.
+.BR "def main(args: Array[String]): Unit" .
 It supports
 .BR val / var
 bindings,
 .BR if / while
-and range
+and every
 .B for
-loops,
+form,
 .BR println / print ,
 and the arithmetic, comparison, and boolean operators, with faithful
 .BR Int -vs- Double
@@ -36,8 +37,27 @@ concatenation, structural
 and Java
 .B Double.toString
 formatting.
-User\-defined methods, classes, traits, and collections are not yet
-carried \(em see
+User\-defined methods (including block\-local ones), classes, objects,
+.BR "case class" es,
+traits with inheritance and virtual dispatch,
+.BR try / catch / throw ,
+first\-class and partial functions, and the collection library
+.RB ( List ,
+.BR Seq ,
+.BR Vector ,
+.BR Set ,
+.BR Map ,
+.BR Array ,
+.BR Range ,
+and the
+.B scala.collection.mutable
+buffers, sets and maps) are carried too, each reproducing Scala's own
+iteration order.  For the gaps that remain \(em lazy views,
+.BR Iterator ,
+.BR LazyList ,
+user
+.BR Ordering s,
+and the wider standard library \(em see
 .B BUGS.md
 in the source tree.
 .SH OPTIONS
