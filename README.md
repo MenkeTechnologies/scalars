@@ -74,7 +74,7 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   against a live `scala` across eighteen generators (39,000+ probes clean, plus
   8,000+ across the five generators added for this wave).
 
-This is an early slice: programs with an entry point (`def main`, or an
+The language surface today: programs with an entry point (`def main`, or an
 `extends App` body) plus sibling `class`/`object` declarations, using `val`/`var`
 bindings (with `val` immutability enforced), arithmetic, `if`/`while`, the Scala
 range `for` (with a `by` step), `try`/`catch`/`finally`/`throw`, and
