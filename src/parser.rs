@@ -835,9 +835,14 @@ impl Parser {
     /// (the lexer suppresses newlines there, so `;` is the separator).
     fn for_comprehension(&mut self) -> Result<Expr, String> {
         self.eat(&Tok::For)?;
-        self.eat(&Tok::LParen)?;
-        let enums = self.for_enums()?;
-        self.eat(&Tok::RParen)?;
+        // Scala accepts either bracketing for the enumerator group. Inside `( )`
+        // the lexer suppresses line breaks, so `;` separates; inside `{ }` a line
+        // break separates and `;` is optional.
+        let braced = self.is(&Tok::LBrace);
+        self.eat(if braced { &Tok::LBrace } else { &Tok::LParen })?;
+        let enums = self.for_enums(braced)?;
+        self.skip_seps();
+        self.eat(if braced { &Tok::RBrace } else { &Tok::RParen })?;
         if matches!(self.peek(), Tok::Ident(w) if w == "yield") {
             self.advance();
             // A `yield` body is a value expression (or block expression).
@@ -863,46 +868,66 @@ impl Parser {
         }
     }
 
-    /// Parse the enumerator list of a `for (...)`: one or more range generators
-    /// (`name <- a until|to b`) with optional trailing `if` guards, separated by
-    /// `;`.
-    fn for_enums(&mut self) -> Result<Vec<ForEnum>, String> {
+    /// Parse the enumerator list of a `for`: generators (`pat <- source`, either
+    /// a range or a collection) and `if` guards. In the parenthesized form an
+    /// explicit `;` separates them; in the brace form a line break does too, and
+    /// a guard may stand alone on its own line.
+    fn for_enums(&mut self, braced: bool) -> Result<Vec<ForEnum>, String> {
+        let closer = if braced { Tok::RBrace } else { Tok::RParen };
         let mut out = Vec::new();
         loop {
             self.skip_seps();
-            let name = self.ident()?;
-            self.eat(&Tok::LArrow)?;
-            // `expression` already parses `a to b [by s]` as an infix range, so
-            // a generator source is recognized by *shape*: a literal range keeps
-            // the counted-loop lowering, anything else is a collection generator
-            // desugared to `.map`/`.flatMap`.
-            let src = self.expression()?;
-            match as_range(&src) {
-                Some((start, end, inclusive, step)) => out.push(ForEnum::Gen {
-                    name,
-                    start,
-                    end,
-                    inclusive,
-                    step,
-                }),
-                None => out.push(ForEnum::GenColl { name, coll: src }),
+            if self.is(&closer) {
+                break;
             }
-            // Trailing `if` guards bind to the generator just parsed.
-            while self.is(&Tok::If) {
+            // A guard on its own (`for { x <- xs; if x > 1 }`) filters the
+            // generator before it.
+            if self.is(&Tok::If) {
                 self.advance();
                 out.push(ForEnum::Guard(self.expression()?));
-            }
-            // Another enumerator follows only after an explicit `;`.
-            if self.is(&Tok::Semi) {
-                self.skip_seps();
-                if self.is(&Tok::RParen) {
-                    break;
+            } else {
+                out.push(self.for_generator()?);
+                // Trailing `if` guards bind to the generator just parsed.
+                while self.is(&Tok::If) {
+                    self.advance();
+                    out.push(ForEnum::Guard(self.expression()?));
                 }
+            }
+            // In the parenthesized form only an explicit `;` continues the list;
+            // in the brace form the inferred line break does too.
+            if self.is(&Tok::Semi) || (braced && self.is(&Tok::Newline)) {
+                self.skip_seps();
             } else {
                 break;
             }
         }
         Ok(out)
+    }
+
+    /// One `pat <- source` generator. A parenthesized binder is a destructuring
+    /// (tuple) pattern; a bare identifier is the usual binding.
+    fn for_generator(&mut self) -> Result<ForEnum, String> {
+        let pat = if self.is(&Tok::LParen) {
+            self.pattern()?
+        } else {
+            Pattern::Bind(self.ident()?)
+        };
+        self.eat(&Tok::LArrow)?;
+        // `expression` already parses `a to b [by s]` as an infix range, so a
+        // generator source is recognized by *shape*: a literal range over a plain
+        // binder keeps the counted-loop lowering, anything else is a collection
+        // generator desugared to `.map`/`.flatMap`.
+        let src = self.expression()?;
+        match (&pat, as_range(&src)) {
+            (Pattern::Bind(name), Some((start, end, inclusive, step))) => Ok(ForEnum::Gen {
+                name: name.clone(),
+                start,
+                end,
+                inclusive,
+                step,
+            }),
+            _ => Ok(ForEnum::GenColl { pat, coll: src }),
+        }
     }
 
     // ── expressions (precedence climbing) ─────────────────────────────────
@@ -915,30 +940,30 @@ impl Parser {
         // `match` binds looser than every binary operator (`a + b match { … }`
         // matches on the sum), so it wraps the fully-parsed binary expression.
         let mut e = self.binary(0)?;
-        // `a to b`, `a until b`, `… by s` — Scala spells these as infix methods
-        // on `Int`/`Range`, and an alphabetic operator binds looser than every
-        // symbolic one, so `1 to n - 1` is `1 to (n - 1)`.
-        if matches!(self.peek(), Tok::Ident(w) if w == "to" || w == "until") {
+        // Alphanumeric infix method syntax: Scala reads `a m b` as `a.m(b)` for
+        // any single-argument method — `xs contains 2`, `1 to n`, `s startsWith
+        // "a"`. An alphanumeric operator binds looser than every symbolic one
+        // (so `1 to n - 1` is `1 to (n - 1)`) and is left-associative
+        // (`xs map f filter g` is `(xs.map(f)).filter(g)`).
+        while let Tok::Ident(name) = self.peek().clone() {
+            if !self.at_infix_operator(&name) {
+                break;
+            }
             let line = self.line();
-            let name = self.ident()?;
-            let end = self.binary(0)?;
+            self.advance();
+            let rhs = if self.at_lambda_start() {
+                self.lambda()?
+            } else if self.is(&Tok::LBrace) {
+                self.brace_arg()?
+            } else {
+                self.binary(0)?
+            };
             e = Expr::Method {
                 recv: Box::new(e),
                 name,
-                args: vec![end],
+                args: vec![rhs],
                 line,
             };
-            while matches!(self.peek(), Tok::Ident(w) if w == "by") {
-                let line = self.line();
-                self.advance();
-                let step = self.binary(0)?;
-                e = Expr::Method {
-                    recv: Box::new(e),
-                    name: "by".to_string(),
-                    args: vec![step],
-                    line,
-                };
-            }
         }
         // `a -> b` — the tuple-pair sugar (binds looser than every binary op).
         if self.is(&Tok::RArrow) {
@@ -954,6 +979,69 @@ impl Parser {
             e = self.match_expr(e)?;
         }
         Ok(e)
+    }
+
+    /// Whether the identifier at the cursor is an infix method name rather than
+    /// the start of the next construct.
+    ///
+    /// Two conditions decide it. First, `name` must not be one of Scala's *soft*
+    /// keywords — the words the lexer hands back as identifiers (`yield`, `with`,
+    /// `class`, `private`, …) and which legitimately follow a complete
+    /// expression. Second, the token after it must be able to open an operand:
+    /// a line break between the receiver and the name already rules the infix
+    /// reading out, because the lexer only infers a [`Tok::Newline`] where one
+    /// statement can end and another begin.
+    fn at_infix_operator(&self, name: &str) -> bool {
+        const SOFT_KEYWORDS: &[&str] = &[
+            "yield",
+            "then",
+            "with",
+            "do",
+            "forSome",
+            "given",
+            "using",
+            "end",
+            "derives",
+            "class",
+            "trait",
+            "type",
+            "enum",
+            "import",
+            "export",
+            "package",
+            "extension",
+            "implicit",
+            "inline",
+            "opaque",
+            "override",
+            "private",
+            "protected",
+            "final",
+            "sealed",
+            "abstract",
+            "lazy",
+        ];
+        if SOFT_KEYWORDS.contains(&name) || name == "_" {
+            return false;
+        }
+        matches!(
+            self.toks.get(self.pos + 1).map(|t| &t.kind),
+            Some(
+                Tok::Int(_)
+                    | Tok::Float(_)
+                    | Tok::Str(_)
+                    | Tok::InterpStr { .. }
+                    | Tok::Ident(_)
+                    | Tok::True
+                    | Tok::False
+                    | Tok::Null
+                    | Tok::LParen
+                    | Tok::LBrace
+                    | Tok::Minus
+                    | Tok::Not
+                    | Tok::New
+            )
+        )
     }
 
     /// Whether the cursor begins a lambda: `ident =>` or a `( … ) =>` parameter
@@ -994,6 +1082,26 @@ impl Parser {
     /// identifier or a parenthesized (optionally typed) list; `body` is a single
     /// expression or a `{ … }` block.
     fn lambda(&mut self) -> Result<Expr, String> {
+        let params = self.lambda_params()?;
+        let body = if self.is(&Tok::LBrace) {
+            self.advance();
+            Expr::Block(self.block()?)
+        } else if self.assignment_ahead() {
+            // A lambda whose body is an assignment (`x => acc += x`) is a `Unit`
+            // statement, not an expression — wrap it in a single-statement block.
+            Expr::Block(vec![self.statement()?])
+        } else {
+            self.expression()?
+        };
+        Ok(Expr::Lambda {
+            params,
+            body: Box::new(body),
+        })
+    }
+
+    /// A function literal's parameter list, through the `=>`: a single bare
+    /// identifier or a parenthesized (optionally typed) list.
+    fn lambda_params(&mut self) -> Result<Vec<String>, String> {
         let mut params = Vec::new();
         if self.is(&Tok::LParen) {
             self.advance();
@@ -1018,40 +1126,57 @@ impl Parser {
         }
         self.eat(&Tok::FatArrow)?;
         self.skip_seps();
-        let body = if self.is(&Tok::LBrace) {
-            self.advance();
-            Expr::Block(self.block()?)
-        } else if self.assignment_ahead() {
-            // A lambda whose body is an assignment (`x => acc += x`) is a `Unit`
-            // statement, not an expression — wrap it in a single-statement block.
-            Expr::Block(vec![self.statement()?])
-        } else {
-            self.expression()?
-        };
-        Ok(Expr::Lambda {
-            params,
-            body: Box::new(body),
-        })
+        Ok(params)
     }
 
     fn binary(&mut self, min_bp: u8) -> Result<Expr, String> {
         let mut lhs = self.unary()?;
-        while let Some((op, bp)) = binop(self.peek()) {
-            if bp < min_bp {
-                break;
+        loop {
+            if let Some((op, bp)) = binop(self.peek()) {
+                if bp < min_bp {
+                    break;
+                }
+                self.advance();
+                // `::` (cons) is right-associative: `1 :: 2 :: Nil` is
+                // `1 :: (2 :: Nil)`.
+                let rhs = if op == BinOp::Cons {
+                    self.binary(bp)?
+                } else {
+                    self.binary(bp + 1)?
+                };
+                lhs = Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                };
+                continue;
             }
-            self.advance();
-            // `::` (cons) is right-associative: `1 :: 2 :: Nil` == `1 :: (2 :: Nil)`.
-            let rhs = if op == BinOp::Cons {
-                self.binary(bp)?
-            } else {
-                self.binary(bp + 1)?
-            };
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
+            // A symbolic method operator (`++`, `:+`, `+:`, `--`) is an infix
+            // method call. Scala takes its precedence from the first character
+            // and makes it right-associative when the name ends in `:`, in which
+            // case the *right* operand is the receiver (`0 +: xs` is `xs.+:(0)`).
+            if let Tok::Op(sym) = self.peek().clone() {
+                let (bp, right_assoc) = symbolic_op(&sym);
+                if bp < min_bp {
+                    break;
+                }
+                let line = self.line();
+                self.advance();
+                let rhs = if right_assoc {
+                    self.binary(bp)?
+                } else {
+                    self.binary(bp + 1)?
+                };
+                let (recv, arg) = if right_assoc { (rhs, lhs) } else { (lhs, rhs) };
+                lhs = Expr::Method {
+                    recv: Box::new(recv),
+                    name: sym,
+                    args: vec![arg],
+                    line,
+                };
+                continue;
+            }
+            break;
         }
         Ok(lhs)
     }
@@ -1117,10 +1242,15 @@ impl Parser {
                 self.skip_bracket_group();
             }
             // A method may be curried (`foldLeft(z)(op)`); flatten every trailing
-            // argument list into the one call.
+            // argument list into the one call. A brace group takes the place of a
+            // parenthesized single argument (`xs.map { x => … }`), including the
+            // trailing one of a curried call (`xs.foldLeft(0) { (a, b) => … }`).
             let mut args = Vec::new();
             while self.is(&Tok::LParen) {
                 args.extend(self.arg_list()?);
+            }
+            if self.is(&Tok::LBrace) {
+                args.push(self.brace_arg()?);
             }
             e = Expr::Method {
                 recv: Box::new(e),
@@ -1142,6 +1272,27 @@ impl Parser {
             };
         }
         Ok(e)
+    }
+
+    /// A `{ … }` group standing in for a method's single argument: either the
+    /// pattern-matching anonymous function `{ case … }` or a block whose value is
+    /// the argument — most often a function literal (`{ x => x + 1 }`).
+    fn brace_arg(&mut self) -> Result<Expr, String> {
+        if self.at_case_block() {
+            return self.case_lambda();
+        }
+        self.eat(&Tok::LBrace)?;
+        self.skip_seps();
+        if self.at_lambda_start() {
+            // `{ x => s1; s2 }` — the arrow's body is the rest of the brace group,
+            // which may be several statements, so it is read as a block.
+            let params = self.lambda_params()?;
+            return Ok(Expr::Lambda {
+                params,
+                body: Box::new(Expr::Block(self.block()?)),
+            });
+        }
+        Ok(Expr::Block(self.block()?))
     }
 
     /// Parse a `.copy(...)` update list (cursor on `(`): comma-separated
@@ -1204,8 +1355,13 @@ impl Parser {
                 Ok(Expr::Null)
             }
             // A brace block in value position: `val q = { s1; s2; last }`. Its
-            // value is the last statement's (Scala's block expression).
+            // value is the last statement's (Scala's block expression). A block
+            // made only of `case` arms is instead a pattern-matching anonymous
+            // function (`xs.map { case (k, v) => k + v }`).
             Tok::LBrace => {
+                if self.at_case_block() {
+                    return self.case_lambda();
+                }
                 self.advance();
                 Ok(Expr::Block(self.block()?))
             }
@@ -1243,11 +1399,14 @@ impl Parser {
             Tok::LParen => {
                 self.advance();
                 self.skip_seps();
-                let mut elems = vec![self.expression()?];
+                // Parentheses delimit an `_` placeholder.s scope, so `(_ * 2)` is
+                // the function `x => x * 2` wherever it appears — including as the
+                // right operand of an infix call (`xs map (_ * 2)`).
+                let mut elems = vec![wrap_placeholders(self.expression()?)];
                 while self.is(&Tok::Comma) {
                     self.advance();
                     self.skip_seps();
-                    elems.push(self.expression()?);
+                    elems.push(wrap_placeholders(self.expression()?));
                 }
                 self.eat(&Tok::RParen)?;
                 if elems.len() == 1 {
@@ -1288,7 +1447,10 @@ impl Parser {
                 }
                 if self.is(&Tok::LParen) {
                     // `List(...)` / `Map(...)` / `Array(...)` collection literals.
-                    if name == "List" || name == "Map" || name == "Array" {
+                    if matches!(
+                        name.as_str(),
+                        "List" | "Map" | "Array" | "Seq" | "Vector" | "Set" | "IndexedSeq"
+                    ) {
                         let elems = self.arg_list()?;
                         return Ok(Expr::Collection { ctor: name, elems });
                     }
@@ -1522,6 +1684,43 @@ impl Parser {
         })
     }
 
+    /// Whether the cursor is on a `{` that opens a pattern-matching anonymous
+    /// function — a brace whose first token (past statement separators) is `case`.
+    fn at_case_block(&self) -> bool {
+        if !self.is(&Tok::LBrace) {
+            return false;
+        }
+        let mut i = self.pos + 1;
+        while matches!(
+            self.toks.get(i).map(|t| &t.kind),
+            Some(Tok::Newline | Tok::Semi)
+        ) {
+            i += 1;
+        }
+        matches!(self.toks.get(i).map(|t| &t.kind), Some(Tok::Case))
+    }
+
+    /// `{ case p1 => e1; case p2 => e2 }` — Scala's pattern-matching anonymous
+    /// function, which is a one-parameter lambda matching on its argument.
+    fn case_lambda(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::LBrace)?;
+        self.skip_seps();
+        let mut arms = Vec::new();
+        while self.is(&Tok::Case) {
+            arms.push(self.match_arm()?);
+            self.skip_seps();
+        }
+        self.eat(&Tok::RBrace)?;
+        let param = "$case".to_string();
+        Ok(Expr::Lambda {
+            params: vec![param.clone()],
+            body: Box::new(Expr::Match {
+                scrut: Box::new(Expr::Var(param)),
+                arms,
+            }),
+        })
+    }
+
     /// One `case pat [if guard] => body` arm. The body runs to the next `case`,
     /// the closing `}`, or EOF.
     fn match_arm(&mut self) -> Result<MatchArm, String> {
@@ -1617,6 +1816,24 @@ impl Parser {
                     Ok(Pattern::Stable(name))
                 } else {
                     Ok(Pattern::Bind(name))
+                }
+            }
+            // `case (a, b) =>` — a tuple pattern. A single parenthesized pattern
+            // is just grouping, as in Scala.
+            Tok::LParen => {
+                self.advance();
+                self.skip_seps();
+                let mut elems = vec![self.pattern()?];
+                while self.is(&Tok::Comma) {
+                    self.advance();
+                    self.skip_seps();
+                    elems.push(self.pattern()?);
+                }
+                self.eat(&Tok::RParen)?;
+                if elems.len() == 1 {
+                    Ok(elems.pop().unwrap())
+                } else {
+                    Ok(Pattern::Tuple(elems))
                 }
             }
             other => Err(format!(
@@ -1790,6 +2007,19 @@ fn assign_op(t: &Tok) -> Option<AssignOp> {
 }
 
 /// Binary operator + its binding power (higher binds tighter).
+/// The `(binding power, right-associative)` of a symbolic method operator, per
+/// the SLS: precedence comes from the operator's first character — `:` sits with
+/// `::` just below `+`/`-` — and an operator whose name ends in `:` is
+/// right-associative.
+fn symbolic_op(sym: &str) -> (u8, bool) {
+    let bp = match sym.chars().next() {
+        Some('+' | '-') => 6,
+        Some(':') => 5,
+        _ => 7,
+    };
+    (bp, sym.ends_with(':'))
+}
+
 fn binop(t: &Tok) -> Option<(BinOp, u8)> {
     Some(match t {
         Tok::OrOr => (BinOp::Or, 1),

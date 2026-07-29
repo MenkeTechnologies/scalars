@@ -561,10 +561,13 @@ impl Resolver {
                             let n = name.clone();
                             self.bind_value(&n);
                         }
-                        ForEnum::GenColl { name, coll } => {
+                        ForEnum::GenColl { pat, coll } => {
                             self.walk_expr(coll)?;
-                            let n = name.clone();
-                            self.bind_value(&n);
+                            let mut names = HashSet::new();
+                            pattern_binds(pat, &mut names);
+                            for n in names {
+                                self.bind_value(&n);
+                            }
                         }
                         ForEnum::Guard(g) => self.walk_expr(g)?,
                     }
@@ -653,7 +656,7 @@ fn pattern_binds(p: &Pattern, out: &mut HashSet<String>) {
         Pattern::Typed { name, .. } if name != "_" => {
             out.insert(name.clone());
         }
-        Pattern::Constructor { elems, .. } => {
+        Pattern::Constructor { elems, .. } | Pattern::Tuple(elems) => {
             for e in elems {
                 pattern_binds(e, out);
             }

@@ -201,6 +201,42 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "val a = Array(1, 2, 3)\na(1) = 9\nprintln(a.mkString(\",\"))   // => 1,9,3",
     ),
     (
+        "yield",
+        "Contextual",
+        "collect a `for` comprehension's body for each binding instead of running it for effect; a range generator yields a `Vector`, a collection generator the source's own kind",
+        "println(for (x <- List(1, 2, 3) if x > 1) yield x * 10)   // => List(20, 30)",
+    ),
+    (
+        "List",
+        "Contextual",
+        "the default immutable sequence (`Seq` is an alias for it): `List(a, b)`, `Nil`, `::` cons, indexing `xs(i)`, and the combinator set (`map`, `filter`, `flatMap`, `foldLeft`, `sorted`, `zip`, `groupBy`, `mkString`, …)",
+        "println(List(3, 1, 2).sorted.map(_ * 2))   // => List(2, 4, 6)",
+    ),
+    (
+        "Vector",
+        "Contextual",
+        "the immutable indexed sequence (`IndexedSeq` is an alias for it); the same combinators as `List`, and what a range comprehension yields",
+        "println(Vector(1, 2, 3).map(_ + 1))   // => Vector(2, 3, 4)",
+    ),
+    (
+        "Set",
+        "Contextual",
+        "the immutable set: duplicates dropped, `+`/`-`/`++`/`union`/`intersect`/`diff`/`subsetOf`. Up to four elements it prints in insertion order; beyond that it is a `HashSet` printed in hash-trie order",
+        "println(Set(3, 1, 2))\nprintln(Set(9, 3, 1, 2, 7))   // => Set(3, 1, 2) then HashSet(1, 9, 2, 7, 3)",
+    ),
+    (
+        "Map",
+        "Contextual",
+        "the immutable map of `k -> v` pairs: `apply`/`get`/`getOrElse`/`contains`/`keys`/`values`/`updated`/`+`/`-`. Up to four entries it prints in insertion order; beyond that it is a `HashMap` printed in hash-trie order",
+        "val m = Map(\"a\" -> 1, \"b\" -> 2)\nprintln(m.getOrElse(\"z\", 0))   // => 0",
+    ),
+    (
+        "Nil",
+        "Contextual",
+        "the empty `List`; the tail a `::` chain terminates with",
+        "println(1 :: 2 :: Nil)   // => List(1, 2)",
+    ),
+    (
         "math",
         "Contextual",
         "the `scala.math` module (also spelled `scala.math`, `Math`, `java.lang.Math`): `abs`, `min`/`max`, `sqrt`, `pow`, `floor`/`ceil`/`round`, the trig family, `Pi`, `E`",

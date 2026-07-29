@@ -17,8 +17,9 @@
 
 use fusevm::{Frame, NumOp, VMResult, Value, VM};
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -174,6 +175,12 @@ pub const MAKE_RANGE: u16 = 735;
 /// Builtin id for a `scala.math` (`java.lang.Math`) member: pops the member
 /// name and, beneath it, its arguments — the same shape as [`SMETHOD`].
 pub const SMATH: u16 = 736;
+/// Builtin id for a `Vector(...)` literal: pops `argc` elements and returns the
+/// vector handle.
+pub const MAKE_VECTOR: u16 = 737;
+/// Builtin id for a `Set(...)` literal: pops `argc` elements and returns the set
+/// handle (duplicates dropped; five or more elements make a `HashSet`).
+pub const MAKE_SET: u16 = 738;
 
 thread_local! {
     /// `type name → (linearized supertypes, primary-constructor arity)`,
@@ -301,6 +308,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ARRAY_FILL, b_array_fill);
     vm.register_builtin(MAKE_RANGE, b_make_range);
     vm.register_builtin(SMATH, b_math);
+    vm.register_builtin(MAKE_VECTOR, b_make_vector);
+    vm.register_builtin(MAKE_SET, b_make_set);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -651,10 +660,11 @@ enum HeapVal {
     /// A sequence collection. `kind` selects the `toString` prefix (`List(…)`,
     /// `Set(…)`, `Iterable(…)`) so `.keys`/`.values` render as Scala does.
     Seq(SeqKind, Vec<Value>),
-    /// An insertion-ordered map (matches `Map1`..`Map4`'s stable order and
-    /// `m + (k -> v)` mutation semantics — a new key appends, an existing key
-    /// keeps its position with the new value).
-    Map(Vec<(Value, Value)>),
+    /// An immutable map. `Map1`..`Map4` (`HashRep::Small`) keep insertion order
+    /// and `m + (k -> v)` semantics — a new key appends, an existing key keeps
+    /// its position with the new value; a `HashMap` (`HashRep::Hashed`) is stored
+    /// in CHAMP trie order (see [`champ_order`]).
+    Map(HashRep, Vec<(Value, Value)>),
     /// A tuple (`(a, b)`, `a -> b`).
     Tuple(Vec<Value>),
     /// A first-class function value (lambda) — see [`Closure`].
@@ -664,12 +674,25 @@ enum HeapVal {
     Exc(ExcObj),
 }
 
+/// Which representation an immutable `Set`/`Map` has. Scala's factories return
+/// the fixed-arity `Set1`..`Set4` / `Map1`..`Map4` classes for up to four
+/// entries — insertion-ordered, printed `Set(…)` / `Map(…)` — and a CHAMP
+/// `HashSet`/`HashMap` beyond that, printed `HashSet(…)` / `HashMap(…)` in trie
+/// order. An operation on a hashed receiver stays hashed however small the
+/// result, so `Set(1,2,3,4,5).filter(_ > 1)` is a four-element `HashSet`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HashRep {
+    Small,
+    Hashed,
+}
+
 /// The rendered prefix of a [`HeapVal::Seq`].
 #[derive(Clone, Copy, PartialEq)]
 enum SeqKind {
     List,
     Vector,
-    Set,
+    /// An immutable `Set` — `Set1`..`Set4` or a CHAMP `HashSet` (see [`HashRep`]).
+    Set(HashRep),
     Iterable,
     /// A mutable `Array`: the only sequence kind that answers `update`.
     Array,
@@ -689,21 +712,25 @@ impl SeqKind {
         match self {
             SeqKind::List => "List",
             SeqKind::Vector => "Vector",
-            SeqKind::Set => "Set",
+            SeqKind::Set(HashRep::Small) => "Set",
+            SeqKind::Set(HashRep::Hashed) => "HashSet",
             SeqKind::Iterable => "Iterable",
             SeqKind::Array => "Array",
             SeqKind::Range { .. } => "Range",
         }
     }
+}
 
-    /// The collection a transforming op (`map`, `filter`, …) produces. A `Range`
-    /// is a view over consecutive integers, so mapping one yields a `Vector` —
-    /// exactly as Scala's `IndexedSeq` result does.
-    fn derived(self) -> SeqKind {
-        match self {
-            SeqKind::Range { .. } => SeqKind::Vector,
-            other => other,
-        }
+/// Build the collection a transforming op (`map`, `filter`, …) produces from a
+/// receiver of `kind`. A `Range` is a view over consecutive integers, so mapping
+/// one yields a `Vector` — exactly as Scala's `IndexedSeq` result does; a `Set`
+/// re-deduplicates and re-orders (a hashed receiver stays hashed, and a small one
+/// grows into a `HashSet` past four elements).
+fn derive_seq(kind: SeqKind, items: Vec<Value>) -> Value {
+    match kind {
+        SeqKind::Set(rep) => new_set(rep, items),
+        SeqKind::Range { .. } => new_seq(SeqKind::Vector, items),
+        other => new_seq(other, items),
     }
 }
 
@@ -826,6 +853,18 @@ fn with_obj<R>(v: &Value, f: impl FnOnce(&ScalaObj) -> R) -> Option<R> {
     }
 }
 
+/// The element count of a `Tuple` handle, if `v` is one.
+fn seq_or_tuple_len(v: &Value) -> Option<usize> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Tuple(items)) => Some(items.len()),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
 /// Clone the elements of a `Seq`/`Tuple` handle (both are element sequences), if
 /// `v` is one. Used by the pure (`vm`-free) helpers.
 fn as_seq(v: &Value) -> Option<Vec<Value>> {
@@ -853,9 +892,14 @@ fn seq_kind_items(v: &Value) -> Option<(SeqKind, Vec<Value>)> {
 
 /// Clone the entries of a `Map` handle, if `v` is one.
 fn as_map(v: &Value) -> Option<Vec<(Value, Value)>> {
+    map_rep_entries(v).map(|(_, m)| m)
+}
+
+/// Clone a `Map` handle's representation and entries, if `v` is one.
+fn map_rep_entries(v: &Value) -> Option<(HashRep, Vec<(Value, Value)>)> {
     if let Value::Obj(id) = v {
         HEAP.with(|h| match h.borrow().get(*id as usize) {
-            Some(HeapVal::Map(m)) => Some(m.clone()),
+            Some(HeapVal::Map(rep, m)) => Some((*rep, m.clone())),
             _ => None,
         })
     } else {
@@ -1009,6 +1053,27 @@ fn b_make_list(vm: &mut VM, argc: u8) -> Value {
     heap_push(HeapVal::Seq(SeqKind::List, items))
 }
 
+/// `MAKE_VECTOR` builtin — pop `argc` element values (deepest first) into a
+/// `Vector`.
+fn b_make_vector(vm: &mut VM, argc: u8) -> Value {
+    new_seq(SeqKind::Vector, pop_n(vm, argc))
+}
+
+/// `MAKE_SET` builtin — pop `argc` element values (deepest first) into a `Set`.
+fn b_make_set(vm: &mut VM, argc: u8) -> Value {
+    new_set(HashRep::Small, pop_n(vm, argc))
+}
+
+/// Pop `argc` stack values into source order (the deepest is the first element).
+fn pop_n(vm: &mut VM, argc: u8) -> Vec<Value> {
+    let mut items = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        items.push(vm.pop());
+    }
+    items.reverse();
+    items
+}
+
 /// `MAKE_TUPLE` builtin — pop `argc` element values (deepest first) into a tuple.
 fn b_make_tuple(vm: &mut VM, argc: u8) -> Value {
     let mut items = Vec::with_capacity(argc as usize);
@@ -1019,9 +1084,10 @@ fn b_make_tuple(vm: &mut VM, argc: u8) -> Value {
     heap_push(HeapVal::Tuple(items))
 }
 
-/// `MAKE_MAP` builtin — pop `argc` `Tuple2` pair values (deepest first) into an
-/// insertion-ordered map. A duplicate key keeps its first position with the last
-/// value (Scala's `Map(a -> 1, a -> 2)` == `Map(a -> 2)`).
+/// `MAKE_MAP` builtin — pop `argc` `Tuple2` pair values (deepest first) into a
+/// map. A duplicate key keeps its first position with the last value (Scala's
+/// `Map(a -> 1, a -> 2)` == `Map(a -> 2)`); five or more entries make a
+/// `HashMap`, printed in trie order.
 fn b_make_map(vm: &mut VM, argc: u8) -> Value {
     let mut pairs = Vec::with_capacity(argc as usize);
     for _ in 0..argc {
@@ -1036,7 +1102,7 @@ fn b_make_map(vm: &mut VM, argc: u8) -> Value {
         };
         map_put(&mut entries, k, v);
     }
-    heap_push(HeapVal::Map(entries))
+    new_map(HashRep::Small, entries)
 }
 
 /// `LIST_CONS` builtin (`head :: tail`) — pop the tail `List` and the head, and
@@ -1144,7 +1210,7 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
             h.borrow().get(*id as usize).map(|o| match o {
                 HeapVal::Seq(..) => 0u8,
                 HeapVal::Tuple(_) => 1,
-                HeapVal::Map(_) => 2,
+                HeapVal::Map(..) => 2,
                 _ => 3,
             })
         });
@@ -1229,6 +1295,18 @@ fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Result<Value, Str
         .find_sub(meta.name_idx)
         .ok_or_else(|| "scalars: closure body not found".to_string())?;
     let want = meta.params as usize;
+    // A pattern-matching anonymous function (`{ case (a, b) => … }`) is one
+    // parameter matched against its argument, and Scala unifies that with the
+    // `FunctionN` a two-argument caller like `foldLeft` wants by tupling the
+    // arguments. Do the same when a caller passes more values than the closure
+    // declares.
+    let tupled;
+    let args = if want == 1 && args.len() > 1 {
+        tupled = [heap_push(HeapVal::Tuple(args.to_vec()))];
+        &tupled[..]
+    } else {
+        args
+    };
     let stack_base = vm.stack.len();
     for i in 0..want {
         vm.stack.push(args.get(i).cloned().unwrap_or(Value::Undef));
@@ -1306,13 +1384,18 @@ fn obj_to_string(v: &Value) -> String {
                 let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(", ");
                 format!("{}({inner})", kind.label())
             }
-            Some(HeapVal::Map(entries)) => {
+            Some(HeapVal::Map(rep, entries)) => {
                 let inner = entries
                     .iter()
                     .map(|(k, val)| format!("{} -> {}", scala_str(k), scala_str(val)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("Map({inner})")
+                let label = if *rep == HashRep::Hashed {
+                    "HashMap"
+                } else {
+                    "Map"
+                };
+                format!("{label}({inner})")
             }
             Some(HeapVal::Tuple(items)) => {
                 let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(",");
@@ -1325,39 +1408,200 @@ fn obj_to_string(v: &Value) -> String {
     })
 }
 
-/// A `case` instance's structural hash (equal instances hash equal). A plain
-/// instance hashes by handle identity. Masked to a non-negative 31-bit value so
-/// it reads like a JVM `hashCode` (the exact bits are not observable-equal to the
-/// JVM's MurmurHash, only the equal-implies-equal contract is).
-fn obj_hash(class: &str, is_case: bool, fields: &[(Arc<str>, Value)], v: &Value) -> i64 {
-    let mut h = DefaultHasher::new();
-    if is_case {
-        class.hash(&mut h);
-        // Same primary-constructor prefix `equals` uses, so the
-        // equal-implies-equal contract holds.
-        for (_, val) in &fields[..ctor_arity(class, fields.len())] {
-            hash_value(val, &mut h);
+// ── Scala hashing and CHAMP trie order ──────────────────────────────────────
+//
+// An immutable `Set`/`Map` of five or more entries is a CHAMP hash trie, and
+// Scala prints it in *trie* order rather than insertion order — so
+// `println(Set(9,3,1,2,7))` is `HashSet(1, 9, 2, 7, 3)`. Matching the reference
+// compiler byte-for-byte therefore needs the three pieces the trie is built
+// from, all ported here: the JVM/Scala `##` hash codes, the trie's `improve`
+// scramble of them, and the depth-first traversal its iterator performs.
+
+/// `java.lang.String.hashCode` — `h = 31*h + c` over the UTF-16 code units.
+fn string_hash(s: &str) -> i32 {
+    s.encode_utf16()
+        .fold(0i32, |h, u| h.wrapping_mul(31).wrapping_add(u as i32))
+}
+
+/// `java.lang.Long.hashCode` — the two halves xored.
+fn long_hash(v: i64) -> i32 {
+    (v ^ ((v as u64) >> 32) as i64) as i32
+}
+
+/// `scala.runtime.Statics.doubleHash` — the `##` of a `Double`, which agrees
+/// with `Int`/`Long`/`Float` hashes wherever the value is exactly representable
+/// as one (so `2.0.## == 2` and a `Set[Any]` mixing `2` and `2.0` collides as
+/// Scala's does).
+fn double_hash(d: f64) -> i32 {
+    let iv = d as i32;
+    if f64::from(iv) == d {
+        return iv;
+    }
+    let lv = d as i64;
+    if lv as f64 == d {
+        return long_hash(lv);
+    }
+    let fv = d as f32;
+    if f64::from(fv) == d {
+        return fv.to_bits() as i32;
+    }
+    long_hash(d.to_bits() as i64)
+}
+
+/// `scala.util.hashing.MurmurHash3.productSeed`.
+const PRODUCT_SEED: i32 = 0xcafe_babeu32 as i32;
+
+/// `MurmurHash3.mixLast`.
+fn mm_mix_last(hash: i32, data: i32) -> i32 {
+    let mut k = data as u32;
+    k = k.wrapping_mul(0xcc9e_2d51);
+    k = k.rotate_left(15);
+    k = k.wrapping_mul(0x1b87_3593);
+    (hash as u32 ^ k) as i32
+}
+
+/// `MurmurHash3.mix`.
+fn mm_mix(hash: i32, data: i32) -> i32 {
+    let h = (mm_mix_last(hash, data) as u32).rotate_left(13);
+    (h.wrapping_mul(5).wrapping_add(0xe654_6b64)) as i32
+}
+
+/// `MurmurHash3.finalizeHash` — the length mixed in, then avalanched.
+fn mm_finalize(hash: i32, length: i32) -> i32 {
+    let mut h = (hash ^ length) as u32;
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    h as i32
+}
+
+/// `MurmurHash3.productHash` — the seed, the `productPrefix` hash, then every
+/// element's `##`, finalized with the arity. A zero-arity product (a `case
+/// object`) hashes as its prefix alone, matching Scala.
+fn product_hash(prefix: &str, elems: &[Value]) -> Option<i32> {
+    if elems.is_empty() {
+        return Some(string_hash(prefix));
+    }
+    let mut h = mm_mix(PRODUCT_SEED, string_hash(prefix));
+    for e in elems {
+        h = mm_mix(h, scala_hash(e)?);
+    }
+    Some(mm_finalize(h, elems.len() as i32))
+}
+
+/// Scala's `##` for the value kinds whose JVM hash is reproducible here: the
+/// primitives, `String`, `null`, tuples and `case` records (via
+/// [`product_hash`]). `None` for the rest — a plain class hashes by JVM identity
+/// and a collection by an unported `MurmurHash3` seq/set/map hash, neither of
+/// which can be reproduced, so a hashed `Set`/`Map` keyed by one keeps insertion
+/// order instead of guessing a trie order (documented in `BUGS.md`).
+fn scala_hash(v: &Value) -> Option<i32> {
+    match v {
+        Value::Int(i) => Some(if let Ok(n) = i32::try_from(*i) {
+            n
+        } else {
+            long_hash(*i)
+        }),
+        Value::Float(f) => Some(double_hash(*f)),
+        Value::Str(s) => Some(string_hash(s)),
+        Value::Bool(b) => Some(if *b { 1231 } else { 1237 }),
+        Value::Undef => Some(0),
+        Value::Obj(id) => {
+            let hv = HEAP.with(|h| h.borrow().get(*id as usize).cloned())?;
+            match hv {
+                HeapVal::Tuple(items) => product_hash(&format!("Tuple{}", items.len()), &items),
+                HeapVal::Record(o) if o.is_case => {
+                    let n = ctor_arity(&o.class, o.fields.len());
+                    let elems: Vec<Value> =
+                        o.fields[..n].iter().map(|(_, val)| val.clone()).collect();
+                    product_hash(&o.class, &elems)
+                }
+                _ => None,
+            }
         }
-    } else if let Value::Obj(id) = v {
+        _ => None,
+    }
+}
+
+/// The CHAMP trie's hash scramble (`scala.collection.immutable.Node.improve`).
+fn improve(hcode: i32) -> u32 {
+    let mut h = hcode as u32;
+    h = h.wrapping_add(!(h << 9));
+    h ^= h >> 14;
+    h = h.wrapping_add(h << 4);
+    h ^ (h >> 10)
+}
+
+/// The order a CHAMP trie iterates `hashes`, as a permutation of their indices.
+///
+/// Each level consumes five bits of the improved hash, low bits first. Within a
+/// node the slots holding exactly one element are the *data* payloads and are
+/// emitted first in ascending slot order; the slots holding two or more are
+/// sub-tries, walked afterwards in ascending slot order. The shape is canonical
+/// (CHAMP compacts on removal), so it depends only on the set of hashes.
+fn champ_order(hashes: &[u32]) -> Vec<usize> {
+    fn walk(idxs: &[usize], hashes: &[u32], shift: u32, out: &mut Vec<usize>) {
+        // Past 32 bits every hash in `idxs` is identical: a `HashCollisionNode`,
+        // which keeps insertion order.
+        if shift >= 32 {
+            out.extend_from_slice(idxs);
+            return;
+        }
+        let mut slots: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for &i in idxs {
+            slots.entry((hashes[i] >> shift) & 31).or_default().push(i);
+        }
+        for group in slots.values() {
+            if group.len() == 1 {
+                out.push(group[0]);
+            }
+        }
+        for group in slots.values() {
+            if group.len() > 1 {
+                walk(group, hashes, shift + 5, out);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(hashes.len());
+    walk(&(0..hashes.len()).collect::<Vec<_>>(), hashes, 0, &mut out);
+    out
+}
+
+/// Reorder `items` into CHAMP trie order, keyed by `key`. `None` when any key's
+/// JVM hash is not reproducible (see [`scala_hash`]), in which case the caller
+/// keeps insertion order.
+fn champ_sorted<T: Clone>(items: &[T], key: impl Fn(&T) -> Value) -> Option<Vec<T>> {
+    let mut hashes = Vec::with_capacity(items.len());
+    for it in items {
+        hashes.push(improve(scala_hash(&key(it))?));
+    }
+    Some(
+        champ_order(&hashes)
+            .into_iter()
+            .map(|i| items[i].clone())
+            .collect(),
+    )
+}
+
+/// A `case` instance's `hashCode`: `MurmurHash3.productHash` over the
+/// primary-constructor prefix (the same fields `equals` compares, so the
+/// equal-implies-equal contract holds). A plain instance hashes by handle
+/// identity, standing in for the JVM identity hash.
+fn obj_hash(class: &str, is_case: bool, fields: &[(Arc<str>, Value)], v: &Value) -> i64 {
+    if is_case {
+        let n = ctor_arity(class, fields.len());
+        let elems: Vec<Value> = fields[..n].iter().map(|(_, val)| val.clone()).collect();
+        if let Some(h) = product_hash(class, &elems) {
+            return i64::from(h);
+        }
+    }
+    let mut h = DefaultHasher::new();
+    if let Value::Obj(id) = v {
         id.hash(&mut h);
     }
     (h.finish() & 0x7fff_ffff) as i64
-}
-
-/// Hash a field value structurally (recursing into nested `case` objects) so two
-/// equal records hash identically.
-fn hash_value(v: &Value, h: &mut DefaultHasher) {
-    match v {
-        Value::Obj(_) => {
-            with_obj(v, |o| {
-                o.class.hash(h);
-                for (_, val) in &o.fields {
-                    hash_value(val, h);
-                }
-            });
-        }
-        _ => scala_str(v).hash(h),
-    }
 }
 
 /// Scala `==`/`equals` between two values, with object semantics: a `case`
@@ -1399,7 +1643,7 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
                 | (HeapVal::Tuple(xa), HeapVal::Tuple(xb)) => {
                     xa.len() == xb.len() && xa.iter().zip(&xb).all(|(x, y)| value_eq(x, y))
                 }
-                (HeapVal::Map(ma), HeapVal::Map(mb)) => {
+                (HeapVal::Map(_, ma), HeapVal::Map(_, mb)) => {
                     ma.len() == mb.len()
                         && ma
                             .iter()
@@ -1484,6 +1728,11 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Double" | "Float" => matches!(v, Value::Float(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
         "Any" | "AnyRef" | "AnyVal" | "Object" => true,
+        // `TupleN` — the type a tuple pattern (`case (a, b) =>`) tests against.
+        _ if ty.starts_with("Tuple") => match ty[5..].parse::<usize>() {
+            Ok(n) => matches!(seq_or_tuple_len(v), Some(len) if len == n),
+            Err(_) => false,
+        },
         // A user instance conforms to its own class and to every supertype the
         // compiler registered for it (`case c: Shape` on a `Circle`).
         _ => with_obj(v, |o| class_conforms(&o.class, ty)).unwrap_or(false),
@@ -1714,7 +1963,7 @@ fn is_heap_collection(v: &Value) -> bool {
         HEAP.with(|h| {
             matches!(
                 h.borrow().get(*id as usize),
-                Some(HeapVal::Seq(..) | HeapVal::Map(_) | HeapVal::Tuple(_) | HeapVal::Closure(_))
+                Some(HeapVal::Seq(..) | HeapVal::Map(..) | HeapVal::Tuple(_) | HeapVal::Closure(_))
             )
         })
     } else {
@@ -1728,7 +1977,7 @@ fn heap_kind(v: &Value) -> Option<u8> {
         HEAP.with(|h| {
             h.borrow().get(*id as usize).map(|o| match o {
                 HeapVal::Seq(..) => 0u8,
-                HeapVal::Map(_) => 1,
+                HeapVal::Map(..) => 1,
                 HeapVal::Tuple(_) => 2,
                 HeapVal::Closure(_) => 3,
                 HeapVal::Record(_) => 4,
@@ -1764,7 +2013,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
     // A transforming op keeps the receiver's collection kind (`List.map` → `List`,
     // a range-derived `Vector.map` → `Vector`).
-    let same = |v: Vec<Value>| new_seq(kind.derived(), v);
+    let same = |v: Vec<Value>| derive_seq(kind, v);
+    // The pure slice/reorder methods first — they share one body.
+    if let Some(out) = seq_slice_method(&items, name, args) {
+        return Ok(same(out));
+    }
     match (name, args.len()) {
         // `Range.reverse` is another `Range`, walked the other way.
         ("reverse", 0) if matches!(kind, SeqKind::Range { .. }) => {
@@ -1830,20 +2083,26 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             Ok(Value::Undef)
         }
         ("min", 0) | ("max", 0) => {
-            if items.is_empty() {
-                return Err(format!(
-                    "scalars: java.lang.UnsupportedOperationException: empty.{name}"
-                ));
-            }
-            let want_max = name == "max";
-            let mut best = items[0].clone();
-            for it in &items[1..] {
-                let gt = it.to_float() > best.to_float();
-                if gt == want_max {
-                    best = it.clone();
-                }
-            }
-            Ok(best)
+            let want = if name == "max" {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+            items
+                .iter()
+                .skip(1)
+                .fold(items.first().cloned(), |best, it| {
+                    best.map(|b| {
+                        if value_cmp(it, &b) == want {
+                            it.clone()
+                        } else {
+                            b
+                        }
+                    })
+                })
+                .ok_or_else(|| {
+                    format!("scalars: java.lang.UnsupportedOperationException: empty.{name}")
+                })
         }
         ("toArray", 0) => Ok(new_seq(SeqKind::Array, items)),
         ("toVector", 0) => Ok(new_seq(SeqKind::Vector, items)),
@@ -1965,46 +2224,475 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(acc)
         }
+        ("reduceRight", 1) => {
+            if items.is_empty() {
+                return Err(
+                    "scalars: java.lang.UnsupportedOperationException: empty.reduceRight".into(),
+                );
+            }
+            let mut acc = items[items.len() - 1].clone();
+            for it in items[..items.len() - 1].iter().rev() {
+                acc = invoke_closure(vm, &args[0], &[it.clone(), acc])?;
+            }
+            Ok(acc)
+        }
+        // `fold(z)(op)` — the parser flattens the two argument lists into one.
+        ("fold", 2) => {
+            let mut acc = args[0].clone();
+            for it in &items {
+                acc = invoke_closure(vm, &args[1], &[acc, it.clone()])?;
+            }
+            Ok(acc)
+        }
+        ("headOption", 0) => Ok(opt(items.first().cloned())),
+        ("lastOption", 0) => Ok(opt(items.last().cloned())),
+        ("product", 0) => Ok(seq_product(&items)),
+        ("mkString", 3) => {
+            let joined = items
+                .iter()
+                .map(scala_str)
+                .collect::<Vec<_>>()
+                .join(&args[1].as_str_cow());
+            Ok(Value::str(format!(
+                "{}{joined}{}",
+                args[0].as_str_cow(),
+                args[2].as_str_cow()
+            )))
+        }
+        ("indexOf", 1) => Ok(Value::int(
+            items
+                .iter()
+                .position(|x| value_eq(x, &args[0]))
+                .map_or(-1, |i| i as i64),
+        )),
+        ("lastIndexOf", 1) => Ok(Value::int(
+            items
+                .iter()
+                .rposition(|x| value_eq(x, &args[0]))
+                .map_or(-1, |i| i as i64),
+        )),
+        ("zip", 1) => {
+            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            Ok(same(
+                items
+                    .iter()
+                    .zip(other)
+                    .map(|(a, b)| new_pair(a.clone(), b))
+                    .collect(),
+            ))
+        }
+        ("zipWithIndex", 0) => Ok(same(
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, a)| new_pair(a.clone(), Value::int(i as i64)))
+                .collect(),
+        )),
+        ("unzip", 0) => {
+            let mut ls = Vec::with_capacity(items.len());
+            let mut rs = Vec::with_capacity(items.len());
+            for it in &items {
+                match as_seq_or_tuple(it) {
+                    Some(t) if t.len() == 2 => {
+                        ls.push(t[0].clone());
+                        rs.push(t[1].clone());
+                    }
+                    _ => return Err("scalars: unzip expects a collection of pairs".into()),
+                }
+            }
+            Ok(new_pair(same(ls), same(rs)))
+        }
+        ("splitAt", 1) => {
+            let at = clamp(args[0].to_int(), items.len());
+            Ok(new_pair(
+                same(items[..at].to_vec()),
+                same(items[at..].to_vec()),
+            ))
+        }
+        // `grouped`/`sliding` answer an `Iterator` in Scala; here they answer the
+        // materialized `List` of windows (see `BUGS.md`), so the usual
+        // `.toList`/`.foreach` consumption matches.
+        ("grouped" | "sliding", 1) => {
+            let n = args[0].to_int();
+            if n < 1 {
+                return Err(format!(
+                    "scalars: java.lang.IllegalArgumentException: requirement failed: size={n}"
+                ));
+            }
+            let n = n as usize;
+            let mut out = Vec::new();
+            if name == "grouped" {
+                for chunk in items.chunks(n) {
+                    out.push(same(chunk.to_vec()));
+                }
+            } else if items.len() < n {
+                out.push(same(items.clone()));
+            } else {
+                for w in items.windows(n) {
+                    out.push(same(w.to_vec()));
+                }
+            }
+            Ok(new_list(out))
+        }
+        ("toSet", 0) => Ok(new_set(HashRep::Small, items)),
+        ("toSeq" | "toIterable", 0) => Ok(new_list(items)),
+        ("toMap", 0) => {
+            let mut entries: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for it in &items {
+                match as_seq_or_tuple(it) {
+                    Some(t) if t.len() == 2 => map_put(&mut entries, t[0].clone(), t[1].clone()),
+                    _ => return Err("scalars: toMap expects a collection of pairs".into()),
+                }
+            }
+            Ok(new_map(HashRep::Small, entries))
+        }
+        // Scala's `groupBy` builds through a `HashMap` builder, so its result is a
+        // `HashMap` however few groups there are.
+        ("groupBy", 1) => {
+            let ks = keys_of(vm, &args[0], &items)?;
+            let mut entries: Vec<(Value, Vec<Value>)> = Vec::new();
+            for (k, it) in ks.into_iter().zip(items.iter()) {
+                match entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
+                    Some(slot) => slot.1.push(it.clone()),
+                    None => entries.push((k, vec![it.clone()])),
+                }
+            }
+            Ok(new_map(
+                HashRep::Hashed,
+                entries
+                    .into_iter()
+                    .map(|(k, group)| (k, same(group)))
+                    .collect(),
+            ))
+        }
+        ("sortBy", 1) => {
+            let ks = keys_of(vm, &args[0], &items)?;
+            let mut idx: Vec<usize> = (0..items.len()).collect();
+            idx.sort_by(|&a, &b| value_cmp(&ks[a], &ks[b]));
+            Ok(same(idx.into_iter().map(|i| items[i].clone()).collect()))
+        }
+        ("sortWith", 1) => {
+            // A user `lt` may be inconsistent, and `sort_by` panics on a bad
+            // comparator, so the merge is written out (stably) instead.
+            let mut out: Vec<Value> = Vec::with_capacity(items.len());
+            for it in &items {
+                let mut at = out.len();
+                while at > 0
+                    && truthy(&invoke_closure(
+                        vm,
+                        &args[0],
+                        &[it.clone(), out[at - 1].clone()],
+                    )?)
+                {
+                    at -= 1;
+                }
+                out.insert(at, it.clone());
+            }
+            Ok(same(out))
+        }
+        ("maxBy" | "minBy", 1) => {
+            if items.is_empty() {
+                return Err(format!(
+                    "scalars: java.lang.UnsupportedOperationException: empty.{name}"
+                ));
+            }
+            let ks = keys_of(vm, &args[0], &items)?;
+            let want = if name == "maxBy" {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+            let mut best = 0usize;
+            for i in 1..items.len() {
+                if value_cmp(&ks[i], &ks[best]) == want {
+                    best = i;
+                }
+            }
+            Ok(items[best].clone())
+        }
+        ("find", 1) => {
+            for it in &items {
+                if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(it))?) {
+                    return Ok(make_some(it.clone()));
+                }
+            }
+            Ok(make_none())
+        }
+        ("indexWhere", 1) => {
+            for (i, it) in items.iter().enumerate() {
+                if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(it))?) {
+                    return Ok(Value::int(i as i64));
+                }
+            }
+            Ok(Value::int(-1))
+        }
+        ("takeWhile" | "dropWhile", 1) => {
+            let mut n = 0usize;
+            while n < items.len()
+                && truthy(&invoke_closure(
+                    vm,
+                    &args[0],
+                    std::slice::from_ref(&items[n]),
+                )?)
+            {
+                n += 1;
+            }
+            Ok(same(if name == "takeWhile" {
+                items[..n].to_vec()
+            } else {
+                items[n..].to_vec()
+            }))
+        }
+        ("partition" | "span", 1) => {
+            let mut yes = Vec::new();
+            let mut no = Vec::new();
+            let mut split = false;
+            for it in &items {
+                let hit = truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(it))?);
+                // `span` stops testing at the first failure; `partition` sorts
+                // every element into one side or the other.
+                if name == "span" && !hit {
+                    split = true;
+                }
+                if if name == "span" { !split } else { hit } {
+                    yes.push(it.clone());
+                } else {
+                    no.push(it.clone());
+                }
+            }
+            Ok(new_pair(same(yes), same(no)))
+        }
+        // Set algebra. `+`/`-` also reach here through the numeric hook.
+        ("union" | "++" | "concat", 1) => {
+            let mut out = items.clone();
+            out.extend(as_seq_or_tuple(&args[0]).unwrap_or_default());
+            Ok(same(out))
+        }
+        ("intersect", 1) => {
+            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            Ok(same(
+                items
+                    .iter()
+                    .filter(|x| other.iter().any(|y| value_eq(x, y)))
+                    .cloned()
+                    .collect(),
+            ))
+        }
+        ("diff" | "--" | "removedAll", 1) => {
+            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            Ok(same(
+                items
+                    .iter()
+                    .filter(|x| !other.iter().any(|y| value_eq(x, y)))
+                    .cloned()
+                    .collect(),
+            ))
+        }
+        ("subsetOf", 1) => {
+            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            Ok(Value::bool(
+                items.iter().all(|x| other.iter().any(|y| value_eq(x, y))),
+            ))
+        }
+        ("incl" | "+", 1) if matches!(kind, SeqKind::Set(_)) => {
+            let mut out = items.clone();
+            out.push(args[0].clone());
+            Ok(same(out))
+        }
+        ("excl" | "-", 1) if matches!(kind, SeqKind::Set(_)) => Ok(same(
+            items
+                .iter()
+                .filter(|x| !value_eq(x, &args[0]))
+                .cloned()
+                .collect(),
+        )),
+        (":+" | "appended", 1) => {
+            let mut out = items.clone();
+            out.push(args[0].clone());
+            Ok(same(out))
+        }
+        ("+:" | "prepended", 1) => {
+            let mut out = vec![args[0].clone()];
+            out.extend(items);
+            Ok(same(out))
+        }
         _ => Err(no_such_method(recv, name)),
     }
 }
 
-/// `Map` methods — a faithful subset.
+/// Multiply a numeric sequence (`Int` result when all `Int`, else `Double`).
+fn seq_product(items: &[Value]) -> Value {
+    if items.iter().all(|v| matches!(v, Value::Int(_))) {
+        Value::int(items.iter().map(Value::to_int).product())
+    } else {
+        Value::float(items.iter().map(Value::to_float).product())
+    }
+}
+
+/// `Map` methods — a faithful subset. A method that answers another map keeps
+/// the receiver's representation (a `HashMap` stays hashed however few entries
+/// survive); one that answers a bare sequence answers a `List`, as Scala's
+/// `Map.to*` do.
 fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
-    let entries = as_map(recv).unwrap_or_default();
+    let (rep, entries) = map_rep_entries(recv).unwrap_or((HashRep::Small, Vec::new()));
+    // Every closure-taking `Map` method passes one `Tuple2` argument.
+    let pairs: Vec<Value> = entries
+        .iter()
+        .map(|(k, v)| new_pair(k.clone(), v.clone()))
+        .collect();
+    match (name, args.len()) {
+        ("updated", 2) | ("+", 1) => {
+            let mut out = entries.clone();
+            match (name, as_seq_or_tuple(&args[0])) {
+                ("updated", _) => map_put(&mut out, args[0].clone(), args[1].clone()),
+                (_, Some(t)) if t.len() == 2 => map_put(&mut out, t[0].clone(), t[1].clone()),
+                _ => return Err("scalars: Map `+` expects a `key -> value` pair".into()),
+            }
+            Ok(new_map(rep, out))
+        }
+        ("removed" | "-", 1) => Ok(new_map(
+            rep,
+            entries
+                .iter()
+                .filter(|(k, _)| !value_eq(k, &args[0]))
+                .cloned()
+                .collect(),
+        )),
+        ("++" | "concat", 1) => {
+            let mut out = entries.clone();
+            for p in as_seq_or_tuple(&args[0]).unwrap_or_default() {
+                match as_seq_or_tuple(&p) {
+                    Some(t) if t.len() == 2 => map_put(&mut out, t[0].clone(), t[1].clone()),
+                    _ => return Err("scalars: Map `++` expects `key -> value` pairs".into()),
+                }
+            }
+            for (k, v) in as_map(&args[0]).unwrap_or_default() {
+                map_put(&mut out, k, v);
+            }
+            Ok(new_map(rep, out))
+        }
+        // `m.map(f)` answers a `Map` when `f` answers pairs (Scala picks the
+        // `Map` builder from the element type) and an `Iterable` otherwise.
+        ("map" | "flatMap", 1) => {
+            let mut out = Vec::with_capacity(pairs.len());
+            for p in &pairs {
+                let r = invoke_closure(vm, &args[0], std::slice::from_ref(p))?;
+                if name == "flatMap" {
+                    out.extend(as_seq_or_tuple(&r).unwrap_or_else(|| vec![r]));
+                } else {
+                    out.push(r);
+                }
+            }
+            let all_pairs = out
+                .iter()
+                .all(|r| as_seq_or_tuple(r).is_some_and(|t| t.len() == 2));
+            if !all_pairs {
+                return Ok(new_seq(SeqKind::Iterable, out));
+            }
+            let mut mapped: Vec<(Value, Value)> = Vec::with_capacity(out.len());
+            for r in &out {
+                let t = as_seq_or_tuple(r).unwrap_or_default();
+                map_put(&mut mapped, t[0].clone(), t[1].clone());
+            }
+            Ok(new_map(rep, mapped))
+        }
+        ("filter" | "filterNot" | "withFilter" | "takeWhile" | "dropWhile", 1) => {
+            let keep_if = name != "filterNot";
+            let mut kept = Vec::new();
+            let mut dropping = false;
+            for (p, e) in pairs.iter().zip(entries.iter()) {
+                let hit = truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(p))?);
+                match name {
+                    "takeWhile" | "dropWhile" => {
+                        dropping |= !hit;
+                        if dropping == (name == "dropWhile") {
+                            kept.push(e.clone());
+                        }
+                    }
+                    _ if hit == keep_if => kept.push(e.clone()),
+                    _ => {}
+                }
+            }
+            Ok(new_map(rep, kept))
+        }
+        ("partition", 1) => {
+            let mut yes = Vec::new();
+            let mut no = Vec::new();
+            for (p, e) in pairs.iter().zip(entries.iter()) {
+                if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(p))?) {
+                    yes.push(e.clone());
+                } else {
+                    no.push(e.clone());
+                }
+            }
+            Ok(new_pair(new_map(rep, yes), new_map(rep, no)))
+        }
+        ("head", 0) | ("last", 0) | ("headOption", 0) | ("lastOption", 0) => {
+            let pick = if name.starts_with("head") {
+                pairs.first()
+            } else {
+                pairs.last()
+            };
+            if name.ends_with("Option") {
+                return Ok(opt(pick.cloned()));
+            }
+            pick.cloned().ok_or_else(|| {
+                "scalars: java.util.NoSuchElementException: head of empty map".into()
+            })
+        }
+        // Everything else that only reads the entries as a pair sequence is the
+        // sequence implementation over `Map`'s `Tuple2` elements.
+        (
+            "exists" | "forall" | "count" | "find" | "foldLeft" | "foldRight" | "fold" | "reduce"
+            | "maxBy" | "minBy" | "groupBy" | "toList" | "toSeq" | "toVector" | "toArray" | "toSet"
+            | "mkString" | "sortBy" | "unzip" | "zipWithIndex",
+            _,
+        ) => {
+            let seq = new_list(pairs);
+            seq_method(vm, &seq, name, args)
+        }
+        ("toMap", 0) => Ok(recv.clone()),
+        ("foreach", 1) => {
+            for p in &pairs {
+                invoke_closure(vm, &args[0], std::slice::from_ref(p))?;
+            }
+            Ok(Value::Undef)
+        }
+        _ => map_read_method(&entries, recv, name, args),
+    }
+}
+
+/// The read-only `Map` lookups (`size`, `get`, `keys`, …) — split out of
+/// [`map_method`] so neither arm grows past a screen.
+fn map_read_method(
+    entries: &[(Value, Value)],
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     match (name, args.len()) {
         ("size", 0) => Ok(Value::int(entries.len() as i64)),
         ("isEmpty", 0) => Ok(Value::bool(entries.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!entries.is_empty())),
-        ("contains", 1) => Ok(Value::bool(map_get(&entries, &args[0]).is_some())),
-        ("apply", 1) => map_get(&entries, &args[0])
+        ("contains", 1) => Ok(Value::bool(map_get(entries, &args[0]).is_some())),
+        ("apply", 1) => map_get(entries, &args[0])
             .ok_or_else(|| format!("scalars: key not found: {}", scala_str(&args[0]))),
-        ("get", 1) => Ok(match map_get(&entries, &args[0]) {
+        ("get", 1) => Ok(match map_get(entries, &args[0]) {
             Some(v) => make_some(v),
             None => make_none(),
         }),
-        ("getOrElse", 2) => Ok(map_get(&entries, &args[0]).unwrap_or_else(|| args[1].clone())),
+        ("getOrElse", 2) => Ok(map_get(entries, &args[0]).unwrap_or_else(|| args[1].clone())),
+        // Scala prints both key views as `Set(…)` whatever the map size (they are
+        // `HashMap.HashKeySet`, not a `HashSet`), and in the map's own order — so
+        // the view is built directly rather than through `new_set`.
         ("keys" | "keySet", 0) => Ok(new_seq(
-            SeqKind::Set,
+            SeqKind::Set(HashRep::Small),
             entries.iter().map(|(k, _)| k.clone()).collect(),
         )),
         ("values", 0) => Ok(new_seq(
             SeqKind::Iterable,
             entries.iter().map(|(_, v)| v.clone()).collect(),
         )),
-        ("toList", 0) => Ok(new_list(
-            entries
-                .iter()
-                .map(|(k, v)| heap_push(HeapVal::Tuple(vec![k.clone(), v.clone()])))
-                .collect(),
-        )),
-        ("foreach", 1) => {
-            for (k, v) in &entries {
-                let pair = heap_push(HeapVal::Tuple(vec![k.clone(), v.clone()]));
-                invoke_closure(vm, &args[0], std::slice::from_ref(&pair))?;
-            }
-            Ok(Value::Undef)
-        }
         _ => Err(no_such_method(recv, name)),
     }
 }
@@ -2012,6 +2700,19 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
 /// `Tuple` methods — element accessors `_1`/`_2`/… and indexing.
 fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let items = as_seq_or_tuple(recv).unwrap_or_default();
+    // A tuple is a `Product`, so its `hashCode` is the same `MurmurHash3`
+    // product hash a `case class` gets — and the one the CHAMP order reads.
+    if name == "hashCode" && args.is_empty() {
+        if let Some(h) = product_hash(&format!("Tuple{}", items.len()), &items) {
+            return Ok(Value::int(i64::from(h)));
+        }
+    }
+    if name == "equals" && args.len() == 1 {
+        return Ok(Value::bool(value_eq(recv, &args[0])));
+    }
+    if name == "productArity" && args.is_empty() {
+        return Ok(Value::int(items.len() as i64));
+    }
     if args.is_empty() {
         if let Some(n) = name.strip_prefix('_').and_then(|d| d.parse::<usize>().ok()) {
             if n >= 1 && n <= items.len() {
@@ -2036,6 +2737,130 @@ fn closure_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Resu
 /// Scala truthiness of a closure result used as a predicate (`Boolean`).
 fn truthy(v: &Value) -> bool {
     matches!(v, Value::Bool(true))
+}
+
+/// The `Ordering` `sorted`/`sortBy`/`min`/`max`/`maxBy` use. Numbers compare
+/// numerically (an `Int` against a `Double` promotes, as Scala's numeric
+/// `Ordering` does), strings lexicographically by code unit (Java's
+/// `String.compareTo`), `false < true`, and tuples element-by-element
+/// (`Ordering.Tuple2`). Any other pairing compares equal, which leaves the sort
+/// — stable in both languages — holding the input order.
+fn value_cmp(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Str(x), Value::Str(y)) => java_str_cmp(x, y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => a
+            .to_float()
+            .partial_cmp(&b.to_float())
+            .unwrap_or(Ordering::Equal),
+        (Value::Obj(_), Value::Obj(_)) => match (as_seq_or_tuple(a), as_seq_or_tuple(b)) {
+            (Some(xs), Some(ys)) => xs
+                .iter()
+                .zip(ys.iter())
+                .map(|(x, y)| value_cmp(x, y))
+                .find(|o| *o != Ordering::Equal)
+                .unwrap_or_else(|| xs.len().cmp(&ys.len())),
+            _ => Ordering::Equal,
+        },
+        _ => Ordering::Equal,
+    }
+}
+
+/// `java.lang.String.compareTo` — by UTF-16 code unit, then by length.
+fn java_str_cmp(a: &str, b: &str) -> Ordering {
+    a.encode_utf16().cmp(b.encode_utf16())
+}
+
+/// The `Some(v)`/`None` a `find`/`headOption`-style method returns.
+fn opt(v: Option<Value>) -> Value {
+    match v {
+        Some(v) => make_some(v),
+        None => make_none(),
+    }
+}
+
+/// Whether `v` is an immutable `Set` handle.
+fn is_set(v: &Value) -> bool {
+    matches!(seq_kind_items(v), Some((SeqKind::Set(_), _)))
+}
+
+/// `set + e` (`incl`) / `set - e` (`excl`), preserving the set.s representation.
+fn set_incl(set: &Value, e: Value, add: bool) -> Value {
+    let (kind, mut items) =
+        seq_kind_items(set).unwrap_or((SeqKind::Set(HashRep::Small), Vec::new()));
+    let rep = match kind {
+        SeqKind::Set(rep) => rep,
+        _ => HashRep::Small,
+    };
+    if add {
+        items.push(e);
+    } else {
+        items.retain(|x| !value_eq(x, &e));
+    }
+    new_set(rep, items)
+}
+
+/// A `Tuple2` heap value — the result shape of `partition`, `span`, `splitAt`
+/// and `unzip`, and the element shape of `zip`.
+fn new_pair(a: Value, b: Value) -> Value {
+    heap_push(HeapVal::Tuple(vec![a, b]))
+}
+
+/// Clamp a Scala `take`/`drop` count into a slice bound (a negative count is a
+/// no-op, an over-long one saturates — Scala never throws for either).
+fn clamp(n: i64, len: usize) -> usize {
+    n.clamp(0, len as i64) as usize
+}
+
+/// `sortBy`/`maxBy`/`minBy` support: the key `f` computes for every element.
+fn keys_of(vm: &mut VM, f: &Value, items: &[Value]) -> Result<Vec<Value>, String> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        out.push(invoke_closure(vm, f, std::slice::from_ref(it))?);
+    }
+    Ok(out)
+}
+
+/// The sequence methods that need no closure and produce a plain slice of the
+/// receiver: `take`/`drop`/`slice`/`init`/… Returns `None` for an unknown name so
+/// the caller can go on to the closure-taking methods.
+fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<Value>> {
+    let len = items.len();
+    Some(match (name, args.len()) {
+        ("take", 1) => items[..clamp(args[0].to_int(), len)].to_vec(),
+        ("drop", 1) => items[clamp(args[0].to_int(), len)..].to_vec(),
+        ("takeRight", 1) => items[len - clamp(args[0].to_int(), len)..].to_vec(),
+        ("dropRight", 1) => items[..len - clamp(args[0].to_int(), len)].to_vec(),
+        ("slice", 2) => {
+            let from = clamp(args[0].to_int(), len);
+            let until = clamp(args[1].to_int(), len).max(from);
+            items[from..until].to_vec()
+        }
+        ("init", 0) => items[..len.saturating_sub(1)].to_vec(),
+        ("distinct", 0) => {
+            let mut out: Vec<Value> = Vec::with_capacity(len);
+            for it in items {
+                if !out.iter().any(|u| value_eq(u, it)) {
+                    out.push(it.clone());
+                }
+            }
+            out
+        }
+        ("sorted", 0) => {
+            let mut out = items.to_vec();
+            out.sort_by(value_cmp);
+            out
+        }
+        ("flatten", 0) => {
+            let mut out = Vec::new();
+            for it in items {
+                out.extend(as_seq_or_tuple(it)?);
+            }
+            out
+        }
+        _ => return None,
+    })
 }
 
 /// Sum a numeric sequence (`Int` result when all `Int`, else `Double`).
@@ -2184,6 +3009,48 @@ fn new_seq(kind: SeqKind, items: Vec<Value>) -> Value {
     heap_push(HeapVal::Seq(kind, items))
 }
 
+/// Build an immutable `Set`: duplicates dropped (the first occurrence wins), the
+/// representation upgraded to a `HashSet` when `rep` already was one or the
+/// result exceeds four elements, and a `HashSet`'s elements put in trie order.
+fn new_set(rep: HashRep, items: Vec<Value>) -> Value {
+    let mut uniq: Vec<Value> = Vec::with_capacity(items.len());
+    for it in items {
+        if !uniq.iter().any(|u| value_eq(u, &it)) {
+            uniq.push(it);
+        }
+    }
+    let rep = hash_rep(rep, uniq.len());
+    if rep == HashRep::Hashed {
+        if let Some(ordered) = champ_sorted(&uniq, Clone::clone) {
+            uniq = ordered;
+        }
+    }
+    heap_push(HeapVal::Seq(SeqKind::Set(rep), uniq))
+}
+
+/// Build an immutable `Map` from already-deduplicated `entries` — the `Set`
+/// treatment of [`new_set`], keyed by the entry key.
+fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
+    let mut entries = entries;
+    let rep = hash_rep(rep, entries.len());
+    if rep == HashRep::Hashed {
+        if let Some(ordered) = champ_sorted(&entries, |(k, _)| k.clone()) {
+            entries = ordered;
+        }
+    }
+    heap_push(HeapVal::Map(rep, entries))
+}
+
+/// The representation an immutable `Set`/`Map` of `len` entries derived from a
+/// `rep` receiver has: hashed once it was hashed or has outgrown `Set4`/`Map4`.
+fn hash_rep(rep: HashRep, len: usize) -> HashRep {
+    if rep == HashRep::Hashed || len > 4 {
+        HashRep::Hashed
+    } else {
+        HashRep::Small
+    }
+}
+
 /// Build a built-in `Some(v)` case-class record.
 fn make_some(v: Value) -> Value {
     heap_alloc(ScalaObj {
@@ -2233,6 +3100,15 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("toUpperCase", 0) => Ok(Value::str(s.to_uppercase())),
         ("toLowerCase", 0) => Ok(Value::str(s.to_lowercase())),
         ("trim", 0) => Ok(Value::str(s.trim())),
+        ("concat", 1) => Ok(Value::str(format!("{s}{}", args[0].as_str_cow()))),
+        // Scala.s `String.split` answers an `Array[String]`.
+        ("split", 1) => Ok(new_seq(
+            SeqKind::Array,
+            s.split(&*args[0].as_str_cow()).map(Value::str).collect(),
+        )),
+        ("toList" | "toSeq", 0) => Ok(new_list(
+            s.chars().map(|c| Value::str(c.to_string())).collect(),
+        )),
         ("reverse", 0) => Ok(Value::str(s.chars().rev().collect::<String>())),
         ("toInt", 0) => s.trim().parse::<i64>().map(Value::int).map_err(|_| {
             format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
@@ -2541,13 +3417,14 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             Value::Int(_) | Value::Float(_) if matches!(b, Value::Str(_)) => {
                 Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b))))
             }
-            // `map + (k -> v)` — a new map with the pair added (`Map`'s `+`).
-            Value::Obj(_) if as_map(a).is_some() => {
-                let mut entries = as_map(a).unwrap();
+            // `set + e` / `map + (k -> v)` — the immutable `+` of `Set`/`Map`.
+            Value::Obj(_) if is_set(a) => Ok(set_incl(a, b.clone(), true)),
+            Value::Obj(_) if map_rep_entries(a).is_some() => {
+                let (rep, mut entries) = map_rep_entries(a).unwrap();
                 match as_seq_or_tuple(b) {
                     Some(t) if t.len() == 2 => {
                         map_put(&mut entries, t[0].clone(), t[1].clone());
-                        Ok(heap_push(HeapVal::Map(entries)))
+                        Ok(new_map(rep, entries))
                     }
                     _ => Err("scalars: Map `+` expects a `key -> value` pair".to_string()),
                 }
@@ -2570,6 +3447,18 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         NumOp::Ge => Ok(Value::bool(scala_str(a) >= scala_str(b))),
         // Arithmetic other than `+` on a non-numeric operand is a type error in
         // Scala (`"a" - 1` does not compile). Report it rather than coercing.
+        // `set - e` / `map - k` — the immutable `-` of `Set`/`Map`.
+        NumOp::Sub if is_set(a) => Ok(set_incl(a, b.clone(), false)),
+        NumOp::Sub if map_rep_entries(a).is_some() => {
+            let (rep, entries) = map_rep_entries(a).unwrap();
+            Ok(new_map(
+                rep,
+                entries
+                    .into_iter()
+                    .filter(|(k, _)| !value_eq(k, b))
+                    .collect(),
+            ))
+        }
         NumOp::Sub | NumOp::Mul | NumOp::Div | NumOp::Mod | NumOp::Pow => Err(format!(
             "scalars: operator `{op:?}` is not defined for operands `{}` and `{}`",
             scala_str(a),

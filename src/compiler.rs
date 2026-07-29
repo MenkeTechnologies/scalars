@@ -264,6 +264,8 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         .keys()
         .map(|n| (n.to_string(), linearize(n, &parents)))
         .collect();
+    drop(parents);
+    inherit_into_objects(&mut objects, &classes, &lin);
     let by_name: HashMap<&str, &ClassDecl> = classes.iter().map(|c| (c.name.as_str(), c)).collect();
 
     let mut class_meta = HashMap::new();
@@ -319,10 +321,8 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 _ => None,
             })
             .collect();
-        // A singleton's own `def`s only: `object X extends T` inherits T's
-        // *type* (so `case x: T` and `case X =>` work) but not its method
-        // bodies, which would need a `this` record the object model does not
-        // build (see `BUGS.md`).
+        // The singleton's `def`s, its own plus whatever `inherit_into_objects`
+        // spliced in from its supertypes.
         let methods: HashSet<String> = od.methods.iter().map(|m| m.name.clone()).collect();
         obj_meta.insert(
             od.name.clone(),
@@ -1071,13 +1071,17 @@ impl Compiler {
         Ok(())
     }
 
-    /// Lower a `List(...)` / `Map(...)` literal to its host constructor builtin.
+    /// Lower a `List`/`Seq`/`Vector`/`Set`/`Map`/`Array` literal to its host
+    /// constructor builtin.
     fn collection(&mut self, ctor: &str, elems: &[Expr]) -> Result<(), String> {
         for el in elems {
             self.expr(el)?;
         }
         let id = match ctor {
-            "List" => crate::host::MAKE_LIST,
+            // Scala 3 `Seq` is `List`; `IndexedSeq` is `Vector`.
+            "List" | "Seq" => crate::host::MAKE_LIST,
+            "Vector" | "IndexedSeq" => crate::host::MAKE_VECTOR,
+            "Set" => crate::host::MAKE_SET,
             "Map" => crate::host::MAKE_MAP,
             "Array" => crate::host::MAKE_ARRAY,
             _ => return Err(format!("scalars: unknown collection constructor `{ctor}`")),
@@ -1438,6 +1442,26 @@ impl Compiler {
                 self.materialize_object(name)?;
                 self.b.emit(Op::NumEq, 0);
                 fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+            }
+            Pattern::Tuple(elems) => {
+                // Arity test, then bind each element through the `_1`.. accessors.
+                self.emit_load(vplace);
+                let tn = self
+                    .b
+                    .add_constant(Value::str(format!("Tuple{}", elems.len())));
+                self.b.emit(Op::LoadConst(tn), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::SISTYPE, 2), 0);
+                fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+                for (i, elem) in elems.iter().enumerate() {
+                    self.emit_load(vplace);
+                    let acc = self.b.add_constant(Value::str(format!("_{}", i + 1)));
+                    self.b.emit(Op::LoadConst(acc), 0);
+                    self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+                    self.obj_counter += 1;
+                    let ep = self.declare_place(&format!(" tup_{}", self.obj_counter));
+                    self.emit_store(ep);
+                    self.match_pattern(elem, ep, fail_jumps)?;
+                }
             }
             Pattern::Constructor { name, elems } => {
                 // Scala's derived `unapply` exposes the primary-constructor
@@ -2751,6 +2775,68 @@ fn is_java_lang(e: &Expr) -> bool {
         if name == "lang" && args.is_empty() && matches!(&**recv, Expr::Var(p) if p == "java"))
 }
 
+/// Splice every concrete member a singleton `object` inherits into the object
+/// itself.
+///
+/// A `class` instance is a host-heap record, so a supertype's method body is
+/// compiled once and dispatched with the instance as `this`. An `object` has no
+/// record: its `val`s are program globals and its `def`s are statically
+/// dispatched subroutines. So `object X extends T` gets T's concrete members by
+/// *copying* them into X, exactly as if they had been written in X's body — the
+/// members then compile in the object's own name scope, where a `val` is a
+/// global and a sibling `def` is `X$name`.
+///
+/// A member X declares itself wins (an `override`), and among supertypes the
+/// linearization order decides. Inherited `val`s are prepended base-most first,
+/// so a supertype's initializer runs before the body that may read it.
+fn inherit_into_objects(
+    objects: &mut [ObjectDecl],
+    classes: &[ClassDecl],
+    lin: &HashMap<String, Vec<String>>,
+) {
+    let by_name: HashMap<&str, &ClassDecl> = classes.iter().map(|c| (c.name.as_str(), c)).collect();
+    for od in objects.iter_mut() {
+        let Some(mro) = lin.get(&od.name) else {
+            continue;
+        };
+        let mut have_methods: HashSet<&str> = od.methods.iter().map(|m| m.name.as_str()).collect();
+        let mut have_vals: HashSet<String> = od.body.iter().filter_map(local_name).collect();
+        let mut inherited_methods = Vec::new();
+        let mut inherited_vals: Vec<Vec<Stmt>> = Vec::new();
+        for anc in mro.iter().skip(1) {
+            let Some(parent) = by_name.get(anc.as_str()) else {
+                continue;
+            };
+            for m in &parent.methods {
+                if !m.is_abstract && have_methods.insert(&m.name) {
+                    inherited_methods.push(m.clone());
+                }
+            }
+            let vals: Vec<Stmt> = parent
+                .body
+                .iter()
+                .filter(|s| local_name(s).is_some_and(|n| have_vals.insert(n)))
+                .cloned()
+                .collect();
+            inherited_vals.push(vals);
+        }
+        // `have_methods` borrows `od.methods`; release it before extending.
+        drop(have_methods);
+        od.methods.extend(inherited_methods);
+        let mut body: Vec<Stmt> = inherited_vals.into_iter().rev().flatten().collect();
+        body.append(&mut od.body);
+        od.body = body;
+    }
+}
+
+/// The name a `val`/`var` declaration statement binds, if `s` is one.
+fn local_name(s: &Stmt) -> Option<String> {
+    match &s.kind {
+        StmtKind::Local { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
 /// Whether an enumerator is a collection generator (`x <- List(…)`).
 fn is_coll_gen(e: &ForEnum) -> bool {
     matches!(e, ForEnum::GenColl { .. })
@@ -2766,30 +2852,30 @@ fn is_coll_gen(e: &ForEnum) -> bool {
 ///
 /// A range generator (`i <- a to b`) is materialized to a `List` first.
 fn desugar_for(enums: &[ForEnum], body: &Expr, is_yield: bool) -> Expr {
-    let (name, mut src) = gen_source(&enums[0]);
+    let (pat, mut src) = gen_source(&enums[0]);
     // Guards immediately after the generator become `withFilter` on its source.
     let mut i = 1;
     while let Some(ForEnum::Guard(g)) = enums.get(i) {
-        src = method(src, "withFilter", vec![lambda1(&name, g.clone())]);
+        src = method(src, "withFilter", vec![lambda1(&pat, g.clone())]);
         i += 1;
     }
     let rest = &enums[i..];
     if rest.is_empty() {
         let m = if is_yield { "map" } else { "foreach" };
-        method(src, m, vec![lambda1(&name, body.clone())])
+        method(src, m, vec![lambda1(&pat, body.clone())])
     } else {
         let inner = desugar_for(rest, body, is_yield);
         // Nested yield collects via `flatMap`; nested foreach nests `foreach`.
         let m = if is_yield { "flatMap" } else { "foreach" };
-        method(src, m, vec![lambda1(&name, inner)])
+        method(src, m, vec![lambda1(&pat, inner)])
     }
 }
 
 /// The `(bound name, source-collection expr)` of a generator enumerator. A range
 /// generator is wrapped in the `$range_list` materialization call.
-fn gen_source(e: &ForEnum) -> (String, Expr) {
+fn gen_source(e: &ForEnum) -> (Pattern, Expr) {
     match e {
-        ForEnum::GenColl { name, coll } => (name.clone(), coll.clone()),
+        ForEnum::GenColl { pat, coll } => (pat.clone(), coll.clone()),
         ForEnum::Gen {
             name,
             start,
@@ -2797,7 +2883,7 @@ fn gen_source(e: &ForEnum) -> (String, Expr) {
             inclusive,
             step,
         } => (
-            name.clone(),
+            Pattern::Bind(name.clone()),
             Expr::Call {
                 name: RANGE_LIST_CALL.to_string(),
                 // An absent `by` materializes with the implicit step of 1, so
@@ -2815,10 +2901,30 @@ fn gen_source(e: &ForEnum) -> (String, Expr) {
     }
 }
 
-/// Build a single-parameter lambda `name => body`.
-fn lambda1(name: &str, body: Expr) -> Expr {
+/// Build the single-parameter function a desugared generator maps with. A plain
+/// binder is `name => body`; a destructuring one becomes the pattern-matching
+/// anonymous function `{ case pat => body }`, so `for ((k, v) <- m)` binds both.
+fn lambda1(pat: &Pattern, body: Expr) -> Expr {
+    let name = match pat {
+        Pattern::Bind(n) => n.clone(),
+        _ => "$forpat".to_string(),
+    };
+    let body = match pat {
+        Pattern::Bind(_) => body,
+        _ => Expr::Match {
+            scrut: Box::new(Expr::Var(name.clone())),
+            arms: vec![MatchArm {
+                pat: pat.clone(),
+                guard: None,
+                body: vec![Stmt {
+                    line: 0,
+                    kind: StmtKind::Expr(body),
+                }],
+            }],
+        },
+    };
     Expr::Lambda {
-        params: vec![name.to_string()],
+        params: vec![name],
         body: Box::new(body),
     }
 }
@@ -2997,9 +3103,9 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
                         }
                         b.insert(name.clone());
                     }
-                    ForEnum::GenColl { name, coll } => {
+                    ForEnum::GenColl { pat, coll } => {
                         fv_expr(coll, &b, out, seen);
-                        b.insert(name.clone());
+                        pattern_binds(pat, &mut b);
                     }
                     ForEnum::Guard(g) => fv_expr(g, &b, out, seen),
                 }
@@ -3037,7 +3143,7 @@ fn pattern_binds(p: &Pattern, bound: &mut HashSet<String>) {
         Pattern::Typed { name, .. } if name != "_" => {
             bound.insert(name.clone());
         }
-        Pattern::Constructor { elems, .. } => {
+        Pattern::Constructor { elems, .. } | Pattern::Tuple(elems) => {
             for e in elems {
                 pattern_binds(e, bound);
             }

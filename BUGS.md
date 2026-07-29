@@ -58,6 +58,66 @@ reported as parse/compile errors, never silently mis-run.
   value), `a(i)` reads, `a(i) = v` writes (Scala's `update` sugar), and the
   sequence operations (`length`, `map`, `filter`, `sum`, `mkString`, `toList`,
   `reverse`, `contains`, `foreach`, …).
+- **Collections: `List`/`Seq`/`Vector`/`Set`/`Map`.** Literals for all five
+  (`Seq` is `List` and `IndexedSeq` is `Vector`, as in Scala 3), `Nil`, `::`,
+  and the combinator set: `map`/`flatMap`/`filter`/`filterNot`/`foreach`;
+  `foldLeft`/`foldRight`/`fold`/`reduce`/`reduceLeft`/`reduceRight`;
+  `sum`/`product`/`min`/`max`/`minBy`/`maxBy`/`count`/`length`/`size`;
+  `exists`/`forall`/`find`/`indexOf`/`lastIndexOf`/`indexWhere`/`contains`;
+  `sorted`/`sortBy`/`sortWith`/`reverse`/`distinct`;
+  `take`/`drop`/`takeRight`/`dropRight`/`takeWhile`/`dropWhile`/`slice`/
+  `splitAt`/`span`/`partition`/`init`/`tail`/`head`/`last`/`headOption`/
+  `lastOption`; `zip`/`zipWithIndex`/`unzip`/`flatten`/`grouped`/`sliding`;
+  `groupBy`; `mkString` in all three arities; `toList`/`toSeq`/`toVector`/
+  `toArray`/`toSet`/`toMap`; the set algebra `union`/`intersect`/`diff`/
+  `subsetOf`/`incl`/`excl`; and the operators `++`, `:+`, `+:`, `+`, `-`.
+  `Map` adds `apply`/`get`/`getOrElse`/`contains`/`keys`/`keySet`/`values`/
+  `updated`/`removed`/`+`/`-`/`++`, and its closure-taking methods pass the
+  `Tuple2` Scala does, so `m.map { case (k, v) => … }` works.
+- **`Set`/`Map` print in their representation's order.** Up to four entries
+  Scala's factories answer `Set1`..`Set4` / `Map1`..`Map4`, which keep insertion
+  order and print `Set(…)`/`Map(…)`; beyond that they answer a CHAMP
+  `HashSet`/`HashMap`, which prints `HashSet(…)`/`HashMap(…)` in *trie* order.
+  Both are reproduced exactly: `src/host.rs` ports the JVM/Scala `##` hash codes
+  (`String`, `Int`/`Long`, `Statics.doubleHash`, `Boolean`, and
+  `MurmurHash3.productHash` for tuples and `case` records), the trie's `improve`
+  scramble, and the depth-first order its iterator walks. A derived collection
+  keeps the receiver's representation, so `Set(1,2,3,4,5).filter(_ > 1)` is a
+  four-element `HashSet` and `groupBy` is always a `HashMap`. A `case class`'s
+  `hashCode` is therefore Scala's exact `MurmurHash3` value, not just a
+  contract-satisfying one.
+- **`for` comprehensions.** `yield` and the side-effecting form; range and
+  collection generators; several generators (nesting through `flatMap`);
+  `if` guards, trailing or standing alone; both the `for (…)` and the `for { … }`
+  enumerator groups; and a destructuring generator (`for ((k, v) <- m)`), which
+  desugars to a pattern-matching anonymous function.
+- **General infix method syntax.** `a m b` is `a.m(b)` for any single-argument
+  method — `xs contains 2`, `s startsWith "a"`, `1 to n`. An alphanumeric
+  operator binds looser than every symbolic one (`1 to n - 1` is `1 to (n - 1)`)
+  and chains left-associatively. The symbolic collection operators `++`, `:+`
+  and `+:` take their precedence from the first character and, for a name ending
+  in `:`, dispatch on the right operand (`0 +: xs` is `xs.+:(0)`). A line break
+  between the receiver and the name rules the infix reading out, so a bare
+  expression statement is never absorbed into the next line.
+- **Pattern-matching anonymous functions.** `{ case p => e }` in argument
+  position is a function that matches on its argument, including tuple patterns
+  (`case (k, v) =>`, nested and wildcarded). A caller that passes more arguments
+  than the literal declares — `foldLeft(z) { case (acc, (k, v)) => … }` — has
+  them tupled, as Scala's `FunctionN` conversion does. A brace group also stands
+  in for a parenthesized argument generally (`xs.map { x => x + 1 }`).
+- **Singleton `object`s inherit concrete members.** `object X extends T` gets
+  T's concrete `def`s and `val`s. A singleton has no `this` record, so the
+  members are spliced into the object as if declared there (`src/compiler.rs`,
+  `inherit_into_objects`) and compile in the object's own scope; a member X
+  declares itself wins, supertypes are consulted in linearization order, and
+  inherited `val`s initialize base-most first. The inherited body is reachable
+  both by name (`X.m`) and by virtual dispatch through a supertype-typed
+  binding.
+- **Generics, type-erased.** Type parameters on `class`/`case class`/`trait`/
+  `def`, type arguments at use sites (`new Box[Int](3)`, `id[String]("hi")`,
+  `xs.map[Int](f)`), and parameterized annotations (`val m: Map[String,
+  List[Int]]`) all parse and run. Nothing is checked or specialized — the
+  runtime is dynamically typed, exactly as the other fusevm frontends are.
 - **`Range` as a first-class value.** `1 to 5`, `1 until 5`, `1 to 10 by 3` are
   values, with Scala's `Range.toString` including the `empty `/`inexact `
   prefixes. `map`/`filter` over one yield a `Vector`, `reverse` yields a
@@ -74,29 +134,31 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **Generics.** Type parameters are parsed and ignored; nothing is checked or
-  specialized. A class's `val`/private access modifiers are parsed but not
-  enforced (every field is reachable — a documented simplification).
-- **A singleton `object` does not inherit method *bodies*.** `object X extends
-  T` registers `T` as a supertype (so `case x: T` and `case X =>` work) and
-  dispatches `X`'s own `def`s, but calling a concrete method it inherited from
-  `T` fails with "value m is not a member of X": a trait method body needs a
-  `this` record, and an `object`'s members are program globals rather than a
-  record.
-- **Mutable / other collections.** `Seq`/`Vector`/`Set` literals, `mutable.*`,
-  and the many collection methods beyond the wired subset. The immutable `List`
-  and `Map` are modeled host-side (`List(…)`, `Nil`, `::`,
-  `.head`/`.tail`/`.length`/`.isEmpty`/`.reverse`/`.contains`/indexing,
-  `.map`/`.filter`/`.flatMap`/`.foreach`/`.foldLeft`/`.foldRight`/`.reduce`/
-  `.sum`/`.mkString`/`.exists`/`.forall`/`.count`/`.min`/`.max`/`.toList`/
-  `.toArray`/`.toVector`; `Map(k -> v)`, `.apply`/`.get`/`.contains`/`.keys`/
-  `.values`/`.size`/`getOrElse`/`+`); a range-led comprehension yields a
-  `Vector`. The `args` parameter of `main` is parsed and ignored.
-- **The wider standard library.** `scala.io`, `scala.collection.*`, and the many
-  `String`/numeric methods beyond the wired subset above.
-- **General infix method syntax.** Scala treats `a m b` as `a.m(b)` for any
-  method. Only the range operators (`to`, `until`, `by`) and `->` are wired;
-  every other infix call must be written `a.m(b)`.
+- **Mutable collections.** `scala.collection.mutable.*` — `ArrayBuffer`,
+  `mutable.Map`/`Set`, `ListBuffer`. `Array` is the only mutable sequence.
+- **`collect` and partial functions.** `xs.collect { case … }` needs a function
+  that reports whether it is defined at a value; a `{ case … }` literal here is
+  a total function, so a non-matching element would raise `MatchError` rather
+  than being skipped. Not wired.
+- **Lazy views and `Iterator`.** `.view`, `.iterator`, and `LazyList`. The
+  strict methods above materialize; `grouped`/`sliding` answer the `List` of
+  windows rather than an `Iterator`, so `.toList`/`.foreach` on one matches but
+  printing it bare does not.
+- **Sorting by a user `Ordering`.** `sorted(ord)`, `sortBy` with an explicit
+  `Ordering`, and `Ordered`/`Comparable` on a user class. The built-in ordering
+  covers numbers, `String`, `Boolean` and tuples of those; anything else
+  compares equal, which a stable sort leaves in input order.
+- **A hashed `Set`/`Map` keyed by a collection.** The trie order needs the
+  key's JVM hash; `MurmurHash3`'s seq/set/map hashes are not ported, so a
+  `HashSet` of `List`s (or a `HashMap` keyed by one) keeps insertion order
+  instead of trie order. Keys that are numbers, `String`s, `Boolean`s, tuples or
+  `case` records are exact.
+- **Symbolic operators beyond the wired set.** `++`, `:+`, `+:`, `::`, `->` and
+  the arithmetic/comparison operators are lexed; `&`, `|`, `^`, `<<`, `--`,
+  `/:`, `:\` and user-defined symbolic method names are not.
+- **The wider standard library.** `scala.io`, `scala.collection.*` as a
+  namespace, and the many `String`/numeric methods beyond the wired subset
+  above. The `args` parameter of `main` is parsed and ignored.
 - **`case NonFatal(e)` and other extractor patterns in `catch`.** Only
   `case e: Type`, `case _: Type`, `case e` and `case _` arms are modeled.
 - **User exception classes inside the hierarchy.** `class MyErr(m: String)
@@ -109,11 +171,14 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Modeled with a documented simplification
 
-- **Types are not checked.** Declared types (`Int`, `String`, …) are retained for
-  diagnostics but do not gate execution — the runtime is dynamically typed on the
-  fusevm value model. Type errors that `scalac` would reject may run. Related:
+- **Types are not checked.** Declared types (`Int`, `String`, …) and type
+  parameters (`class Box[A]`, `def id[A]`) are retained for diagnostics but do
+  not gate execution — the runtime is dynamically typed on the fusevm value
+  model. Type errors that `scalac` would reject may run. Related:
   `x.asInstanceOf[T]` is the identity, not a checked cast, so it never throws
-  `ClassCastException` and never performs a numeric conversion.
+  `ClassCastException` and never performs a numeric conversion. A class's
+  `val`/private access modifiers are parsed but not enforced (every field is
+  reachable).
 - **`Array.toString` renders `Array(1, 2, 3)`.** Scala prints the JVM identity
   form (`[I@1b6d3586`), which no reimplementation can reproduce byte-for-byte,
   so the readable form is emitted instead. This is the one place a supported
@@ -138,6 +203,14 @@ reported as parse/compile errors, never silently mis-run.
   `==`/`equals` for the strings and booleans this frontend handles. Reference
   identity (`eq`) is not modeled.
 - **`char` literals are one-character strings**, not an integer `Char` type.
+- **`m.keys`/`m.keySet` answer the map's own order.** Scala's key view is a
+  `HashMap.HashKeySet`, which prints `Set(…)` however large the map and iterates
+  in the map's order; that is what is built, so a five-entry map's `keys` prints
+  `Set(…)` rather than `HashSet(…)`. Mapping or filtering the view renormalizes
+  it into a real `Set`/`HashSet`.
+- **`grouped`/`sliding` answer a `List` of windows**, not an `Iterator`. Every
+  consumption Scala programs use (`.toList`, `.foreach`, `.map`) matches;
+  printing the un-consumed result does not (Scala prints `<iterator>`).
 - **Integer arithmetic uses fusevm's 64-bit semantics.** Scala `Int` 32-bit
   overflow wrapping is not modeled (values behave like `Long`).
 - **`/` is dispatched at runtime, not by static type.** Scala picks integer vs.
@@ -190,6 +263,42 @@ call the `Owner$method` subroutine of whichever supertype implements it. When a
 name has exactly one implementation and the receiver is a known `this`, the chain
 collapses to a direct call, so a hierarchy-free program emits the bytecode it did
 before traits existed.
+
+A singleton `object` is the one type with no record to dispatch off: its `val`s
+are program globals and its `def`s are statically-called subroutines. It
+therefore inherits by *copy* — `inherit_into_objects` in `src/compiler.rs`
+splices each supertype's concrete `def`s and `val`s into the object before
+anything is indexed, so they compile in the object's own name scope and every
+later stage (the method table, the `Name.val` globals, the class-tag chain) sees
+one flat singleton. Members the object declares itself win, supertypes are
+consulted in linearization order, and inherited `val`s are prepended base-most
+first so a supertype's initializer runs before a body that reads it.
+
+## Collections: how the `HashSet`/`HashMap` order is reproduced
+
+Scala's immutable `Set`/`Map` factories switch representation at five entries:
+`Set1`..`Set4` / `Map1`..`Map4` keep insertion order, and a `HashSet`/`HashMap`
+is a CHAMP hash trie whose iteration order is a function of the elements' hash
+codes alone. Printing one therefore cannot be faked, and three pieces are ported
+into `src/host.rs` to get it byte-for-byte:
+
+1. **`##`** — `String.hashCode` over UTF-16 code units, `Long.hashCode`,
+   `Statics.doubleHash` (which agrees with the `Int`/`Long`/`Float` hash wherever
+   the value is exactly representable as one), `Boolean`'s 1231/1237, and
+   `MurmurHash3.productHash` — seed, `productPrefix` hash, each element's `##`,
+   finalized with the arity — for tuples and `case` records. That last one also
+   became the `case class` `hashCode`, which is now Scala's exact value.
+2. **`improve`** — the trie's hash scramble.
+3. **The traversal** — five bits per level, low bits first; within a node the
+   slots holding one element are emitted first in ascending slot order, then the
+   sub-tries in ascending slot order. CHAMP compacts on removal, so this shape
+   depends only on the set of hashes and can be computed from the elements
+   directly.
+
+A collection's representation is stored alongside it (`HashRep`) because a
+derived collection keeps the receiver's: `Set(1,2,3,4,5).filter(_ > 1)` is a
+four-element `HashSet`, while `Set(1,2,3).map(_ * 2)` is a `Set3`. `groupBy`
+builds through a `HashMap` builder and so is always hashed.
 
 ## Block-local `def`s: how they work
 

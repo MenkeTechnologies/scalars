@@ -1488,3 +1488,218 @@ fn math_is_reachable_under_every_spelling() {
     assert!(ok);
     assert_eq!(out, "4.0\n1024.0\n5.0\n3.141592653589793\n");
 }
+
+// ── collections ────────────────────────────────────────────────────────────
+
+#[test]
+fn seq_literals_carry_their_collection_kind() {
+    // Scala 3's `Seq` *is* `List`, and `IndexedSeq` is `Vector`, so all three
+    // spellings must render as the class they alias.
+    let (out, ok) = run(&wrap(
+        "println(Seq(1, 2, 3))\nprintln(Vector(1, 2, 3))\nprintln(IndexedSeq(1, 2))\nprintln(Vector(1, 2).map(_ + 1))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(1, 2, 3)\nVector(1, 2, 3)\nVector(1, 2)\nVector(2, 3)\n"
+    );
+}
+
+#[test]
+fn a_set_becomes_a_hashset_past_four_elements() {
+    // Up to four entries Scala uses `Set1`..`Set4`, which keep insertion order;
+    // the fifth switches to a CHAMP `HashSet`, printed in trie order. Getting
+    // the trie order wrong is the only way this test can pass the first line and
+    // fail the second.
+    let (out, ok) = run(&wrap(
+        "println(Set(3, 1, 2))\nprintln(Set(9, 3, 1, 2, 7))\nprintln(Set(\"e\", \"a\", \"b\", \"c\", \"d\"))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Set(3, 1, 2)\nHashSet(1, 9, 2, 7, 3)\nHashSet(e, a, b, c, d)\n"
+    );
+}
+
+#[test]
+fn a_hashed_set_stays_hashed_however_small_the_result() {
+    // `HashSet.filter` rebuilds the trie rather than going through the small-set
+    // builder, so a four-element result still prints `HashSet`.
+    let (out, ok) = run(&wrap(
+        "println(Set(1, 2, 3, 4, 5).filter(_ > 1))\nprintln(Set(1, 2, 3, 4, 5).map(_ % 2))\nprintln(Set(1, 2, 3).map(_ * 2))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "HashSet(5, 2, 3, 4)\nHashSet(0, 1)\nSet(2, 4, 6)\n");
+}
+
+#[test]
+fn a_map_becomes_a_hashmap_past_four_entries() {
+    let (out, ok) = run(&wrap(
+        "println(Map(3 -> \"c\", 1 -> \"a\"))\nprintln(Map(1 -> 1, 2 -> 2, 3 -> 3, 4 -> 4, 5 -> 5))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Map(3 -> c, 1 -> a)\nHashMap(5 -> 5, 1 -> 1, 2 -> 2, 3 -> 3, 4 -> 4)\n"
+    );
+}
+
+#[test]
+fn group_by_always_answers_a_hashmap() {
+    // `groupBy` builds through a `HashMap` builder, so even a single group is a
+    // `HashMap` — not the `Map1` a two-entry literal would give.
+    let (out, ok) = run(&wrap(
+        "println(List(1).groupBy(x => x))\nprintln(List(1, 2, 3, 4).groupBy(_ % 2))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "HashMap(1 -> List(1))\nHashMap(0 -> List(2, 4), 1 -> List(1, 3))\n"
+    );
+}
+
+#[test]
+fn a_case_class_hashes_as_scalas_murmurhash3_product_hash() {
+    // The exact bits matter: a `Set` of records is ordered by them.
+    let (out, ok) = run(
+        "case class Pt(x: Int, y: Int)\nobject T extends App {\n  println(Pt(1, 2).hashCode)\n  println((1, 2).hashCode)\n  println(Set((1,2), (3,4), (5,6), (7,8), (9,10)))\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "2081183297\n1316541600\nHashSet((5,6), (3,4), (7,8), (1,2), (9,10))\n"
+    );
+}
+
+#[test]
+fn sequence_combinators_preserve_order_and_kind() {
+    let (out, ok) = run(&wrap(
+        "val xs = List(5, 3, 9, 1)\nprintln(xs.sorted)\nprintln(xs.sortBy(x => -x))\nprintln(xs.zip(List(\"a\", \"b\")))\nprintln(xs.zipWithIndex)\nprintln(xs.partition(_ > 4))\nprintln(xs.grouped(3).toList)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(1, 3, 5, 9)\nList(9, 5, 3, 1)\nList((5,a), (3,b))\nList((5,0), (3,1), (9,2), (1,3))\n(List(5, 9),List(3, 1))\nList(List(5, 3, 9), List(1))\n"
+    );
+}
+
+#[test]
+fn sorting_is_stable_and_orders_strings_by_code_unit() {
+    // Equal keys keep input order in both languages, so the tie between the two
+    // two-character words is the observable part (`ax` was written after `fig`
+    // but sorts before it only because its key is smaller).
+    let (out, ok) = run(&wrap(
+        "println(List(\"pear\", \"fig\", \"ax\", \"by\", \"apple\").sortBy(_.length))\nprintln(List(\"B\", \"a\", \"A\", \"b\").sorted)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(ax, by, fig, pear, apple)\nList(A, B, a, b)\n");
+}
+
+#[test]
+fn map_methods_keep_the_receivers_representation() {
+    let (out, ok) = run(&wrap(
+        "val m = Map(\"a\" -> 1, \"b\" -> 2)\nprintln(m.map { case (k, v) => (k, v * 10) })\nprintln(m.filter { case (_, v) => v > 1 })\nprintln(m + (\"c\" -> 3))\nprintln(m - \"a\")\nprintln(m.updated(\"a\", 9))\nprintln(m.keys)\nprintln(m.values)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Map(a -> 10, b -> 20)\nMap(b -> 2)\nMap(a -> 1, b -> 2, c -> 3)\nMap(b -> 2)\nMap(a -> 9, b -> 2)\nSet(a, b)\nIterable(1, 2)\n"
+    );
+}
+
+#[test]
+fn symbolic_collection_operators_pick_scalas_associativity() {
+    // `+:` ends in `:`, so it is right-associative and dispatches on its RIGHT
+    // operand — `0 +: xs` is `xs.+:(0)`, not `0.+:(xs)`.
+    let (out, ok) = run(&wrap(
+        "println(List(1, 2) ++ List(3))\nprintln(List(1, 2) :+ 3)\nprintln(0 +: List(1, 2))\nprintln(1 +: 2 +: List(3))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(1, 2, 3)\nList(1, 2, 3)\nList(0, 1, 2)\nList(1, 2, 3)\n"
+    );
+}
+
+// ── infix method syntax and `for` comprehensions ────────────────────────────
+
+#[test]
+fn any_single_argument_method_can_be_written_infix() {
+    // An alphanumeric operator binds looser than every symbolic one and chains
+    // left-associatively, so `xs map f mkString s` is `(xs.map(f)).mkString(s)`
+    // and `1 to n - 1` is `1 to (n - 1)`.
+    let (out, ok) = run(&wrap(
+        "println(List(1, 2, 3) contains 2)\nprintln(1 max 2)\nprintln(List(1, 2, 3) map (_ * 2) mkString \",\")\nprintln((1 to 4 - 1).toList)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "true\n2\n2,4,6\nList(1, 2, 3)\n");
+}
+
+#[test]
+fn a_line_break_stops_an_infix_reading() {
+    // `xs` and `println` on separate lines are two statements, not `xs.println`.
+    let (out, ok) = run(&wrap("val xs = List(1, 2)\nxs\nprintln(xs.length)"));
+    assert!(ok);
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn a_soft_keyword_is_never_read_as_an_infix_operator() {
+    // `yield` follows a complete enumerator group but is not a method call on it.
+    let (out, ok) = run(&wrap("println(for (x <- List(1, 2)) yield x * 3)"));
+    assert!(ok);
+    assert_eq!(out, "List(3, 6)\n");
+}
+
+#[test]
+fn a_comprehension_accepts_braces_guards_and_destructuring() {
+    let (out, ok) = run(&wrap(
+        "println(for { x <- List(1, 2, 3); if x > 1 } yield x)\nval m = Map(\"a\" -> 1, \"b\" -> 2)\nfor ((k, v) <- m) println(k + \"=\" + v)\nprintln(for ((k, v) <- m.toList) yield v)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(2, 3)\na=1\nb=2\nList(1, 2)\n");
+}
+
+#[test]
+fn a_case_block_is_a_pattern_matching_anonymous_function() {
+    // The same literal serves a one-argument `map` and a two-argument
+    // `foldLeft`, because Scala tuples the arguments of the latter.
+    let (out, ok) = run(&wrap(
+        "println(List((1, 2), (3, 4)).map { case (a, b) => a * b })\nprintln(List((1, 2), (3, 4)).foldLeft(0) { case (acc, (a, b)) => acc + a + b })",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(2, 12)\n10\n");
+}
+
+// ── singleton objects inheriting concrete members ──────────────────────────
+
+#[test]
+fn an_object_inherits_its_traits_method_bodies() {
+    let (out, ok) = run(
+        "trait Greeter {\n  def name: String\n  def greet: String = \"hello, \" + name\n  def loud: String = greet.toUpperCase\n  val punct: String = \"!\"\n}\nobject Bob extends Greeter { def name = \"bob\" }\nobject Carol extends Greeter {\n  def name = \"carol\"\n  override def greet: String = \"hi, \" + name\n}\nobject T extends App {\n  println(Bob.greet)\n  println(Bob.loud)\n  println(Bob.punct)\n  println(Carol.greet)\n  println(Carol.loud)\n}",
+    );
+    assert!(ok);
+    assert_eq!(out, "hello, bob\nHELLO, BOB\n!\nhi, carol\nHI, CAROL\n");
+}
+
+#[test]
+fn an_inherited_object_method_dispatches_through_the_supertype() {
+    // The `Shape`-typed binding proves the inherited body is reachable by
+    // virtual dispatch, not only by the object's own name.
+    let (out, ok) = run(
+        "sealed trait Shape { def area: Double; def label: String = \"shape:\" + area }\ncase object One extends Shape { def area = 1.0 }\nobject T extends App {\n  val s: Shape = One\n  println(s.label)\n  println(One.label)\n}",
+    );
+    assert!(ok);
+    assert_eq!(out, "shape:1.0\nshape:1.0\n");
+}
+
+// ── generics (type-erased) ─────────────────────────────────────────────────
+
+#[test]
+fn type_parameters_are_erased_but_never_rejected() {
+    let (out, ok) = run(
+        "class Box[A](val v: A) { def get: A = v; def map[B](f: A => B): Box[B] = new Box(f(v)) }\ncase class Pair[A, B](a: A, b: B) { def swap: Pair[B, A] = Pair(b, a) }\ntrait Cont[A] { def item: A; def show: String = \"<\" + item + \">\" }\nclass Cell[A](val item: A) extends Cont[A]\nobject T extends App {\n  def id[A](x: A): A = x\n  println(new Box[Int](3).get)\n  println(new Box(3).map(x => x * 2).get)\n  println(Pair(1, \"a\").swap)\n  println(id[String](\"hi\"))\n  println(new Cell[String](\"z\").show)\n  val m: Map[String, List[Int]] = Map(\"a\" -> List(1, 2))\n  println(m)\n}",
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n6\nPair(a,1)\nhi\n<z>\nMap(a -> List(1, 2))\n");
+}

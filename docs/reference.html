@@ -213,28 +213,60 @@ a(1) = 9
 println(a.mkString(","))   // =&gt; 1,9,3</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-9">
-          <h3><a class="doc-anchor" href="#doc-contextual-9">#</a> <code>math</code></h3>
+          <h3><a class="doc-anchor" href="#doc-contextual-9">#</a> <code>yield</code></h3>
+          <p>collect a `for` comprehension's body for each binding instead of running it for effect; a range generator yields a `Vector`, a collection generator the source's own kind</p>
+          <pre><code class="lang-scala">println(for (x &lt;- List(1, 2, 3) if x &gt; 1) yield x * 10)   // =&gt; List(20, 30)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-10">
+          <h3><a class="doc-anchor" href="#doc-contextual-10">#</a> <code>List</code></h3>
+          <p>the default immutable sequence (`Seq` is an alias for it): `List(a, b)`, `Nil`, `::` cons, indexing `xs(i)`, and the combinator set (`map`, `filter`, `flatMap`, `foldLeft`, `sorted`, `zip`, `groupBy`, `mkString`, …)</p>
+          <pre><code class="lang-scala">println(List(3, 1, 2).sorted.map(_ * 2))   // =&gt; List(2, 4, 6)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-11">
+          <h3><a class="doc-anchor" href="#doc-contextual-11">#</a> <code>Vector</code></h3>
+          <p>the immutable indexed sequence (`IndexedSeq` is an alias for it); the same combinators as `List`, and what a range comprehension yields</p>
+          <pre><code class="lang-scala">println(Vector(1, 2, 3).map(_ + 1))   // =&gt; Vector(2, 3, 4)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-12">
+          <h3><a class="doc-anchor" href="#doc-contextual-12">#</a> <code>Set</code></h3>
+          <p>the immutable set: duplicates dropped, `+`/`-`/`++`/`union`/`intersect`/`diff`/`subsetOf`. Up to four elements it prints in insertion order; beyond that it is a `HashSet` printed in hash-trie order</p>
+          <pre><code class="lang-scala">println(Set(3, 1, 2))
+println(Set(9, 3, 1, 2, 7))   // =&gt; Set(3, 1, 2) then HashSet(1, 9, 2, 7, 3)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-13">
+          <h3><a class="doc-anchor" href="#doc-contextual-13">#</a> <code>Map</code></h3>
+          <p>the immutable map of `k -&gt; v` pairs: `apply`/`get`/`getOrElse`/`contains`/`keys`/`values`/`updated`/`+`/`-`. Up to four entries it prints in insertion order; beyond that it is a `HashMap` printed in hash-trie order</p>
+          <pre><code class="lang-scala">val m = Map("a" -&gt; 1, "b" -&gt; 2)
+println(m.getOrElse("z", 0))   // =&gt; 0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-14">
+          <h3><a class="doc-anchor" href="#doc-contextual-14">#</a> <code>Nil</code></h3>
+          <p>the empty `List`; the tail a `::` chain terminates with</p>
+          <pre><code class="lang-scala">println(1 :: 2 :: Nil)   // =&gt; List(1, 2)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-15">
+          <h3><a class="doc-anchor" href="#doc-contextual-15">#</a> <code>math</code></h3>
           <p>the `scala.math` module (also spelled `scala.math`, `Math`, `java.lang.Math`): `abs`, `min`/`max`, `sqrt`, `pow`, `floor`/`ceil`/`round`, the trig family, `Pi`, `E`</p>
           <pre><code class="lang-scala">println(math.sqrt(16.0))   // =&gt; 4.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-10">
-          <h3><a class="doc-anchor" href="#doc-contextual-10">#</a> <code>App</code></h3>
+        <article class="doc-entry" id="doc-contextual-16">
+          <h3><a class="doc-anchor" href="#doc-contextual-16">#</a> <code>App</code></h3>
           <p>the mixin whose object body scalars runs directly as the program</p>
           <pre><code class="lang-scala">object T extends App { println("hi") }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-11">
-          <h3><a class="doc-anchor" href="#doc-contextual-11">#</a> <code>main</code></h3>
+        <article class="doc-entry" id="doc-contextual-17">
+          <h3><a class="doc-anchor" href="#doc-contextual-17">#</a> <code>main</code></h3>
           <p>the entry method scalars runs: `def main(args: Array[String]): Unit`</p>
           <pre><code class="lang-scala">def main(args: Array[String]): Unit = { println(0) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-12">
-          <h3><a class="doc-anchor" href="#doc-contextual-12">#</a> <code>package</code></h3>
+        <article class="doc-entry" id="doc-contextual-18">
+          <h3><a class="doc-anchor" href="#doc-contextual-18">#</a> <code>package</code></h3>
           <p>a package prologue line; scalars skips it and runs the object entry</p>
           <pre><code class="lang-scala">package demo
 object T extends App { println(1) }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-contextual-13">
-          <h3><a class="doc-anchor" href="#doc-contextual-13">#</a> <code>import</code></h3>
+        <article class="doc-entry" id="doc-contextual-19">
+          <h3><a class="doc-anchor" href="#doc-contextual-19">#</a> <code>import</code></h3>
           <p>an import prologue line; skipped in slice 1</p>
           <pre><code class="lang-scala">import scala.math._
 object T extends App { println(1) }</code></pre>

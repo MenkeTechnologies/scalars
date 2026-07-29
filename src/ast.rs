@@ -157,9 +157,12 @@ pub enum ForEnum {
         inclusive: bool,
         step: Option<Expr>,
     },
-    /// `name <- collExpr` — a collection generator (a `List`/`Map`/etc. source),
+    /// `pat <- collExpr` — a collection generator (a `List`/`Map`/etc. source),
     /// desugared to `.map`/`.flatMap`/`.withFilter` (see [`crate::compiler`]).
-    GenColl { name: String, coll: Expr },
+    /// `pat` is a plain [`Pattern::Bind`] for the usual `x <- xs`, and a
+    /// [`Pattern::Tuple`] for a destructuring generator (`(k, v) <- m`), which
+    /// desugars to a pattern-matching anonymous function.
+    GenColl { pat: Pattern, coll: Expr },
     /// `if cond` — a filter that skips the remaining (inner) enumerators when the
     /// condition is false, desugaring to `withFilter`.
     Guard(Expr),
@@ -355,6 +358,11 @@ pub enum Pattern {
     /// class`/`case object`) whose field arity matches, then binds each field
     /// position against the corresponding sub-pattern (nesting and guards work).
     Constructor { name: String, elems: Vec<Pattern> },
+    /// `case (a, b) =>` — a tuple pattern: matches a tuple of that arity and
+    /// binds each element position against the corresponding sub-pattern. This is
+    /// what a `Map` comprehension (`for ((k, v) <- m)`) and a pair-taking
+    /// anonymous function (`xs.map { case (k, v) => … }`) destructure through.
+    Tuple(Vec<Pattern>),
     /// A capitalized stable-identifier pattern (`case None =>`) — Scala treats an
     /// upper-case bare identifier in a pattern as a reference to a value/singleton
     /// (e.g. the `None` object), matched by `==`, not a binding.

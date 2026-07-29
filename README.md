@@ -71,8 +71,9 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
-  against a live `scala` across eighteen generators (39,000+ probes clean, plus
-  8,000+ across the five generators added for this wave).
+  against a live `scala` across twenty-one generators — 47,000+ probes clean
+  before this wave, and 14,000+ more across its three new ones (collection
+  combinators, `HashSet`/`HashMap` trie ordering, and infix syntax).
 
 The language surface today: programs with an entry point (`def main`, or an
 `extends App` body) plus sibling `class`/`object` declarations, using `val`/`var`
@@ -88,11 +89,12 @@ model (`class`/`object`/`case class`, `trait`, `extends`/`with`, `override`,
 `equals`/`hashCode`/`toString`, `copy`, `apply`/`unapply`, constructor patterns,
 `isInstanceOf`, built-in `Option`) rides fusevm's `Value::Obj` handle.
 First-class functions (`x => …`, `(a, b) => …`, block bodies, `_` placeholders,
-capture of the enclosing frame), the immutable `List`/`Map` collections
-(`.map`/`.filter`/`.flatMap`/`.foldLeft`/…, `::`, indexing, `k -> v`, collection
-`for … yield` comprehensions), mutable `Array`, first-class `Range` values and
-`scala.math` are modeled host-side too. The wider standard library is the next
-wave (see [`BUGS.md`](BUGS.md)).
+capture of the enclosing frame, `{ case … }` pattern-matching literals), the
+immutable collections `List`/`Seq`/`Vector`/`Set`/`Map` (the full combinator set,
+`::`, indexing, `k -> v`, `for … yield` comprehensions, and Scala's own
+`HashSet`/`HashMap` trie ordering past four entries), mutable `Array`,
+first-class `Range` values and `scala.math` are modeled host-side too. The wider
+standard library is the next wave (see [`BUGS.md`](BUGS.md)).
 Nothing is faked — an unsupported construct is a parse error or an honest runtime
 throw, not a silent mis-run.
 
@@ -233,14 +235,24 @@ Implemented and checked against the reference `scala`:
   `f.apply(x)`) — curried closures (`def adder(n: Int): Int => Int = x => x + n`)
   see their upvalues after the defining frame returns. Modeled as a host-heap
   closure re-entering the VM to run its body — no fusevm changes.
-- **Collections** — immutable `List` (`List(1,2,3)`, `Nil`, `::` cons,
-  `.head`/`.tail`/`.length`/`.isEmpty`/`.reverse`/`.contains`/indexing `xs(i)`,
-  and higher-order `.map`/`.filter`/`.flatMap`/`.foreach`/`.foldLeft`/`.foldRight`/
-  `.reduce`/`.sum`/`.mkString`/`.exists`/`.forall`/`.count`) and immutable `Map`
-  (`Map(k -> v)`, `.apply`/`.get`/`.contains`/`.keys`/`.values`/`.size`/`getOrElse`,
-  `+`), plus `a -> b` tuple pairs. Insertion-ordered, byte-faithful `toString`
-  (`List(1, 2, 3)`, `Map(a -> 1, b -> 2)`). Mutable `Array` too — `Array(a, b)`,
-  `new Array[T](n)` (zero-filled per `T`), `a(i)` reads and `a(i) = v` writes.
+- **Collections** — the immutable `List`/`Seq`/`Vector`/`Set`/`Map` family, plus
+  `Nil`, `::` cons and `a -> b` tuple pairs. Transformations
+  (`map`/`flatMap`/`filter`/`foreach`), folds
+  (`foldLeft`/`foldRight`/`fold`/`reduce*`), aggregates
+  (`sum`/`product`/`min`/`max`/`minBy`/`maxBy`/`count`), predicates
+  (`exists`/`forall`/`find`/`indexOf`/`indexWhere`/`contains`), ordering
+  (`sorted`/`sortBy`/`sortWith`/`reverse`/`distinct`), slicing
+  (`take`/`drop`/`slice`/`splitAt`/`span`/`partition`/`takeWhile`/`dropWhile`/
+  `init`/`tail`/`headOption`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
+  `grouped`/`sliding`), `groupBy`, `mkString`, the `to*` conversions, the set
+  algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`), and
+  `Map`'s `apply`/`get`/`getOrElse`/`keys`/`values`/`updated`. `toString` is
+  byte-faithful, which for `Set`/`Map` means reproducing Scala's representation
+  split: up to four entries the insertion-ordered `Set(…)`/`Map(…)`, beyond that
+  a CHAMP `HashSet(…)`/`HashMap(…)` in trie order (the JVM hash codes, the
+  trie's `improve` scramble and its iteration order are all ported). Mutable
+  `Array` too — `Array(a, b)`, `new Array[T](n)` (zero-filled per `T`), `a(i)`
+  reads and `a(i) = v` writes.
 - **`scala.math`** — `abs`, `signum`, `min`/`max`, `round`/`floor`/`ceil`/`rint`,
   `sqrt`/`cbrt`/`exp`/`log`/`log10`/`pow`/`hypot`, the trig family, `atan2`,
   `toRadians`/`toDegrees`, `Pi`, `E`, under the `math`, `scala.math`, `Math` and
@@ -256,8 +268,16 @@ Implemented and checked against the reference `scala`:
   position), `while`, and `for` comprehensions over both integer ranges
   (`for (i <- a until b) …`, `for (i <- a to b) yield …` collecting a `Vector`)
   and collections (`for (x <- List(1,2,3)) yield x*2`, desugared to
-  `.map`/`.flatMap`/`.withFilter`), with multiple `;`-separated generators and
-  `if` guards.
+  `.map`/`.flatMap`/`.withFilter`), with multiple generators, `if` guards, both
+  the `for (…)` and `for { … }` enumerator groups, and destructuring generators
+  (`for ((k, v) <- m)`).
+- **Infix method syntax** — `a m b` is `a.m(b)` for any single-argument method
+  (`xs contains 2`, `1 to n`, `xs map f mkString ","`), with Scala's precedence
+  (alphanumeric operators bind loosest) and associativity (a name ending in `:`
+  dispatches on its right operand, so `0 +: xs` is `xs.+:(0)`).
+- **Generics, type-erased** — type parameters on `class`/`case class`/`trait`/
+  `def` and type arguments at use sites parse and run; nothing is checked or
+  specialized.
 - **Statement separators** — inferred line breaks *or* explicit `;` (the lexer
   applies Scala's can-end / can-begin newline rule, so no semicolons are needed).
 - **Output** — `println(x)` / `print(x)` with Scala value formatting.
@@ -342,20 +362,22 @@ division by zero, `try`/`catch`, block-local `def` scoping, traits and virtual
 dispatch, `Range` values, `Array`, and the `scala.math` overload split) and diffs
 `scala <file>` against this frontend, shrinking any divergence to the offending
 probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
-`localdef`, `oop`, `range`, `array`, `math`, …). It needs a real `scala` on
+`localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
 release — the block-expression-in-value-position gap and the
-`Math.signum` vs. `math.signum` overload split. 39,000+ probes ran clean before
-this wave, and 8,000+ more across its five new generators.
+`Math.signum` vs. `math.signum` overload split. 47,000+ probes ran clean before
+this wave, and 14,000+ more across its three new generators.
 
 Next waves, in priority order:
 
-1. **More collections** — `Seq`/`Vector`/`Set` literals and the `mutable.*`
-   family, on the same host heap `List`/`Map`/`Array` already ride.
-2. **Generics** for the wider type system, general infix method syntax, and the
-   broader standard library (`scala.io`, `scala.collection.*`).
+1. **Mutable collections** — the `scala.collection.mutable.*` family, on the same
+   host heap the immutable ones already ride.
+2. **Lazy views and `Iterator`** — `.view`, `.iterator`, `LazyList`, and the
+   partial-function `collect`.
+3. **The broader standard library** — `scala.io`, `scala.collection.*` as a
+   namespace, and user `Ordering`s.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

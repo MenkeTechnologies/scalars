@@ -19,8 +19,11 @@
 //! steps and their sign-dependent bound test), IEEE division by zero
 //! (`x/0.0 == Infinity`, `0.0/0.0 == NaN`), `try`/`catch`/`finally`/`throw`
 //! unwinding, block-local `def` scoping and capture, trait/class inheritance
-//! and virtual dispatch, `Range` values, `Array` mutation, and the `scala.math`
-//! vs. `java.lang.Math` overload split. Pure random bytes only produce mutual
+//! and virtual dispatch, `Range` values, `Array` mutation, the `scala.math`
+//! vs. `java.lang.Math` overload split, the collection combinators, the
+//! `Set`/`Map` representation split (an insertion-ordered `Set1`..`Set4` up to
+//! four entries, a CHAMP `HashSet`/`HashMap` in trie order beyond it), and
+//! infix method syntax with its `for`-comprehension forms. Pure random bytes only produce mutual
 //! parse errors that agree on both sides and teach nothing.
 //!
 //! Scope + determinism invariants (mirroring the node-js/pythonrs harnesses):
@@ -536,6 +539,197 @@ fn g_array(r: &mut Rng) -> String {
     }
 }
 
+/// `n` distinct small ints in a shuffled order, for a collection literal.
+/// Distinctness keeps `Set`/`Map`/`distinct` results a pure function of the
+/// list, and the shuffle makes insertion order differ from both sorted and hash
+/// order, so a wrong ordering cannot pass by luck.
+fn int_elems(r: &mut Rng, n: usize) -> String {
+    let mut pool: Vec<i64> = (0..24).map(|i| i * 3 - 11).collect();
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(pool.swap_remove(r.below(pool.len() as u64) as usize));
+    }
+    out.iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `n` distinct short string literals, likewise shuffled.
+fn str_elems(r: &mut Rng, n: usize) -> String {
+    let mut pool: Vec<&str> = vec![
+        "a", "b", "cc", "dd", "eee", "fig", "kiwi", "pear", "plum", "apple", "z", "yy",
+    ];
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(pool.swap_remove(r.below(pool.len() as u64) as usize));
+    }
+    out.iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `println` of several values joined by a space. Scala 3 dropped
+/// `any2stringadd`, so a collection may not lead a `+` chain; the empty string
+/// literal in front makes the whole chain a `String.+`. Each part is
+/// parenthesized because an alphanumeric infix operator binds looser than `+`,
+/// so a bare `5 max 12` part would otherwise read as `("" + 5) max 12`.
+fn println_all(parts: &[String]) -> String {
+    let joined = parts
+        .iter()
+        .map(|p| format!("({p})"))
+        .collect::<Vec<_>>()
+        .join(" + \" \" + ");
+    format!("println(\"\" + {joined})")
+}
+
+/// Sequence combinators over `List`/`Vector`/`Seq`: the transformations, folds,
+/// slices, orderings and conversions, each printed as a whole collection so the
+/// element order is part of the comparison.
+fn g_coll(r: &mut Rng) -> String {
+    let ctor = *pick(r, &["List", "Vector", "Seq"]);
+    let n = 3 + r.below(4) as usize;
+    let xs = format!("{ctor}({})", int_elems(r, n));
+    let wn = 3 + r.below(3) as usize;
+    let ws = format!("List({})", str_elems(r, wn));
+    let k = 1 + r.below(4);
+    let one = |e: String| println_all(&[e]);
+    let two = |a: String, b: String| println_all(&[a, b]);
+    let three = |a: String, b: String, c: String| println_all(&[a, b, c]);
+    match r.below(16) {
+        0 => one(format!("{xs}.map(_ * 2).filter(_ > 0)")),
+        1 => one(format!("{xs}.flatMap(x => List(x, -x))")),
+        2 => two(
+            format!("{xs}.foldLeft(0)(_ + _)"),
+            format!("{xs}.foldRight(\"\")((a, b) => a + b)"),
+        ),
+        3 => two(format!("{xs}.sorted"), format!("{ws}.sorted")),
+        4 => two(
+            format!("{xs}.sortBy(x => -x)"),
+            format!("{ws}.sortBy(_.length)"),
+        ),
+        5 => one(format!("{xs}.sortWith((a, b) => a > b)")),
+        6 => two(format!("{xs}.zip({ws})"), format!("{xs}.zipWithIndex")),
+        7 => three(
+            format!("{xs}.take({k})"),
+            format!("{xs}.drop({k})"),
+            format!("{xs}.slice(1, {k})"),
+        ),
+        8 => three(
+            format!("{xs}.exists(_ > 5)"),
+            format!("{xs}.forall(_ > -20)"),
+            format!("{xs}.count(_ < 0)"),
+        ),
+        9 => three(
+            format!("{xs}.sum"),
+            format!("{xs}.min"),
+            format!("{xs}.max + {xs}.length"),
+        ),
+        10 => two(
+            format!("{xs}.mkString(\"[\", \";\", \"]\")"),
+            format!("{ws}.mkString(\"-\")"),
+        ),
+        11 => two(
+            format!("{xs}.partition(_ > 0)"),
+            format!("{xs}.span(_ > 0)"),
+        ),
+        12 => three(
+            format!("{xs}.takeWhile(_ > 0)"),
+            format!("{xs}.dropWhile(_ > 0)"),
+            format!("{xs}.init"),
+        ),
+        13 => three(
+            format!("{xs}.reverse"),
+            format!("{xs}.tail"),
+            format!("{xs}.distinct"),
+        ),
+        14 => three(
+            format!("{xs}.find(_ > 0)"),
+            format!("{xs}.headOption"),
+            format!("{xs}.indexWhere(_ < 0)"),
+        ),
+        _ => two(
+            format!("{xs}.grouped(2).toList"),
+            format!("{xs}.maxBy(x => -x)"),
+        ),
+    }
+}
+
+/// `Set`/`Map`, whose printed order is the *representation's* order: up to four
+/// entries a `Set1`..`Set4` / `Map1`..`Map4` keeps insertion order, and beyond
+/// that a CHAMP `HashSet`/`HashMap` prints in trie order. Sizes straddle the
+/// boundary deliberately, and derived collections are printed too because a
+/// hashed receiver keeps its representation however small the result.
+fn g_hashcoll(r: &mut Rng) -> String {
+    let n = 1 + r.below(9) as usize;
+    let ints = int_elems(r, n);
+    let sn = 1 + r.below(6) as usize;
+    let strs = str_elems(r, sn);
+    let pairs = |elems: &str| {
+        elems
+            .split(", ")
+            .enumerate()
+            .map(|(i, e)| format!("{e} -> {i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let ipairs = pairs(&ints);
+    let spairs = pairs(&strs);
+    match r.below(12) {
+        0 => format!("println(Set({ints}))"),
+        1 => format!("println(Set({strs}))"),
+        2 => format!("println(List({ints}).toSet)"),
+        3 => format!("println(Map({ipairs}))"),
+        4 => format!("println(Map({spairs}))"),
+        5 => format!("println(List({ints}).groupBy(x => x % 3))"),
+        6 => format!("println(List({strs}).groupBy(_.length))"),
+        7 => println_all(&[
+            format!("Set({ints}).filter(_ > 0)"),
+            format!("Set({ints}).map(_ * 2)"),
+        ]),
+        8 => format!("println(Set({ints}) + 100)"),
+        9 => println_all(&[
+            format!("Map({ipairs}).keys"),
+            format!("Map({ipairs}).values"),
+        ]),
+        10 => println_all(&[
+            format!("Map({ipairs}).size"),
+            format!("Map({ipairs}).toList.length"),
+        ]),
+        _ => println_all(&[
+            format!("Set({ints}).sum"),
+            format!("Set({ints}).size"),
+            format!("Set({ints}).toList.sorted"),
+        ]),
+    }
+}
+
+/// Infix method syntax (`a m b`) and the `for` comprehension forms: guards,
+/// several generators, the brace-bracketed enumerator group, and a destructuring
+/// generator over a `Map`'s pairs.
+fn g_infix(r: &mut Rng) -> String {
+    let xn = 3 + r.below(3) as usize;
+    let xs = format!("List({})", int_elems(r, xn));
+    let ws = format!("List({})", str_elems(r, 3));
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    match r.below(10) {
+        0 => format!("println({xs} contains {a})"),
+        1 => println_all(&[format!("{a} max {b}"), format!("{a} min {b}")]),
+        2 => format!("println({xs} map (_ * 2))"),
+        3 => format!("println({xs} mkString \",\")"),
+        4 => format!("println({ws} map (_.length) mkString \"|\")"),
+        5 => format!("println(for (x <- {xs} if x > 0) yield x * 2)"),
+        6 => format!("println(for {{ x <- {xs}; if x < 0 }} yield x - 1)"),
+        7 => format!("println(for (x <- {xs}; y <- List(0, 1)) yield x + y)"),
+        8 => "{ val m = Map(\"k1\" -> 1, \"k2\" -> 2, \"k3\" -> 3); \
+              println(for ((k, v) <- m.toList) yield k + \":\" + v) }"
+            .to_string(),
+        _ => format!("println({xs}.map {{ x => x + 1 }} ++ List({a}))"),
+    }
+}
+
 /// `scala.math` members, over both the `Int` and the `Double` overloads (Scala
 /// keeps `abs`/`min`/`max`/`signum` integral for integral arguments).
 fn g_math(r: &mut Rng) -> String {
@@ -590,6 +784,9 @@ enum Mode {
     Range,
     Array,
     Math,
+    Coll,
+    HashColl,
+    Infix,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -613,6 +810,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Range => "range",
         Mode::Array => "array",
         Mode::Math => "math",
+        Mode::Coll => "coll",
+        Mode::HashColl => "hashcoll",
+        Mode::Infix => "infix",
     }
 }
 
@@ -637,6 +837,9 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "range" => Mode::Range,
         "array" => Mode::Array,
         "math" => Mode::Math,
+        "coll" => Mode::Coll,
+        "hashcoll" => Mode::HashColl,
+        "infix" => Mode::Infix,
         _ => return None,
     })
 }
@@ -660,6 +863,9 @@ const CONCRETE: &[Mode] = &[
     Mode::Range,
     Mode::Array,
     Mode::Math,
+    Mode::Coll,
+    Mode::HashColl,
+    Mode::Infix,
 ];
 
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
@@ -687,6 +893,9 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Range => g_range(r),
         Mode::Array => g_array(r),
         Mode::Math => g_math(r),
+        Mode::Coll => g_coll(r),
+        Mode::HashColl => g_hashcoll(r),
+        Mode::Infix => g_infix(r),
         Mode::All => unreachable!(),
     }
 }

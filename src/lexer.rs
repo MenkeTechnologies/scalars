@@ -83,6 +83,10 @@ pub enum Tok {
     RArrow,
     /// `::` — list cons.
     ColonColon,
+    /// A symbolic method operator with no dedicated token: `++`, `--`, `:+`, `+:`.
+    /// Parsed as an infix method call, with SLS precedence taken from the first
+    /// character and right-associativity from a trailing `:`.
+    Op(String),
     // operators
     Assign,
     PlusAssign,
@@ -400,6 +404,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             "=>" => (Tok::FatArrow, 2),
             "->" => (Tok::RArrow, 2),
             "::" => (Tok::ColonColon, 2),
+            "++" | "--" | ":+" | "+:" => (Tok::Op(two.to_string()), 2),
             "+=" => (Tok::PlusAssign, 2),
             "-=" => (Tok::MinusAssign, 2),
             "*=" => (Tok::StarAssign, 2),
