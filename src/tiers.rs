@@ -234,8 +234,8 @@ fn op_name(op: &Op) -> String {
     }
 }
 
-
 /// The counted loop this module's tests measure, in the frontend's own syntax.
+#[cfg(test)]
 const PROGRAM: &str = "object Main {\n def f(n: Int): Int = { var t = 0; var i = 0; while (i < n) { t += i; i += 1 }; t }\n def main(a: Array[String]): Unit = println(f(200000))\n}";
 
 #[cfg(test)]
