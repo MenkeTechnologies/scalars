@@ -22,6 +22,15 @@ exclude = [
     "/tests/",
     "/examples/",
     "/docs/",
+    "/bench/",
+    "/benches/",
+    "/parity/",
+    "/parity-scripts/",
+    "/scripts/",
+    "/vendor/",
+    "/tools/",
+    "/fuzz/",
+    "/BUGS.md",
 ]
 
 # scalars is a standalone crate, not a workspace member. An explicit empty
