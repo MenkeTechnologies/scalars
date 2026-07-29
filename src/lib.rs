@@ -17,6 +17,7 @@ pub mod lsp;
 pub mod parser;
 pub mod resolve;
 pub mod rust_ffi;
+pub mod tiers;
 
 pub use banner::version_banner;
 use fusevm::{VMResult, Value, VM};

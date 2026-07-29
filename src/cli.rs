@@ -20,6 +20,8 @@ pub struct Cli {
     pub dump_ast: bool,
     /// `--disasm FILE` — print the lowered fusevm bytecode and exit.
     pub disasm: bool,
+    /// `--tiers FILE` — run it, then report which fusevm tiers took its chunk.
+    pub tiers: bool,
     /// `--lsp` — speak the Language Server Protocol over stdio.
     pub lsp: bool,
     /// `--dap` — speak the Debug Adapter Protocol over stdio.
@@ -36,6 +38,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "--dump-tokens" => cli.dump_tokens = true,
             "--dump-ast" => cli.dump_ast = true,
             "--disasm" => cli.disasm = true,
+            "--tiers" => cli.tiers = true,
             "--lsp" => cli.lsp = true,
             "--dap" => cli.dap = true,
             _ if a.starts_with('-') && cli.file.is_none() => {
@@ -63,6 +66,7 @@ options:
   --dump-tokens FILE    print the lexer token stream and exit
   --dump-ast FILE       print the parsed AST and exit
   --disasm FILE         print the lowered fusevm bytecode and exit
+  --tiers FILE          run it, then report which fusevm tiers took it
   --lsp                 speak the Language Server Protocol over stdio
   --dap                 speak the Debug Adapter Protocol over stdio
 ";

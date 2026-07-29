@@ -275,6 +275,7 @@ Implemented and checked against the reference `scala`:
 | `--dump-tokens FILE` | Print the lexer token stream and exit. |
 | `--dump-ast FILE` | Print the parsed AST and exit. |
 | `--disasm FILE` | Print the lowered fusevm bytecode and exit. |
+| `--tiers FILE` | Run it, then report which fusevm execution tier took each of its chunks. |
 
 `scala --version` reports the targeted language level (`3.3`) followed by the
 real engine (`scalars <crate-version>`) and the host triple, so nothing is

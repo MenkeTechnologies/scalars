@@ -78,7 +78,7 @@ path = "src/bin/parity_fuzz.rs"
 # block in Scala source is scanned/rewritten by `fusevm::RustSugar`
 # (src/rust_ffi.rs), compiled to a cdylib, and its exports are called by name
 # (the `__rust_compile` / by-name-call dispatch into `fusevm::ffi`).
-fusevm = { version = "0.14.17", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
+fusevm = { version = "0.15.0", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 thiserror = "2.0"
 

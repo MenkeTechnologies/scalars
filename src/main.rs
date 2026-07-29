@@ -52,6 +52,15 @@ fn main() -> ExitCode {
     if cli.disasm {
         return finish(scalars::disassemble(&src));
     }
+    if cli.tiers {
+        return match scalars::tiers::report(&src) {
+            Ok(r) => {
+                println!("{r}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        };
+    }
 
     match scalars::run_str(&src) {
         Ok(_) => ExitCode::SUCCESS,
