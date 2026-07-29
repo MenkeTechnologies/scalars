@@ -136,7 +136,7 @@ pub const EXC_MATCH: u16 = 724;
 /// returns it and clears the in-flight slot, so the handler body runs normally.
 pub const EXC_TAKE: u16 = 725;
 /// Builtin id for entering a `try` region (increments the dynamic try depth, so
-/// [`fault`] raises instead of halting).
+/// `fault` raises instead of halting).
 pub const EXC_ENTER: u16 = 726;
 /// Builtin id for leaving a `try` region (decrements the dynamic try depth).
 pub const EXC_EXIT: u16 = 727;
