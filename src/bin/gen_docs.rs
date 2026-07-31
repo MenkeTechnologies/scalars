@@ -1,17 +1,21 @@
-//! Offline generator for `docs/reference.html` — the keyword / Predef / operator
-//! reference page, rendered with the same cyberpunk HUD chrome as
-//! `docs/index.html`. Run before publishing GitHub Pages:
+//! Offline generator for `docs/reference.html` — the full language reference:
+//! keywords, declarations, patterns, the collection/`String`/numeric method
+//! surfaces, `scala.math`, the throwable hierarchy, the operators and Predef.
+//! Rendered with the same cyberpunk HUD chrome as `docs/index.html`. Run before
+//! publishing GitHub Pages:
 //!
 //! ```sh
 //! cargo run --bin gen-docs
 //! ```
 //!
-//! Source of truth: the LSP corpus in `scalars::lsp` (`corpus()`), the exact
-//! `(name, chapter, doc, example)` table the editor completion/hover path
-//! renders from. The static page and the language server therefore never drift
-//! — a name is documented here only if the runtime actually recognizes it in
-//! `lexer.rs` (keywords), the parser (contextual words), or `host.rs`
-//! (Predef print builtins / operator lowering).
+//! Source of truth: `scalars::corpus::CORPUS` (reached through
+//! `scalars::lsp::corpus()`), the exact `(name, chapter, doc, signature +
+//! example)` table the editor completion/hover path renders from. The static
+//! page and the language server therefore never drift — a name is documented
+//! only if the runtime actually resolves it, in `lexer.rs` (keywords),
+//! `parser.rs` (declarations, patterns, contextual words) or `host.rs` (the
+//! method surfaces, `scala.math`, throwables, print builtins, operator
+//! lowering).
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -115,7 +119,7 @@ const HEAD: &str = r#"<!DOCTYPE html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="scalars — Language reference. Keywords, Predef print builtins, and operators recognized by the current scalars build. MIT licensed.">
+  <meta name="description" content="scalars — Language reference. Every keyword, declaration form, pattern, collection / String / numeric method, scala.math member, throwable, operator and Predef builtin the current scalars build resolves. MIT licensed.">
   <title>scalars &mdash; Language Reference</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -158,7 +162,7 @@ const HEAD: &str = r#"<!DOCTYPE html>
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>LANGUAGE REFERENCE</h2>
-      <p class="tutorial-subtitle">Every reserved keyword, contextual word, Predef print builtin, and operator the current scalars build recognizes, grouped by category. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>; Predef and operators mirror real lowering in <code>src/host.rs</code> and <code>src/compiler.rs</code>.</p>
+      <p class="tutorial-subtitle">Every name the current scalars build resolves, grouped by chapter: reserved keywords, declaration forms and modifiers, comprehensions and ranges, pattern forms, collection constructors, the sequence and map method surfaces, <code>String</code> / <code>Int</code> / <code>Double</code> / <code>Boolean</code> methods, tuples and records, function values, <code>scala.math</code>, the throwable hierarchy, the operators, and Predef with the string interpolators. Each entry carries a signature and a runnable example. This page is generated from the reference corpus (<code>src/corpus.rs</code>) by the <code>gen-docs</code> binary, which is also what editor completion and hover read, so the page never drifts from the runtime. Keywords mirror <code>lexer.rs</code>; declarations and patterns mirror <code>parser.rs</code>; the method surfaces, <code>scala.math</code>, throwables and operator lowering mirror <code>src/host.rs</code> and <code>src/compiler.rs</code>. Where behaviour diverges from Scala on the JVM, the entry says so.</p>
 "#;
 
 const FOOT: &str = r#"

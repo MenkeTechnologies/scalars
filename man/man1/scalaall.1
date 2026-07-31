@@ -281,10 +281,13 @@ speaks the Language Server Protocol over stdio.  It is self\-contained and
 read\-only:
 .IP \[bu] 2
 .B completion
-of the recognized keyword / contextual\-word / Predef / operator corpus;
+of the full reference corpus \(em keywords, declarations, patterns,
+collection / String / numeric methods, scala.math, throwables, operators
+and Predef;
 .IP \[bu] 2
 .B hover
-rendering each name's category, one\-line doc, and a runnable example;
+rendering each name's chapter, one\-line doc, signature, and a runnable
+example;
 .IP \[bu] 2
 .B diagnostics
 computed by the runtime's own parser \(em a syntax error maps to a

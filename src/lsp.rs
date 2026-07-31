@@ -2,7 +2,7 @@
 //!
 //! Self-contained and read-only: diagnostics come from the same `parser::parse`
 //! the runtime uses (a syntax error maps to the reported line); hover and
-//! completion draw on the keyword / Predef corpus below. No output ever reaches
+//! completion draw on the reference corpus in `src/corpus.rs`. No output reaches
 //! the terminal — JSON-RPC on stdio only. Structure follows the sibling `-rs`
 //! frontends' `lsp.rs` (see `pythonrs/src/lsp.rs`).
 
@@ -22,364 +22,15 @@ use lsp_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, Uri,
 };
 
-/// The keyword / Predef corpus: (name, chapter, one-line doc, example). Single
-/// source of truth for LSP completion, hover, and the generated
-/// `docs/reference.html`. Every entry mirrors something the scalars runtime
-/// actually recognizes:
-///   * "Keyword"    → a reserved word in `lexer.rs` (`keyword_or_ident`).
-///   * "Contextual" → a word the parser gives meaning in position (`until`/`to`
-///     range bounds, `App`/`main` entry points, `package`/`import` prologue).
-///   * "Predef"     → a print builtin dispatched in `host.rs` (`SPRINTLN`/`SPRINT`).
-///   * "Operator"   → an operator token the parser lowers to a fusevm op / host
-///     hook.
-///
-/// A name is documented here only if the runtime recognizes it, so the language
-/// server and the static reference never drift from what `scala` can run.
-const CORPUS: &[(&str, &str, &str, &str)] = &[
-    // ── Keyword (lexer keyword set) ──
-    (
-        "object",
-        "Keyword",
-        "declare a singleton object; scalars runs its `main` or `extends App` body",
-        "object T extends App { println(\"hi\") }",
-    ),
-    (
-        "def",
-        "Keyword",
-        "define a method; scalars locates and runs `def main(args: Array[String])`. A `def` inside a block is scoped to that block and may shadow an outer one",
-        "object T { def main(args: Array[String]): Unit = { println(1) } }",
-    ),
-    (
-        "val",
-        "Keyword",
-        "an immutable binding: `val x = expr`",
-        "val x = 41\nprintln(x + 1)   // => 42",
-    ),
-    (
-        "var",
-        "Keyword",
-        "a mutable binding, reassignable with `=` / `+=` / `-=` / `*=` / `/=` / `%=`",
-        "var n = 0\nn += 5\nprintln(n)   // => 5",
-    ),
-    (
-        "if",
-        "Keyword",
-        "conditional branch: `if (cond) { .. } else { .. }`",
-        "if (1 < 2) println(\"yes\") else println(\"no\")",
-    ),
-    (
-        "else",
-        "Keyword",
-        "the fallback branch of an `if`",
-        "if (false) println(1) else println(2)   // => 2",
-    ),
-    (
-        "while",
-        "Keyword",
-        "loop while the condition is true: `while (cond) { .. }`",
-        "var i = 0\nwhile (i < 3) { i += 1 }\nprintln(i)   // => 3",
-    ),
-    (
-        "for",
-        "Keyword",
-        "range comprehension in statement position: `for (i <- a until b) { .. }`",
-        "for (i <- 1 to 3) println(i)   // prints 1 2 3",
-    ),
-    (
-        "extends",
-        "Keyword",
-        "name a supertype: its fields and concrete methods are inherited, and its constructor takes the `extends P(args)` arguments. `extends App` instead makes the object body the program entry point",
-        "class A(val n: Int)\nclass B(m: Int) extends A(m)\nprintln(new B(2).n)   // => 2",
-    ),
-    (
-        "trait",
-        "Keyword",
-        "declare an abstract type to mix in: abstract members (`def f: Int`, `val x: String`) plus concrete ones. Cannot be instantiated",
-        "trait S { def area: Int; def show: String = \"a=\" + area }\nclass C(r: Int) extends S { def area = r * r }\nprintln(new C(3).show)   // => a=9",
-    ),
-    (
-        "new",
-        "Keyword",
-        "construct an instance: a user `class`/`case class`, or a built-in throwable",
-        "class P(val n: Int)\nprintln(new P(2).n)   // => 2",
-    ),
-    (
-        "return",
-        "Keyword",
-        "early return from a `def`, exiting before the body's last expression",
-        "def f(x: Int): Int = { if (x < 0) return 0; x * 2 }\nprintln(f(-1))   // => 0",
-    ),
-    (
-        "try",
-        "Keyword",
-        "run a body with handlers: `try { .. } catch { case e: T => .. } finally { .. }`; its value is the body's, or the matching handler's",
-        "println(try { 1 / 0 } catch { case _: ArithmeticException => -1 })   // => -1",
-    ),
-    (
-        "catch",
-        "Keyword",
-        "the handler block of a `try`; arms are `case e: Type [if guard] => ..` and match the JVM throwable hierarchy",
-        "try { \"z\".toInt } catch { case e: NumberFormatException => println(e.getMessage) }",
-    ),
-    (
-        "finally",
-        "Keyword",
-        "a block that runs on both the normal and the exceptional exit of a `try`, before the exception continues unwinding",
-        "try { println(1) } finally { println(\"done\") }   // => 1 done",
-    ),
-    (
-        "throw",
-        "Keyword",
-        "raise an exception; an expression (type `Nothing`), so it may appear in operand position",
-        "def pick(b: Boolean): Int = if (b) 7 else throw new RuntimeException(\"no\")",
-    ),
-    (
-        "true",
-        "Keyword",
-        "the Boolean true literal",
-        "println(true && false)   // => false",
-    ),
-    (
-        "false",
-        "Keyword",
-        "the Boolean false literal",
-        "println(false || true)   // => true",
-    ),
-    (
-        "null",
-        "Keyword",
-        "the null reference literal; prints as `null`",
-        "val x = null\nprintln(x)   // => null",
-    ),
-    // ── Contextual (parser-recognized in position) ──
-    (
-        "with",
-        "Contextual",
-        "mix another supertype into a `class`/`trait`: `extends P with T1 with T2`. Method lookup is self, then the parents right-to-left",
-        "trait L { def tag = \"L\" }\nclass R extends L\nprintln(new R().tag)   // => L",
-    ),
-    (
-        "override",
-        "Contextual",
-        "replace a supertype's concrete member; the call dispatches on the receiver's runtime class",
-        "class A { def f = 1 }\nclass B extends A { override def f = 2 }\nval a: A = new B()\nprintln(a.f)   // => 2",
-    ),
-    (
-        "super",
-        "Contextual",
-        "call the supertype's implementation of a member, skipping this type in the linearization",
-        "class A { def f = \"a\" }\nclass B extends A { override def f = super.f + \"b\" }\nprintln(new B().f)   // => ab",
-    ),
-    (
-        "isInstanceOf",
-        "Contextual",
-        "runtime type test against the registered class hierarchy; the same test `case x: T =>` performs",
-        "trait S; class C extends S\nprintln(new C().isInstanceOf[S])   // => true",
-    ),
-    (
-        "until",
-        "Contextual",
-        "exclusive range bound: `a until b` is the values a..b-1, as a `for` generator or as a first-class `Range`",
-        "for (i <- 0 until 3) print(i)   // => 012",
-    ),
-    (
-        "to",
-        "Contextual",
-        "inclusive range bound: `a to b` is the values a..b, as a `for` generator or as a first-class `Range`",
-        "println((1 to 3).sum)   // => 6",
-    ),
-    (
-        "by",
-        "Contextual",
-        "range step: `a until b by s`; a negative step counts down, and a zero step throws `IllegalArgumentException`",
-        "for (i <- 10 to 1 by -3) print(i + \" \")   // => 10 7 4 1",
-    ),
-    (
-        "Array",
-        "Contextual",
-        "the mutable sequence: `Array(a, b)`, `new Array[T](n)` (zero-filled), `a(i)` reads and `a(i) = v` writes",
-        "val a = Array(1, 2, 3)\na(1) = 9\nprintln(a.mkString(\",\"))   // => 1,9,3",
-    ),
-    (
-        "yield",
-        "Contextual",
-        "collect a `for` comprehension's body for each binding instead of running it for effect; a range generator yields a `Vector`, a collection generator the source's own kind",
-        "println(for (x <- List(1, 2, 3) if x > 1) yield x * 10)   // => List(20, 30)",
-    ),
-    (
-        "List",
-        "Contextual",
-        "the default immutable sequence (`Seq` is an alias for it): `List(a, b)`, `Nil`, `::` cons, indexing `xs(i)`, and the combinator set (`map`, `filter`, `flatMap`, `foldLeft`, `sorted`, `zip`, `groupBy`, `mkString`, …)",
-        "println(List(3, 1, 2).sorted.map(_ * 2))   // => List(2, 4, 6)",
-    ),
-    (
-        "Vector",
-        "Contextual",
-        "the immutable indexed sequence (`IndexedSeq` is an alias for it); the same combinators as `List`, and what a range comprehension yields",
-        "println(Vector(1, 2, 3).map(_ + 1))   // => Vector(2, 3, 4)",
-    ),
-    (
-        "Set",
-        "Contextual",
-        "the immutable set: duplicates dropped, `+`/`-`/`++`/`union`/`intersect`/`diff`/`subsetOf`. Up to four elements it prints in insertion order; beyond that it is a `HashSet` printed in hash-trie order",
-        "println(Set(3, 1, 2))\nprintln(Set(9, 3, 1, 2, 7))   // => Set(3, 1, 2) then HashSet(1, 9, 2, 7, 3)",
-    ),
-    (
-        "Map",
-        "Contextual",
-        "the immutable map of `k -> v` pairs: `apply`/`get`/`getOrElse`/`contains`/`keys`/`values`/`updated`/`+`/`-`. Up to four entries it prints in insertion order; beyond that it is a `HashMap` printed in hash-trie order",
-        "val m = Map(\"a\" -> 1, \"b\" -> 2)\nprintln(m.getOrElse(\"z\", 0))   // => 0",
-    ),
-    (
-        "mutable",
-        "Contextual",
-        "the `scala.collection.mutable` package: `mutable.ListBuffer`, `mutable.ArrayBuffer`, `mutable.Set` and `mutable.Map`, mutated with `+=`/`-=`/`++=`/`--=`. A mutable `Set`/`Map` prints `HashSet(…)`/`HashMap(…)` at every size, in its hash table's iteration order",
-        "val s = mutable.Set(1, 2, 3)\ns += 4\nprintln(s)   // => HashSet(1, 2, 3, 4)",
-    ),
-    (
-        "ListBuffer",
-        "Contextual",
-        "the growable `scala.collection.mutable` sequence: `+=`, `++=`, `-=`, `append`, `prepend`, `insert`, `remove`, `clear`, `b(i) = v`, plus every `List` combinator. A derived collection is another `ListBuffer`",
-        "val b = mutable.ListBuffer(1, 2)\nb += 3\nprintln(b)   // => ListBuffer(1, 2, 3)",
-    ),
-    (
-        "ArrayBuffer",
-        "Contextual",
-        "the growable indexed `scala.collection.mutable` sequence (`Buffer` is an alias); the same mutators and combinators as `ListBuffer`, printed `ArrayBuffer(…)`",
-        "val a = mutable.ArrayBuffer(1, 2)\na ++= List(3, 4)\nprintln(a)   // => ArrayBuffer(1, 2, 3, 4)",
-    ),
-    (
-        "PartialFunction",
-        "Contextual",
-        "a function defined only on some arguments — what a `{ case … }` literal builds. Besides `apply` it answers `isDefinedAt`, which is what `collect`/`collectFirst` use to skip a non-matching element; `applyOrElse`, `lift`, `orElse`, `andThen` and `compose` compose them",
-        "val pf: PartialFunction[Int, String] = { case 1 => \"one\" }\nprintln(pf.isDefinedAt(2))   // => false\nprintln(pf.lift(1))          // => Some(one)",
-    ),
-    (
-        "collect",
-        "Contextual",
-        "`filter` and `map` in one pass over a partial function: an element the function is not defined at is skipped instead of raising `MatchError`, and the arm body never runs for it. `collectFirst` answers the first result as an `Option`",
-        "println(List(1, 2, 3, 4).collect { case x if x % 2 == 0 => x * 10 })   // => List(20, 40)",
-    ),
-    (
-        "Nil",
-        "Contextual",
-        "the empty `List`; the tail a `::` chain terminates with",
-        "println(1 :: 2 :: Nil)   // => List(1, 2)",
-    ),
-    (
-        "math",
-        "Contextual",
-        "the `scala.math` module (also spelled `scala.math`, `Math`, `java.lang.Math`): `abs`, `min`/`max`, `sqrt`, `pow`, `floor`/`ceil`/`round`, the trig family, `Pi`, `E`",
-        "println(math.sqrt(16.0))   // => 4.0",
-    ),
-    (
-        "App",
-        "Contextual",
-        "the mixin whose object body scalars runs directly as the program",
-        "object T extends App { println(\"hi\") }",
-    ),
-    (
-        "main",
-        "Contextual",
-        "the entry method scalars runs: `def main(args: Array[String]): Unit`",
-        "def main(args: Array[String]): Unit = { println(0) }",
-    ),
-    (
-        "package",
-        "Contextual",
-        "a package prologue line; scalars skips it and runs the object entry",
-        "package demo\nobject T extends App { println(1) }",
-    ),
-    (
-        "import",
-        "Contextual",
-        "an import prologue line; tolerated and ignored (imports are skipped, not tracked)",
-        "import scala.math._\nobject T extends App { println(1) }",
-    ),
-    // ── Predef (print builtins in host.rs) ──
-    (
-        "println",
-        "Predef",
-        "print one Scala-formatted argument followed by a newline; returns Unit",
-        "println(3.0)   // prints 3.0",
-    ),
-    (
-        "print",
-        "Predef",
-        "print one Scala-formatted argument with no trailing newline",
-        "print(\"a\"); print(\"b\")   // prints ab",
-    ),
-    // ── Operator (lowered to a fusevm op or the numeric hook) ──
-    (
-        "+",
-        "Operator",
-        "numeric addition, or String concatenation when either operand is a String",
-        "println(\"n=\" + 41)   // => n=41",
-    ),
-    (
-        "/",
-        "Operator",
-        "division: truncating for two Ints (`7/2==3`), floating if either is a Double",
-        "println(7 / 2); println(7 / 2.0)   // => 3 then 3.5",
-    ),
-    (
-        "%",
-        "Operator",
-        "remainder of integer division",
-        "println(7 % 3)   // => 1",
-    ),
-    (
-        "==",
-        "Operator",
-        "structural equality (Scala `==` is value `equals`, so strings compare by content)",
-        "println(\"a\" == \"a\")   // => true",
-    ),
-    (
-        "&&",
-        "Operator",
-        "short-circuiting logical AND",
-        "println(true && false)   // => false",
-    ),
-    (
-        "||",
-        "Operator",
-        "short-circuiting logical OR",
-        "println(false || true)   // => true",
-    ),
-    (
-        "&",
-        "Operator",
-        "bitwise AND on `Int`, non-short-circuiting AND on `Boolean`, intersection on `Set`. It binds tighter than `^` and `|` (and `&~` is set difference)",
-        "println(6 & 3)                     // => 2\nprintln(Set(1, 2, 3) & Set(2, 3, 4))   // => Set(2, 3)",
-    ),
-    (
-        "|",
-        "Operator",
-        "bitwise OR on `Int`, non-short-circuiting OR on `Boolean`, union on `Set`. The loosest-binding symbolic operator, which is where `||` gets its precedence",
-        "println(6 | 3)   // => 7\nprintln(5 & 3 | 2)   // => 3",
-    ),
-    (
-        "^",
-        "Operator",
-        "bitwise XOR on `Int`, exclusive OR on `Boolean`. Binds between `|` and `&`",
-        "println(6 ^ 3)   // => 5",
-    ),
-    (
-        "~",
-        "Operator",
-        "bitwise complement of an `Int` (`unary_~`). Parenthesize a negative operand — Scala lexes `~-` as one operator name",
-        "println(~(6))   // => -7",
-    ),
-    (
-        "<<",
-        "Operator",
-        "left shift, evaluated at `Int` width: the distance masks to five bits and the result wraps at 32 bits, so `1 << 33` is `2`. `>>` is the arithmetic right shift and `>>>` the logical one",
-        "println(1 << 4)     // => 16\nprintln(-16 >>> 2)   // => 1073741820",
-    ),
-];
+/// The language-reference corpus lives in [`crate::corpus`] — the single
+/// source of truth for LSP completion, LSP hover, and the generated
+/// `docs/reference.html`. A name appears there only if the runtime resolves it,
+/// so the language server and the static reference never drift from what
+/// `scala` can run.
+use crate::corpus::{Entry, CORPUS};
 
-/// The keyword/Predef corpus, exposed for offline doc generation.
-pub fn corpus() -> &'static [(&'static str, &'static str, &'static str, &'static str)] {
+/// The reference corpus, exposed for offline doc generation.
+pub fn corpus() -> &'static [Entry] {
     CORPUS
 }
 
@@ -510,10 +161,15 @@ fn completions() -> CompletionResponse {
         .map(|(name, chapter, doc, _example)| CompletionItem {
             label: name.to_string(),
             kind: Some(match *chapter {
-                "Keyword" => CompletionItemKind::KEYWORD,
-                "Predef" => CompletionItemKind::FUNCTION,
-                "Operator" => CompletionItemKind::OPERATOR,
-                _ => CompletionItemKind::CONSTANT,
+                "Keywords" | "Declarations and Modifiers" | "Comprehensions and Ranges"
+                | "Pattern Matching" => CompletionItemKind::KEYWORD,
+                "Operators" => CompletionItemKind::OPERATOR,
+                "Collection Constructors" | "Throwables" => CompletionItemKind::CLASS,
+                "Predef and Interpolation" | "Function Values" | "scala.math" => {
+                    CompletionItemKind::FUNCTION
+                }
+                // Every remaining chapter is a method surface on a receiver.
+                _ => CompletionItemKind::METHOD,
             }),
             detail: Some((*doc).to_string()),
             ..Default::default()
@@ -537,8 +193,7 @@ fn hover(docs: &Docs, params: &HoverParams) -> Hover {
         .and_then(|text| word_at(text, pos))
         .unwrap_or_default();
 
-    let matches: Vec<&(&str, &str, &str, &str)> =
-        CORPUS.iter().filter(|(name, ..)| *name == word).collect();
+    let matches: Vec<&Entry> = CORPUS.iter().filter(|(name, ..)| *name == word).collect();
 
     let body = if matches.is_empty() {
         "**scalars** — Scala on the fusevm bytecode VM + Cranelift JIT.".to_string()
