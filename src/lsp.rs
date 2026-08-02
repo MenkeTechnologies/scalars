@@ -161,7 +161,9 @@ fn completions() -> CompletionResponse {
         .map(|(name, chapter, doc, _example)| CompletionItem {
             label: name.to_string(),
             kind: Some(match *chapter {
-                "Keywords" | "Declarations and Modifiers" | "Comprehensions and Ranges"
+                "Keywords"
+                | "Declarations and Modifiers"
+                | "Comprehensions and Ranges"
                 | "Pattern Matching" => CompletionItemKind::KEYWORD,
                 "Operators" => CompletionItemKind::OPERATOR,
                 "Collection Constructors" | "Throwables" => CompletionItemKind::CLASS,
