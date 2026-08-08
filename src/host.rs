@@ -223,6 +223,18 @@ pub const NLR_RAISE: u16 = 746;
 /// value is a non-local return, clear it and push its payload; otherwise push
 /// `Undef` and leave a real exception in flight to keep unwinding.
 pub const NLR_TAKE: u16 = 747;
+/// Builtin id for boxing a `var` that a closure mutates: pops the initial value
+/// and answers a one-slot heap CELL holding it. A closure captures the cell
+/// handle by value, so a write through it is visible in the frame that declared
+/// the `var` — Scala's own lowering of a captured mutable local
+/// (`scala.runtime.IntRef` and friends). Emitted only for the vars
+/// `compiler::boxed_vars` finds; every other local keeps its plain frame slot.
+pub const CELL_NEW: u16 = 748;
+/// Builtin id for reading a boxed `var`: pops the cell handle, pushes its value.
+pub const CELL_GET: u16 = 749;
+/// Builtin id for writing a boxed `var`: pops the cell handle (top) and then the
+/// value, stores it, and answers `Unit`.
+pub const CELL_SET: u16 = 750;
 
 thread_local! {
     /// `type name → (linearized supertypes, primary-constructor arity)`,
@@ -361,6 +373,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_OPTION, b_make_option);
     vm.register_builtin(NLR_RAISE, b_nlr_raise);
     vm.register_builtin(NLR_TAKE, b_nlr_take);
+    vm.register_builtin(CELL_NEW, b_cell_new);
+    vm.register_builtin(CELL_GET, b_cell_get);
+    vm.register_builtin(CELL_SET, b_cell_set);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -726,6 +741,21 @@ enum HeapVal {
     /// A built-in throwable (`new RuntimeException("…")`, or one raised by the
     /// runtime itself) — see [`ExcObj`].
     Exc(ExcObj),
+    /// A `scala.util.matching.Regex` (`"…".r`). The *source* pattern is stored,
+    /// which is what `toString`/`regex` answer; the compiled automaton lives in
+    /// the [`REGEX_CACHE`] keyed by that source.
+    Regex(Arc<str>),
+    /// One `Regex.Match` — the matched text plus its capture groups (`None` for
+    /// a group that did not participate). `toString` is the matched text, as
+    /// `java.util.regex.Matcher.group()` is.
+    Match {
+        matched: Arc<str>,
+        groups: Vec<Option<Arc<str>>>,
+    },
+    /// A boxed `var` — one mutable slot shared by the frame that declared it and
+    /// every closure that captured it (see [`CELL_NEW`]). Never user-visible: the
+    /// compiler emits a `CELL_GET`/`CELL_SET` around every access.
+    Cell(Value),
 }
 
 /// Which representation an immutable `Set`/`Map` has. Scala's factories return
@@ -756,6 +786,10 @@ enum SeqKind {
     /// `HashSet` (see [`HashRep`]).
     Set(HashRep),
     Iterable,
+    /// `scala.collection.immutable.ArraySeq` — the `IndexedSeq` a `StringOps`
+    /// combinator answers when its function's result type is not `Char`
+    /// (`"abc".map(_.toInt)` is an `ArraySeq`, not a `Vector`).
+    ArraySeq,
     /// A mutable `Array`: the only sequence kind that answers `update`.
     Array,
     /// `scala.collection.mutable.ListBuffer` — a growable sequence.
@@ -782,6 +816,7 @@ impl SeqKind {
             SeqKind::Set(HashRep::Small) => "Set",
             SeqKind::Set(HashRep::Hashed | HashRep::Mutable(_)) => "HashSet",
             SeqKind::Iterable => "Iterable",
+            SeqKind::ArraySeq => "ArraySeq",
             SeqKind::Array => "Array",
             SeqKind::ListBuffer => "ListBuffer",
             SeqKind::ArrayBuffer => "ArrayBuffer",
@@ -902,6 +937,12 @@ struct Closure {
     /// `Map.map`/`Map.collect` produced **no** results, where the run-time shape
     /// of the results cannot pick the builder.
     pair_body: bool,
+    /// Whether every value the body can answer is statically a `String` rather
+    /// than a `Char` (see `compiler::yields_strings`). `String.map` picks its
+    /// result type from Scala's `Char => Char` vs `Char => B` overload split,
+    /// which the run-time results cannot distinguish for a body like
+    /// `_.toString` — a one-char `String` either way.
+    string_body: bool,
 }
 
 /// A function value composed from other function values. There is no compiled
@@ -946,6 +987,7 @@ thread_local! {
 /// Clear the object arena. Called by the runner before each program run.
 pub fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
+    reset_regex_cache();
 }
 
 /// Allocate `o` in the arena and return its `Value::Obj` handle.
@@ -1201,7 +1243,10 @@ fn make_closure(vm: &mut VM, argc: u8, partial: bool) -> Value {
     }
     captures.reverse();
     let defined_idx = partial.then(|| vm.pop().to_int() as u16);
-    let pair_body = vm.pop().to_int() != 0;
+    // One packed operand carries every compile-time fact about the body (see
+    // `compiler::body_flags`), so adding a fact does not change the closure's
+    // operand layout.
+    let flags = vm.pop().to_int();
     let params = vm.pop().to_int() as u8;
     let name_idx = vm.pop().to_int() as u16;
     heap_push(HeapVal::Closure(Closure {
@@ -1209,7 +1254,8 @@ fn make_closure(vm: &mut VM, argc: u8, partial: bool) -> Value {
         params,
         captures,
         defined_idx,
-        pair_body,
+        pair_body: flags & 1 != 0,
+        string_body: flags & 2 != 0,
     }))
 }
 
@@ -1308,6 +1354,38 @@ fn b_nlr_take(_vm: &mut VM, _argc: u8) -> Value {
     ctl.and_then(|v| with_obj(&v, |o| o.fields.first().map(|(_, v)| v.clone())))
         .flatten()
         .unwrap_or(Value::Undef)
+}
+
+/// `CELL_NEW` builtin — see [`CELL_NEW`].
+fn b_cell_new(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    heap_push(HeapVal::Cell(v))
+}
+
+/// `CELL_GET` builtin — see [`CELL_GET`].
+fn b_cell_get(vm: &mut VM, _argc: u8) -> Value {
+    let cell = vm.pop();
+    let Value::Obj(id) = cell else {
+        return Value::Undef;
+    };
+    HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HeapVal::Cell(v)) => v.clone(),
+        _ => Value::Undef,
+    })
+}
+
+/// `CELL_SET` builtin — see [`CELL_SET`].
+fn b_cell_set(vm: &mut VM, _argc: u8) -> Value {
+    let cell = vm.pop();
+    let v = vm.pop();
+    if let Value::Obj(id) = cell {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Cell(slot)) = h.borrow_mut().get_mut(id as usize) {
+                *slot = v;
+            }
+        });
+    }
+    Value::Undef
 }
 
 /// `MAKE_OPTION` builtin — see [`MAKE_OPTION`].
@@ -1771,6 +1849,14 @@ fn obj_to_string(v: &Value) -> String {
             // `andThen`/`compose` all build a `Function1`).
             Some(HeapVal::Derived(_)) => "<function1>".to_string(),
             Some(HeapVal::Exc(e)) => exc_to_string(e),
+            // `Regex.toString` is the source pattern; `Match.toString` is the
+            // matched text (both as in Scala/`java.util.regex`).
+            Some(HeapVal::Regex(p)) => p.to_string(),
+            Some(HeapVal::Match { matched, .. }) => matched.to_string(),
+            // A boxed `var` is compiler-internal — every access goes through
+            // `CELL_GET`/`CELL_SET`, so a cell handle never reaches user code.
+            // Rendering the value it holds keeps a diagnostic dump readable.
+            Some(HeapVal::Cell(v)) => scala_str(v),
             None => "null".to_string(),
         }
     })
@@ -2600,6 +2686,10 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 HeapVal::Closure(_) | HeapVal::Derived(_) => 3,
                 HeapVal::Record(_) => 4,
                 HeapVal::Exc(_) => 5,
+                // A `Regex`/`Regex.Match` is answered by `regex_method` before
+                // any of the routed dispatchers, so it needs no kind of its own.
+                HeapVal::Regex(_) | HeapVal::Match { .. } => 6,
+                HeapVal::Cell(_) => 7,
             })
         })
     } else {
@@ -4338,6 +4428,20 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     if name == "toString" && args.is_empty() {
         return Ok(Value::str(scala_str(recv)));
     }
+    // A `Regex`/`Regex.Match` handle is not a record, so it is answered before
+    // the record dispatcher below.
+    if let Some(r) = regex_method(recv, name, args) {
+        return r;
+    }
+    // Scala's operators ARE methods, so the dotted spelling (`n.+(1)`, `"a".*(3)`)
+    // is legal wherever the infix one is. Only the primitive receivers route here:
+    // `+`/`-` on a `Set`/`Map` mean set inclusion/removal and stay with the
+    // collection dispatcher below.
+    if matches!(recv, Value::Str(_) | Value::Int(_) | Value::Float(_)) {
+        if let Some(r) = operator_method(recv, name, args) {
+            return r;
+        }
+    }
     match recv {
         Value::Str(s) => string_method(s, name, args),
         Value::Int(n) => int_method(*n, name, args),
@@ -4346,6 +4450,77 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         Value::Obj(_) => obj_method(recv, name, args),
         _ => Err(no_such_method(recv, name)),
     }
+}
+
+/// The dotted spelling of a binary operator on a primitive receiver — `n.+(1)`,
+/// `x./(2)`, `"a".*(3)`, `a.<(b)`. `None` when `name` is not one (so ordinary
+/// method dispatch continues), which is also the answer for a recognized
+/// operator at the wrong arity.
+///
+/// The semantics are the infix ones exactly: `/` truncates for two `Int`s and
+/// throws on an integer zero divisor (see [`b_div`]), `+` concatenates when
+/// either side is a `String` (Scala 3 has no universal `any2stringadd`, and one
+/// side here is always primitive), and `*` on a `String` repeats it.
+fn operator_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    const OPS: &[&str] = &["+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!="];
+    if !OPS.contains(&name) || args.len() != 1 {
+        return None;
+    }
+    let b = &args[0];
+    let both_int = matches!((recv, b), (Value::Int(_), Value::Int(_)));
+    Some(match name {
+        "==" => Ok(Value::bool(scala_eq(recv, b))),
+        "!=" => Ok(Value::bool(!scala_eq(recv, b))),
+        // A `String` receiver compares lexicographically; anything else compares
+        // as a number, where an IEEE NaN operand correctly makes all four false.
+        "<" | ">" | "<=" | ">=" => Ok(Value::bool(match recv {
+            Value::Str(x) => {
+                let (x, y) = (x.as_str(), b.as_str_cow());
+                match name {
+                    "<" => x < &*y,
+                    ">" => x > &*y,
+                    "<=" => x <= &*y,
+                    _ => x >= &*y,
+                }
+            }
+            _ => {
+                let (x, y) = (recv.to_float(), b.to_float());
+                match name {
+                    "<" => x < y,
+                    ">" => x > y,
+                    "<=" => x <= y,
+                    _ => x >= y,
+                }
+            }
+        })),
+        "*" if matches!(recv, Value::Str(_)) => string_method(&recv.as_str_cow(), "*", args),
+        "+" if matches!(recv, Value::Str(_)) || matches!(b, Value::Str(_)) => {
+            Ok(Value::str(format!("{}{}", scala_str(recv), scala_str(b))))
+        }
+        _ if matches!(recv, Value::Str(_)) => Err(no_such_method(recv, name)),
+        "+" if both_int => Ok(Value::int(recv.to_int().wrapping_add(b.to_int()))),
+        "-" if both_int => Ok(Value::int(recv.to_int().wrapping_sub(b.to_int()))),
+        "*" if both_int => Ok(Value::int(recv.to_int().wrapping_mul(b.to_int()))),
+        "/" if both_int => {
+            if b.to_int() == 0 {
+                Err("scalars: java.lang.ArithmeticException: / by zero".to_string())
+            } else {
+                Ok(Value::int(recv.to_int().wrapping_div(b.to_int())))
+            }
+        }
+        "%" if both_int => {
+            if b.to_int() == 0 {
+                Err("scalars: java.lang.ArithmeticException: / by zero".to_string())
+            } else {
+                Ok(Value::int(recv.to_int().wrapping_rem(b.to_int())))
+            }
+        }
+        "+" => Ok(Value::float(recv.to_float() + b.to_float())),
+        "-" => Ok(Value::float(recv.to_float() - b.to_float())),
+        "*" => Ok(Value::float(recv.to_float() * b.to_float())),
+        "/" => Ok(Value::float(recv.to_float() / b.to_float())),
+        _ => Ok(Value::float(recv.to_float() % b.to_float())),
+    })
 }
 
 /// `String` methods (a faithful subset of `java.lang.String` / Scala
@@ -4361,14 +4536,24 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("toLowerCase", 0) => Ok(Value::str(s.to_lowercase())),
         ("trim", 0) => Ok(Value::str(s.trim())),
         ("concat", 1) => Ok(Value::str(format!("{s}{}", args[0].as_str_cow()))),
-        // Scala.s `String.split` answers an `Array[String]`.
-        ("split", 1) => Ok(new_seq(
-            SeqKind::Array,
-            s.split(&*args[0].as_str_cow()).map(Value::str).collect(),
-        )),
-        ("toList" | "toSeq", 0) => Ok(new_list(
+        // `String.split` answers an `Array[String]`, and its separator is a
+        // REGEX (`java.lang.String.split`), not a literal — see [`java_split`].
+        ("split", 1) => java_split(s, &args[0].as_str_cow())
+            .map(|parts| new_seq(SeqKind::Array, parts.into_iter().map(Value::str).collect())),
+        // The `java.util.regex` surface of `String`.
+        ("matches", 1) => regex_full_match(&args[0].as_str_cow(), s),
+        ("replaceAll", 2) => regex_replace(s, &args[0].as_str_cow(), &args[1].as_str_cow(), false),
+        ("replaceFirst", 2) => regex_replace(s, &args[0].as_str_cow(), &args[1].as_str_cow(), true),
+        // `"…".r` — `StringOps.r`, the `scala.util.matching.Regex` builder.
+        ("r", 0) => Ok(heap_push(HeapVal::Regex(Arc::from(s)))),
+        ("toList", 0) => Ok(new_list(
             s.chars().map(|c| Value::str(c.to_string())).collect(),
         )),
+        // `"abc".toSeq` is a `WrappedString` — a VIEW of the same characters,
+        // which prints as the string itself (`abc`, not `List(a, b, c)`) and
+        // answers every `Seq` operation through `StringOps`. The string is
+        // exactly that view here.
+        ("toSeq", 0) => Ok(Value::str(s)),
         ("reverse", 0) => Ok(Value::str(s.chars().rev().collect::<String>())),
         ("toInt", 0) => s.trim().parse::<i64>().map(Value::int).map_err(|_| {
             format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
@@ -4544,6 +4729,294 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
     }
 }
 
+// ── regular expressions (`java.util.regex` / `scala.util.matching`) ─────────
+
+thread_local! {
+    /// Compiled patterns, keyed by source. `String.matches` inside a loop
+    /// recompiles nothing, matching the JDK's own `Pattern` caching in
+    /// `String.matches`/`split` well enough to keep the cost off the hot path.
+    static REGEX_CACHE: RefCell<HashMap<String, Arc<fancy_regex::Regex>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Compile (or fetch) `pat`. An invalid pattern answers Java's
+/// `PatternSyntaxException`, which a Scala program can catch.
+fn regex_compile(pat: &str) -> Result<Arc<fancy_regex::Regex>, String> {
+    REGEX_CACHE.with(|c| {
+        if let Some(r) = c.borrow().get(pat) {
+            return Ok(r.clone());
+        }
+        match fancy_regex::Regex::new(pat) {
+            Ok(r) => {
+                let r = Arc::new(r);
+                c.borrow_mut().insert(pat.to_string(), r.clone());
+                Ok(r)
+            }
+            Err(e) => Err(format!(
+                "scalars: java.util.regex.PatternSyntaxException: {e}"
+            )),
+        }
+    })
+}
+
+/// Clear the compiled-pattern cache. Called by [`reset_heap`] so a process
+/// running several programs (the library `run_str` path) does not accumulate
+/// every pattern every program ever compiled.
+fn reset_regex_cache() {
+    REGEX_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+/// Every match of `re` in `s`, as `(start, end)` byte ranges, iterated by
+/// `java.util.regex.Matcher.find`'s rule rather than the `regex` crate's.
+///
+/// The two differ after a non-empty match: Java resumes the search AT the
+/// previous match's end, so an empty match is allowed there (`"xx9".split("x*")`
+/// is `["", "", "9"]` because `x*` matches `xx`, then the empty string at index
+/// 2), while Rust's iterator skips an empty match adjacent to the previous one.
+/// Java only skips forward a character when the previous match was ITSELF empty,
+/// which is what stops the scan spinning.
+///
+/// A failed step ends the scan (`fancy_regex`'s backtracking engine can hit a
+/// step limit), which is the same observable answer as "no further match".
+fn regex_matches(re: &fancy_regex::Regex, s: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos <= s.len() {
+        let Ok(Some(m)) = re.find_from_pos(s, pos) else {
+            break;
+        };
+        let (a, b) = (m.start(), m.end());
+        out.push((a, b));
+        pos = if a == b {
+            // Empty match: step one whole character so the next search cannot
+            // return the same position (and stays on a UTF-8 boundary).
+            b + s[b..].chars().next().map_or(1, char::len_utf8)
+        } else {
+            b
+        };
+    }
+    out
+}
+
+/// Expand a `java.util.regex.Matcher` replacement string against one match:
+/// `$N` splices capture group `N` (Java takes the longest group number that
+/// exists), `\x` is a literal `x`, and everything else is copied through. A
+/// reference to a group the pattern does not have throws, as Java's does; a
+/// group that exists but did not participate splices nothing.
+fn expand_replacement(repl: &str, caps: &fancy_regex::Captures) -> Result<String, String> {
+    let mut out = String::new();
+    let mut it = repl.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                if let Some(esc) = it.next() {
+                    out.push(esc);
+                }
+            }
+            '$' if it.peek().is_some_and(char::is_ascii_digit) => {
+                // Java grows the group number while the longer number is still a
+                // real group, so `$12` is group 12 when it exists and group 1
+                // followed by `2` when it does not.
+                let mut n = 0usize;
+                while let Some(d) = it.peek().and_then(|c| c.to_digit(10)) {
+                    let wider = n * 10 + d as usize;
+                    if n > 0 && wider >= caps.len() {
+                        break;
+                    }
+                    n = wider;
+                    it.next();
+                }
+                if n >= caps.len() {
+                    return Err(format!(
+                        "scalars: java.lang.IndexOutOfBoundsException: No group {n}"
+                    ));
+                }
+                if let Some(g) = caps.get(n) {
+                    out.push_str(g.as_str());
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// `Matcher.replaceAll` / `replaceFirst`: substitute `repl` (with its `$N` group
+/// splices) for each match, or only the first.
+fn regex_replace(s: &str, pat: &str, repl: &str, first_only: bool) -> Result<Value, String> {
+    let re = regex_compile(pat)?;
+    let mut out = String::new();
+    let mut last = 0;
+    for (start, end) in regex_matches(&re, s) {
+        // Re-run the match at its own offset to recover the capture groups the
+        // replacement may splice in.
+        let caps = match re.captures_from_pos(s, start) {
+            Ok(Some(c)) => c,
+            _ => continue,
+        };
+        out.push_str(&s[last..start]);
+        out.push_str(&expand_replacement(repl, &caps)?);
+        last = end;
+        if first_only {
+            break;
+        }
+    }
+    out.push_str(&s[last..]);
+    Ok(Value::str(out))
+}
+
+/// `java.util.regex.Pattern.split` with the default limit of 0, ported: split on
+/// every match, drop the empty leading substring a zero-width match at position
+/// 0 would produce, and then drop every TRAILING empty substring.
+///
+/// `String.split` is regex-based in Java (and so in Scala), which is why
+/// `"a.b".split(".")` answers an empty array rather than `[a, b]`.
+fn java_split(s: &str, pat: &str) -> Result<Vec<String>, String> {
+    let re = regex_compile(pat)?;
+    let mut parts: Vec<String> = Vec::new();
+    let mut index = 0;
+    for (start, end) in regex_matches(&re, s) {
+        if index == 0 && start == 0 && end == 0 {
+            continue;
+        }
+        parts.push(s[index..start].to_string());
+        index = end;
+    }
+    // No match consumed anything: the input is the single field.
+    if index == 0 {
+        return Ok(vec![s.to_string()]);
+    }
+    parts.push(s[index..].to_string());
+    while parts.last().is_some_and(String::is_empty) {
+        parts.pop();
+    }
+    Ok(parts)
+}
+
+/// Build the `Regex.Match` handle for the match of `re` starting at `start`.
+fn make_match(re: &fancy_regex::Regex, s: &str, start: usize) -> Value {
+    let Ok(Some(caps)) = re.captures_from_pos(s, start) else {
+        return Value::Undef;
+    };
+    let matched: Arc<str> = Arc::from(caps.get(0).map_or("", |m| m.as_str()));
+    let groups = (1..caps.len())
+        .map(|i| caps.get(i).map(|g| Arc::from(g.as_str())))
+        .collect();
+    heap_push(HeapVal::Match { matched, groups })
+}
+
+/// The `scala.util.matching.Regex` / `Regex.Match` surface, dispatched off a
+/// heap handle. `None` when `recv` is neither (so ordinary object dispatch
+/// continues).
+fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let Value::Obj(id) = recv else { return None };
+    let held = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::Regex(p)) => Some(Ok(p.clone())),
+        Some(HeapVal::Match { matched, groups }) => Some(Err((matched.clone(), groups.clone()))),
+        _ => None,
+    })?;
+    let pat = match held {
+        Ok(p) => p,
+        // A `Match`: its groups are 1-based, and group 0 is the whole match.
+        Err((matched, groups)) => {
+            return Some(match (name, args.len()) {
+                ("matched" | "toString", 0) => Ok(Value::str(matched.to_string())),
+                ("groupCount", 0) => Ok(Value::int(groups.len() as i64)),
+                ("group", 1) => {
+                    let i = args[0].to_int();
+                    if i == 0 {
+                        Ok(Value::str(matched.to_string()))
+                    } else {
+                        match usize::try_from(i).ok().and_then(|i| groups.get(i - 1)) {
+                            Some(Some(g)) => Ok(Value::str(g.to_string())),
+                            Some(None) => Ok(Value::Undef),
+                            None => Err(format!(
+                                "scalars: java.lang.IndexOutOfBoundsException: No group {i}"
+                            )),
+                        }
+                    }
+                }
+                ("subgroups", 0) => Ok(new_list(
+                    groups
+                        .iter()
+                        .map(|g| match g {
+                            Some(t) => Value::str(t.to_string()),
+                            None => Value::Undef,
+                        })
+                        .collect(),
+                )),
+                _ => Err(no_such_obj_member("Regex.Match", name)),
+            })
+        }
+    };
+    let re = match regex_compile(&pat) {
+        Ok(r) => r,
+        Err(e) => return Some(Err(e)),
+    };
+    let target = || args[0].as_str_cow().into_owned();
+    Some(match (name, args.len()) {
+        ("regex" | "toString", 0) => Ok(Value::str(pat.to_string())),
+        // `Regex.matches` (2.13+) is the anchored test, like `String.matches`.
+        ("matches", 1) => regex_full_match(&pat, &target()),
+        ("findFirstIn", 1) => {
+            let s = target();
+            Ok(match regex_matches(&re, &s).first() {
+                Some(&(a, b)) => make_some(Value::str(&s[a..b])),
+                None => make_none(),
+            })
+        }
+        ("findFirstMatchIn", 1) => {
+            let s = target();
+            Ok(match regex_matches(&re, &s).first() {
+                Some(&(a, _)) => make_some(make_match(&re, &s, a)),
+                None => make_none(),
+            })
+        }
+        // `findAllIn`/`findAllMatchIn` answer a `MatchIterator` in Scala; as
+        // everywhere else in this frontend an iterator is modeled STRICTLY (see
+        // `BUGS.md`), so every downstream consumption matches and only printing
+        // the un-consumed result differs.
+        ("findAllIn", 1) => {
+            let s = target();
+            Ok(new_seq(
+                SeqKind::Iterable,
+                regex_matches(&re, &s)
+                    .into_iter()
+                    .map(|(a, b)| Value::str(&s[a..b]))
+                    .collect(),
+            ))
+        }
+        ("findAllMatchIn", 1) => {
+            let s = target();
+            Ok(new_seq(
+                SeqKind::Iterable,
+                regex_matches(&re, &s)
+                    .into_iter()
+                    .map(|(a, _)| make_match(&re, &s, a))
+                    .collect(),
+            ))
+        }
+        ("replaceAllIn", 2) => regex_replace(&target(), &pat, &args[1].as_str_cow(), false),
+        ("replaceFirstIn", 2) => regex_replace(&target(), &pat, &args[1].as_str_cow(), true),
+        ("split", 1) => java_split(&target(), &pat)
+            .map(|parts| new_seq(SeqKind::Array, parts.into_iter().map(Value::str).collect())),
+        ("unanchored", 0) => Ok(recv.clone()),
+        _ => Err(no_such_obj_member("Regex", name)),
+    })
+}
+
+/// `String.matches` / `Regex.matches` — a whole-input match. Java anchors the
+/// pattern to the entire region rather than searching, so the source is wrapped
+/// in `\A(?:…)\z` (a non-capturing group, so the user's own group numbers are
+/// untouched).
+fn regex_full_match(pat: &str, s: &str) -> Result<Value, String> {
+    // Validate the user's own pattern first, so a syntax error reports the
+    // pattern they wrote rather than the anchored rewrite.
+    regex_compile(pat)?;
+    let re = regex_compile(&format!("\\A(?:{pat})\\z"))?;
+    Ok(Value::bool(re.is_match(s).unwrap_or(false)))
+}
+
 /// Scala/Java `String.substring(begin, end)` — a half-open `char` slice that
 /// throws `StringIndexOutOfBoundsException` for an out-of-range or inverted range.
 fn substring(s: &str, begin: i64, end: i64) -> Result<Value, String> {
@@ -4598,19 +5071,28 @@ fn string_fn_method(
         return None;
     }
     Some(match name {
+        // `StringOps.map` has two overloads: `Char => Char` rebuilds a `String`,
+        // `Char => B` builds an `IndexedSeq[B]`. Scala reads that off the
+        // function's static result type. With `Char` modeled as a one-char
+        // `String` the results alone cannot tell the two apart when `B` is
+        // itself `String` (`_.toString`), so a body whose result is statically a
+        // `String` is flagged at compile time (`compiler::yields_strings`) and
+        // takes the `Char => B` branch; everything else reads the results.
         "map" => {
+            let string_body = as_closure(&args[0]).is_some_and(|c| c.string_body);
             let mut out = Vec::with_capacity(chars.len());
             for c in &chars {
                 out.push(call!(c));
             }
             Ok(
-                if out
-                    .iter()
-                    .all(|v| matches!(v, Value::Str(t) if one_char(t).is_some()))
+                if !string_body
+                    && out
+                        .iter()
+                        .all(|v| matches!(v, Value::Str(t) if one_char(t).is_some()))
                 {
                     join(&out)
                 } else {
-                    new_seq(SeqKind::Vector, out)
+                    new_seq(SeqKind::ArraySeq, out)
                 },
             )
         }
@@ -5073,6 +5555,13 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
                     .filter(|(k, _)| !value_eq(k, b))
                     .collect(),
             ))
+        }
+        // `s * n` — `StringOps.*`, the only non-numeric `*` Scala defines. The
+        // infix form reaches the arithmetic hook (the method form `s.*(n)` goes
+        // straight to `string_method`), so it is answered here with the same
+        // semantics: a count of zero or less answers the empty string.
+        NumOp::Mul if matches!(a, Value::Str(_)) => {
+            string_method(&a.as_str_cow(), "*", std::slice::from_ref(b))
         }
         NumOp::Sub | NumOp::Mul | NumOp::Div | NumOp::Mod | NumOp::Pow => Err(format!(
             "scalars: operator `{op:?}` is not defined for operands `{}` and `{}`",

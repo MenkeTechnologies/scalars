@@ -19,6 +19,47 @@ reported as parse/compile errors, never silently mis-run.
   uniquely renames each block-local `def` and **lambda-lifts** whatever
   enclosing-frame locals its body reads into extra trailing parameters that
   every call site passes; capture sets propagate through calls to a fixpoint.
+- **Type ascription in expression position, and the unit literal.** `(e: T)`
+  parses wherever an expression does (`(None: Option[Int])`, `(xs: Seq[Int])`).
+  The runtime is dynamically typed, so the annotation is dropped — except for a
+  numeric widening, which is observable WITHOUT a type checker and so is
+  performed: `(3: Double)` answers `3.0`, not `3`. `()` is the `Unit` value; it
+  lowers to an empty tuple, which is exactly what Scala prints it as.
+- **A `y = e` value definition in a `for` comprehension.**
+  `for { x <- xs; y = f(x); if y > 0 } yield y`. Over a *range* generator it
+  lowers inline (a store into a loop-body slot, so the counted loop is kept);
+  over a *collection* generator it takes Scala's own translation, which pairs the
+  value onto the generator (`for ((x, y) <- xs.map(x => (x, f(x))))`), so a later
+  guard and the body both see the defined name. A run of definitions nests one
+  more pair each.
+- **Regular expressions (`java.util.regex` / `scala.util.matching`).**
+  `String.matches`/`replaceAll`/`replaceFirst`, and the regex-based
+  `String.split`; `"…".r` building a `Regex` that answers `findFirstIn`,
+  `findAllIn`, `findFirstMatchIn`, `findAllMatchIn`, `replaceAllIn`,
+  `replaceFirstIn`, `matches`, `split` and `regex`; and `Regex.Match` with
+  `group`/`subgroups`/`matched`. A replacement's `$N` splices are Java's,
+  including its "longest group number that exists" rule and its
+  `IndexOutOfBoundsException` for a group the pattern does not have. The match
+  scan follows `java.util.regex.Matcher.find` rather than the Rust iterator: Java
+  resumes AT the previous match's end (so an empty match is allowed there) and
+  only steps forward a character after an empty match — which is what makes
+  `"xx9".split("x*")` answer `["", "", "9"]` and `"abc".split("")` answer
+  `["a", "b", "c"]`. Backed by `fancy-regex`, whose backtracking engine accepts
+  the lookaround and backreferences `java.util.regex` has and the `regex` crate
+  rejects.
+- **A closure that ASSIGNS an enclosing `var`.** `var t = 0;
+  xs.foreach(x => t += x)` inside a `def` reaches the declaring frame. Captures
+  are threaded by value, so such a binding is BOXED into a shared heap cell
+  (`host::CELL_NEW`/`CELL_GET`/`CELL_SET`) exactly as Scala boxes it into a
+  `scala.runtime.IntRef`; the closure captures the cell handle, so the write is
+  shared, and it may outlive the frame (`def mk() = { var i = 0; () => { i += 1;
+  i } }`). Only the vars a closure actually writes are boxed
+  (`compiler::boxed_vars`), so every other local keeps its plain frame slot and a
+  program with no mutating closure emits the bytecode it did before.
+- **Every operator is a method.** `+ - * / % < > <= >= == !=` dispatch the same
+  whether written infix or dotted (`n.+(1)`, `7./(2)`, `"a".*(3)`), including
+  `/`'s Int-vs-Double split and its zero-divisor throw. `s * n` is
+  `StringOps.*` in both spellings.
 - **Postfix method dispatch on core values.** `s.length`/`.size`,
   `.toUpperCase`/`.toLowerCase`, `.trim`, `.reverse`, `.isEmpty`/`.nonEmpty`,
   `.substring`, `.charAt`, `.contains`/`.startsWith`/`.endsWith`,
@@ -257,24 +298,31 @@ reported as parse/compile errors, never silently mis-run.
   above. The `args` parameter of `main` is parsed and ignored.
 - **`case NonFatal(e)` and other extractor patterns in `catch`.** Only
   `case e: Type`, `case _: Type`, `case e` and `case _` arms are modeled.
+- **A constructor pattern as a `for` generator binder.** `for (Some(x) <- opts)`
+  — Scala reads a *refutable* generator pattern as a filter plus a
+  destructuring. A generator binder here is a name or a parenthesized tuple
+  pattern (`for ((k, v) <- m)`), so the constructor form is a parse error.
+  Filter first (`opts.flatten`), or match inside the body.
 - **User exception classes inside the hierarchy.** `class MyErr(m: String)
   extends Exception` can be thrown and caught *by its own name*, but the JDK
   throwables are not part of the registered class hierarchy, so `case e:
   Exception` will not catch it.
-- **Type ascription in expression position.** `(e: T)` and `(None: Option[Int])`
-  are a parse error. Annotate a `val` instead (`val e: Option[Int] = None`).
-- **The unit literal `()`.** `x => ()` and `val u = ()` are a parse error.
-- **A value definition in a `for` comprehension.** `for { x <- xs; y = f(x) }
-  yield y` — the `y = …` enumerator. Rewrite it as a `yield` expression.
 - **`Char` as its own type.** `'a'` lexes to a one-char `String`, so `Char`'s
   predicates and case conversions work but its NUMERIC surface does not:
   `'a'.toInt` answers a `NumberFormatException` rather than `97`, `'a' + 1` is a
-  concatenation rather than `98`, and there is no `.toChar`.
-- **`s * n` on a `String` written as an operator.** The method form
-  `s.*(n)` resolves; the infix `s * 2` reaches fusevm's `Op::Mul`, which has no
-  `String` case, and faults.
-- **Regular expressions.** `matches`, `replaceAll`/`replaceFirst` with a regex,
-  `r"…".r`, and `scala.util.matching`.
+  concatenation rather than `98`, and there is no `.toChar`. This is a
+  *representation* decision in this front end, not a limit of the VM: it needs a
+  value that dispatches as a number for arithmetic and as text for printing,
+  which is a change to how every `String` method here decides its receiver — not
+  something a width-tagged integer would supply. Two consequences are already
+  documented above: `String.map`'s overload split, and `String.toSeq`.
+- **`String.flatMap` and `String.collect`.** The other `StringOps` combinators
+  (`map`/`filter`/`takeWhile`/`partition`/…) are wired; these two are not, and
+  answer "not a member" rather than a wrong result. `String.toVector` likewise.
+- **A `Regex` in a pattern.** `case r(a, b) => …` needs `Regex.unapplySeq`, which
+  is not modeled; use `findFirstMatchIn` and `Match.group` instead. `new
+  Regex(…)` (as opposed to `"…".r`) is also absent, as are named groups
+  (`(?<name>…)` and `${name}` in a replacement).
 - **By-name params, `given`/`using`, `@main` (Scala 3 annotation entry).**
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
@@ -289,15 +337,20 @@ reported as parse/compile errors, never silently mis-run.
   `ClassCastException` and never performs a numeric conversion. A class's
   `val`/private access modifiers are parsed but not enforced (every field is
   reachable).
-- **`String.map`'s result type is decided from the RESULTS.** With `Char` modeled
-  as a one-char `String`, there is no static way to tell Scala's `Char => Char`
-  overload (which answers a `String`) from `Char => B` (which answers an
-  `IndexedSeq`). The rule is: all-one-char results rebuild a `String`, anything
-  else answers a `Vector`. That is right for `s.map(_.toUpper)` and for
-  `s.map(_.toInt)`; the one shape it gets wrong is `s.map(_.toString)`, whose
-  Scala result is a `Vector` of one-char strings and whose result here is a
-  `String`. `filter`/`takeWhile`/`dropWhile`/`partition`/`span` are unaffected —
-  their result is always a `String`.
+- **`String.map`'s result type is decided from the results, plus one
+  compile-time flag.** With `Char` modeled as a one-char `String`, there is no
+  runtime way to tell Scala's `Char => Char` overload (which answers a `String`)
+  from `Char => B` (which answers an `ArraySeq`) when `B` is itself `String`. The
+  rule is: a body whose result is STATICALLY a `String` — a string literal, a
+  concatenation with one, `toString`, `mkString` (`compiler::yields_strings`,
+  carried on the closure next to `yields_pairs`) — answers an `ArraySeq`;
+  otherwise all-one-char results rebuild a `String` and anything else answers an
+  `ArraySeq`. That covers `s.map(_.toUpper)`, `s.map(_.toString)` and
+  `s.map(c => c + "!")`. A body that answers a one-character `String` some OTHER
+  way — a call, a variable — still takes the runtime rule and rebuilds a
+  `String` where Scala would answer an `ArraySeq`.
+  `filter`/`takeWhile`/`dropWhile`/`partition`/`span` are unaffected — their
+  result is always a `String`.
 - **A `catch` arm cannot see a non-local return, even as `Throwable`.** Scala's
   `NonLocalReturnControl` extends `ControlThrowable`, so `case e: Exception`
   misses it but a bare `case e =>` (i.e. `Throwable`) would catch it. Here the
@@ -309,11 +362,18 @@ reported as parse/compile errors, never silently mis-run.
   so the readable form is emitted instead. This is the one place a supported
   construct deliberately diverges; the parity fuzzer therefore never prints a
   bare `Array`.
-- **A local `def` may not *assign* to a binding it captures.** Captures are
-  threaded by value, so a write inside the lifted body could not reach the
-  enclosing frame. It is rejected at compile time ("a captured binding is
-  read-only here") rather than silently lost. Reads see the value at call time,
-  which matches Scala for the `val`s and parameters that make up the common case.
+- **A local `def` may not *assign* to a binding it captures.** A block-local
+  `def` is lambda-LIFTED (its captures become extra parameters), not closed over,
+  so a write inside the lifted body could not reach the enclosing frame. It is
+  rejected at compile time ("a captured binding is read-only here") rather than
+  silently lost. Reads see the value at call time, which matches Scala for the
+  `val`s and parameters that make up the common case. A *lambda* has no such
+  restriction — it captures a boxed cell and its writes are shared (see the
+  closure entry above); only the lifted-`def` path is affected.
+- **`"abc".toSeq` is the string itself.** Scala's is a `WrappedString` view,
+  which prints as `abc` and answers every `Seq` operation through `StringOps`;
+  the string stands in for it. Observably identical except for an equality
+  against a `String`, which Scala answers `false` and this answers `true`.
 - **A subclass constructor parameter that renames a superclass field.** Our
   parser makes every constructor parameter a field, so in `class D(n: String)
   extends A(f(n))` the superclass argument is stored under `A`'s parameter name

@@ -1557,8 +1557,32 @@ pub const CORPUS: &[Entry] = &[
     (
         "split",
         "String Methods",
-        "Split on a literal separator, answering an `Array[String]`. The separator is a plain substring, not a regular expression — this frontend has no regex engine.",
-        "s.split(sep: String): Array[String]\nprintln(\"a-b\".split(\"-\").mkString(\"/\"))   // => a/b",
+        "Split on a REGULAR EXPRESSION, answering an `Array[String]`. `java.lang.String.split`'s rule exactly: trailing empty fields are dropped, and a zero-width match at position 0 produces no leading empty field.",
+        "s.split(regex: String): Array[String]\nprintln(\"a1b22c\".split(\"[0-9]+\").mkString(\"/\"))   // => a/b/c",
+    ),
+    (
+        "matches",
+        "String Methods",
+        "Whether the regular expression matches the WHOLE string (`java.lang.String.matches` anchors both ends, unlike a search).",
+        "s.matches(regex: String): Boolean\nprintln(\"a1\".matches(\"[a-z][0-9]\"))   // => true",
+    ),
+    (
+        "replaceAll",
+        "String Methods",
+        "Replace every match of a regular expression. `$N` in the replacement splices capture group `N`; `\\\\x` is a literal `x`.",
+        "s.replaceAll(regex: String, repl: String): String\nprintln(\"a1b2\".replaceAll(\"[0-9]\", \"#\"))   // => a#b#",
+    ),
+    (
+        "replaceFirst",
+        "String Methods",
+        "As `replaceAll`, but only the first match is replaced.",
+        "s.replaceFirst(regex: String, repl: String): String\nprintln(\"a1b2\".replaceFirst(\"[0-9]\", \"#\"))   // => a#b2",
+    ),
+    (
+        "r",
+        "String Methods",
+        "Compile the string as a `scala.util.matching.Regex`, which answers `findFirstIn`, `findAllIn`, `findFirstMatchIn`, `findAllMatchIn`, `replaceAllIn`, `replaceFirstIn`, `matches`, `split` and `regex`.",
+        "s.r: Regex\nprintln(\"(\\\\d+)\".r.findFirstIn(\"ab12\"))   // => Some(12)",
     ),
     (
         "toList",
@@ -1569,8 +1593,8 @@ pub const CORPUS: &[Entry] = &[
     (
         "toSeq",
         "String Methods",
-        "The characters as a `Seq`, which is the same `List` of one-character strings.",
-        "s.toSeq: List[String]\nprintln(\"ab\".toSeq)   // => List(a, b)",
+        "The characters as a `Seq` — Scala's `WrappedString` view over the same string, which prints as the string itself.",
+        "s.toSeq: Seq[Char]\nprintln(\"ab\".toSeq)   // => ab",
     ),
     (
         "reverse",

@@ -169,6 +169,14 @@ pub enum ForEnum {
     /// `if cond` — a filter that skips the remaining (inner) enumerators when the
     /// condition is false, desugaring to `withFilter`.
     Guard(Expr),
+    /// `y = e` — a value definition. `e` is re-evaluated per binding of the
+    /// generators to its left and `y` is in scope for every enumerator to its
+    /// right and for the body. Over a *range* generator it lowers inline (a store
+    /// into a loop-body slot, keeping the counted loop); over a *collection*
+    /// generator it takes Scala's own translation, which pairs the value onto the
+    /// generator (`for (x <- xs; y = f(x))` becomes `for ((x, y) <- xs.map(x =>
+    /// (x, f(x))))`), so a later guard can see both names.
+    Val { name: String, value: Expr },
 }
 
 /// Compound-assignment operator. `Assign` is a plain `=`.

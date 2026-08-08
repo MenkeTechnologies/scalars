@@ -755,11 +755,204 @@ fn g_strops(r: &mut Rng) -> String {
             format!("{s}.indexWhere(_ == 'b')"),
             format!("{s}.find(_ == 'b')"),
         ]),
-        _ => println_all(&[
+        9 => println_all(&[
             format!("{s}.partition(_ < 'c')"),
             format!("{s}.span(_ != 'b')"),
             format!("{s}.zipWithIndex"),
         ]),
+        // `StringOps.*` — the infix form and the dotted method form of the same
+        // method, plus a count of zero or less (which answers the empty string).
+        10 => println_all(&[
+            format!("{s} * {k}"),
+            format!("{s}.*({k})"),
+            format!("({s} * 2).length"),
+        ]),
+        // `StringOps.map`'s two overloads: a `Char => Char` body rebuilds a
+        // `String`, a `Char => B` one answers an `ArraySeq` — including the
+        // `_.toString` body, whose one-char results are indistinguishable from
+        // `Char`s at run time.
+        11 => println_all(&[
+            format!("{s}.map(_.toString)"),
+            format!("{s}.map(c => c + \"!\")"),
+            format!("{s}.toSeq"),
+        ]),
+        // Every operator is a method: the dotted spelling must answer what the
+        // infix one does, including the `/`-truncation and `+`-concatenation
+        // dispatch.
+        _ => println_all(&[
+            format!("{k}.+({k})"),
+            format!("7./({})", 1 + r.below(4)),
+            format!("{s}.<(\"m\")"),
+        ]),
+    }
+}
+
+/// Type ascription in expression position and the unit literal — the two
+/// parenthesized forms that are neither a grouping nor a tuple.
+///
+/// An ascription is dropped by a dynamically typed runtime except for a numeric
+/// widening, which is observable WITHOUT a type checker (`(3: Double)` prints
+/// `3.0`, not `3`), so both kinds are generated. `()` is Scala's `Unit` value and
+/// prints `()`.
+fn g_ascribe(r: &mut Rng) -> String {
+    let i = *pick(r, INTS);
+    let d = *pick(r, DBLS);
+    let s = *pick(r, &["\"ab\"", "\"\"", "\"Hello\"", "\"a b\""]);
+    match r.below(10) {
+        0 => println_all(&[format!("({i}: Double)"), format!("({i}: Int)")]),
+        1 => println_all(&[format!("({i}: Any)"), format!("({d}: Double)")]),
+        2 => println_all(&[format!("({i}: Double) + 1"), format!("({i}: Long) + 1")]),
+        3 => println_all(&[format!("({s}: String).length"), format!("({s}: Any)")]),
+        4 => format!("println((List({}): Seq[Int]).length)", int_elems(r, 3)),
+        5 => "{ val u = (); println(u); println(()) }".to_string(),
+        6 => "println(() == ())".to_string(),
+        7 => format!("{{ val f = (x: Int) => (); println(f({i})) }}"),
+        8 => "println((None: Option[Int]).isEmpty)".to_string(),
+        _ => format!("println((Some({i}): Option[Int]).getOrElse(0))"),
+    }
+}
+
+/// The `y = e` enumerator of a `for` comprehension, over both lowerings: inline
+/// inside a counted range loop, and Scala's generator-pairing translation over a
+/// collection (where a later `if` guard has to see the defined name too).
+fn g_forval(r: &mut Rng) -> String {
+    let n = 3 + r.below(3) as usize;
+    let xs = format!("List({})", int_elems(r, n));
+    let k = *pick(r, &["1", "2", "3", "-2"]);
+    let lim = *pick(r, &["0", "2", "-3", "10"]);
+    match r.below(10) {
+        0 => format!("println(for {{ x <- {xs}; y = x * {k} }} yield y)"),
+        1 => format!("println(for {{ x <- {xs}; y = x + {k}; if y > {lim} }} yield y)"),
+        2 => format!("println(for {{ x <- {xs}; y = x * {k}; z = y + 1 }} yield x + y + z)"),
+        3 => format!("println(for {{ i <- 1 to {n}; s = i * i }} yield s)"),
+        4 => format!("println(for {{ i <- 1 to {n}; s = i * {k}; if s != 0 }} yield s)"),
+        5 => "{ val mv = Map(\"a\" -> 1, \"b\" -> 2); \
+              println(for { (mk, v) <- mv; d = v * 10 } yield mk + d) }"
+            .to_string(),
+        6 => format!("println(for {{ x <- {xs}; y <- List(1, 2); p = x * y }} yield p)"),
+        7 => format!("for {{ x <- {xs}; y = x - {k} }} println(y)"),
+        8 => format!("for {{ i <- 1 to {n}; s = i + {k}; if s > {lim} }} println(s)"),
+        _ => format!("println(for {{ x <- {xs}; if x > {lim}; y = x * {k} }} yield y)"),
+    }
+}
+
+/// `java.util.regex` through its three Scala doorways: `String.matches`/
+/// `replaceAll`/`replaceFirst`/`split`, the `"…".r` `Regex` object, and its
+/// `Match` groups. `findAllIn` is always CONSUMED (`.toList`/`.mkString`) — the
+/// un-consumed `MatchIterator` is the documented strict-iterator gap.
+fn g_regex(r: &mut Rng) -> String {
+    let s = *pick(
+        r,
+        &[
+            "\"a1b22c\"",
+            "\"2024-01-02\"",
+            "\"hello world\"",
+            "\"\"",
+            "\"abc\"",
+            "\"a,b,,c\"",
+            "\"xx9\"",
+        ],
+    );
+    // Group-free patterns: safe with any replacement that has no `$N`.
+    let plain = *pick(
+        r,
+        &[
+            "\"[0-9]+\"",
+            "\"[a-z]\"",
+            "\"\\\\d\"",
+            "\"\\\\s\"",
+            "\"[abc]\"",
+            "\",\"",
+            "\"x*\"",
+        ],
+    );
+    // Two-group patterns, for the `$1`/`$2` replacement and `Match.group` probes.
+    let grouped = *pick(
+        r,
+        &["\"([a-z])([0-9])\"", "\"(\\\\d)(\\\\d)\"", "\"(a)(b)\""],
+    );
+    let rep = *pick(r, &["\"#\"", "\"\"", "\"-\"", "\"[]\""]);
+    match r.below(12) {
+        0 => println_all(&[
+            format!("{s}.matches({plain})"),
+            format!("{s}.matches(\".*\")"),
+        ]),
+        1 => println_all(&[
+            format!("{s}.replaceAll({plain}, {rep})"),
+            format!("{s}.replaceFirst({plain}, {rep})"),
+        ]),
+        2 => format!("println({s}.split({plain}).toList)"),
+        3 => format!("println({s}.replaceAll({grouped}, \"$2$1\"))"),
+        4 => format!("println({s}.replaceAll({grouped}, \"<$0>\"))"),
+        5 => format!("println({s}.r)"),
+        6 => format!("println({plain}.r.findFirstIn({s}))"),
+        7 => format!("println({plain}.r.findAllIn({s}).toList)"),
+        8 => format!("println({plain}.r.findAllIn({s}).mkString(\"|\"))"),
+        9 => println_all(&[
+            format!("{plain}.r.replaceAllIn({s}, {rep})"),
+            format!("{plain}.r.replaceFirstIn({s}, {rep})"),
+        ]),
+        10 => println_all(&[
+            format!("{plain}.r.matches({s})"),
+            format!("{plain}.r.regex"),
+        ]),
+        _ => format!("println({grouped}.r.findFirstMatchIn({s}).map(_.group(1)))"),
+    }
+}
+
+/// A closure that ASSIGNS a `var` of the frame that declares it — the shape that
+/// only works if the binding is boxed rather than captured by value. The result
+/// is always read back from the enclosing frame, so a write that never arrived
+/// is a divergence rather than a silently discarded one.
+fn g_capture(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let n = 3 + r.below(3) as usize;
+    let xs = format!("List({})", int_elems(r, n));
+    let ws = format!("List({})", str_elems(r, 3));
+    let k = *pick(r, &["1", "2", "3", "-2"]);
+    match r.below(10) {
+        0 => format!(
+            "{{ def c{u}(): Int = {{ var t = 0; {xs}.foreach(x => t += x); t }}; println(c{u}()) }}"
+        ),
+        1 => format!(
+            "{{ def c{u}(): Int = {{ var t = {k}; val add = (x: Int) => {{ t = t * x }}; \
+               add(3); add(5); t }}; println(c{u}()) }}"
+        ),
+        2 => format!(
+            "{{ def c{u}(): String = {{ var s = \"\"; {ws}.foreach(w => s = s + w); s }}; \
+               println(c{u}()) }}"
+        ),
+        3 => format!(
+            "{{ def c{u}(): Int = {{ var t = 0; for (x <- {xs}) {{ t += x * {k} }}; t }}; \
+               println(c{u}()) }}"
+        ),
+        4 => format!(
+            "{{ def c{u}(): Int = {{ var t = 0; {xs}.foreach(a => {xs}.foreach(b => t += a + b)); \
+               t }}; println(c{u}()) }}"
+        ),
+        // A closure that OUTLIVES the frame that declared the `var`.
+        5 => format!(
+            "{{ def mk{u}(): () => Int = {{ var i = {k}; () => {{ i += 1; i }} }}; \
+               val f = mk{u}(); println(f() + \",\" + f() + \",\" + f()) }}"
+        ),
+        6 => format!(
+            "{{ def c{u}(): Int = {{ var t = 0; {xs}.foreach(x => if (x > 0) t += x); t }}; \
+               println(c{u}()) }}"
+        ),
+        7 => format!(
+            "{{ def c{u}(): Int = {{ var t = 0; var n2 = 0; \
+               {xs}.foreach(x => {{ t += x; n2 += 1 }}); t * 100 + n2 }}; println(c{u}()) }}"
+        ),
+        // A `var` the closure writes but the frame reads only afterwards, with a
+        // range comprehension (an inline counted loop) in between.
+        8 => format!(
+            "{{ def c{u}(): Int = {{ var t = 0; for (i <- 1 to {n}) t += i; \
+               {xs}.foreach(x => t += x); t }}; println(c{u}()) }}"
+        ),
+        _ => format!(
+            "{{ def c{u}(): Int = {{ var t = 0; {xs}.map(x => {{ t += 1; x }}); t }}; \
+               println(c{u}()) }}"
+        ),
     }
 }
 
@@ -1404,6 +1597,10 @@ enum Mode {
     CaseClass,
     StrOps,
     Nlr,
+    Ascribe,
+    ForVal,
+    Regex,
+    Capture,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1438,6 +1635,10 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::CaseClass => "caseclass",
         Mode::StrOps => "strops",
         Mode::Nlr => "nlr",
+        Mode::Ascribe => "ascribe",
+        Mode::ForVal => "forval",
+        Mode::Regex => "regex",
+        Mode::Capture => "capture",
     }
 }
 
@@ -1473,6 +1674,10 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "caseclass" => Mode::CaseClass,
         "strops" => Mode::StrOps,
         "nlr" => Mode::Nlr,
+        "ascribe" => Mode::Ascribe,
+        "forval" => Mode::ForVal,
+        "regex" => Mode::Regex,
+        "capture" => Mode::Capture,
         _ => return None,
     })
 }
@@ -1507,6 +1712,10 @@ const CONCRETE: &[Mode] = &[
     Mode::CaseClass,
     Mode::StrOps,
     Mode::Nlr,
+    Mode::Ascribe,
+    Mode::ForVal,
+    Mode::Regex,
+    Mode::Capture,
 ];
 
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
@@ -1545,6 +1754,10 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::CaseClass => g_caseclass(r),
         Mode::StrOps => g_strops(r),
         Mode::Nlr => g_nlr(r),
+        Mode::Ascribe => g_ascribe(r),
+        Mode::ForVal => g_forval(r),
+        Mode::Regex => g_regex(r),
+        Mode::Capture => g_capture(r),
         Mode::All => unreachable!(),
     }
 }

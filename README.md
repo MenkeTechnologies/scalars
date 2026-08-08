@@ -189,11 +189,14 @@ Implemented and checked against the reference `scala`:
   the enclosing-frame locals a local `def` reads are lambda-lifted into extra
   parameters every call site passes (`src/resolve.rs`).
 - **Expressions** — integer / floating / string / char / boolean / `null`
-  literals; the binary operators `+ - * / %`, `== != < > <= >=`, `&& ||`
-  (short-circuiting); unary `-` and `!`; parenthesised grouping; Scala's `+`
-  string concatenation; `Int`-vs-`Double` division dispatch (integer `/ 0`
+  literals and the unit literal `()`; the binary operators `+ - * / %`,
+  `== != < > <= >=`, `&& ||` (short-circuiting); unary `-` and `!`;
+  parenthesised grouping and type ascription (`(e: T)`, with the numeric
+  widening `(3: Double)` actually widening); Scala's `+` string concatenation
+  and `*` string repetition; `Int`-vs-`Double` division dispatch (integer `/ 0`
   throws `ArithmeticException`, floating `/ 0.0` is `Infinity`); `if`/`else` in
-  value position (`val r = if (c) a else b`, including block branches).
+  value position (`val r = if (c) a else b`, including block branches). Every
+  operator is a method, so the dotted spelling works too (`n.+(1)`, `"a".*(3)`).
 - **Exceptions** — `try { … } catch { case e: T [if guard] => … } finally { … }`
   and `throw e`, both value-producing expressions. Handler arms match the JVM
   throwable hierarchy (`case e: Exception` catches an
@@ -238,8 +241,14 @@ Implemented and checked against the reference `scala`:
   form (`_ + 1`, `_ * 2`, `_ + _`). A lambda captures its enclosing frame, so it
   can be stored in a `val`, passed as an argument, returned, and invoked (`f(x)` /
   `f.apply(x)`) — curried closures (`def adder(n: Int): Int => Int = x => x + n`)
-  see their upvalues after the defining frame returns. Modeled as a host-heap
-  closure re-entering the VM to run its body — no fusevm changes.
+  see their upvalues after the defining frame returns. A lambda that ASSIGNS an
+  enclosing `var` (`var t = 0; xs.foreach(x => t += x)`) works: such a binding is
+  boxed into a shared heap cell exactly as Scala boxes it, so the write reaches
+  the declaring frame — and the closure may outlive that frame
+  (`def mk() = { var i = 0; () => { i += 1; i } }`). Only the vars a closure
+  actually writes are boxed, so every other local keeps its plain frame slot.
+  Modeled as a host-heap closure re-entering the VM to run its body — no fusevm
+  changes.
 - **Collections** — the immutable `List`/`Seq`/`Vector`/`Set`/`Map` family, plus
   `Nil`, `::` cons and `a -> b` tuple pairs. Transformations
   (`map`/`flatMap`/`filter`/`foreach`), folds
@@ -284,13 +293,25 @@ Implemented and checked against the reference `scala`:
   `contains`/`startsWith`/`endsWith`, `toInt`/`toDouble`, …), `Int`/`Double`
   (`abs`, `min`/`max`, `round`, `toDouble`/`toInt`, …), and `toString` on any
   value; chains left-to-right (`s.trim.length`).
+- **Regular expressions** — `java.util.regex` through its three Scala doorways:
+  `String.matches`/`replaceAll`/`replaceFirst` (with `$N` group splices in the
+  replacement) and the regex-based `String.split`; `"…".r` building a
+  `scala.util.matching.Regex` with `findFirstIn`/`findAllIn`/`findFirstMatchIn`/
+  `findAllMatchIn`/`replaceAllIn`/`replaceFirstIn`/`matches`/`split`/`regex`;
+  and `Regex.Match` with `group`/`subgroups`/`matched`. The match scan follows
+  `java.util.regex.Matcher.find`'s rule rather than the Rust iterator's, which is
+  what makes `"xx9".split("x*")` answer `["", "", "9"]` and `"abc".split("")`
+  answer `["a", "b", "c"]`.
 - **Control flow** — `if` / `else if` / `else` (statement *and* expression
   position), `while`, and `for` comprehensions over both integer ranges
   (`for (i <- a until b) …`, `for (i <- a to b) yield …` collecting a `Vector`)
   and collections (`for (x <- List(1,2,3)) yield x*2`, desugared to
   `.map`/`.flatMap`/`.withFilter`), with multiple generators, `if` guards, both
-  the `for (…)` and `for { … }` enumerator groups, and destructuring generators
-  (`for ((k, v) <- m)`).
+  the `for (…)` and `for { … }` enumerator groups, destructuring generators
+  (`for ((k, v) <- m)`), and `y = e` value definitions
+  (`for { x <- xs; y = f(x); if y > 0 } yield y` — lowered inline inside a
+  counted range loop, and by Scala's own generator-pairing translation over a
+  collection, so a later guard sees the defined name).
 - **Infix method syntax** — `a m b` is `a.m(b)` for any single-argument method
   (`xs contains 2`, `1 to n`, `xs map f mkString ","`), with Scala's precedence
   (alphanumeric operators bind loosest) and associativity (a name ending in `:`
@@ -392,7 +413,7 @@ dispatch, `Range` values, `Array`, and the `scala.math` overload split) and diff
 probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
-`nlr`, …). It needs a real `scala` on
+`nlr`, `ascribe`, `forval`, `regex`, `capture`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -401,17 +422,21 @@ release — the block-expression-in-value-position gap, the
 `Map.collect` picks, and `-3.abs` reading as `-(3.abs)` instead of `(-3).abs`.
 The `nlr` mode found two control-flow bugs in this release: a `return` inside a
 `for`/`foreach` body silently ended only that iteration instead of the method,
-and a `return` out of a `try` skipped the `finally` entirely.
+and a `return` out of a `try` skipped the `finally` entirely. The new `regex`
+mode found `String.split` iterating matches by the Rust rule instead of
+`java.util.regex.Matcher.find`'s, which dropped a field from
+`"xx9".split("x*")`.
 
 Next waves, in priority order:
 
-1. **Lazy views** — `.view` and `LazyList` (`.iterator` is wired, but strictly).
-   Alongside them the three parse-level gaps the new modes surfaced: type
-   ascription in expression position (`(e: T)`), the unit literal `()`, and a
-   `y = …` value definition inside a `for` comprehension.
-2. **The broader standard library** — `scala.io`, `scala.collection.*` as a
+1. **`Char` as its own type.** `'a'` is modeled as a one-character `String`, so
+   `Char`'s predicates and case conversions work but its numeric surface does
+   not (`'a'.toInt` is a `NumberFormatException`, `'a' + 1` concatenates). This
+   is a representation question in the front end, not a fusevm one.
+2. **Lazy views** — `.view` and `LazyList` (`.iterator` is wired, but strictly).
+3. **The broader standard library** — `scala.io`, `scala.collection.*` as a
    namespace, and user `Ordering`s.
-3. **The rest of `scala.collection.mutable`** — the insertion-ordered
+4. **The rest of `scala.collection.mutable`** — the insertion-ordered
    `LinkedHashSet`/`LinkedHashMap`, `Queue`, `Stack` and `ArrayDeque`.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.

@@ -92,5 +92,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
 
+# `String.matches`/`replaceAll`/`split` and `"…".r` are `java.util.regex`, whose
+# syntax includes lookaround and backreferences. The `regex` crate's linear-time
+# automaton rejects both, so the backtracking `fancy-regex` (which layers onto
+# `regex` and only backtracks where it must) is what makes those patterns
+# behave as the JDK's do rather than fail to compile.
+fancy-regex = "0.18"
+
 [dev-dependencies]
 tempfile = "3"

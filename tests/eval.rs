@@ -2139,3 +2139,173 @@ fn a_catch_arm_never_intercepts_a_non_local_return() {
     assert!(ok);
     assert_eq!(out, "y5\nn\n");
 }
+
+#[test]
+fn unit_literal_prints_as_scala_prints_it() {
+    // `()` is a value, not just a statement separator: it binds, compares and
+    // renders. Rendering is the part a `null` stand-in would get wrong.
+    let (out, ok) = run(&wrap(
+        "val u = (); println(u); println(()); println(u == ()); val f = (x: Int) => (); println(f(1))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "()\n()\ntrue\n()\n");
+}
+
+#[test]
+fn type_ascription_widens_a_numeric_and_is_otherwise_transparent() {
+    // The runtime is dynamically typed, so the only ascription that may change
+    // an answer is the numeric widening — and it must, or `(3: Double)` prints
+    // `3` where Scala prints `3.0`.
+    let (out, ok) = run(&wrap(
+        "println((3: Double)); println((3: Long)); println((2.5: Double) + 1); println((\"ab\": String).length); println((None: Option[Int]))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "3.0\n3\n3.5\n2\nNone\n");
+}
+
+#[test]
+fn for_comprehension_value_definition_over_a_collection_and_a_range() {
+    // The two lowerings differ: a range generator stores inline (keeping the
+    // counted loop), a collection generator takes Scala's pairing translation.
+    let (out, ok) = run(&wrap(
+        "val xs = List(1, 2, 3)\nprintln(for { x <- xs; y = x * 2 } yield y)\nprintln(for { i <- 1 to 3; s = i * i } yield s)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(2, 4, 6)\nVector(1, 4, 9)\n");
+}
+
+#[test]
+fn a_for_value_definition_is_visible_to_a_later_guard() {
+    // The pairing translation exists precisely so a guard after the definition
+    // can read BOTH the generator's binding and the defined name; a naive
+    // `withFilter`-on-the-source lowering would not have `y` in scope.
+    let (out, ok) = run(&wrap(
+        "val xs = List(1, 2, 3, 4)\nprintln(for { x <- xs; y = x * 10; if y > 15 } yield (x, y))\nprintln(for { x <- xs; y = x + 1; z = y + 1 } yield x + y + z)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List((2,20), (3,30), (4,40))\nList(6, 9, 12, 15)\n");
+}
+
+#[test]
+fn string_repetition_works_infix_and_dotted() {
+    // The infix form reaches the arithmetic hook and the dotted form reaches
+    // method dispatch; both are `StringOps.*` and must agree.
+    let (out, ok) = run(&wrap(
+        "val s = \"ab\"; println(s * 3); println(s * 0); println(s * -2); println(s.*(2))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "ababab\n\n\nabab\n");
+}
+
+#[test]
+fn dotted_operators_dispatch_like_their_infix_spelling() {
+    // Including `/`'s Int-vs-Double split, which is decided at run time.
+    let (out, ok) = run(&wrap(
+        "println(1.+(2)); println(7./(2)); println(7.0./(2)); println(7.%(3)); println(3.<(4)); println(1.==(1))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "3\n3\n3.5\n1\ntrue\ntrue\n");
+}
+
+#[test]
+fn string_regex_methods_match_replace_and_splice_groups() {
+    let (out, ok) = run(&wrap(
+        r##"println("a1b2".matches("[a-z0-9]+")); println("a1b2".matches("[a-z]+")); println("a1b2".replaceAll("[0-9]", "#")); println("a1b2".replaceFirst("[0-9]", "#")); println("2024-01-02".replaceAll("(\\d+)-(\\d+)-(\\d+)", "$3/$2/$1"))"##,
+    ));
+    assert!(ok);
+    assert_eq!(out, "true\nfalse\na#b#\na#b2\n02/01/2024\n");
+}
+
+#[test]
+fn split_is_regex_based_with_javas_match_iteration() {
+    // Three separate JDK rules, each observable only here: `split` takes a
+    // REGEX (so `.` is not a literal dot), trailing empty fields are dropped,
+    // and `Matcher.find` allows an empty match at the end of a non-empty one
+    // (which is the field Rust's own iterator would drop from `"xx9"`).
+    let (out, ok) = run(&wrap(
+        r##"println("a,b,,".split(",").toList); println("a.b".split(".").toList); println("abc".split("").toList); println("xx9".split("x*").toList)"##,
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(a, b)\nList()\nList(a, b, c)\nList(, , 9)\n");
+}
+
+#[test]
+fn regex_object_finds_replaces_and_exposes_match_groups() {
+    let (out, ok) = run(&wrap(
+        r##"val r = "([a-z])([0-9])".r; println(r); println(r.findFirstIn("xa1y")); println(r.findFirstIn("xyz")); println(r.findAllIn("a1b2").toList); println(r.replaceAllIn("a1b2", "-")); println(r.findFirstMatchIn("xa1y").map(_.group(2)))"##,
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "([a-z])([0-9])\nSome(a1)\nNone\nList(a1, b2)\n--\nSome(1)\n"
+    );
+}
+
+#[test]
+fn a_replacement_referencing_a_missing_group_throws_like_java() {
+    let (out, ok) = run(&wrap(
+        r##"try { println("a1".replaceAll("[0-9]", "$1")) } catch { case e: Exception => println(e.getMessage) }"##,
+    ));
+    assert!(ok);
+    assert_eq!(out, "No group 1\n");
+}
+
+#[test]
+fn string_map_picks_its_result_type_from_the_functions_static_type() {
+    // `Char => Char` rebuilds a `String`; `Char => B` answers an `ArraySeq`.
+    // `_.toString` is the shape the results alone cannot classify, because a
+    // `Char` is modeled as a one-character `String`.
+    let (out, ok) = run(&wrap(
+        r##"println("abc".map(_.toUpper)); println("abc".map(_.toString)); println("abc".map(c => c + "!")); println("".map(_.toString)); println("abc".filter(_ != 'b'))"##,
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "ABC\nArraySeq(a, b, c)\nArraySeq(a!, b!, c!)\nArraySeq()\nac\n"
+    );
+}
+
+#[test]
+fn a_closure_assigning_an_enclosing_var_reaches_the_declaring_frame() {
+    // Captures are threaded by value, so without boxing every one of these
+    // reads back the initial value instead of the accumulated one.
+    let (out, ok) = run(&wrap(
+        "def f(): Int = { var c = 0; List(1, 2, 3).foreach(x => c += x); c }\ndef g(): String = { var s = \"\"; List(\"a\", \"b\").foreach(x => s = s + x); s }\ndef h(): Int = { var t = 0; List(1, 2).foreach(a => List(10, 20).foreach(b => t += a * b)); t }\nprintln(f()); println(g()); println(h())",
+    ));
+    assert!(ok);
+    assert_eq!(out, "6\nab\n90\n");
+}
+
+#[test]
+fn a_boxed_var_outlives_the_frame_that_declared_it() {
+    // The cell is heap-allocated, so a closure returned from the frame keeps
+    // mutating the same binding across calls.
+    let (out, ok) = run(&wrap(
+        "def mk(): () => Int = { var i = 0; () => { i += 1; i } }\nval c = mk(); val d = mk()\nprintln(c() + \",\" + c() + \",\" + c() + \",\" + d())",
+    ));
+    assert!(ok);
+    assert_eq!(out, "1,2,3,1\n");
+}
+
+#[test]
+fn an_if_branch_may_be_an_assignment_statement() {
+    // `if (p) c += x` as a brace-less lambda body — the idiomatic conditional
+    // accumulate, whose branch is a `Unit` statement rather than an expression.
+    let (out, ok) = run(&wrap(
+        "def f(): Int = { var c = 0; List(1, 2, 3, 4).foreach(x => if (x % 2 == 0) c += x); c }\nprintln(f())",
+    ));
+    assert!(ok);
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn a_for_value_definition_carries_a_destructuring_generator_through() {
+    // The generator's element is threaded through the pairing map unchanged and
+    // re-destructured by the SAME pattern, so a tuple binder — including one
+    // with a `_` or a nested tuple — keeps every name it bound.
+    let (out, ok) = run(&wrap(
+        "val m = Map(\"a\" -> 1, \"b\" -> 2)\nprintln(for { (k, v) <- m; d = v * 10 } yield k + d)\nprintln(for { (a, _) <- List((1, \"x\"), (2, \"y\")); t = a * 5 } yield t)\nprintln(for { (a, (b, c)) <- List((1, (2, 3))); s = a + b + c } yield s)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(a10, b20)\nList(5, 10)\nList(6)\n");
+}

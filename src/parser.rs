@@ -938,6 +938,28 @@ impl Parser {
             if self.is(&Tok::If) {
                 self.advance();
                 out.push(ForEnum::Guard(self.expression()?));
+            } else if self.at_for_value_def() {
+                // `y = e` (Scala also accepts the `val y = e` spelling) — a value
+                // definition, in scope for every later enumerator and the body.
+                if self.is(&Tok::Val) {
+                    self.advance();
+                }
+                let name = self.ident()?;
+                // A declared type is parsed and dropped, as everywhere else.
+                if self.is(&Tok::Colon) {
+                    self.advance();
+                    self.type_ref()?;
+                }
+                self.eat(&Tok::Assign)?;
+                out.push(ForEnum::Val {
+                    name,
+                    value: self.expression()?,
+                });
+                // Trailing `if` guards bind to the value just defined.
+                while self.is(&Tok::If) {
+                    self.advance();
+                    out.push(ForEnum::Guard(self.expression()?));
+                }
             } else {
                 out.push(self.for_generator()?);
                 // Trailing `if` guards bind to the generator just parsed.
@@ -955,6 +977,37 @@ impl Parser {
             }
         }
         Ok(out)
+    }
+
+    /// Whether the enumerator at the cursor is a value definition (`y = e`,
+    /// optionally spelled `val y = e` or typed `y: Int = e`) rather than a
+    /// generator. Decided by scanning to the first `=` / `<-`: a `<-` first means
+    /// a generator, and only a *bare* `=` (never `==`, which lexes as its own
+    /// token) opens a definition.
+    fn at_for_value_def(&self) -> bool {
+        if self.is(&Tok::Val) {
+            return true;
+        }
+        if !matches!(self.peek(), Tok::Ident(_)) {
+            return false;
+        }
+        match self.peek_at(1) {
+            Tok::Assign => true,
+            // `y: T = e` — walk the type annotation, which cannot itself contain
+            // an `=` or a `<-`, to the assignment.
+            Tok::Colon => {
+                let mut i = self.pos + 2;
+                while let Some(t) = self.toks.get(i) {
+                    match t.kind {
+                        Tok::Assign => return true,
+                        Tok::LArrow | Tok::Semi | Tok::Newline | Tok::Eof => return false,
+                        _ => i += 1,
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     /// One `pat <- source` generator. A parenthesized binder is a destructuring
@@ -1296,7 +1349,20 @@ impl Parser {
         while self.is(&Tok::Dot) {
             self.advance(); // `.`
             let line = self.line();
-            let name = self.ident()?;
+            // A method name is normally an identifier, but Scala's symbolic
+            // operators are ordinary method names too and may be written in the
+            // dotted form (`"a".*(3)`, `n.+(1)`) — the lexer hands those back as
+            // operator tokens, so they are spelled out here.
+            let name = match self.peek() {
+                Tok::Ident(_) => self.ident()?,
+                _ => match dotted_operator(self.peek()) {
+                    Some(op) => {
+                        self.advance();
+                        op.to_string()
+                    }
+                    None => self.ident()?,
+                },
+            };
             // `.copy(field = e, …)` — a `case class` copy with named/positional
             // updates. Named args (`field =`) are not general-purpose method args
             // in this frontend, so `copy` is parsed specially.
@@ -1501,19 +1567,29 @@ impl Parser {
                 self.advance();
                 self.build_interp(raw, is_f, &parts, &exprs, &fmts)
             }
-            // `( e )` grouping, or a tuple literal `(a, b, …)`. A `( … ) =>`
-            // lambda is caught earlier in `expression`.
+            // `( e )` grouping, `( e: T )` ascription, the unit literal `()`, or a
+            // tuple literal `(a, b, …)`. A `( … ) =>` lambda is caught earlier in
+            // `expression`.
             Tok::LParen => {
                 self.advance();
                 self.skip_seps();
+                // `()` — the unit literal. Scala's `Unit` value prints `()`, which
+                // is exactly what an empty tuple renders as, so it lowers to one
+                // (`HeapVal::Tuple(vec![])`) rather than to a bespoke value: the
+                // representation is structural, so `() == ()` and `().toString`
+                // both answer what Scala answers.
+                if self.is(&Tok::RParen) {
+                    self.advance();
+                    return Ok(Expr::Tuple(Vec::new()));
+                }
                 // Parentheses delimit an `_` placeholder.s scope, so `(_ * 2)` is
                 // the function `x => x * 2` wherever it appears — including as the
                 // right operand of an infix call (`xs map (_ * 2)`).
-                let mut elems = vec![wrap_placeholders(self.expression()?)];
+                let mut elems = vec![self.ascribed()?];
                 while self.is(&Tok::Comma) {
                     self.advance();
                     self.skip_seps();
-                    elems.push(wrap_placeholders(self.expression()?));
+                    elems.push(self.ascribed()?);
                 }
                 self.eat(&Tok::RParen)?;
                 if elems.len() == 1 {
@@ -1582,6 +1658,31 @@ impl Parser {
                 self.line()
             )),
         }
+    }
+
+    /// One parenthesized element: an expression, optionally with a *type
+    /// ascription* (`e: T`). Scala's ascription tells the typer which type to
+    /// use; the runtime here is dynamically typed, so the annotation is dropped —
+    /// except for the one ascription that is OBSERVABLE without a type checker,
+    /// a numeric widening (`(3: Double)` prints `3.0`, not `3`), which lowers to
+    /// the same `toDouble` conversion Scala's implicit widening performs.
+    fn ascribed(&mut self) -> Result<Expr, String> {
+        let line = self.line();
+        let e = wrap_placeholders(self.expression()?);
+        if !self.is(&Tok::Colon) {
+            return Ok(e);
+        }
+        self.advance();
+        let ty = self.type_ref()?;
+        Ok(match ty.as_str() {
+            "Double" | "Float" => Expr::Method {
+                recv: Box::new(e),
+                name: "toDouble".to_string(),
+                args: Vec::new(),
+                line,
+            },
+            _ => e,
+        })
     }
 
     /// Parse a named call `name(arg, arg, …)` — the cursor is on the `(` and
@@ -1796,10 +1897,17 @@ impl Parser {
         self.skip_seps();
         if self.is(&Tok::LBrace) {
             self.advance();
-            Ok(Expr::Block(self.block()?))
-        } else {
-            self.expression()
+            return Ok(Expr::Block(self.block()?));
         }
+        // A brace-less branch that is an ASSIGNMENT (`if (p) c += x`) is a `Unit`
+        // statement, not an expression — the same one-statement block a
+        // brace-less lambda body takes.
+        if self.assignment_ahead() {
+            let line = self.line();
+            let kind = self.simple_statement()?;
+            return Ok(Expr::Block(vec![Stmt { line, kind }]));
+        }
+        self.expression()
     }
 
     /// `scrutinee match { case … }` — the cursor is on `match`, `scrut` already
@@ -2092,6 +2200,28 @@ impl Parser {
             )),
         }
     }
+}
+
+/// The method name of an operator token written in the dotted form (`n.+(1)`,
+/// `"a".*(3)`, `a.<(b)`). Scala has no separate operator namespace — every
+/// operator is a method — so the two spellings are the same call, dispatched by
+/// [`crate::host`]'s `operator_method`. `None` for a token that cannot name a
+/// method, which keeps the ordinary "expected an identifier" diagnostic.
+fn dotted_operator(t: &Tok) -> Option<&'static str> {
+    Some(match t {
+        Tok::Plus => "+",
+        Tok::Minus => "-",
+        Tok::Star => "*",
+        Tok::Slash => "/",
+        Tok::Percent => "%",
+        Tok::Lt => "<",
+        Tok::Gt => ">",
+        Tok::Le => "<=",
+        Tok::Ge => ">=",
+        Tok::EqEq => "==",
+        Tok::NotEq => "!=",
+        _ => return None,
+    })
 }
 
 /// Parse a single expression from a splice source fragment (an interpolation's

@@ -1706,66 +1706,90 @@ println("abc".concat("d"))   // =&gt; abcd</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-9">
           <h3><a class="doc-anchor" href="#doc-string-methods-9">#</a> <code>split</code></h3>
-          <p>Split on a literal separator, answering an `Array[String]`. The separator is a plain substring, not a regular expression — this frontend has no regex engine.</p>
-          <pre><code class="lang-scala">s.split(sep: String): Array[String]
-println("a-b".split("-").mkString("/"))   // =&gt; a/b</code></pre>
+          <p>Split on a REGULAR EXPRESSION, answering an `Array[String]`. `java.lang.String.split`'s rule exactly: trailing empty fields are dropped, and a zero-width match at position 0 produces no leading empty field.</p>
+          <pre><code class="lang-scala">s.split(regex: String): Array[String]
+println("a1b22c".split("[0-9]+").mkString("/"))   // =&gt; a/b/c</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-10">
-          <h3><a class="doc-anchor" href="#doc-string-methods-10">#</a> <code>toList</code></h3>
+          <h3><a class="doc-anchor" href="#doc-string-methods-10">#</a> <code>matches</code></h3>
+          <p>Whether the regular expression matches the WHOLE string (`java.lang.String.matches` anchors both ends, unlike a search).</p>
+          <pre><code class="lang-scala">s.matches(regex: String): Boolean
+println("a1".matches("[a-z][0-9]"))   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-11">
+          <h3><a class="doc-anchor" href="#doc-string-methods-11">#</a> <code>replaceAll</code></h3>
+          <p>Replace every match of a regular expression. `$N` in the replacement splices capture group `N`; `\\x` is a literal `x`.</p>
+          <pre><code class="lang-scala">s.replaceAll(regex: String, repl: String): String
+println("a1b2".replaceAll("[0-9]", "#"))   // =&gt; a#b#</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-12">
+          <h3><a class="doc-anchor" href="#doc-string-methods-12">#</a> <code>replaceFirst</code></h3>
+          <p>As `replaceAll`, but only the first match is replaced.</p>
+          <pre><code class="lang-scala">s.replaceFirst(regex: String, repl: String): String
+println("a1b2".replaceFirst("[0-9]", "#"))   // =&gt; a#b2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-13">
+          <h3><a class="doc-anchor" href="#doc-string-methods-13">#</a> <code>r</code></h3>
+          <p>Compile the string as a `scala.util.matching.Regex`, which answers `findFirstIn`, `findAllIn`, `findFirstMatchIn`, `findAllMatchIn`, `replaceAllIn`, `replaceFirstIn`, `matches`, `split` and `regex`.</p>
+          <pre><code class="lang-scala">s.r: Regex
+println("(\\d+)".r.findFirstIn("ab12"))   // =&gt; Some(12)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-14">
+          <h3><a class="doc-anchor" href="#doc-string-methods-14">#</a> <code>toList</code></h3>
           <p>The characters as a `List` of one-character strings — there is no distinct `Char` value here.</p>
           <pre><code class="lang-scala">s.toList: List[String]
 println("abc".toList)   // =&gt; List(a, b, c)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-11">
-          <h3><a class="doc-anchor" href="#doc-string-methods-11">#</a> <code>toSeq</code></h3>
-          <p>The characters as a `Seq`, which is the same `List` of one-character strings.</p>
-          <pre><code class="lang-scala">s.toSeq: List[String]
-println("ab".toSeq)   // =&gt; List(a, b)</code></pre>
+        <article class="doc-entry" id="doc-string-methods-15">
+          <h3><a class="doc-anchor" href="#doc-string-methods-15">#</a> <code>toSeq</code></h3>
+          <p>The characters as a `Seq` — Scala's `WrappedString` view over the same string, which prints as the string itself.</p>
+          <pre><code class="lang-scala">s.toSeq: Seq[Char]
+println("ab".toSeq)   // =&gt; ab</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-12">
-          <h3><a class="doc-anchor" href="#doc-string-methods-12">#</a> <code>reverse</code></h3>
+        <article class="doc-entry" id="doc-string-methods-16">
+          <h3><a class="doc-anchor" href="#doc-string-methods-16">#</a> <code>reverse</code></h3>
           <p>The characters in the opposite order.</p>
           <pre><code class="lang-scala">s.reverse: String
 println("abc".reverse)   // =&gt; cba</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-13">
-          <h3><a class="doc-anchor" href="#doc-string-methods-13">#</a> <code>toInt</code></h3>
+        <article class="doc-entry" id="doc-string-methods-17">
+          <h3><a class="doc-anchor" href="#doc-string-methods-17">#</a> <code>toInt</code></h3>
           <p>Parse the string as an integer, tolerating surrounding whitespace. A malformed string raises `java.lang.NumberFormatException: For input string: "…"`.</p>
           <pre><code class="lang-scala">s.toInt: Int
 println("42".toInt + 1)   // =&gt; 43</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-14">
-          <h3><a class="doc-anchor" href="#doc-string-methods-14">#</a> <code>toDouble</code></h3>
+        <article class="doc-entry" id="doc-string-methods-18">
+          <h3><a class="doc-anchor" href="#doc-string-methods-18">#</a> <code>toDouble</code></h3>
           <p>Parse the string as a floating-point number, tolerating surrounding whitespace. A malformed string raises `NumberFormatException`.</p>
           <pre><code class="lang-scala">s.toDouble: Double
 println("1.5".toDouble * 2)   // =&gt; 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-15">
-          <h3><a class="doc-anchor" href="#doc-string-methods-15">#</a> <code>charAt</code></h3>
+        <article class="doc-entry" id="doc-string-methods-19">
+          <h3><a class="doc-anchor" href="#doc-string-methods-19">#</a> <code>charAt</code></h3>
           <p>The character at an index, as a one-character string. Out of range it raises `StringIndexOutOfBoundsException` with the JDK's own message.</p>
           <pre><code class="lang-scala">s.charAt(i: Int): String
 println("abc".charAt(1))   // =&gt; b</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-16">
-          <h3><a class="doc-anchor" href="#doc-string-methods-16">#</a> <code>contains</code></h3>
+        <article class="doc-entry" id="doc-string-methods-20">
+          <h3><a class="doc-anchor" href="#doc-string-methods-20">#</a> <code>contains</code></h3>
           <p>Whether the argument occurs as a substring.</p>
           <pre><code class="lang-scala">s.contains(sub: String): Boolean
 println("abc".contains("bc"))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-17">
-          <h3><a class="doc-anchor" href="#doc-string-methods-17">#</a> <code>startsWith</code></h3>
+        <article class="doc-entry" id="doc-string-methods-21">
+          <h3><a class="doc-anchor" href="#doc-string-methods-21">#</a> <code>startsWith</code></h3>
           <p>Whether the string begins with the argument.</p>
           <pre><code class="lang-scala">s.startsWith(prefix: String): Boolean
 println("abc".startsWith("a"))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-18">
-          <h3><a class="doc-anchor" href="#doc-string-methods-18">#</a> <code>endsWith</code></h3>
+        <article class="doc-entry" id="doc-string-methods-22">
+          <h3><a class="doc-anchor" href="#doc-string-methods-22">#</a> <code>endsWith</code></h3>
           <p>Whether the string ends with the argument.</p>
           <pre><code class="lang-scala">s.endsWith(suffix: String): Boolean
 println("abc".endsWith("c"))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-19">
-          <h3><a class="doc-anchor" href="#doc-string-methods-19">#</a> <code>substring</code></h3>
+        <article class="doc-entry" id="doc-string-methods-23">
+          <h3><a class="doc-anchor" href="#doc-string-methods-23">#</a> <code>substring</code></h3>
           <p>The characters in the half-open range `[begin, end)`, or from `begin` to the end with one argument. An out-of-range or inverted range raises `StringIndexOutOfBoundsException`.</p>
           <pre><code class="lang-scala">s.substring(begin: Int[, end: Int]): String
 println("abc".substring(1))      // =&gt; bc

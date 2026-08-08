@@ -52,7 +52,19 @@ first\-class and partial functions, and the collection library
 and the
 .B scala.collection.mutable
 buffers, sets and maps) are carried too, each reproducing Scala's own
-iteration order.  For the gaps that remain \(em lazy views,
+iteration order.  Regular expressions are
+.BR java.util.regex :
+.BR matches ,
+.BR replaceAll ,
+the regex\-based
+.BR split ,
+and
+.BR \(dq\&...\(dq.r
+with the
+.B scala.util.matching.Regex
+surface.  For the gaps that remain \(em
+.B Char
+as its own type, lazy views,
 .BR Iterator ,
 .BR LazyList ,
 user

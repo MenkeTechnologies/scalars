@@ -146,6 +146,10 @@ struct PendingClosure {
     name_idx: u16,
     params: Vec<String>,
     captures: Vec<String>,
+    /// The subset of `captures` that were BOXED in the enclosing frame, so the
+    /// captured value is a cell handle and the body must read/write through it
+    /// (see [`Scope::boxed`]).
+    boxed: HashSet<String>,
     body: Expr,
     current_class: Option<(String, HashSet<String>)>,
     current_object: Option<String>,
@@ -219,6 +223,11 @@ struct Scope {
     slots: HashMap<String, u16>,
     /// Next unused slot index (parameters take `0..arity`).
     next_slot: u16,
+    /// The locals whose slot holds a heap CELL rather than the value itself,
+    /// because a closure in this frame ASSIGNS them (see [`boxed_vars`]). Every
+    /// read of one goes through `CELL_GET` and every write through `CELL_SET`;
+    /// a capture takes the raw slot, which is what makes the write shared.
+    boxed: HashSet<String>,
 }
 
 /// Where a name lives: a frame slot (function-local) or a global.
@@ -655,6 +664,21 @@ impl Compiler {
             } => {
                 let place = self.declare_place(name);
                 self.vals.insert(name.clone(), *is_val);
+                // A `var` a closure assigns lives in a heap cell, allocated here
+                // even without an initializer so the closure has something to
+                // write through (see [`boxed_vars`]).
+                if self.is_boxed(name) {
+                    match init {
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            self.b.emit(Op::LoadUndef, 0);
+                        }
+                    }
+                    self.unwind_check_dropping(1);
+                    self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
+                    self.emit_store(place);
+                    return Ok(());
+                }
                 if let Some(e) = init {
                     self.expr(e)?;
                     self.unwind_check_dropping(1);
@@ -736,15 +760,27 @@ impl Compiler {
                     }
                 }
                 let place = self.resolve_place(name);
+                let boxed = self.is_boxed(name);
                 // `x = e`, or `x <op>= e` → the current value then the operator.
                 if *op == AssignOp::Assign {
                     self.expr(value)?;
                 } else {
                     self.emit_load(place);
+                    if boxed {
+                        self.b.emit(Op::CallBuiltin(crate::host::CELL_GET, 1), 0);
+                    }
                     self.compound_tail(*op, value)?;
                 }
                 self.unwind_check_dropping(1);
-                self.emit_store(place);
+                // A boxed `var` is written through its cell, so the write is
+                // seen by every closure that captured it.
+                if boxed {
+                    self.emit_load(place);
+                    self.b.emit(Op::CallBuiltin(crate::host::CELL_SET, 2), 0);
+                    self.b.emit(Op::Pop, 0);
+                } else {
+                    self.emit_store(place);
+                }
                 Ok(())
             }
             StmtKind::Return(val) => {
@@ -890,6 +926,15 @@ impl Compiler {
                 self.lower_for(enums, idx + 1, body, yield_into)?;
                 let end = self.b.current_pos();
                 self.b.patch_jump(jf, end);
+            }
+            // `y = e` inside a counted loop: re-evaluate `e` per iteration into
+            // its own slot, in scope for the enumerators to the right and the
+            // body. No closure is built, so the loop stays trace-eligible.
+            ForEnum::Val { name, value } => {
+                self.expr(value)?;
+                let place = self.declare_place(name);
+                self.emit_store(place);
+                self.lower_for(enums, idx + 1, body, yield_into)?;
             }
             ForEnum::Gen {
                 name,
@@ -1217,6 +1262,17 @@ impl Compiler {
             }
         }
 
+        // Which captures are boxed cells in the enclosing frame — the closure
+        // body must go through `CELL_GET`/`CELL_SET` for exactly those.
+        let boxed: HashSet<String> = match self.scope.as_ref() {
+            Some(scope) => captures
+                .iter()
+                .filter(|c| scope.boxed.contains(*c))
+                .cloned()
+                .collect(),
+            None => HashSet::new(),
+        };
+
         // A `{ case … }` literal is a `PartialFunction`: a second subroutine
         // answers `isDefinedAt`. It re-uses the same parameter and capture
         // layout, so the one capture list serves both bodies.
@@ -1230,6 +1286,7 @@ impl Compiler {
                     name_idx: idx,
                     params: params.to_vec(),
                     captures: captures.clone(),
+                    boxed: boxed.clone(),
                     body: test,
                     current_class: self.current_class.clone(),
                     current_object: self.current_object.clone(),
@@ -1245,7 +1302,7 @@ impl Compiler {
         // and MAKE_PARTIAL reads that one extra leading operand.
         self.b.emit(Op::LoadInt(name_idx as i64), 0);
         self.b.emit(Op::LoadInt(params.len() as i64), 0);
-        self.b.emit(Op::LoadInt(i64::from(yields_pairs(body))), 0);
+        self.b.emit(Op::LoadInt(body_flags(body)), 0);
         if let Some(idx) = defined_idx {
             self.b.emit(Op::LoadInt(idx as i64), 0);
         }
@@ -1263,6 +1320,7 @@ impl Compiler {
             name_idx,
             params: params.to_vec(),
             captures,
+            boxed,
             body: body.clone(),
             current_class: self.current_class.clone(),
             current_object: self.current_object.clone(),
@@ -1285,9 +1343,15 @@ impl Compiler {
             slots.insert(cap.clone(), (pc.params.len() + j) as u16);
         }
         let total = pc.params.len() + pc.captures.len();
+        // A captured cell stays a cell inside the closure, and a `var` this body
+        // declares gets boxed for exactly the same reason the enclosing frame's
+        // would: a lambda nested one level deeper assigns it.
+        let mut boxed = pc.boxed.clone();
+        boxed.extend(boxed_vars_expr(&pc.body));
         let saved_scope = self.scope.replace(Scope {
             slots,
             next_slot: total as u16,
+            boxed,
         });
         let saved_vals = std::mem::take(&mut self.vals);
         for p in &pc.params {
@@ -1804,6 +1868,10 @@ impl Compiler {
         if is_local {
             let place = self.resolve_place(name);
             self.emit_load(place);
+            // A boxed `var` keeps its value in a heap cell (see [`boxed_vars`]).
+            if self.is_boxed(name) {
+                self.b.emit(Op::CallBuiltin(crate::host::CELL_GET, 1), 0);
+            }
             return Ok(());
         }
         // Inside a class method: a bare field is `this.field`; a bare sibling
@@ -2401,6 +2469,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: cd.params.len() as u16,
+            boxed: boxed_vars(&cd.body),
         });
         for i in (0..cd.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
@@ -2483,6 +2552,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: (m.params.len() + 1) as u16,
+            boxed: boxed_vars(&m.body),
         });
         // Prologue: args arrive as `[this, p0, …]` (deepest = this); pop reverse.
         for i in (0..=m.params.len()).rev() {
@@ -2524,6 +2594,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: m.params.len() as u16,
+            boxed: boxed_vars(&m.body),
         });
         for i in (0..m.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
@@ -2703,6 +2774,11 @@ impl Compiler {
         Place::Global(self.b.add_name(name))
     }
 
+    /// Whether `name` is a boxed local of the current frame (see [`Scope::boxed`]).
+    fn is_boxed(&self, name: &str) -> bool {
+        self.scope.as_ref().is_some_and(|s| s.boxed.contains(name))
+    }
+
     fn emit_load(&mut self, p: Place) {
         match p {
             Place::Slot(s) => self.b.emit(Op::GetSlot(s), 0),
@@ -2740,6 +2816,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: f.params.len() as u16,
+            boxed: boxed_vars(&f.body),
         });
 
         // Prologue: args arrive on the stack (deepest = param 0). Pop them into
@@ -2965,6 +3042,7 @@ fn enum_any(e: &ForEnum, pred: &impl Fn(&Expr) -> bool) -> bool {
         }
         ForEnum::GenColl { coll, .. } => expr_any(coll, pred),
         ForEnum::Guard(c) => expr_any(c, pred),
+        ForEnum::Val { value, .. } => expr_any(value, pred),
     }
 }
 
@@ -3286,6 +3364,23 @@ fn desugar_for(enums: &[ForEnum], body: &Expr, is_yield: bool) -> Expr {
         src = method(src, "withFilter", vec![lambda1(&pat, g.clone())]);
         i += 1;
     }
+    // `y = e` — Scala's own translation pairs the value onto the generator, so
+    // every enumerator to the right (and the body) sees BOTH names:
+    //   `for (x <- xs; y = e; rest)` → `for ((x, y) <- xs.map(x => (x, e)); rest)`
+    // Recursing on the rewritten list handles a run of definitions (each nests
+    // one more tuple) and a guard that reads a defined name.
+    if let Some(ForEnum::Val { name, value }) = enums.get(i) {
+        // The pair carries the generator's element THROUGH unchanged (read from
+        // the mapping lambda's own parameter), so the rewritten generator can
+        // re-destructure it with the very same pattern — whatever shape it has.
+        let paired = Expr::Tuple(vec![gen_elem_expr(&pat), value.clone()]);
+        let mut rewritten = vec![ForEnum::GenColl {
+            pat: Pattern::Tuple(vec![pat.clone(), Pattern::Bind(name.clone())]),
+            coll: method(src, "map", vec![lambda1(&pat, paired)]),
+        }];
+        rewritten.extend_from_slice(&enums[i + 1..]);
+        return desugar_for(&rewritten, body, is_yield);
+    }
     let rest = &enums[i..];
     if rest.is_empty() {
         let m = if is_yield { "map" } else { "foreach" };
@@ -3296,6 +3391,17 @@ fn desugar_for(enums: &[ForEnum], body: &Expr, is_yield: bool) -> Expr {
         let m = if is_yield { "flatMap" } else { "foreach" };
         method(src, m, vec![lambda1(&pat, inner)])
     }
+}
+
+/// The element a [`lambda1`] over `pat` received, as an expression readable from
+/// inside that lambda's body: its parameter. [`lambda1`] names that parameter
+/// after a plain binder and `$forpat` for every other shape, so this mirrors the
+/// same choice — the two must agree.
+fn gen_elem_expr(pat: &Pattern) -> Expr {
+    Expr::Var(match pat {
+        Pattern::Bind(n) => n.clone(),
+        _ => "$forpat".to_string(),
+    })
 }
 
 /// The `(bound name, source-collection expr)` of a generator enumerator. A range
@@ -3324,7 +3430,12 @@ fn gen_source(e: &ForEnum) -> (Pattern, Expr) {
                 line: 0,
             },
         ),
+        // Scala requires the first enumerator to be a generator, so neither of
+        // these can open a comprehension.
         ForEnum::Guard(_) => unreachable!("a comprehension does not begin with a guard"),
+        ForEnum::Val { .. } => {
+            unreachable!("a comprehension does not begin with a value definition")
+        }
     }
 }
 
@@ -3351,6 +3462,49 @@ fn yields_pairs(body: &Expr) -> bool {
         }),
         Expr::If { then, els, .. } => {
             yields_pairs(then) && els.as_ref().is_some_and(|e| yields_pairs(e))
+        }
+        _ => false,
+    }
+}
+
+/// The compile-time facts about a lambda body, packed into the single operand
+/// `MAKE_CLOSURE`/`MAKE_PARTIAL` carries: bit 0 is [`yields_pairs`], bit 1 is
+/// [`yields_strings`]. One operand means a new fact costs no change to the
+/// closure's stack layout.
+fn body_flags(body: &Expr) -> i64 {
+    i64::from(yields_pairs(body)) | (i64::from(yields_strings(body)) << 1)
+}
+
+/// Whether every value this function body can answer is statically a `String`.
+///
+/// `String.map` needs Scala's `Char => Char` / `Char => B` overload split, and
+/// `Char` is modeled here as a one-char `String` — so a body answering a one-char
+/// `String` is ambiguous at run time and only the SYNTAX resolves it. The shapes
+/// recognized are the ones whose Scala result type is `String` no matter what
+/// the receiver is: a string literal, an interpolation (which lowers to a
+/// concatenation with a literal), and `toString`/`mkString`. Any other
+/// String-typed body still falls back to the runtime rule, which is right for
+/// every result that is not exactly one character long.
+fn yields_strings(body: &Expr) -> bool {
+    match body {
+        Expr::Str(_) => true,
+        Expr::Method { name, .. } => name == "toString" || name == "mkString",
+        // A concatenation is a `String` as soon as either side is one.
+        Expr::Binary {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => yields_strings(lhs) || yields_strings(rhs),
+        Expr::Block(stmts) => match stmts.last().map(|s| &s.kind) {
+            Some(StmtKind::Expr(e)) => yields_strings(e),
+            _ => false,
+        },
+        Expr::Match { arms, .. } => arms.iter().all(|a| match a.body.last().map(|s| &s.kind) {
+            Some(StmtKind::Expr(e)) => yields_strings(e),
+            _ => false,
+        }),
+        Expr::If { then, els, .. } => {
+            yields_strings(then) && els.as_ref().is_some_and(|e| yields_strings(e))
         }
         _ => false,
     }
@@ -3428,6 +3582,198 @@ fn method(recv: Expr, name: &str, args: Vec<Expr>) -> Expr {
         name: name.to_string(),
         args,
         line: 0,
+    }
+}
+
+// ── boxed-`var` analysis (closures that mutate an enclosing local) ──────────
+//
+// Captures are threaded BY VALUE, so a closure writing to a captured slot would
+// write to its own copy and the enclosing frame would never see it. Scala solves
+// this by boxing such a local (`scala.runtime.IntRef` and friends); so does this
+// compiler, with one heap cell per boxed `var`. The analysis below finds exactly
+// which locals need it, so every other local keeps a plain frame slot and the
+// bytecode for a program with no mutating closure is unchanged.
+
+/// The locals of one frame that a closure inside it ASSIGNS: declared as a `var`
+/// directly in this frame, and written from inside a nested lambda.
+fn boxed_vars(body: &[Stmt]) -> HashSet<String> {
+    let mut scan = BoxScan::default();
+    scan.block(body, false);
+    scan.finish()
+}
+
+/// [`boxed_vars`] for a frame whose body is a single expression (a lambda body).
+fn boxed_vars_expr(body: &Expr) -> HashSet<String> {
+    let mut scan = BoxScan::default();
+    scan.expr(body, false);
+    scan.finish()
+}
+
+/// One walk collecting both halves of [`boxed_vars`]: the `var`s declared in
+/// this frame and the names assigned from inside a nested lambda.
+#[derive(Default)]
+struct BoxScan {
+    declared: HashSet<String>,
+    assigned_in_lambda: HashSet<String>,
+}
+
+impl BoxScan {
+    fn finish(self) -> HashSet<String> {
+        self.declared
+            .intersection(&self.assigned_in_lambda)
+            .cloned()
+            .collect()
+    }
+
+    /// `in_lambda` is true once the walk has entered a nested function body —
+    /// a lambda literal, or a comprehension over a COLLECTION, which
+    /// [`desugar_for`] turns into `map`/`foreach` closures. A comprehension over
+    /// a range stays an inline counted loop, so its body is still this frame.
+    fn block(&mut self, body: &[Stmt], in_lambda: bool) {
+        for s in body {
+            match &s.kind {
+                StmtKind::Local {
+                    name, init, is_val, ..
+                } if !*is_val => {
+                    if !in_lambda {
+                        self.declared.insert(name.clone());
+                    }
+                    if let Some(e) = init {
+                        self.expr(e, in_lambda);
+                    }
+                }
+                StmtKind::Local { init, .. } => {
+                    if let Some(e) = init {
+                        self.expr(e, in_lambda);
+                    }
+                }
+                StmtKind::Destructure { init, .. } => self.expr(init, in_lambda),
+                StmtKind::Assign { name, value, .. } => {
+                    if in_lambda {
+                        self.assigned_in_lambda.insert(name.clone());
+                    }
+                    self.expr(value, in_lambda);
+                }
+                StmtKind::Expr(e) => self.expr(e, in_lambda),
+                StmtKind::If { cond, then, els } => {
+                    self.expr(cond, in_lambda);
+                    self.block(then, in_lambda);
+                    self.block(els, in_lambda);
+                }
+                StmtKind::While { cond, body } => {
+                    self.expr(cond, in_lambda);
+                    self.block(body, in_lambda);
+                }
+                StmtKind::Return(e) => {
+                    if let Some(e) = e {
+                        self.expr(e, in_lambda);
+                    }
+                }
+                // Lifted into `Program::functions` by `resolve` before compiling,
+                // and scanned there as a frame of its own.
+                StmtKind::DefDecl(_) => {}
+            }
+        }
+    }
+
+    fn expr(&mut self, e: &Expr, in_lambda: bool) {
+        match e {
+            Expr::Lambda { body, .. } => self.expr(body, true),
+            Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
+                let desugars = enums.iter().any(is_coll_gen);
+                for en in enums {
+                    match en {
+                        ForEnum::Gen {
+                            start, end, step, ..
+                        } => {
+                            self.expr(start, in_lambda);
+                            self.expr(end, in_lambda);
+                            if let Some(s) = step {
+                                self.expr(s, in_lambda);
+                            }
+                        }
+                        ForEnum::GenColl { coll, .. } => self.expr(coll, in_lambda),
+                        ForEnum::Guard(g) => self.expr(g, in_lambda || desugars),
+                        ForEnum::Val { value, .. } => self.expr(value, in_lambda || desugars),
+                    }
+                }
+                self.expr(body, in_lambda || desugars);
+            }
+            Expr::Block(stmts) => self.block(stmts, in_lambda),
+            Expr::Try {
+                body,
+                catches,
+                finalizer,
+            } => {
+                self.block(body, in_lambda);
+                for a in catches {
+                    if let Some(g) = &a.guard {
+                        self.expr(g, in_lambda);
+                    }
+                    self.block(&a.body, in_lambda);
+                }
+                if let Some(f) = finalizer {
+                    self.block(f, in_lambda);
+                }
+            }
+            Expr::Match { scrut, arms } => {
+                self.expr(scrut, in_lambda);
+                for a in arms {
+                    if let Some(g) = &a.guard {
+                        self.expr(g, in_lambda);
+                    }
+                    self.block(&a.body, in_lambda);
+                }
+            }
+            Expr::Throw { value, .. }
+            | Expr::Format { value, .. }
+            | Expr::Unary { rhs: value, .. } => self.expr(value, in_lambda),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.expr(lhs, in_lambda);
+                self.expr(rhs, in_lambda);
+            }
+            Expr::Println { arg, .. } => {
+                if let Some(a) = arg {
+                    self.expr(a, in_lambda);
+                }
+            }
+            Expr::Call { args, .. } | Expr::New { args, .. } => {
+                for a in args {
+                    self.expr(a, in_lambda);
+                }
+            }
+            Expr::Method { recv, args, .. } => {
+                self.expr(recv, in_lambda);
+                for a in args {
+                    self.expr(a, in_lambda);
+                }
+            }
+            Expr::Copy { recv, updates, .. } => {
+                self.expr(recv, in_lambda);
+                for (_, v) in updates {
+                    self.expr(v, in_lambda);
+                }
+            }
+            Expr::If { cond, then, els } => {
+                self.expr(cond, in_lambda);
+                self.expr(then, in_lambda);
+                if let Some(x) = els {
+                    self.expr(x, in_lambda);
+                }
+            }
+            Expr::Tuple(elems) | Expr::Collection { elems, .. } => {
+                for el in elems {
+                    self.expr(el, in_lambda);
+                }
+            }
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::Placeholder
+            | Expr::Var(_) => {}
+        }
     }
 }
 
@@ -3604,6 +3950,12 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
                         pattern_binds(pat, &mut b);
                     }
                     ForEnum::Guard(g) => fv_expr(g, &b, out, seen),
+                    // The definition's expression is evaluated with everything
+                    // to its LEFT in scope; the name it binds joins for the rest.
+                    ForEnum::Val { name, value } => {
+                        fv_expr(value, &b, out, seen);
+                        b.insert(name.clone());
+                    }
                 }
             }
             fv_expr(body, &b, out, seen);
