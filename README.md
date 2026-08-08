@@ -71,8 +71,8 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
-  against a live `scala` across twenty-four generators — every probe in this
-  wave's `partial`, `mutable`, `bitwise` and extended `hashcoll` modes ran clean,
+  against a live `scala` across twenty-nine generators — every probe in this
+  wave's `patmatch`, `option`, `caseclass`, `strops` and `nlr` modes ran clean,
   on top of the 61,000+ that ran clean before it.
 
 The language surface today: programs with an entry point (`def main`, or an
@@ -368,8 +368,16 @@ statement-granular unwind protocol that needs no fusevm changes;
 **block-local `def` scoping** with lambda-lifted captures (`src/resolve.rs`);
 **traits and inheritance** — `trait`, `extends`/`with`, `override`, `super`,
 virtual dispatch, inherited fields and constructor-argument threading, and
-`isInstanceOf`/typed patterns over the registered hierarchy; and **`Array`,
-first-class `Range` values and `scala.math`**.
+`isInstanceOf`/typed patterns over the registered hierarchy; **`Array`,
+first-class `Range` values and `scala.math`**; the **full pattern grammar** —
+`@` binders, `|` alternations, `h :: t` and `Nil`, sequence patterns with a
+trailing `_*`, and pattern definitions (`val (a, b) = pair`); **`scala.Option`'s
+method surface** plus the `Option(x)` factory and `Either`'s `Left`/`Right`;
+`Product` on every case class and tuple; a wider `String`/`StringOps` surface
+including the closure-taking combinators; and **non-local `return`** — a
+`return` inside a lambda (or inside the closures a `for` desugars to) leaves the
+enclosing method, running every `finally` on the way out, lowered exactly as
+Scala lowers it.
 
 ### Differential parity fuzzer
 
@@ -383,17 +391,24 @@ dispatch, `Range` values, `Array`, and the `scala.math` overload split) and diff
 `scala <file>` against this frontend, shrinking any divergence to the offending
 probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
-`partial`, `mutable`, `bitwise`, …). It needs a real `scala` on
+`partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
+`nlr`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
 release — the block-expression-in-value-position gap, the
 `Math.signum` vs. `math.signum` overload split, the builder an empty
 `Map.collect` picks, and `-3.abs` reading as `-(3.abs)` instead of `(-3).abs`.
+The `nlr` mode found two control-flow bugs in this release: a `return` inside a
+`for`/`foreach` body silently ended only that iteration instead of the method,
+and a `return` out of a `try` skipped the `finally` entirely.
 
 Next waves, in priority order:
 
-1. **Lazy views and `Iterator`** — `.view`, `.iterator` and `LazyList`.
+1. **Lazy views** — `.view` and `LazyList` (`.iterator` is wired, but strictly).
+   Alongside them the three parse-level gaps the new modes surfaced: type
+   ascription in expression position (`(e: T)`), the unit literal `()`, and a
+   `y = …` value definition inside a `for` comprehension.
 2. **The broader standard library** — `scala.io`, `scala.collection.*` as a
    namespace, and user `Ordering`s.
 3. **The rest of `scala.collection.mutable`** — the insertion-ordered

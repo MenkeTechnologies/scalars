@@ -206,6 +206,23 @@ pub const MAKE_MUTMAP: u16 = 743;
 /// compiler-emitted branch to `x.+=(e)`, `false` to `x = x + e` — Scala makes
 /// that choice statically from whether the receiver's type has a `+=` method.
 pub const IS_GROWABLE: u16 = 744;
+/// Builtin id for the `Option(x)` factory: pops one value and answers `None` for
+/// `null` (fusevm's `Undef`), `Some(x)` for anything else.
+pub const MAKE_OPTION: u16 = 745;
+/// Builtin id for a NON-LOCAL return: pops the return value and parks a
+/// `scala.runtime.NonLocalReturnControl` carrying it in the same in-flight slot
+/// an exception uses, so the compiler-emitted unwind checks carry it out of the
+/// closure (and through any enclosing `finally`) to the method that lexically
+/// contains the `return`. This is Scala's own lowering — a `return` inside a
+/// lambda, or one that has to run a `finally` on the way out, is a throw.
+///
+/// The parked value is a plain record, not a throwable, so [`EXC_MATCH`] never
+/// matches it: no `catch` arm can intercept a non-local return.
+pub const NLR_RAISE: u16 = 746;
+/// Builtin id for the method-boundary half of [`NLR_RAISE`]: if the in-flight
+/// value is a non-local return, clear it and push its payload; otherwise push
+/// `Undef` and leave a real exception in flight to keep unwinding.
+pub const NLR_TAKE: u16 = 747;
 
 thread_local! {
     /// `type name → (linearized supertypes, primary-constructor arity)`,
@@ -341,6 +358,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_MUTSET, b_make_mutset);
     vm.register_builtin(MAKE_MUTMAP, b_make_mutmap);
     vm.register_builtin(IS_GROWABLE, b_is_growable);
+    vm.register_builtin(MAKE_OPTION, b_make_option);
+    vm.register_builtin(NLR_RAISE, b_nlr_raise);
+    vm.register_builtin(NLR_TAKE, b_nlr_take);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -785,6 +805,12 @@ impl SeqKind {
     fn is_buffer(self) -> bool {
         matches!(self, SeqKind::ListBuffer | SeqKind::ArrayBuffer)
     }
+
+    /// Whether this kind is a `Set` (any representation). A `Set` is `Iterable`
+    /// but not a `Seq`, which is what the type-pattern tests turn on.
+    fn is_set(self) -> bool {
+        matches!(self, SeqKind::Set(_))
+    }
 }
 
 /// Build the collection a transforming op (`map`, `filter`, …) produces from a
@@ -972,6 +998,11 @@ fn as_seq(v: &Value) -> Option<Vec<Value>> {
     } else {
         None
     }
+}
+
+/// A `Seq` handle's kind, if `v` is one.
+fn seq_kind(v: &Value) -> Option<SeqKind> {
+    seq_kind_items(v).map(|(k, _)| k)
 }
 
 /// Clone a `Seq` handle's kind and elements, if `v` is one.
@@ -1238,6 +1269,55 @@ fn b_is_growable(vm: &mut VM, _argc: u8) -> Value {
     let mutable_seq = seq_kind_items(&v).is_some_and(|(k, _)| k.is_mutable());
     let mutable_map = matches!(map_rep_entries(&v), Some((HashRep::Mutable(_), _)));
     Value::bool(mutable_seq || mutable_map)
+}
+
+/// The class tag of a parked non-local return (see [`NLR_RAISE`]).
+const NLR_CLASS: &str = "scala.runtime.NonLocalReturnControl";
+
+/// `NLR_RAISE` builtin — see [`NLR_RAISE`].
+fn b_nlr_raise(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    // An exception already unwinding wins, exactly as in `raise`: the side
+    // effects that would have produced this return are suppressed anyway.
+    if unwinding() {
+        return Value::Undef;
+    }
+    let ctl = heap_alloc(ScalaObj {
+        class: Arc::from(NLR_CLASS),
+        is_case: false,
+        is_object: false,
+        fields: vec![(Arc::from("value"), v)],
+    });
+    PENDING.with(|p| *p.borrow_mut() = Some(ctl));
+    let _ = vm;
+    Value::Undef
+}
+
+/// `NLR_TAKE` builtin — see [`NLR_TAKE`].
+fn b_nlr_take(_vm: &mut VM, _argc: u8) -> Value {
+    let is_nlr = PENDING.with(|p| {
+        p.borrow()
+            .as_ref()
+            .and_then(|v| with_obj(v, |o| &*o.class == NLR_CLASS))
+            .unwrap_or(false)
+    });
+    if !is_nlr {
+        return Value::Undef;
+    }
+    let ctl = PENDING.with(|p| p.borrow_mut().take());
+    ctl.and_then(|v| with_obj(&v, |o| o.fields.first().map(|(_, v)| v.clone())))
+        .flatten()
+        .unwrap_or(Value::Undef)
+}
+
+/// `MAKE_OPTION` builtin — see [`MAKE_OPTION`].
+fn b_make_option(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    if matches!(v, Value::Undef) {
+        make_none()
+    } else {
+        make_some(v)
+    }
 }
 
 /// Pop `argc` stack values into source order (the deepest is the first element).
@@ -1576,6 +1656,36 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     match (name, args.len()) {
         ("hashCode", 0) => Ok(Value::int(obj_hash(&class, is_case, &fields, recv))),
         ("equals", 1) => Ok(Value::bool(obj_eq(recv, &args[0]))),
+        // `scala.Product`, which every `case class`/`case object` implements.
+        // The primary-constructor prefix is what Scala exposes, matching the
+        // derived `unapply` and `toString`.
+        ("productArity", 0) if is_case => Ok(Value::int(ctor_fields(&class, &fields).len() as i64)),
+        ("productPrefix", 0) if is_case => Ok(Value::str(class.clone())),
+        ("productIterator" | "productElementNames", 0) if is_case => {
+            let ctor = ctor_fields(&class, &fields);
+            Ok(new_list(if name == "productIterator" {
+                ctor.iter().map(|(_, v)| v.clone()).collect()
+            } else {
+                ctor.iter()
+                    .map(|(n, _)| Value::str(n.to_string()))
+                    .collect()
+            }))
+        }
+        ("productElement" | "productElementName", 1) if is_case => {
+            let ctor = ctor_fields(&class, &fields);
+            let i = args[0].to_int();
+            match usize::try_from(i).ok().and_then(|i| ctor.get(i)) {
+                Some((n, v)) => Ok(if name == "productElement" {
+                    v.clone()
+                } else {
+                    Value::str(n.to_string())
+                }),
+                None => Err(format!(
+                    "scalars: java.lang.IndexOutOfBoundsException: {i} is out of bounds (min 0, max {})",
+                    ctor.len().saturating_sub(1)
+                )),
+            }
+        }
         // A paren-less access naming a field reads that field.
         (_, 0) => match fields.iter().find(|(fname, _)| &**fname == name) {
             Some((_, v)) => Ok(v.clone()),
@@ -1583,6 +1693,13 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         },
         _ => Err(no_such_obj_member(&class, name)),
     }
+}
+
+/// The primary-constructor prefix of a record's fields — exactly what Scala's
+/// derived `Product`/`unapply`/`toString` expose (an inherited or body-declared
+/// field is not a product element).
+fn ctor_fields<'a>(class: &str, fields: &'a [(Arc<str>, Value)]) -> &'a [(Arc<str>, Value)] {
+    &fields[..ctor_arity(class, fields.len()).min(fields.len())]
 }
 
 /// The Scala "value … is not a member of …" message for an unresolved access on
@@ -2184,6 +2301,20 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Double" | "Float" => matches!(v, Value::Float(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
         "Any" | "AnyRef" | "AnyVal" | "Object" => true,
+        // The sequence shapes a sequence pattern (`case List(a, b) =>`) and the
+        // cons pattern (`case h :: t =>`) test against. `Seq`/`Iterable` accept
+        // any sequence; the named kinds accept only their own representation,
+        // matching Scala — a `Vector` does not match `case List(…)`.
+        "Seq" | "Iterable" | "collection.Seq" => matches!(seq_kind(v), Some(k) if !k.is_set()),
+        "List" => matches!(seq_kind(v), Some(SeqKind::List)),
+        "Vector" | "IndexedSeq" => matches!(seq_kind(v), Some(SeqKind::Vector)),
+        "Array" => matches!(seq_kind(v), Some(SeqKind::Array)),
+        "Set" => matches!(seq_kind(v), Some(k) if k.is_set()),
+        "Map" => as_map(v).is_some(),
+        // `Nil` is the empty `List`; `::` is a non-empty one (the cons cell
+        // class). Both are shape tests, not `==` against a singleton.
+        "Nil" => matches!(seq_kind_items(v), Some((SeqKind::List, xs)) if xs.is_empty()),
+        "::" => matches!(seq_kind_items(v), Some((SeqKind::List, xs)) if !xs.is_empty()),
         // `TupleN` — the type a tuple pattern (`case (a, b) =>`) tests against.
         _ if ty.starts_with("Tuple") => match ty[5..].parse::<usize>() {
             Ok(n) => matches!(seq_or_tuple_len(v), Some(len) if len == n),
@@ -2396,6 +2527,31 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
                 format!("scalars: value {name} is not a member of {}", e.class),
             ),
         };
+    }
+
+    // `StringOps`' closure-taking combinators. Dispatched here (not in
+    // `string_method`) because running the predicate body needs the VM.
+    if let Value::Str(s) = &recv {
+        let s = s.to_string();
+        if let Some(r) = string_fn_method(vm, &s, &name, &args) {
+            return match r {
+                Ok(v) => v,
+                Err(e) => fault(vm, e),
+            };
+        }
+    }
+
+    // `Option`'s surface. Dispatched here rather than in `obj_method` because
+    // `map`/`filter`/`fold`/… run a closure body and so need the VM. An
+    // unrecognized name falls through to the record dispatcher below, which
+    // still answers `Some(x).value`, `hashCode`, `equals`, ….
+    if let Some(inner) = as_option(&recv) {
+        if let Some(r) = option_method(vm, inner, &name, &args) {
+            return match r {
+                Ok(v) => v,
+                Err(e) => fault(vm, e),
+            };
+        }
     }
 
     // A heap collection/tuple/closure may need to run a closure body mid-method
@@ -2899,6 +3055,16 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         ("toArray", 0) => Ok(new_seq(SeqKind::Array, items)),
         ("toVector", 0) => Ok(new_seq(SeqKind::Vector, items)),
+        // `iterator`/`reverseIterator` are strict here: the result is an
+        // `Iterable` carrying the same elements, so the downstream combinators
+        // (`.toList`, `.map`, `.size`, …) answer exactly what Scala's lazy
+        // iterator would. Only printing the iterator itself would differ, and
+        // Scala's own `Iterator.toString` is unreproducible anyway.
+        ("iterator", 0) => Ok(new_seq(SeqKind::Iterable, items)),
+        ("reverseIterator", 0) => Ok(new_seq(
+            SeqKind::Iterable,
+            items.into_iter().rev().collect(),
+        )),
         ("length" | "size", 0) => Ok(Value::int(items.len() as i64)),
         ("isEmpty", 0) => Ok(Value::bool(items.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!items.is_empty())),
@@ -3551,6 +3717,22 @@ fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
     if name == "productArity" && args.is_empty() {
         return Ok(Value::int(items.len() as i64));
     }
+    if name == "productPrefix" && args.is_empty() {
+        return Ok(Value::str(format!("Tuple{}", items.len())));
+    }
+    if name == "productIterator" && args.is_empty() {
+        return Ok(new_list(items));
+    }
+    if name == "productElement" && args.len() == 1 {
+        return list_index(&items, args[0].to_int());
+    }
+    // `Tuple2.swap` — the only arity that has it.
+    if name == "swap" && args.is_empty() && items.len() == 2 {
+        return Ok(heap_push(HeapVal::Tuple(vec![
+            items[1].clone(),
+            items[0].clone(),
+        ])));
+    }
     if args.is_empty() {
         if let Some(n) = name.strip_prefix('_').and_then(|d| d.parse::<usize>().ok()) {
             if n >= 1 && n <= items.len() {
@@ -3737,7 +3919,13 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
         ("flatten", 0) => {
             let mut out = Vec::new();
             for it in items {
-                out.extend(as_seq_or_tuple(it)?);
+                // `List[Option[A]].flatten` drops the empties and unwraps the
+                // rest — an `Option` is an `IterableOnce` in Scala, so it
+                // flattens exactly like a one-or-zero element collection.
+                match as_option(it) {
+                    Some(inner) => out.extend(inner),
+                    None => out.extend(as_seq_or_tuple(it)?),
+                }
             }
             out
         }
@@ -4000,6 +4188,148 @@ fn make_none() -> Value {
     })
 }
 
+/// Build a built-in `Left(v)` / `Right(v)` case-class record (`Either`'s cases,
+/// which `Option.toRight`/`toLeft` answer).
+fn make_either(right: bool, v: Value) -> Value {
+    heap_alloc(ScalaObj {
+        class: Arc::from(if right { "Right" } else { "Left" }),
+        is_case: true,
+        is_object: false,
+        fields: vec![(Arc::from("value"), v)],
+    })
+}
+
+/// View a value as an `Option`: `Some(Some(inner))` for a `Some` record,
+/// `Some(None)` for the `None` singleton, `None` for anything else. The class
+/// tag is the whole test — the compiler injects these two built-ins unless the
+/// user shadows them, in which case the user's own record dispatches here too
+/// and gets the same (correct) `Option` surface.
+fn as_option(v: &Value) -> Option<Option<Value>> {
+    with_obj(v, |o| match &*o.class {
+        "Some" => o.fields.first().map(|(_, v)| v.clone()).map(Some),
+        "None" => Some(None),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `scala.Option`'s method surface. Returns `None` when `name` is not an
+/// `Option` method, so the caller falls through to the record dispatcher (which
+/// still answers `Some(x).value`, `hashCode`, `equals`, …).
+///
+/// `getOrElse`/`orElse`/`fold`'s default is by-name in Scala but is already
+/// evaluated by the time it reaches here; that is observable only for a default
+/// with side effects, which the parity corpus never generates.
+fn option_method(
+    vm: &mut VM,
+    inner: Option<Value>,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let some = |v: Value| Ok(make_some(v));
+    // A closure call can fault; `?`-style early return is spelled out because
+    // this function answers `Option<Result<…>>`.
+    macro_rules! call {
+        ($f:expr, $x:expr) => {
+            match invoke_closure(vm, $f, std::slice::from_ref($x)) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            }
+        };
+    }
+    Some(match (name, args.len()) {
+        ("get", 0) => match inner {
+            Some(v) => Ok(v),
+            None => Err("scalars: java.util.NoSuchElementException: None.get".into()),
+        },
+        ("getOrElse", 1) => Ok(inner.unwrap_or_else(|| args[0].clone())),
+        ("orNull", 0) => Ok(inner.unwrap_or(Value::Undef)),
+        ("isEmpty", 0) => Ok(Value::bool(inner.is_none())),
+        ("isDefined" | "nonEmpty", 0) => Ok(Value::bool(inner.is_some())),
+        ("size" | "knownSize", 0) => Ok(Value::int(i64::from(inner.is_some()))),
+        ("contains", 1) => Ok(Value::bool(inner.is_some_and(|v| value_eq(&v, &args[0])))),
+        ("toList" | "toSeq", 0) => Ok(new_list(inner.into_iter().collect())),
+        ("toVector", 0) => Ok(new_seq(SeqKind::Vector, inner.into_iter().collect())),
+        ("iterator", 0) => Ok(new_list(inner.into_iter().collect())),
+        ("toRight", 1) => Ok(match inner {
+            Some(v) => make_either(true, v),
+            None => make_either(false, args[0].clone()),
+        }),
+        ("toLeft", 1) => Ok(match inner {
+            Some(v) => make_either(false, v),
+            None => make_either(true, args[0].clone()),
+        }),
+        ("orElse", 1) => Ok(match inner {
+            Some(v) => make_some(v),
+            None => args[0].clone(),
+        }),
+        // `Option[Option[A]].flatten` — the inner option, or `None`.
+        ("flatten", 0) => Ok(match inner {
+            Some(v) if as_option(&v).is_some() => v,
+            Some(_) => return Some(Err("scalars: flatten needs an Option of Option".into())),
+            None => make_none(),
+        }),
+        ("map", 1) => match inner {
+            Some(v) => some(call!(&args[0], &v)),
+            None => Ok(make_none()),
+        },
+        ("flatMap", 1) => match inner {
+            Some(v) => Ok(call!(&args[0], &v)),
+            None => Ok(make_none()),
+        },
+        ("filter" | "filterNot" | "withFilter", 1) => match inner {
+            Some(v) => {
+                let keep = truthy(&call!(&args[0], &v)) == (name != "filterNot");
+                Ok(if keep { make_some(v) } else { make_none() })
+            }
+            None => Ok(make_none()),
+        },
+        ("exists", 1) => match inner {
+            Some(v) => Ok(Value::bool(truthy(&call!(&args[0], &v)))),
+            None => Ok(Value::bool(false)),
+        },
+        ("forall", 1) => match inner {
+            Some(v) => Ok(Value::bool(truthy(&call!(&args[0], &v)))),
+            None => Ok(Value::bool(true)),
+        },
+        ("count", 1) => match inner {
+            Some(v) => Ok(Value::int(i64::from(truthy(&call!(&args[0], &v))))),
+            None => Ok(Value::int(0)),
+        },
+        ("foreach", 1) => {
+            if let Some(v) = inner {
+                call!(&args[0], &v);
+            }
+            Ok(Value::Undef)
+        }
+        // `fold(ifEmpty)(f)` — the parser folds the second argument list into
+        // one call, so both arrive together.
+        ("fold", 2) => match inner {
+            Some(v) => Ok(call!(&args[1], &v)),
+            None => Ok(args[0].clone()),
+        },
+        // `collect`/`collectFirst` over an `Option` follow the same
+        // `isDefinedAt`-then-apply protocol the collections use.
+        ("collect", 1) => match inner {
+            Some(v) => match is_defined_at(vm, &args[0], &v) {
+                Ok(true) => some(call!(&args[0], &v)),
+                Ok(false) => Ok(make_none()),
+                Err(e) => Err(e),
+            },
+            None => Ok(make_none()),
+        },
+        ("head", 0) => match inner {
+            Some(v) => Ok(v),
+            None => Err("scalars: java.util.NoSuchElementException: head of empty list".into()),
+        },
+        ("headOption" | "lastOption", 0) => Ok(match inner {
+            Some(v) => make_some(v),
+            None => make_none(),
+        }),
+        _ => return None,
+    })
+}
+
 /// Resolve `recv.name(args)` against the wired stdlib, or return the Scala-style
 /// error message for an unresolved call. Kept host-only (no VM handle) so it is
 /// straightforward to unit-test.
@@ -4064,6 +4394,144 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("endsWith", 1) => Ok(Value::bool(s.ends_with(&*args[0].as_str_cow()))),
         ("substring", 1) => substring(s, args[0].to_int(), s.chars().count() as i64),
         ("substring", 2) => substring(s, args[0].to_int(), args[1].to_int()),
+        // `indexOf`/`lastIndexOf` answer a CHAR index, so the byte offset
+        // `str::find` returns has to be converted (`café`.indexOf("é") is 3).
+        ("indexOf", 1) => Ok(Value::int(char_index(s, s.find(&*args[0].as_str_cow())))),
+        ("indexOf", 2) => {
+            let from = char_offset(s, args[1].to_int());
+            Ok(Value::int(match s.get(from..) {
+                Some(rest) => char_index(s, rest.find(&*args[0].as_str_cow()).map(|i| i + from)),
+                None => -1,
+            }))
+        }
+        ("lastIndexOf", 1) => Ok(Value::int(char_index(s, s.rfind(&*args[0].as_str_cow())))),
+        ("replace" | "replaceAllLiterally", 2) => Ok(Value::str(
+            s.replace(&*args[0].as_str_cow(), &args[1].as_str_cow()),
+        )),
+        ("stripPrefix", 1) => Ok(Value::str(
+            s.strip_prefix(&*args[0].as_str_cow()).unwrap_or(s),
+        )),
+        ("stripSuffix", 1) => Ok(Value::str(
+            s.strip_suffix(&*args[0].as_str_cow()).unwrap_or(s),
+        )),
+        ("capitalize", 0) => Ok(Value::str(match s.chars().next() {
+            Some(c) => c.to_uppercase().collect::<String>() + &s[c.len_utf8()..],
+            None => String::new(),
+        })),
+        // `String.compareTo` answers the char difference at the first differing
+        // position, or the length difference — `java.lang.String`'s exact rule,
+        // not a normalized -1/0/1.
+        ("compareTo" | "compare", 1) => Ok(Value::int(str_compare(s, &args[0].as_str_cow()))),
+        ("compareToIgnoreCase", 1) => Ok(Value::int(str_compare(
+            &s.to_lowercase(),
+            &args[0].as_str_cow().to_lowercase(),
+        ))),
+        ("equalsIgnoreCase", 1) => Ok(Value::bool(
+            s.to_lowercase() == args[0].as_str_cow().to_lowercase(),
+        )),
+        ("*", 1) => Ok(Value::str(s.repeat(args[0].to_int().max(0) as usize))),
+        ("take", 1) => Ok(Value::str(char_slice(s, 0, args[0].to_int()))),
+        ("drop", 1) => Ok(Value::str(char_slice(
+            s,
+            args[0].to_int(),
+            s.chars().count() as i64,
+        ))),
+        ("takeRight", 1) => {
+            let n = s.chars().count() as i64;
+            Ok(Value::str(char_slice(s, n - args[0].to_int(), n)))
+        }
+        ("dropRight", 1) => Ok(Value::str(char_slice(
+            s,
+            0,
+            s.chars().count() as i64 - args[0].to_int(),
+        ))),
+        ("slice", 2) => Ok(Value::str(char_slice(
+            s,
+            args[0].to_int(),
+            args[1].to_int(),
+        ))),
+        ("splitAt", 1) => {
+            let n = args[0].to_int();
+            Ok(heap_push(HeapVal::Tuple(vec![
+                Value::str(char_slice(s, 0, n)),
+                Value::str(char_slice(s, n, s.chars().count() as i64)),
+            ])))
+        }
+        ("head", 0) => s
+            .chars()
+            .next()
+            .map(|c| Value::str(c.to_string()))
+            .ok_or_else(|| {
+                "scalars: java.util.NoSuchElementException: head of empty String".to_string()
+            }),
+        ("last", 0) => s
+            .chars()
+            .next_back()
+            .map(|c| Value::str(c.to_string()))
+            .ok_or_else(|| {
+                "scalars: java.lang.UnsupportedOperationException: last of empty String".to_string()
+            }),
+        ("init", 0) => Ok(Value::str(char_slice(s, 0, s.chars().count() as i64 - 1))),
+        ("tail", 0) => Ok(Value::str(char_slice(s, 1, s.chars().count() as i64))),
+        ("apply", 1) => string_method(s, "charAt", args),
+        ("distinct", 0) => {
+            let mut seen = String::new();
+            for c in s.chars() {
+                if !seen.contains(c) {
+                    seen.push(c);
+                }
+            }
+            Ok(Value::str(seen))
+        }
+        ("sorted", 0) => {
+            let mut cs: Vec<char> = s.chars().collect();
+            cs.sort_unstable();
+            Ok(Value::str(cs.into_iter().collect::<String>()))
+        }
+        ("mkString", 0) => Ok(Value::str(s)),
+        ("mkString", 1) => Ok(Value::str(
+            s.chars()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(&args[0].as_str_cow()),
+        )),
+        ("mkString", 3) => Ok(Value::str(format!(
+            "{}{}{}",
+            args[0].as_str_cow(),
+            s.chars()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(&args[1].as_str_cow()),
+            args[2].as_str_cow()
+        ))),
+        ("toCharArray", 0) => Ok(new_seq(
+            SeqKind::Array,
+            s.chars().map(|c| Value::str(c.to_string())).collect(),
+        )),
+        // `StringOps.zipWithIndex` answers an `IndexedSeq`, printed `Vector(…)`.
+        ("zipWithIndex", 0) => Ok(new_seq(
+            SeqKind::Vector,
+            s.chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    heap_push(HeapVal::Tuple(vec![
+                        Value::str(c.to_string()),
+                        Value::int(i as i64),
+                    ]))
+                })
+                .collect(),
+        )),
+        // A one-char string stands in for `Char` (the lexer gives `'a'` that
+        // shape), so `Char`'s predicates live here. `String` has none of these
+        // names, so a valid Scala program can never reach them on a real string.
+        ("toUpper", 0) => Ok(Value::str(s.to_uppercase())),
+        ("toLower", 0) => Ok(Value::str(s.to_lowercase())),
+        ("isLetter", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_alphabetic))),
+        ("isDigit", 0) => Ok(Value::bool(one_char(s).is_some_and(|c| c.is_ascii_digit()))),
+        ("isLetterOrDigit", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_alphanumeric))),
+        ("isUpper", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_uppercase))),
+        ("isLower", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_lowercase))),
+        ("isWhitespace", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_whitespace))),
         // A recognized name with the wrong arity is an arity error; an
         // unrecognized name is "no such method".
         (
@@ -4092,6 +4560,193 @@ fn substring(s: &str, begin: i64, end: i64) -> Result<Value, String> {
             .iter()
             .collect::<String>(),
     ))
+}
+
+/// `StringOps`' combinators that take a function. Returns `None` when `name` is
+/// not one of them, so the caller falls through to the pure [`string_method`].
+///
+/// The element type is a one-char `String` (this frontend's `Char` model).
+/// `map` therefore decides its result type by inspecting the results: all
+/// one-char strings rebuild a `String` (Scala's `Char => Char` overload), and
+/// anything else answers an `IndexedSeq`, printed `Vector(…)`. The one shape
+/// that model gets wrong is `s.map(_.toString)`, whose Scala result is a
+/// `Vector` of one-char strings — recorded in `BUGS.md`.
+fn string_fn_method(
+    vm: &mut VM,
+    s: &str,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let chars: Vec<Value> = s.chars().map(|c| Value::str(c.to_string())).collect();
+    macro_rules! call {
+        ($x:expr) => {
+            match invoke_closure(vm, &args[0], std::slice::from_ref($x)) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            }
+        };
+    }
+    // Re-join a char run into the `String` the receiver's type implies.
+    let join = |xs: &[Value]| {
+        Value::str(
+            xs.iter()
+                .map(|v| v.as_str_cow().into_owned())
+                .collect::<String>(),
+        )
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    Some(match name {
+        "map" => {
+            let mut out = Vec::with_capacity(chars.len());
+            for c in &chars {
+                out.push(call!(c));
+            }
+            Ok(
+                if out
+                    .iter()
+                    .all(|v| matches!(v, Value::Str(t) if one_char(t).is_some()))
+                {
+                    join(&out)
+                } else {
+                    new_seq(SeqKind::Vector, out)
+                },
+            )
+        }
+        "filter" | "filterNot" | "withFilter" => {
+            let keep = name != "filterNot";
+            let mut out = Vec::new();
+            for c in &chars {
+                if truthy(&call!(c)) == keep {
+                    out.push(c.clone());
+                }
+            }
+            Ok(join(&out))
+        }
+        "takeWhile" | "dropWhile" => {
+            let mut n = 0;
+            while n < chars.len() && truthy(&call!(&chars[n])) {
+                n += 1;
+            }
+            Ok(join(if name == "takeWhile" {
+                &chars[..n]
+            } else {
+                &chars[n..]
+            }))
+        }
+        "count" => {
+            let mut n = 0i64;
+            for c in &chars {
+                n += i64::from(truthy(&call!(c)));
+            }
+            Ok(Value::int(n))
+        }
+        "exists" | "forall" => {
+            let want = name == "exists";
+            for c in &chars {
+                if truthy(&call!(c)) == want {
+                    return Some(Ok(Value::bool(want)));
+                }
+            }
+            Ok(Value::bool(!want))
+        }
+        "foreach" => {
+            for c in &chars {
+                call!(c);
+            }
+            Ok(Value::Undef)
+        }
+        "find" => {
+            for c in &chars {
+                if truthy(&call!(c)) {
+                    return Some(Ok(make_some(c.clone())));
+                }
+            }
+            Ok(make_none())
+        }
+        "indexWhere" => {
+            for (i, c) in chars.iter().enumerate() {
+                if truthy(&call!(c)) {
+                    return Some(Ok(Value::int(i as i64)));
+                }
+            }
+            Ok(Value::int(-1))
+        }
+        // `span` stops testing at the FIRST failure and hands the whole
+        // remainder to the second component; `partition` tests every element
+        // and sorts it into one side or the other.
+        "span" => {
+            let mut n = 0;
+            while n < chars.len() && truthy(&call!(&chars[n])) {
+                n += 1;
+            }
+            Ok(heap_push(HeapVal::Tuple(vec![
+                join(&chars[..n]),
+                join(&chars[n..]),
+            ])))
+        }
+        "partition" => {
+            let (mut yes, mut no) = (Vec::new(), Vec::new());
+            for c in &chars {
+                if truthy(&call!(c)) {
+                    yes.push(c.clone());
+                } else {
+                    no.push(c.clone());
+                }
+            }
+            Ok(heap_push(HeapVal::Tuple(vec![join(&yes), join(&no)])))
+        }
+        _ => return None,
+    })
+}
+
+/// The single `char` of a one-char string, if that is what `s` is. A `Char`
+/// value is modeled as a one-char `String` (the lexer gives `'a'` that shape).
+fn one_char(s: &str) -> Option<char> {
+    let mut it = s.chars();
+    it.next().filter(|_| it.next().is_none())
+}
+
+/// Convert a BYTE offset from `str::find`/`rfind` into the CHAR index Scala's
+/// `indexOf` answers; `None` (not found) is `-1`.
+fn char_index(s: &str, byte: Option<usize>) -> i64 {
+    match byte {
+        Some(b) => s[..b].chars().count() as i64,
+        None => -1,
+    }
+}
+
+/// The byte offset of char index `i`, clamped to the string's bounds.
+fn char_offset(s: &str, i: i64) -> usize {
+    if i <= 0 {
+        return 0;
+    }
+    s.char_indices().nth(i as usize).map_or(s.len(), |(b, _)| b)
+}
+
+/// `s`'s chars in `[from, until)`, with both ends clamped — the total,
+/// non-throwing slicing `StringOps.take`/`drop`/`slice` do (unlike `substring`,
+/// which throws out of range).
+fn char_slice(s: &str, from: i64, until: i64) -> String {
+    let len = s.chars().count() as i64;
+    let from = from.clamp(0, len) as usize;
+    let until = until.clamp(0, len) as usize;
+    if until <= from {
+        return String::new();
+    }
+    s.chars().skip(from).take(until - from).collect()
+}
+
+/// `java.lang.String.compareTo`: the char difference at the first differing
+/// position, else the length difference. Not normalized to -1/0/1.
+fn str_compare(a: &str, b: &str) -> i64 {
+    for (x, y) in a.chars().zip(b.chars()) {
+        if x != y {
+            return x as i64 - y as i64;
+        }
+    }
+    a.chars().count() as i64 - b.chars().count() as i64
 }
 
 /// `Int` methods (a faithful subset of `scala.Int` / `RichInt`).

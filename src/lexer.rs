@@ -83,6 +83,8 @@ pub enum Tok {
     RArrow,
     /// `::` — list cons.
     ColonColon,
+    /// `@` — the pattern binder (`case n @ Some(v) =>`).
+    At,
     /// A symbolic method operator with no dedicated token: `++`, `--`, `:+`, `+:`.
     /// Parsed as an infix method call, with SLS precedence taken from the first
     /// character and right-associativity from a trailing `:`.
@@ -475,6 +477,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     // SLS precedence comes from this first character.
                     '&' | '|' | '^' => (Tok::Op(c.to_string()), 1),
                     '~' => (Tok::Tilde, 1),
+                    // `@` only ever introduces a pattern binder here — the
+                    // annotation syntax (`@tailrec`) is not modeled.
+                    '@' => (Tok::At, 1),
                     '+' => (Tok::Plus, 1),
                     '-' => (Tok::Minus, 1),
                     '*' => (Tok::Star, 1),

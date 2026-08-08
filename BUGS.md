@@ -128,6 +128,52 @@ reported as parse/compile errors, never silently mis-run.
   matches, matching Scala's `Function1` reading of the same literal. A
   `PartialFunction[A, B]` annotation is a type ascription, so binding one to a
   `val` and passing it around works.
+- **The full `match` pattern grammar.** Beyond literal/wildcard/typed/tuple and
+  constructor patterns: `@` binders (`case w @ Pt(0, _) =>`, which bind the whole
+  scrutinee alongside its parts), `|` alternations (`case 0 | 1 | 2 =>`, each
+  branch tried in turn), the cons pattern `h :: t` and `Nil`, and sequence
+  patterns `List(a, b)` / `Seq(…)` / `Vector(…)` / `Array(…)` with an optional
+  trailing `_*` (named — `rest @ _*` — or anonymous). A sequence pattern tests the
+  receiver's REPRESENTATION first and its length second, so `case List(a, b)`
+  does not match a two-element `Vector`, matching Scala. The same grammar backs
+  **pattern definitions**: `val (a, b) = pair`, `val Some(x) = opt`,
+  `val h :: t = xs`, `val Pt(x, y) = p` and nested forms all bind into the
+  enclosing scope and raise `scala.MatchError` on a non-matching value.
+- **`scala.Option`'s method surface.** `get`, `getOrElse`, `orNull`, `isEmpty`,
+  `isDefined`, `nonEmpty`, `size`, `contains`, `map`, `flatMap`, `filter`,
+  `filterNot`, `exists`, `forall`, `count`, `foreach`, `fold(ifEmpty)(f)`,
+  `orElse`, `collect`, `flatten`, `head`, `headOption`, `toList`/`toSeq`/
+  `toVector`/`iterator`, and `toRight`/`toLeft`. The `Option(x)` factory answers
+  `None` for `null`. `Either`'s `Left`/`Right` are built-in case classes, so
+  `Right(1)`, `case Left(e) =>` and `List[Either[…]].collect` all work.
+  `List[Option[A]].flatten` drops the empties.
+- **`Product` on every `case class`/`case object` and tuple.** `productArity`,
+  `productPrefix`, `productElement(i)`, `productElementName(i)`,
+  `productIterator` and `productElementNames`, all over the
+  primary-constructor prefix (a body `val` is a field but not a product
+  element). `Tuple2.swap` and `iterator`/`reverseIterator` on a sequence.
+- **Non-local `return`, and `finally` on the way out.** A `return` inside a
+  lambda — including the `foreach`/`map` closures a `for` comprehension
+  desugars to — leaves the *method* that lexically contains it, not just the
+  closure. It is lowered the way Scala lowers it: the value is parked as a
+  `scala.runtime.NonLocalReturnControl` and carried out by the same unwind walk
+  an exception uses (`NLR_RAISE`/`NLR_TAKE` in `src/host.rs`), so every
+  enclosing `finally` runs, innermost first, before the value reaches the
+  caller. No `catch` arm can intercept it. `return` is also accepted in
+  expression position (`xs.foreach(x => if (p(x)) return x)`), as in Scala,
+  where its type is `Nothing`.
+- **The wider `String`/`StringOps` surface.** `indexOf`(+`from`), `lastIndexOf`,
+  `replace`, `stripPrefix`/`stripSuffix`, `capitalize`, `compareTo`(the JDK's
+  char-difference result, not a normalized sign)/`compareToIgnoreCase`/
+  `equalsIgnoreCase`, `*` (repeat), the total slicing operations `take`/`drop`/
+  `takeRight`/`dropRight`/`slice`/`splitAt` (clamped, never throwing),
+  `head`/`last`/`init`/`tail`, `apply(i)`, `distinct`, `sorted`, `mkString`
+  (0/1/3-arg), `toCharArray`, `zipWithIndex`, and the closure-taking
+  combinators `map`, `filter`/`filterNot`, `takeWhile`/`dropWhile`, `count`,
+  `exists`/`forall`, `foreach`, `find`, `indexWhere`, `partition` and `span`.
+  `Char` is modeled as a one-char `String` (which is what `'a'` lexes to), so
+  `Char`'s predicates — `toUpper`, `toLower`, `isLetter`, `isDigit`,
+  `isLetterOrDigit`, `isUpper`, `isLower`, `isWhitespace` — live on `String`.
 - **The bitwise and shift operators.** `&`, `|`, `^`, `~`, `<<`, `>>` and `>>>`
   on `Int`; `&`, `|` and `^` on `Boolean` (Scala's non-short-circuiting forms);
   and `&`/`|`/`&~` on `Set` (intersection, union, difference). Hexadecimal
@@ -194,10 +240,12 @@ reported as parse/compile errors, never silently mis-run.
 - **`x += e` in expression position.** `println(buf += 1)` — Scala's `+=` is an
   expression whose value is the buffer. Here `+=` is a statement, so it is a
   parse error rather than a mis-run. `buf += 1` on its own line works.
-- **Lazy views and `Iterator`.** `.view`, `.iterator`, and `LazyList`. The
-  strict methods above materialize; `grouped`/`sliding` answer the `List` of
-  windows rather than an `Iterator`, so `.toList`/`.foreach` on one matches but
-  printing it bare does not.
+- **Lazy views and a real `Iterator`.** `.view` and `LazyList`. `.iterator` and
+  `.reverseIterator` answer a STRICT `Iterable` carrying the same elements, so
+  every downstream combinator (`.toList`, `.map`, `.size`, …) matches; only
+  printing the iterator itself differs, and Scala's own `Iterator.toString` is
+  unreproducible anyway. Likewise `grouped`/`sliding` answer the `List` of
+  windows rather than an `Iterator`.
 - **Sorting by a user `Ordering`.** `sorted(ord)`, `sortBy` with an explicit
   `Ordering`, and `Ordered`/`Comparable` on a user class. The built-in ordering
   covers numbers, `String`, `Boolean` and tuples of those; anything else
@@ -213,6 +261,20 @@ reported as parse/compile errors, never silently mis-run.
   extends Exception` can be thrown and caught *by its own name*, but the JDK
   throwables are not part of the registered class hierarchy, so `case e:
   Exception` will not catch it.
+- **Type ascription in expression position.** `(e: T)` and `(None: Option[Int])`
+  are a parse error. Annotate a `val` instead (`val e: Option[Int] = None`).
+- **The unit literal `()`.** `x => ()` and `val u = ()` are a parse error.
+- **A value definition in a `for` comprehension.** `for { x <- xs; y = f(x) }
+  yield y` — the `y = …` enumerator. Rewrite it as a `yield` expression.
+- **`Char` as its own type.** `'a'` lexes to a one-char `String`, so `Char`'s
+  predicates and case conversions work but its NUMERIC surface does not:
+  `'a'.toInt` answers a `NumberFormatException` rather than `97`, `'a' + 1` is a
+  concatenation rather than `98`, and there is no `.toChar`.
+- **`s * n` on a `String` written as an operator.** The method form
+  `s.*(n)` resolves; the infix `s * 2` reaches fusevm's `Op::Mul`, which has no
+  `String` case, and faults.
+- **Regular expressions.** `matches`, `replaceAll`/`replaceFirst` with a regex,
+  `r"…".r`, and `scala.util.matching`.
 - **By-name params, `given`/`using`, `@main` (Scala 3 annotation entry).**
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
@@ -227,6 +289,21 @@ reported as parse/compile errors, never silently mis-run.
   `ClassCastException` and never performs a numeric conversion. A class's
   `val`/private access modifiers are parsed but not enforced (every field is
   reachable).
+- **`String.map`'s result type is decided from the RESULTS.** With `Char` modeled
+  as a one-char `String`, there is no static way to tell Scala's `Char => Char`
+  overload (which answers a `String`) from `Char => B` (which answers an
+  `IndexedSeq`). The rule is: all-one-char results rebuild a `String`, anything
+  else answers a `Vector`. That is right for `s.map(_.toUpper)` and for
+  `s.map(_.toInt)`; the one shape it gets wrong is `s.map(_.toString)`, whose
+  Scala result is a `Vector` of one-char strings and whose result here is a
+  `String`. `filter`/`takeWhile`/`dropWhile`/`partition`/`span` are unaffected —
+  their result is always a `String`.
+- **A `catch` arm cannot see a non-local return, even as `Throwable`.** Scala's
+  `NonLocalReturnControl` extends `ControlThrowable`, so `case e: Exception`
+  misses it but a bare `case e =>` (i.e. `Throwable`) would catch it. Here the
+  parked control value is not a throwable at all, so NO arm matches it. The
+  difference is observable only for a `catch` that deliberately swallows
+  `Throwable` around a `return`, which is a bug in the Scala program either way.
 - **`Array.toString` renders `Array(1, 2, 3)`.** Scala prints the JVM identity
   form (`[I@1b6d3586`), which no reimplementation can reproduce byte-for-byte,
   so the readable form is emitted instead. This is the one place a supported

@@ -93,6 +93,10 @@ struct Compiler {
     /// per-statement unwind checks emitted, so an exception-free program keeps
     /// byte-identical bytecode (and its speed).
     has_try: bool,
+    /// Whether the body currently being emitted is a LAMBDA body. A `return`
+    /// there is non-local (it belongs to the enclosing `def`), so it lowers to
+    /// `NLR_RAISE` + the unwind walk rather than a frame-local `ReturnValue`.
+    in_lambda: bool,
     /// Whether the program builds a mutable collection anywhere — see
     /// [`body_has_mutable`].
     has_mutable: bool,
@@ -115,8 +119,14 @@ enum UnwindKind {
     /// Out of the enclosing loop; the check after the loop statement continues
     /// the walk outward.
     Loop,
-    /// Out of the enclosing `def`/method/closure frame, returning `Unit`.
+    /// Out of the enclosing `def`/method frame. This is the frame a non-local
+    /// return lands in: the check takes the parked return value (`NLR_TAKE`) and
+    /// returns it, or returns `Unit` and leaves a real exception in flight.
     Def,
+    /// Out of the enclosing LAMBDA frame, returning `Unit`. A lambda is not a
+    /// method, so a non-local return passes straight through it — that is the
+    /// whole point of routing `return` through the unwind path.
+    Lambda,
 }
 
 /// One entry of [`Compiler::unwind`]: the target kind plus the forward jumps
@@ -246,6 +256,13 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut classes: Vec<ClassDecl> = prog.classes.clone();
     if !classes.iter().any(|c| c.name == "Some") {
         classes.push(builtin_some());
+    }
+    // `Either`'s two cases, so `Right(v)` / `case Left(e) =>` and the
+    // `Option.toRight`/`toLeft` results all round-trip through one record shape.
+    for (name, field) in [("Left", "value"), ("Right", "value")] {
+        if !classes.iter().any(|c| c.name == name) {
+            classes.push(builtin_case1(name, field));
+        }
     }
     // Built-in `None` case object, unless redefined.
     let mut objects: Vec<ObjectDecl> = prog.objects.clone();
@@ -399,7 +416,12 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         closures_seen: 0,
         // Scan once up front: the unwind checks cost two ops per statement, so
         // they are emitted only for programs that can actually catch.
-        has_try: program_any(prog, &classes, &objects, body_has_try),
+        // A `return` inside a lambda, and any `return` that must run a
+        // `finally` on the way out, both travel the unwind path — so a program
+        // with either needs the per-statement checks even without a `try`.
+        has_try: program_any(prog, &classes, &objects, body_has_try)
+            || program_any(prog, &classes, &objects, body_has_lambda_return),
+        in_lambda: false,
         // Likewise for `+=`: only a program that builds a mutable collection
         // can need the run-time growable test (see `compound_tail`).
         has_mutable: program_any(prog, &classes, &objects, body_has_mutable),
@@ -484,15 +506,20 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
 
 /// The built-in `Some(value)` case class (`Option`'s non-empty case).
 fn builtin_some() -> ClassDecl {
+    builtin_case1("Some", "value")
+}
+
+/// A built-in single-field `case class` (`Some`, `Left`, `Right`).
+fn builtin_case1(name: &str, field: &str) -> ClassDecl {
     ClassDecl {
-        name: "Some".to_string(),
+        name: name.to_string(),
         is_case: true,
         is_trait: false,
         parents: Vec::new(),
         super_args: Vec::new(),
-        params: vec!["value".to_string()],
+        params: vec![field.to_string()],
         body: Vec::new(),
-        field_names: vec!["value".to_string()],
+        field_names: vec![field.to_string()],
         methods: Vec::new(),
     }
 }
@@ -572,11 +599,18 @@ impl Compiler {
                     .jumps
                     .push(j);
             }
-            // A `def`/method/closure body: return `Unit` immediately; the
-            // caller's own check resumes the walk in its frame. `ReturnValue`
-            // (not the bare `Return` the Unit tail paths use) so the call site
-            // still receives exactly one value whatever position it is in.
+            // A `def`/method body: the frame a non-local return targets. Take
+            // the parked return value and answer it; a real exception makes
+            // `NLR_TAKE` answer `Unit` and stays in flight, so the caller's own
+            // check resumes the walk in its frame. `ReturnValue` (not the bare
+            // `Return` the Unit tail paths use) so the call site still receives
+            // exactly one value whatever position it is in.
             Some(UnwindKind::Def) => {
+                self.b.emit(Op::CallBuiltin(crate::host::NLR_TAKE, 0), 0);
+                self.b.emit(Op::ReturnValue, 0);
+            }
+            // A lambda body: pass everything through, non-local return included.
+            Some(UnwindKind::Lambda) => {
                 self.b.emit(Op::LoadUndef, 0);
                 self.b.emit(Op::ReturnValue, 0);
             }
@@ -629,6 +663,30 @@ impl Compiler {
                 // An initializer-less binding is unbound until first assigned
                 // (Scala requires an initializer for concrete `val`/`var`; slice
                 // 1 does not enforce it).
+                Ok(())
+            }
+            // `val (a, b) = pair` — a pattern definition. The initializer is
+            // evaluated once into an anonymous place, the pattern binds against
+            // it into the ENCLOSING scope, and a mismatch raises the same
+            // `scala.MatchError` a failed `match` does.
+            StmtKind::Destructure { pat, init } => {
+                self.expr(init)?;
+                self.unwind_check_dropping(1);
+                self.obj_counter += 1;
+                let src = self.declare_place(&format!(" destr_{}", self.obj_counter));
+                self.emit_store(src);
+                let mut fail_jumps = Vec::new();
+                self.match_pattern(pat, src, &mut fail_jumps)?;
+                let ok = self.b.emit(Op::Jump(0), 0);
+                let at = self.b.current_pos();
+                for j in fail_jumps {
+                    self.b.patch_jump(j, at);
+                }
+                self.emit_load(src);
+                self.b.emit(Op::CallBuiltin(crate::host::SMATCHERR, 1), 0);
+                self.b.emit(Op::Pop, 0);
+                let end = self.b.current_pos();
+                self.b.patch_jump(ok, end);
                 Ok(())
             }
             StmtKind::Assign { name, op, value } => {
@@ -690,6 +748,24 @@ impl Compiler {
                 Ok(())
             }
             StmtKind::Return(val) => {
+                // A `return` that has to leave a lambda frame, or run an
+                // enclosing `finally` on its way out, is lowered the way Scala
+                // lowers it: park the value as a non-local return and let the
+                // unwind walk carry it (through every `finally`) to the method
+                // frame, whose check answers it. Everything else is the direct,
+                // free form — pop the frame with the value on the stack.
+                if self.in_lambda || self.unwind.iter().any(|f| f.kind == UnwindKind::Try) {
+                    match val {
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            self.b.emit(Op::LoadUndef, s.line);
+                        }
+                    };
+                    self.b
+                        .emit(Op::CallBuiltin(crate::host::NLR_RAISE, 1), s.line);
+                    self.b.emit(Op::Pop, s.line);
+                    return Ok(());
+                }
                 // `return e` / bare `return` — leave the enclosing `def` (frame
                 // popped by `ReturnValue`/`Return`). At the top level (frame 0)
                 // the VM treats it as program end.
@@ -1224,9 +1300,14 @@ impl Compiler {
         for i in (0..total).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
-        // A closure body is its own unwind boundary (see `unwind_check`).
-        self.push_unwind(UnwindKind::Def);
+        // A closure body is its own unwind boundary (see `unwind_check`), but
+        // NOT a method boundary: a `return` inside it belongs to the enclosing
+        // `def`, so the frame is `Lambda` and lets a non-local return through.
+        self.push_unwind(UnwindKind::Lambda);
+        let saved_lambda = self.in_lambda;
+        self.in_lambda = true;
         self.expr(&pc.body)?;
+        self.in_lambda = saved_lambda;
         self.pop_unwind_to(self.b.current_pos());
         self.b.emit(Op::ReturnValue, 0);
 
@@ -1483,11 +1564,65 @@ impl Compiler {
                 }
             }
             Pattern::Stable(name) => {
-                // `case None =>` / a stable-identifier pattern: `scrut == <value>`.
+                // `case Nil =>` — the empty `List`. Tested by runtime shape
+                // rather than by `==` against a materialized object, because
+                // `Nil` is a collection value, not a case singleton.
+                if name == "Nil" && !self.objects.contains_key(name) {
+                    self.emit_type_test(vplace, "Nil", fail_jumps);
+                } else {
+                    // `case None =>` / a stable-identifier pattern: `scrut == <value>`.
+                    self.emit_load(vplace);
+                    self.materialize_object(name)?;
+                    self.b.emit(Op::NumEq, 0);
+                    fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+                }
+            }
+            // `case n @ p =>` — bind the whole scrutinee, then match `p`. The
+            // binding is emitted first; it is only ever *read* from the arm body,
+            // which runs solely when `p` matched too, so the order is unobservable.
+            Pattern::At { name, pat } => {
+                let p = self.declare_place(name);
                 self.emit_load(vplace);
-                self.materialize_object(name)?;
-                self.b.emit(Op::NumEq, 0);
-                fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+                self.emit_store(p);
+                self.match_pattern(pat, vplace, fail_jumps)?;
+            }
+            // `case a | b | c =>` — the first branch that matches wins. Each
+            // non-final branch gets its own failure list, patched to the start of
+            // the next branch; only the last branch's failures reach the arm's.
+            Pattern::Alt(alts) => {
+                let mut matched = Vec::new();
+                for (i, alt) in alts.iter().enumerate() {
+                    if i + 1 == alts.len() {
+                        self.match_pattern(alt, vplace, fail_jumps)?;
+                        break;
+                    }
+                    let mut local = Vec::new();
+                    self.match_pattern(alt, vplace, &mut local)?;
+                    matched.push(self.b.emit(Op::Jump(0), 0));
+                    let next = self.b.current_pos();
+                    for j in local {
+                        self.b.patch_jump(j, next);
+                    }
+                }
+                let end = self.b.current_pos();
+                for j in matched {
+                    self.b.patch_jump(j, end);
+                }
+            }
+            // `case h :: t =>` — a non-empty `List`, destructured into head/tail.
+            Pattern::Cons(head, tail) => {
+                self.emit_type_test(vplace, "::", fail_jumps);
+                let hp = self.bind_accessor(vplace, "head", "hd");
+                self.match_pattern(head, hp, fail_jumps)?;
+                let tp = self.bind_accessor(vplace, "tail", "tl");
+                self.match_pattern(tail, tp, fail_jumps)?;
+            }
+            // A bare `_*` outside a sequence pattern is not Scala.
+            Pattern::Rest(_) => {
+                return Err(
+                    "scalars: `_*` is only valid as the last element of a sequence pattern"
+                        .to_string(),
+                )
             }
             Pattern::Tuple(elems) => {
                 // Arity test, then bind each element through the `_1`.. accessors.
@@ -1514,6 +1649,12 @@ impl Compiler {
                 // parameters only — the leading prefix of the record.
                 let fields = match self.classes.get(name) {
                     Some(meta) => meta.field_names[..meta.arity].to_vec(),
+                    // `case List(a, b) =>` / `Seq(…)` / `Vector(…)` / `Array(…)`
+                    // are sequence patterns, matched on shape and length rather
+                    // than against a record's fields.
+                    None if seq_pattern_ctor(name) => {
+                        return self.match_seq_pattern(name, elems, vplace, fail_jumps)
+                    }
                     None => {
                         return Err(format!("scalars: not found: constructor pattern `{name}`"))
                     }
@@ -1544,6 +1685,91 @@ impl Compiler {
                     self.match_pattern(elem, fp, fail_jumps)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Emit `SISTYPE(scrut, ty)` and push its failure branch onto `fail_jumps`.
+    /// Every shape test in [`Self::match_pattern`] goes through here, so the
+    /// branch is always taken BEFORE any method is dispatched on the scrutinee —
+    /// that ordering is what keeps a wrong-shaped value from faulting the VM on
+    /// an accessor it does not have.
+    fn emit_type_test(&mut self, vplace: Place, ty: &str, fail_jumps: &mut Vec<usize>) {
+        self.emit_load(vplace);
+        let c = self.b.add_constant(Value::str(ty.to_string()));
+        self.b.emit(Op::LoadConst(c), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SISTYPE, 2), 0);
+        fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+    }
+
+    /// Call the zero-argument accessor `method` on the scrutinee and store the
+    /// result in a fresh anonymous place, returning it for sub-pattern matching.
+    fn bind_accessor(&mut self, vplace: Place, method: &str, tag: &str) -> Place {
+        self.emit_load(vplace);
+        let c = self.b.add_constant(Value::str(method.to_string()));
+        self.b.emit(Op::LoadConst(c), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+        self.obj_counter += 1;
+        let p = self.declare_place(&format!(" {tag}_{}", self.obj_counter));
+        self.emit_store(p);
+        p
+    }
+
+    /// Call the one-argument method `method(arg)` on the scrutinee and store the
+    /// result in a fresh anonymous place.
+    fn bind_accessor1(&mut self, vplace: Place, method: &str, arg: i64, tag: &str) -> Place {
+        self.emit_load(vplace);
+        let a = self.b.add_constant(Value::int(arg));
+        self.b.emit(Op::LoadConst(a), 0);
+        let c = self.b.add_constant(Value::str(method.to_string()));
+        self.b.emit(Op::LoadConst(c), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 3), 0);
+        self.obj_counter += 1;
+        let p = self.declare_place(&format!(" {tag}_{}", self.obj_counter));
+        self.emit_store(p);
+        p
+    }
+
+    /// `case List(a, b) =>` / `case Seq(x, rest @ _*) =>` — a sequence pattern:
+    /// a shape test on the receiver kind, then a length test (exact, or `>=` when
+    /// a trailing `_*` absorbs the remainder), then positional binding through
+    /// `apply(i)`. A named `_*` binds `drop(n)`.
+    fn match_seq_pattern(
+        &mut self,
+        name: &str,
+        elems: &[Pattern],
+        vplace: Place,
+        fail_jumps: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        let (fixed, rest) = match elems.last() {
+            Some(Pattern::Rest(r)) => (&elems[..elems.len() - 1], Some(r.clone())),
+            _ => (elems, None),
+        };
+        if fixed.iter().any(|p| matches!(p, Pattern::Rest(_))) {
+            return Err(
+                "scalars: `_*` is only valid as the last element of a sequence pattern".to_string(),
+            );
+        }
+        self.emit_type_test(vplace, name, fail_jumps);
+        // Length test. `Op::NumGe` for the `_*` form, `Op::NumEq` otherwise.
+        self.emit_load(vplace);
+        let lc = self.b.add_constant(Value::str("length".to_string()));
+        self.b.emit(Op::LoadConst(lc), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+        let n = self.b.add_constant(Value::int(fixed.len() as i64));
+        self.b.emit(Op::LoadConst(n), 0);
+        self.b
+            .emit(if rest.is_some() { Op::NumGe } else { Op::NumEq }, 0);
+        fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+        for (i, elem) in fixed.iter().enumerate() {
+            let p = self.bind_accessor1(vplace, "apply", i as i64, "elt");
+            self.match_pattern(elem, p, fail_jumps)?;
+        }
+        if let Some(Some(rname)) = rest {
+            let p = self.bind_accessor1(vplace, "drop", fixed.len() as i64, "rest");
+            let dst = self.declare_place(&rname);
+            self.emit_load(p);
+            self.emit_store(dst);
         }
         Ok(())
     }
@@ -2336,6 +2562,18 @@ impl Compiler {
                 .emit(Op::CallBuiltin(crate::host::RANGE_LIST, 3), line);
             return Ok(());
         }
+        // `Option(x)` — the factory whose `null` case is `None`. Only when the
+        // program has not bound `Option` itself.
+        if name == "Option"
+            && args.len() == 1
+            && !self.func_arity.contains_key(name)
+            && !self.classes.contains_key(name)
+        {
+            self.expr(&args[0])?;
+            self.b
+                .emit(Op::CallBuiltin(crate::host::MAKE_OPTION, 1), line);
+            return Ok(());
+        }
         // `new Array[T](n)` — the length and the element-type name.
         if name == crate::parser::NEW_ARRAY {
             for a in args {
@@ -2539,9 +2777,13 @@ impl Compiler {
 
     fn tail_stmt(&mut self, s: &Stmt) -> Result<(), String> {
         match &s.kind {
-            // The value of a tail expression is the function's result.
+            // The value of a tail expression is the function's result — unless
+            // it left something in flight (a raise, or a non-local return out of
+            // a `try`/lambda inside it), in which case the check drops the
+            // garbage value and dispatches instead.
             StmtKind::Expr(e) => {
                 self.expr(e)?;
+                self.unwind_check_dropping(1);
                 self.b.emit(Op::ReturnValue, s.line);
                 Ok(())
             }
@@ -2643,6 +2885,7 @@ impl Compiler {
 fn body_any(body: &[Stmt], pred: &impl Fn(&Expr) -> bool) -> bool {
     body.iter().any(|s| match &s.kind {
         StmtKind::Local { init, .. } => init.as_ref().is_some_and(|e| expr_any(e, pred)),
+        StmtKind::Destructure { init, .. } => expr_any(init, pred),
         StmtKind::Assign { value, .. } => expr_any(value, pred),
         StmtKind::Expr(e) => expr_any(e, pred),
         StmtKind::If { cond, then, els } => {
@@ -2740,6 +2983,61 @@ fn body_has_try(stmts: &[Stmt]) -> bool {
     body_any(stmts, &|e| matches!(e, Expr::Try { .. }))
 }
 
+/// True if a statement list contains a `return` inside something that becomes a
+/// LAMBDA body — an explicit lambda, or a `for`/`for … yield` comprehension,
+/// which desugars to `foreach`/`map` closures after this scan runs. Such a
+/// `return` is non-local: it travels the unwind path, so the per-statement
+/// checks must be armed even in a program with no `try`.
+fn body_has_lambda_return(stmts: &[Stmt]) -> bool {
+    body_any(stmts, &|e| match e {
+        Expr::Lambda { body, .. } | Expr::ForEach { body, .. } | Expr::ForYield { body, .. } => {
+            expr_has_return(body)
+        }
+        _ => false,
+    })
+}
+
+/// Whether a lambda/comprehension body contains a `return` statement anywhere.
+///
+/// A statement-level walk, because `body_any` only tests EXPRESSIONS and a
+/// `return` is a statement — and the block that holds it is often a bare
+/// `Vec<Stmt>` (an `if` branch, a `while` body), never an `Expr::Block`.
+fn expr_has_return(e: &Expr) -> bool {
+    // Any nested block reached through a sub-expression counts too, which is
+    // what the recursive `expr_any` walk covers.
+    expr_any(e, &|inner| match inner {
+        Expr::Block(stmts) => stmts_have_return(stmts),
+        Expr::Try {
+            body,
+            catches,
+            finalizer,
+        } => {
+            stmts_have_return(body)
+                || catches.iter().any(|a| stmts_have_return(&a.body))
+                || finalizer.as_deref().is_some_and(stmts_have_return)
+        }
+        _ => false,
+    })
+}
+
+/// Whether a statement list holds a `return` at any nesting depth.
+fn stmts_have_return(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        StmtKind::Return(_) => true,
+        StmtKind::If { then, els, cond } => {
+            stmts_have_return(then) || stmts_have_return(els) || expr_has_return(cond)
+        }
+        StmtKind::While { body, cond } => stmts_have_return(body) || expr_has_return(cond),
+        StmtKind::Expr(e) => expr_has_return(e),
+        StmtKind::Local { init, .. } => init.as_ref().is_some_and(expr_has_return),
+        StmtKind::Destructure { init, .. } => expr_has_return(init),
+        StmtKind::Assign { value, .. } => expr_has_return(value),
+        // Lifted into `Program::functions` before compiling; its own `return`s
+        // are local to it, not to the enclosing body.
+        StmtKind::DefDecl(_) => false,
+    })
+}
+
 /// True if a statement list builds a mutable collection anywhere — a
 /// `ListBuffer`/`ArrayBuffer` literal (which the parser already recognizes) or a
 /// `scala.collection.mutable` factory call. Only such a program pays for the
@@ -2774,6 +3072,12 @@ fn program_any(
 /// Whether a collection-literal constructor names a mutable collection.
 fn mutable_buffer_literal(ctor: &str) -> bool {
     matches!(ctor, "ListBuffer" | "ArrayBuffer")
+}
+
+/// Whether a constructor pattern names a *sequence* extractor (`case List(a, b)`)
+/// rather than a case class. Only consulted when no user class shadows the name.
+fn seq_pattern_ctor(name: &str) -> bool {
+    matches!(name, "List" | "Seq" | "Vector" | "IndexedSeq" | "Array")
 }
 
 /// The caught type of a `catch` arm's pattern. A bare `case e =>` / `case _ =>`
@@ -3165,6 +3469,10 @@ fn fv_block(
                 }
                 b.insert(name.clone());
             }
+            StmtKind::Destructure { pat, init } => {
+                fv_expr(init, &b, out, seen);
+                pattern_binds(pat, &mut b);
+            }
             StmtKind::Assign { name, value, .. } => {
                 fv_note(name, &b, out, seen);
                 fv_expr(value, &b, out, seen);
@@ -3331,10 +3639,21 @@ fn pattern_binds(p: &Pattern, bound: &mut HashSet<String>) {
         Pattern::Typed { name, .. } if name != "_" => {
             bound.insert(name.clone());
         }
-        Pattern::Constructor { elems, .. } | Pattern::Tuple(elems) => {
+        Pattern::Constructor { elems, .. } | Pattern::Tuple(elems) | Pattern::Alt(elems) => {
             for e in elems {
                 pattern_binds(e, bound);
             }
+        }
+        Pattern::At { name, pat } => {
+            bound.insert(name.clone());
+            pattern_binds(pat, bound);
+        }
+        Pattern::Cons(h, t) => {
+            pattern_binds(h, bound);
+            pattern_binds(t, bound);
+        }
+        Pattern::Rest(Some(n)) => {
+            bound.insert(n.clone());
         }
         _ => {}
     }

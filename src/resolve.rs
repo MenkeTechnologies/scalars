@@ -416,6 +416,17 @@ impl Resolver {
                 self.bind_value(&n);
                 Ok(())
             }
+            // `val (a, b) = pair` — the initializer is walked first, then every
+            // name the pattern binds enters the current scope.
+            StmtKind::Destructure { pat, init } => {
+                self.walk_expr(init)?;
+                let mut names = HashSet::new();
+                pattern_binds(pat, &mut names);
+                for n in names {
+                    self.bind_value(&n);
+                }
+                Ok(())
+            }
             StmtKind::Assign { name, value, .. } => {
                 self.walk_expr(value)?;
                 let n = name.clone();
@@ -656,10 +667,21 @@ fn pattern_binds(p: &Pattern, out: &mut HashSet<String>) {
         Pattern::Typed { name, .. } if name != "_" => {
             out.insert(name.clone());
         }
-        Pattern::Constructor { elems, .. } | Pattern::Tuple(elems) => {
+        Pattern::Constructor { elems, .. } | Pattern::Tuple(elems) | Pattern::Alt(elems) => {
             for e in elems {
                 pattern_binds(e, out);
             }
+        }
+        Pattern::At { name, pat } => {
+            out.insert(name.clone());
+            pattern_binds(pat, out);
+        }
+        Pattern::Cons(h, t) => {
+            pattern_binds(h, out);
+            pattern_binds(t, out);
+        }
+        Pattern::Rest(Some(n)) => {
+            out.insert(n.clone());
         }
         _ => {}
     }
@@ -696,6 +718,7 @@ fn cs_block(stmts: &mut [Stmt], sigs: &HashMap<String, Sig>) {
                     cs_expr(e, sigs);
                 }
             }
+            StmtKind::Destructure { init, .. } => cs_expr(init, sigs),
             StmtKind::Assign { value, .. } => cs_expr(value, sigs),
             StmtKind::Expr(e) => cs_expr(e, sigs),
             StmtKind::If { cond, then, els } => {

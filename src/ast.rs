@@ -113,6 +113,10 @@ pub enum StmtKind {
         name: String,
         init: Option<Expr>,
     },
+    /// A pattern definition: `val (a, b) = pair`, `val Some(x) = opt`,
+    /// `val h :: t = xs`. Every name the pattern binds enters the enclosing
+    /// scope; a non-matching value raises `scala.MatchError`, as in Scala.
+    Destructure { pat: Pattern, init: Expr },
     /// An assignment to an existing `var`: `x = expr`, `x += expr`.
     Assign {
         name: String,
@@ -374,6 +378,20 @@ pub enum Pattern {
     /// upper-case bare identifier in a pattern as a reference to a value/singleton
     /// (e.g. the `None` object), matched by `==`, not a binding.
     Stable(String),
+    /// `case n @ Some(v) =>` — a binder: matches `pat`, and additionally binds
+    /// the *whole* scrutinee to `name`. Scala's `Pattern2` production.
+    At { name: String, pat: Box<Pattern> },
+    /// `case 1 | 2 | 3 =>` — an alternation: matches when ANY branch matches.
+    /// Scala forbids variable bindings inside alternatives, so no branch may
+    /// contribute bindings to the arm body.
+    Alt(Vec<Pattern>),
+    /// `case h :: t =>` — the cons pattern: matches a non-empty `List`, binding
+    /// its head and tail. Right-associative, so `a :: b :: rest` nests right.
+    Cons(Box<Pattern>, Box<Pattern>),
+    /// `case List(a, rest @ _*) =>` — the trailing sequence wildcard. Only legal
+    /// as the last element of a sequence pattern; binds the remaining elements
+    /// (as a `List`) when `name` is `Some`.
+    Rest(Option<String>),
 }
 
 /// Unary operators.

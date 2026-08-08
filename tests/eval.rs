@@ -1909,3 +1909,233 @@ fn an_import_line_does_not_swallow_a_following_case_class() {
     assert!(ok);
     assert_eq!(out, "Q(1)\ntrue\n");
 }
+
+// ── Pattern-matching forms beyond literal/type/tuple (byte-verified vs scala
+//    3.8.4 via the `patmatch` fuzz mode) ──────────────────────────────────────
+
+#[test]
+fn at_binder_binds_the_whole_scrutinee_alongside_its_parts() {
+    // `w @ Pt(x, y)` must bind BOTH the record and its fields, and the binder
+    // must be visible to the guard's arm body, not just to the pattern.
+    let src = "case class Pt(x: Int, y: Int)\nobject T extends App {\n  def f(p: Pt): String = p match { case w @ Pt(0, _) => \"z\" + w; case w @ Pt(x, y) if x > y => \"gt\" + w.x; case w => \"o\" + w }\n  println(f(Pt(0, 4))); println(f(Pt(9, 1))); println(f(Pt(1, 9)))\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "zPt(0,4)\ngt9\noPt(1,9)\n");
+}
+
+#[test]
+fn alternation_tries_every_branch_before_falling_through() {
+    // The regression this guards: a `|` arm that only ever tested its FIRST
+    // branch would still answer "low" for 0 and drop 1 and 2 to the catch-all.
+    let (out, ok) = run(&wrap(
+        "def f(x: Int): String = x match { case 0 | 1 | 2 => \"low\"; case 7 | 9 => \"odd\"; case v if v < 0 => \"neg\"; case v => \"hi\" + v }\nList(0, 1, 2, 7, 9, -4, 12).foreach(x => println(f(x)))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "low\nlow\nlow\nodd\nodd\nneg\nhi12\n");
+}
+
+#[test]
+fn cons_and_nil_patterns_destructure_a_list_by_shape() {
+    let (out, ok) = run(&wrap(
+        "def f(l: List[Int]): String = l match { case Nil => \"nil\"; case x :: Nil => \"one\" + x; case x :: y :: Nil => \"two\" + (x + y); case h :: t => \"n\" + h + \"/\" + t.length }\nprintln(f(Nil)); println(f(List(4))); println(f(List(4, 5))); println(f(List(1, 2, 3, 4)))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "nil\none4\ntwo9\nn1/3\n");
+}
+
+#[test]
+fn sequence_pattern_matches_on_length_and_binds_the_rest() {
+    // `List(x, y)` is an EXACT-length test; the trailing `_*` turns it into a
+    // minimum, and a named `_*` binds the remainder as a `List`.
+    let (out, ok) = run(&wrap(
+        "def f(l: List[Int]): String = l match { case List() => \"e\"; case List(x) => \"1:\" + x; case List(x, y) => \"2:\" + (x * y); case List(x, rest @ _*) => \"r:\" + x + rest }\nprintln(f(Nil)); println(f(List(3))); println(f(List(3, 4))); println(f(List(1, 2, 3)))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "e\n1:3\n2:12\nr:1List(2, 3)\n");
+}
+
+#[test]
+fn a_vector_does_not_match_a_list_pattern() {
+    // The shape test is per-representation, as in Scala: `case List(a, b)` on a
+    // `Vector` must fall through rather than destructure it. Both non-matching
+    // cases answer the same catch-all, so the assertion pins that the shape test
+    // runs BEFORE the length test (a `Vector` of the right length still misses).
+    let (out, ok) = run(&wrap(
+        "def f(s: Seq[Int]): String = s match { case List(a, b) => \"list\" + a + b; case _ => \"?\" }\nprintln(f(List(1, 2))); println(f(Vector(1, 2))); println(f(List(1)))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "list12\n?\n?\n");
+}
+
+#[test]
+fn pattern_definitions_bind_into_the_enclosing_scope() {
+    let src = "case class D(x: Int, y: String)\nobject T extends App {\n  val (p, q) = (3, \"k\")\n  println(p + q)\n  val D(dx, dy) = D(7, \"m\")\n  println(dx + dy)\n  val hd :: tl = List(1, 2, 3)\n  println(hd); println(tl)\n  val ((m, n) , o) = ((1, 2), \"t\")\n  println(m + n + o)\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "3k\n7m\n1\nList(2, 3)\n3t\n");
+}
+
+// ── `scala.Option` (byte-verified vs scala 3.8.4 via the `option` fuzz mode) ──
+
+#[test]
+fn option_combinators_answer_both_the_some_and_the_none_case() {
+    let (out, ok) = run(&wrap(
+        "val s: Option[Int] = Some(5)\nval e: Option[Int] = None\nprintln(s.getOrElse(0)); println(e.getOrElse(0))\nprintln(s.map(_ * 2)); println(e.map(_ * 2))\nprintln(s.flatMap(x => Some(x + 1))); println(e.flatMap(x => Some(x + 1)))\nprintln(s.fold(-1)(_ + 1)); println(e.fold(-1)(_ + 1))\nprintln(s.filter(_ > 9)); println(s.exists(_ > 3)); println(e.forall(_ > 3))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "5\n0\nSome(10)\nNone\nSome(6)\nNone\n6\n-1\nNone\ntrue\ntrue\n"
+    );
+}
+
+#[test]
+fn option_conversions_and_the_null_factory() {
+    // `Option(null)` is the one factory case that is NOT `Some`, and
+    // `List[Option[A]].flatten` must drop the empties rather than fault.
+    let (out, ok) = run(&wrap(
+        "val e: Option[Int] = None\nprintln(Option(3)); println(Option(null))\nprintln(List(Some(1), None, Some(3)).flatten)\nprintln(Some(Some(1)).flatten)\nprintln(Some(5).toRight(\"z\")); println(e.toRight(\"z\"))\nprintln(Some(5).toLeft(\"z\")); println(e.toLeft(\"z\"))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Some(3)\nNone\nList(1, 3)\nSome(1)\nRight(5)\nLeft(z)\nLeft(5)\nRight(z)\n"
+    );
+}
+
+#[test]
+fn either_cases_construct_and_destructure() {
+    let (out, ok) = run(&wrap(
+        "val rs: List[Either[String, Int]] = List(Right(1), Left(\"e\"), Right(4))\nprintln(rs)\nprintln(rs.collect { case Right(v) => v })\nprintln(rs.map { case Right(v) => v * 2; case Left(m) => m.length })",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(Right(1), Left(e), Right(4))\nList(1, 4)\nList(2, 1, 8)\n"
+    );
+}
+
+// ── `Product` on a case class (byte-verified vs scala 3.8.4) ─────────────────
+
+#[test]
+fn product_members_expose_the_constructor_prefix_only() {
+    // A body `val` is a member but NOT a product element — the same prefix
+    // `toString`/`unapply` use.
+    let src = "case class C(x: Int, y: String) { val extra = x * 2 }\nobject T extends App {\n  val c = C(3, \"q\")\n  println(c.productArity); println(c.productPrefix)\n  println(c.productElement(0)); println(c.productElement(1))\n  println(c.productIterator.toList)\n  println(c.extra)\n}";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "2\nC\n3\nq\nList(3, q)\n6\n");
+}
+
+#[test]
+fn tuple_swap_and_product_members() {
+    let (out, ok) = run(&wrap(
+        "println((1, \"a\").swap); println((1, 2, 3).productArity); println((1, 2).productPrefix)\nprintln(List(3, 1, 2).iterator.toList); println(List(3, 1, 2).reverseIterator.toList)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "(a,1)\n3\nTuple2\nList(3, 1, 2)\nList(2, 1, 3)\n");
+}
+
+// ── Wider `String`/`StringOps` surface (byte-verified vs scala 3.8.4) ────────
+
+#[test]
+fn string_index_search_and_total_slicing() {
+    let (out, ok) = run(&wrap(
+        "val s = \"Hello, World\"\nprintln(s.indexOf(\"o\")); println(s.lastIndexOf(\"o\")); println(s.indexOf(\"z\"))\nprintln(s.take(3)); println(s.drop(3)); println(s.slice(1, 4)); println(s.splitAt(3))\nprintln(s.take(99)); println(s.drop(99))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "4\n8\n-1\nHel\nlo, World\nell\n(Hel,lo, World)\nHello, World\n\n"
+    );
+}
+
+#[test]
+fn string_char_combinators_rebuild_a_string() {
+    // A `Char => Char` map answers a `String`; the predicates and the searches
+    // answer scalars/`Option`, so this pins both result shapes at once.
+    let (out, ok) = run(&wrap(
+        "val s = \"abcabc\"\nprintln(s.distinct); println(s.sorted)\nprintln(s.filter(_ != 'a')); println(s.count(_ == 'a'))\nprintln(s.map(c => c.toUpper))\nprintln(s.takeWhile(_ != 'b')); println(s.dropWhile(_ != 'b'))\nprintln(s.find(_ == 'b')); println(s.indexWhere(_ == 'b'))\nprintln(s.partition(_ < 'c')); println(s.span(_ != 'b'))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "abc\naabbcc\nbcbc\n2\nABCABC\na\nbcabc\nSome(b)\n1\n(abab,cc)\n(a,bcabc)\n"
+    );
+}
+
+// ── Non-local `return` and `finally` ordering (byte-verified vs scala 3.8.4
+//    via the `nlr` fuzz mode) ─────────────────────────────────────────────────
+
+#[test]
+fn return_inside_a_for_leaves_the_enclosing_def() {
+    // The `for` desugars to a `foreach` CLOSURE, so a frame-local return would
+    // only end one iteration and the method would fall through to "none".
+    let (out, ok) = run(&wrap(
+        "def f(l: List[Int]): String = { for (x <- l) { if (x > 2) return \"hit\" + x }; \"none\" }\nprintln(f(List(1, 5, 9))); println(f(Nil))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "hit5\nnone\n");
+}
+
+#[test]
+fn return_inside_an_explicit_lambda_leaves_the_enclosing_def() {
+    // `return` in expression position (a brace-less lambda body) is also the
+    // parse shape this covers.
+    let (out, ok) = run(&wrap(
+        "def f(l: List[Int]): Int = { l.foreach(x => if (x > 2) return x); -1 }\nprintln(f(List(1, 5, 9))); println(f(Nil))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "5\n-1\n");
+}
+
+#[test]
+fn finally_runs_before_a_return_leaves_the_try() {
+    // Output ORDER is the assertion: the finalizer prints before the caller's
+    // `println` of the returned value.
+    let (out, ok) = run(&wrap(
+        "def f(n: Int): Int = { try { if (n > 0) return n * 10; 0 } finally { println(\"fin\") } }\nprintln(f(9)); println(f(-9))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "fin\n90\nfin\n0\n");
+}
+
+#[test]
+fn nested_finalizers_run_innermost_first_on_a_return() {
+    let (out, ok) = run(&wrap(
+        "def f(n: Int): Int = { try { try { if (n > 0) return n; 0 } finally { println(\"inner\") } } finally { println(\"outer\") } }\nprintln(f(4))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "inner\nouter\n4\n");
+}
+
+#[test]
+fn return_from_a_catch_arm_still_runs_the_finalizer() {
+    let (out, ok) = run(&wrap(
+        "def f(n: Int): Int = { try { if (n > 0) throw new RuntimeException(\"x\"); 1 } catch { case e: RuntimeException => return 7 } finally { println(\"fin\") } }\nprintln(f(1)); println(f(-1))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "fin\n7\nfin\n1\n");
+}
+
+#[test]
+fn return_inside_a_try_inside_a_while_terminates_the_loop() {
+    // A `return` that only ended the `try` region would leave the `while`
+    // spinning forever; this test fails as a HANG if that regresses.
+    let (out, ok) = run(&wrap(
+        "def f(n: Int): Int = { var i = 0; while (i < 5) { try { if (i == n) return i * 100 } catch { case e: RuntimeException => println(\"c\") }; i += 1 }; -1 }\nprintln(f(2)); println(f(99))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "200\n-1\n");
+}
+
+#[test]
+fn a_catch_arm_never_intercepts_a_non_local_return() {
+    // The non-local return travels the same in-flight slot an exception uses,
+    // so this pins that a `catch` cannot swallow it.
+    let (out, ok) = run(&wrap(
+        "def f(l: List[Int]): String = { try { for (x <- l) { if (x > 2) return \"y\" + x }; \"n\" } catch { case e: RuntimeException => \"caught\" } }\nprintln(f(List(1, 5))); println(f(List(1)))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "y5\nn\n");
+}

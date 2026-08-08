@@ -495,6 +495,334 @@ fn g_oop(r: &mut Rng) -> String {
     }
 }
 
+/// The pattern-matching forms beyond the simple literal/type/tuple cases:
+/// `@` binders, `|` alternations, `::` cons and `Nil`, sequence patterns with a
+/// trailing `_*`, nested constructor patterns, and pattern definitions
+/// (`val (a, b) = pair`). Every arm set is exhaustive over the values probed, so
+/// a `MatchError` is never the expected answer.
+fn g_patmatch(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let n = 3 + r.below(4) as usize;
+    let xs = format!("List({})", int_elems(r, n));
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    match r.below(12) {
+        // `|` alternation over literals, with a catch-all.
+        0 => format!(
+            "{{ def f(x: Int): String = x match {{ case 0 | 1 | 2 => \"low\"; \
+               case 7 | 9 => \"odd\"; case v if v < 0 => \"neg\"; case v => \"hi\" + v }}; \
+             {xs}.foreach(x => println(f(x))); println(f({a})); println(f({b})) }}"
+        ),
+        // `@` binder around a constructor pattern.
+        1 => format!(
+            "case class B{u}(x: Int, y: Int)\n{sep}\
+             {{ def f(p: B{u}): String = p match {{ case w @ B{u}(0, _) => \"z\" + w; \
+               case w @ B{u}(x, y) if x > y => \"gt\" + w.x; case w => \"o\" + w }}; \
+             println(f(B{u}(0, {a}))); println(f(B{u}(9, 1))); println(f(B{u}(1, 9))) }}"
+        ),
+        // `::` cons chains and `Nil`.
+        2 => format!(
+            "{{ def f(l: List[Int]): String = l match {{ case Nil => \"nil\"; \
+               case x :: Nil => \"one\" + x; case x :: y :: Nil => \"two\" + (x + y); \
+               case h :: t => \"n\" + h + \"/\" + t.length }}; \
+             println(f(Nil)); println(f(List({a}))); println(f(List({a}, {b}))); \
+             println(f({xs})) }}"
+        ),
+        // Sequence patterns, exact and with a trailing `_*`.
+        3 => format!(
+            "{{ def f(l: List[Int]): String = l match {{ case List() => \"e\"; \
+               case List(x) => \"1:\" + x; case List(x, y) => \"2:\" + (x * y); \
+               case List(x, rest @ _*) => \"r:\" + x + rest }}; \
+             println(f(Nil)); println(f(List({a}))); println(f(List({a}, {b}))); \
+             println(f({xs})) }}"
+        ),
+        // Alternation inside a cons pattern, plus a bound tail.
+        4 => format!(
+            "{{ def f(l: List[Int]): Int = l match {{ case Nil => -1; \
+               case (0 | 1) :: t => t.length; case h :: t => h + t.length }}; \
+             println(f(Nil)); println(f(0 :: {xs})); println(f(1 :: Nil)); println(f({xs})) }}"
+        ),
+        // Nested constructor patterns two levels deep.
+        5 => format!(
+            "case class In{u}(v: Int)\ncase class Out{u}(k: String, i: In{u})\n{sep}\
+             {{ def f(o: Out{u}): String = o match {{ case Out{u}(\"a\", In{u}(0)) => \"a0\"; \
+               case Out{u}(\"a\", In{u}(v)) => \"a\" + v; case Out{u}(k, In{u}(v)) => k + v }}; \
+             println(f(Out{u}(\"a\", In{u}(0)))); println(f(Out{u}(\"a\", In{u}({a})))); \
+             println(f(Out{u}(\"b\", In{u}({b})))) }}"
+        ),
+        // Pattern definitions: tuple, constructor, cons.
+        6 => format!(
+            "case class D{u}(x: Int, y: String)\n{sep}\
+             {{ val (p, q) = ({a}, \"k\"); println(p + q); \
+             val D{u}(dx, dy) = D{u}({b}, \"m\"); println(dx + dy); \
+             val hd :: tl = {xs}; println(hd); println(tl); \
+             val ((m, n2), o2) = (({a}, {b}), \"t\"); println(m + n2 + o2) }}"
+        ),
+        // Tuple patterns whose elements are themselves patterns.
+        7 => format!(
+            "{{ def f(t: (List[Int], Int)): String = t match {{ case (Nil, n) => \"e\" + n; \
+               case (h :: _, n) if h > n => \"gt\" + h; case (h :: _, n) => \"le\" + (h + n) }}; \
+             println(f((Nil, {a}))); println(f(({xs}, -99))); println(f(({xs}, 99))) }}"
+        ),
+        // `Option` patterns, including a bound `Some`.
+        8 => format!(
+            "{{ def f(o: Option[Int]): String = o match {{ case Some(0) => \"z\"; \
+               case s @ Some(v) if v < 0 => \"n\" + v + s; case Some(v) => \"p\" + v; \
+               case None => \"e\" }}; \
+             println(f(Some(0))); println(f(Some({a}))); println(f(Some({b}))); println(f(None)) }}"
+        ),
+        // String literal alternation.
+        9 => format!(
+            "{{ def f(s: String): Int = s match {{ case \"a\" | \"b\" => 1; \
+               case \"cc\" | \"dd\" | \"z\" => 2; case _ => 3 }}; \
+             List({}).foreach(s => println(f(s))) }}",
+            str_elems(r, 4)
+        ),
+        // A pattern-matching anonymous function over a cons pattern.
+        10 => format!(
+            "{{ val ls: List[List[Int]] = List({xs}, Nil, List({a})); \
+             println(ls.map {{ case Nil => 0; case h :: t => h + t.length }}); \
+             println(ls.collect {{ case h :: _ if h > 0 => h }}) }}"
+        ),
+        // A sealed ADT with alternation across two cases. Scala forbids a
+        // variable binding inside an alternative, so the alternatives are
+        // binding-free (`_`) and the payload is read through a separate arm.
+        _ => format!(
+            "sealed trait T{u}\ncase class L{u}(v: Int) extends T{u}\n\
+             case class M{u}(v: Int) extends T{u}\ncase object N{u} extends T{u}\n{sep}\
+             {{ def f(t: T{u}): Int = t match {{ case L{u}(0) | M{u}(0) | N{u} => -1; \
+               case L{u}(v) => v * 2; case M{u}(v) => v * 3 }}; \
+             println(f(L{u}({a}))); println(f(M{u}({b}))); println(f(N{u})); \
+             println(f(L{u}(0))); println(f(M{u}(0))) }}"
+        ),
+    }
+}
+
+/// `scala.Option`'s method surface — the combinators, the conversions, the
+/// `Either` results of `toRight`/`toLeft`, and the `Option(x)` factory's `null`
+/// case. Both the `Some` and the `None` side of every probe is printed, because
+/// the empty case is where a from-scratch implementation drifts.
+fn g_option(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let n = 3 + r.below(3) as usize;
+    let xs = format!("List({})", int_elems(r, n));
+    // Two receivers with the same static type, one empty, so every probe below
+    // exercises both branches of the method it names.
+    let pre = format!("val s: Option[Int] = Some({a}); val e: Option[Int] = None; ");
+    let both = |m: &str| format!("{{ {pre}println(s.{m}); println(e.{m}) }}");
+    match r.below(12) {
+        0 => both(&format!("getOrElse({b})")),
+        1 => both("map(_ * 2)"),
+        2 => both("flatMap(x => if (x > 0) Some(x + 1) else None)"),
+        3 => both(&format!("filter(_ > {b})")),
+        4 => both(&format!("exists(_ > {b})")),
+        5 => both(&format!("fold(-1)(_ + {b})")),
+        6 => format!(
+            "{{ {pre}println(s.isEmpty); println(e.isEmpty); println(s.isDefined); \
+             println(e.isDefined); println(s.size); println(e.size); \
+             println(s.nonEmpty); println(e.nonEmpty) }}"
+        ),
+        7 => format!(
+            "{{ {pre}println(s.toList); println(e.toList); println(s.toRight(\"z\")); \
+             println(e.toRight(\"z\")); println(s.toLeft(\"z\")); println(e.toLeft(\"z\")) }}"
+        ),
+        8 => format!(
+            "{{ {pre}println(s.orElse(Some({b}))); println(e.orElse(Some({b}))); \
+             println(s.contains({a})); println(e.contains({a})); \
+             println(s.forall(_ > 0)); println(e.forall(_ > 0)) }}"
+        ),
+        9 => format!(
+            "{{ println({xs}.find(_ > {b})); println({xs}.headOption); \
+             println(List[Int]().headOption); println({xs}.lastOption); \
+             println(List(Some({a}), None, Some({b})).flatten) }}"
+        ),
+        10 => format!(
+            "{{ println(Option({a})); println(Option(null)); \
+             println(Option({a}).map(_ + 1)); \
+             println({xs}.map(x => Option(x).filter(_ > 0))) }}"
+        ),
+        _ => format!(
+            "{{ {pre}println(for (x <- s) yield x * 3); println(for (x <- e) yield x * 3); \
+             println(s.collect {{ case v if v > {b} => v }}); \
+             println(e.collect {{ case v if v > {b} => v }}); \
+             println(s.count(_ > {b})); println(e.count(_ > {b})) }}"
+        ),
+    }
+}
+
+/// A `case class`'s derived members: `Product` (`productArity`/`productPrefix`/
+/// `productElement`/`productIterator`), `copy` with named and positional
+/// updates, structural `equals`, and the `Either` cases.
+fn g_caseclass(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let s = pick(r, STRS);
+    match r.below(5) {
+        0 => format!(
+            "case class C{u}(x: Int, y: String)\n{sep}\
+             {{ val c = C{u}({a}, {s}); println(c.productArity); println(c.productPrefix); \
+             println(c.productElement(0)); println(c.productElement(1)); \
+             println(c.productIterator.toList) }}"
+        ),
+        1 => format!(
+            "case class C{u}(x: Int, y: Int, z: Int)\n{sep}\
+             {{ val c = C{u}({a}, {b}, 0); println(c); println(c.copy(z = 5)); \
+             println(c.copy(x = 1, y = 2)); println(c.copy()); println(c == c.copy()) }}"
+        ),
+        // A body `val` is NOT a product element — only the constructor prefix is.
+        2 => format!(
+            "case class C{u}(x: Int) {{ val doubled = x * 2 }}\n{sep}\
+             {{ val c = C{u}({a}); println(c); println(c.doubled); println(c.productArity); \
+             println(c.productIterator.toList); println(c == C{u}({a})) }}"
+        ),
+        3 => format!(
+            "case object O{u}\ncase class C{u}(x: Int)\n{sep}\
+             {{ println(O{u}); println(C{u}({a})); println(C{u}({a}) == C{u}({a})); \
+             println(C{u}({a}) == C{u}({b})); println(List(C{u}({a}), C{u}({a})).distinct.length) }}"
+        ),
+        _ => format!(
+            "{{ val rs: List[Either[String, Int]] = List(Right({a}), Left(\"e\"), Right({b})); \
+             println(rs); println(rs.collect {{ case Right(v) => v }}); \
+             println(rs.collect {{ case Left(m) => m }}); \
+             println(rs.map {{ case Right(v) => v * 2; case Left(m) => m.length }}) }}"
+        ),
+    }
+}
+
+/// `StringOps`/`java.lang.String`'s wider surface: the index searches, the
+/// total slicing operations, the char-level combinators, and the `Char`
+/// predicates. Every receiver is a literal so the expected output is fixed.
+fn g_strops(r: &mut Rng) -> String {
+    let s = *pick(
+        r,
+        &[
+            "\"Hello, World\"",
+            "\"abcabc\"",
+            "\"\"",
+            "\"x\"",
+            "\"Aa Bb\"",
+        ],
+    );
+    let needle = *pick(r, &["\"a\"", "\"o\"", "\"bc\"", "\"z\"", "\" \""]);
+    let k = r.below(5) as i64;
+    match r.below(10) {
+        0 => println_all(&[
+            format!("{s}.indexOf({needle})"),
+            format!("{s}.lastIndexOf({needle})"),
+            format!("{s}.contains({needle})"),
+        ]),
+        1 => println_all(&[
+            format!("{s}.take({k})"),
+            format!("{s}.drop({k})"),
+            format!("{s}.slice(1, {k})"),
+        ]),
+        2 => println_all(&[
+            format!("{s}.takeRight({k})"),
+            format!("{s}.dropRight({k})"),
+            format!("{s}.splitAt({k})"),
+        ]),
+        3 => println_all(&[
+            format!("{s}.replace({needle}, \"-\")"),
+            format!("{s}.stripPrefix(\"a\")"),
+            format!("{s}.stripSuffix(\"c\")"),
+        ]),
+        4 => println_all(&[
+            format!("{s}.capitalize"),
+            format!("{s}.distinct"),
+            format!("{s}.sorted"),
+        ]),
+        5 => println_all(&[
+            format!("{s}.compareTo(\"abc\")"),
+            format!("{s}.equalsIgnoreCase(\"HELLO, WORLD\")"),
+            format!("{s}.mkString(\"-\")"),
+        ]),
+        6 => println_all(&[
+            format!("{s}.filter(_ != 'a')"),
+            format!("{s}.count(_ == 'a')"),
+            format!("{s}.exists(_ == 'b')"),
+        ]),
+        7 => println_all(&[
+            format!("{s}.map(c => c.toUpper)"),
+            format!("{s}.takeWhile(_ != 'b')"),
+            format!("{s}.dropWhile(_ != 'b')"),
+        ]),
+        8 => println_all(&[
+            format!("{s}.forall(_ != 'q')"),
+            format!("{s}.indexWhere(_ == 'b')"),
+            format!("{s}.find(_ == 'b')"),
+        ]),
+        _ => println_all(&[
+            format!("{s}.partition(_ < 'c')"),
+            format!("{s}.span(_ != 'b')"),
+            format!("{s}.zipWithIndex"),
+        ]),
+    }
+}
+
+/// Non-local `return` and `finally` ordering — the two shapes where a `return`
+/// does NOT simply pop the frame: one inside a lambda (a `for`/`foreach` body),
+/// which must leave the enclosing `def`, and one inside a `try`, which must run
+/// every enclosing `finally` on the way out. Both print from the finalizer, so
+/// the ORDER of the output is part of the comparison, not just the result.
+fn g_nlr(r: &mut Rng) -> String {
+    let n = 3 + r.below(3) as usize;
+    let xs = format!("List({})", int_elems(r, n));
+    let lim = pick(r, &["0", "3", "-5", "10"]);
+    // A second, always-positive knob so the `try`/`finally` probes vary their
+    // loop bound / returned value instead of repeating one fixed program.
+    let stop = 1 + r.below(6);
+    match r.below(8) {
+        // `return` out of a `for` over a collection (a lambda body).
+        0 => format!(
+            "{{ def f(l: List[Int]): String = {{ for (x <- l) {{ if (x > {lim}) return \"hit\" + x }}; \
+             \"none\" }}; println(f({xs})); println(f(Nil)) }}"
+        ),
+        // `return` out of an explicit `foreach` lambda.
+        1 => format!(
+            "{{ def f(l: List[Int]): Int = {{ l.foreach(x => if (x > {lim}) return x); -1 }}; \
+             println(f({xs})); println(f(Nil)) }}"
+        ),
+        // `return` inside a `try` with a `finally` — the finalizer prints first.
+        2 => format!(
+            "{{ def f(n: Int): Int = {{ try {{ if (n > {lim}) return n * 10; 0 }} \
+             finally {{ println(\"fin\") }} }}; println(f(99)); println(f(-99)) }}"
+        ),
+        // `return` inside a `try` inside a `while` — must not spin.
+        3 => format!(
+            "{{ def f(n: Int): Int = {{ var i = 0; while (i < {stop}) {{ \
+             try {{ if (i == n) return i * 100 }} catch {{ case e: RuntimeException => println(\"c\") }}; \
+             i += 1 }}; -1 }}; println(f(2)); println(f(99)) }}"
+        ),
+        // `return` from the `catch` arm, with a `finally`.
+        4 => format!(
+            "{{ def f(n: Int): Int = {{ try {{ if (n > 0) throw new RuntimeException(\"x\"); 1 }} \
+             catch {{ case e: RuntimeException => return {stop} }} finally {{ println(\"fin\") }} }}; \
+             println(f(1)); println(f(-1)) }}"
+        ),
+        // Nested `try`s: both finalizers run, innermost first.
+        5 => format!(
+            "{{ def f(n: Int): Int = {{ try {{ try {{ if (n > 0) return n; 0 }} \
+             finally {{ println(\"inner\") }} }} finally {{ println(\"outer\") }} }}; \
+             println(f({stop})); println(f(-{stop})) }}"
+        ),
+        // `return` out of a `for` nested in a `try` with a `finally`.
+        6 => format!(
+            "{{ def f(l: List[Int]): String = {{ try {{ for (x <- l) {{ \
+             if (x > {lim}) return \"y\" + x }}; \"n\" }} finally {{ println(\"fin\") }} }}; \
+             println(f({xs})); println(f(Nil)) }}"
+        ),
+        // A `finally` on the NORMAL path still runs, and after the body's value.
+        _ => format!(
+            "{{ def f(n: Int): Int = {{ try {{ n * 2 }} finally {{ println(\"fin\" + n) }} }}; \
+             println(f({stop})); println(f(-{stop})) }}"
+        ),
+    }
+}
+
 /// `Range` as a first-class value: its `toString` (including the `empty `/
 /// `inexact ` prefixes), the sequence operations over it, and the `by` step.
 fn g_range(r: &mut Rng) -> String {
@@ -1071,6 +1399,11 @@ enum Mode {
     Partial,
     Mutable,
     Bitwise,
+    PatMatch,
+    Option,
+    CaseClass,
+    StrOps,
+    Nlr,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1100,6 +1433,11 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Partial => "partial",
         Mode::Mutable => "mutable",
         Mode::Bitwise => "bitwise",
+        Mode::PatMatch => "patmatch",
+        Mode::Option => "option",
+        Mode::CaseClass => "caseclass",
+        Mode::StrOps => "strops",
+        Mode::Nlr => "nlr",
     }
 }
 
@@ -1130,6 +1468,11 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "partial" => Mode::Partial,
         "mutable" => Mode::Mutable,
         "bitwise" => Mode::Bitwise,
+        "patmatch" => Mode::PatMatch,
+        "option" => Mode::Option,
+        "caseclass" => Mode::CaseClass,
+        "strops" => Mode::StrOps,
+        "nlr" => Mode::Nlr,
         _ => return None,
     })
 }
@@ -1159,6 +1502,11 @@ const CONCRETE: &[Mode] = &[
     Mode::Partial,
     Mode::Mutable,
     Mode::Bitwise,
+    Mode::PatMatch,
+    Mode::Option,
+    Mode::CaseClass,
+    Mode::StrOps,
+    Mode::Nlr,
 ];
 
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
@@ -1192,6 +1540,11 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Partial => g_partial(r),
         Mode::Mutable => g_mutable(r),
         Mode::Bitwise => g_bitwise(r),
+        Mode::PatMatch => g_patmatch(r),
+        Mode::Option => g_option(r),
+        Mode::CaseClass => g_caseclass(r),
+        Mode::StrOps => g_strops(r),
+        Mode::Nlr => g_nlr(r),
         Mode::All => unreachable!(),
     }
 }

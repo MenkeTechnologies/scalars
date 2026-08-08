@@ -61,6 +61,14 @@ impl Parser {
         &self.toks[self.pos].kind
     }
 
+    /// The token `n` positions ahead of the cursor (`Eof` past the end).
+    fn peek_at(&self, n: usize) -> &Tok {
+        match self.toks.get(self.pos + n) {
+            Some(t) => &t.kind,
+            None => &Tok::Eof,
+        }
+    }
+
     fn line(&self) -> u32 {
         self.toks[self.pos].line
     }
@@ -654,6 +662,15 @@ impl Parser {
     fn local_decl(&mut self) -> Result<StmtKind, String> {
         let is_val = matches!(self.peek(), Tok::Val);
         self.advance(); // val/var
+                        // A pattern definition — `val (a, b) = pair`, `val Some(x) = opt`.
+                        // Recognized by a non-identifier start, or by an identifier that a
+                        // pattern would treat as a constructor/stable id rather than a binder.
+        if self.starts_pattern_decl() {
+            let pat = self.pattern()?;
+            self.eat(&Tok::Assign)?;
+            let init = self.expression()?;
+            return Ok(StmtKind::Destructure { pat, init });
+        }
         let name = self.ident()?;
         let ty = if self.is(&Tok::Colon) {
             self.advance();
@@ -673,6 +690,22 @@ impl Parser {
             name,
             init,
         })
+    }
+
+    /// Whether the token after `val`/`var` starts a PATTERN definition rather
+    /// than a plain binder. `(` opens a tuple pattern; a capitalized identifier
+    /// is a constructor (`Some(x)`) or stable-id pattern; a lower-case one
+    /// followed by `::` is a cons pattern. A bare lower-case identifier is the
+    /// ordinary `val x = …`, which stays on the simple path.
+    fn starts_pattern_decl(&self) -> bool {
+        match self.peek() {
+            Tok::LParen => true,
+            Tok::Ident(n) => {
+                n.chars().next().is_some_and(char::is_uppercase)
+                    || matches!(self.peek_at(1), Tok::ColonColon)
+            }
+            _ => false,
+        }
     }
 
     /// Consume a type reference after `:` (`Int`, `Array[String]`, `a.b.C`) and
@@ -1446,6 +1479,16 @@ impl Parser {
                     line,
                 })
             }
+            // `return` is an EXPRESSION in Scala (of type `Nothing`), so it is
+            // legal wherever a value is — most often a brace-less lambda body,
+            // `xs.foreach(x => if (p(x)) return x)`. A one-statement block is the
+            // exact lowering: the statement runs, and the block's `Unit` stands
+            // in for the value `return` never actually produces.
+            Tok::Return => {
+                let line = self.line();
+                let kind = self.return_stmt()?;
+                Ok(Expr::Block(vec![Stmt { line, kind }]))
+            }
             // An interpolated string `s"…"` / `f"…"` / `raw"…"` desugars to a
             // concatenation of its literal parts and (formatted) splices.
             Tok::InterpStr {
@@ -1848,10 +1891,44 @@ impl Parser {
         Ok(MatchArm { pat, guard, body })
     }
 
-    /// A `case` pattern: literal, `_` wildcard, variable binding, or typed
-    /// `name: Type` / `_: Type`. Constructor/extractor patterns (`Foo(x)`) are
-    /// rejected — the fusevm value model has no ordered record value to bind.
+    /// A `case` pattern, at Scala's outermost `Pattern` precedence: one or more
+    /// [`Self::pattern_cons`] branches separated by `|`.
     fn pattern(&mut self) -> Result<Pattern, String> {
+        let first = self.pattern_cons()?;
+        if !self.is_bar() {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while self.is_bar() {
+            self.advance();
+            self.skip_seps();
+            alts.push(self.pattern_cons()?);
+        }
+        Ok(Pattern::Alt(alts))
+    }
+
+    /// Whether the next token is the alternation `|` (lexed as a symbolic op).
+    fn is_bar(&self) -> bool {
+        matches!(self.peek(), Tok::Op(o) if o == "|")
+    }
+
+    /// Scala's `Pattern3` — the infix `::` pattern, right-associative so
+    /// `a :: b :: rest` nests as `a :: (b :: rest)`.
+    fn pattern_cons(&mut self) -> Result<Pattern, String> {
+        let head = self.pattern_primary()?;
+        if self.is(&Tok::ColonColon) {
+            self.advance();
+            self.skip_seps();
+            let tail = self.pattern_cons()?;
+            return Ok(Pattern::Cons(Box::new(head), Box::new(tail)));
+        }
+        Ok(head)
+    }
+
+    /// A simple `case` pattern: literal, `_` wildcard, `_*` sequence wildcard,
+    /// variable binding, `name @ pat` binder, typed `name: Type` / `_: Type`,
+    /// constructor/extractor `Foo(x, …)`, or a tuple `(a, b)`.
+    fn pattern_primary(&mut self) -> Result<Pattern, String> {
         match self.peek().clone() {
             Tok::Int(n) => {
                 self.advance();
@@ -1914,7 +1991,26 @@ impl Parser {
                     self.advance();
                     let ty = self.type_ref_no_arrow()?;
                     Ok(Pattern::Typed { name, ty })
+                } else if self.is(&Tok::At) {
+                    // `name @ pat` — bind the whole scrutinee, then match `pat`.
+                    // `name @ _*` is the *named* sequence wildcard, which binds
+                    // the trailing elements rather than the scrutinee.
+                    self.advance();
+                    self.skip_seps();
+                    let inner = self.pattern_cons()?;
+                    if inner == Pattern::Rest(None) {
+                        return Ok(Pattern::Rest(Some(name)));
+                    }
+                    Ok(Pattern::At {
+                        name,
+                        pat: Box::new(inner),
+                    })
                 } else if name == "_" {
+                    // `_*` — the trailing sequence wildcard.
+                    if self.is(&Tok::Star) {
+                        self.advance();
+                        return Ok(Pattern::Rest(None));
+                    }
                     Ok(Pattern::Wildcard)
                 } else if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                     // A capitalized bare identifier is a stable-identifier
