@@ -4143,9 +4143,16 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
 }
 
 /// Multiply a numeric sequence (`Int` result when all `Int`, else `Double`).
+///
+/// The integral accumulator wraps, for the reason given on [`seq_sum`].
 fn seq_product(items: &[Value]) -> Value {
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
-        Value::int(items.iter().map(Value::to_int).product())
+        Value::int(
+            items
+                .iter()
+                .map(Value::to_int)
+                .fold(1i64, i64::wrapping_mul),
+        )
     } else {
         Value::float(items.iter().map(Value::to_float).product())
     }
@@ -4590,9 +4597,21 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
 }
 
 /// Sum a numeric sequence (`Int` result when all `Int`, else `Double`).
+///
+/// The integral accumulator wraps. Scala's `sum` is the element type's `+`, so
+/// `List(Long.MaxValue, 1L).sum` answers `Long.MinValue` rather than raising --
+/// `Iterator::sum` would instead panic here in debug and wrap only in release,
+/// making the answer depend on the build profile. The 64-bit wrap is the `Long`
+/// case; a `List[Int]` is narrowed to 32 bits by `member_width` on the compiler
+/// side, so both widths overflow where Scala does.
 fn seq_sum(items: &[Value]) -> Value {
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
-        Value::int(items.iter().map(|v| v.to_int()).sum())
+        Value::int(
+            items
+                .iter()
+                .map(Value::to_int)
+                .fold(0i64, i64::wrapping_add),
+        )
     } else {
         Value::float(items.iter().map(|v| v.to_float()).sum())
     }

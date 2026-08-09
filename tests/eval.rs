@@ -3096,6 +3096,21 @@ fn summing_a_long_or_double_collection_does_not_wrap() {
 }
 
 #[test]
+fn a_long_accumulator_wraps_rather_than_raising() {
+    // The 64-bit counterpart of `sum_and_product_wrap_over_an_int_collection`.
+    // Folding with `Iterator::sum` made this depend on the build profile —
+    // checked `+` raised in debug, and only a release build wrapped into
+    // agreement — so `ok` is asserted alongside the values.
+    let (out, ok) = run(&wrap(
+        "println(List(9223372036854775807L, 1L).sum)\n\
+         println(List(-9223372036854775808L, -1L).sum)\n\
+         println(List(9223372036854775807L, 2L).product)",
+    ));
+    assert!(ok, "a wrapping accumulator must not raise: {out}");
+    assert_eq!(out, "-9223372036854775808\n9223372036854775807\n-2\n");
+}
+
+#[test]
 fn an_element_width_survives_a_filter_but_an_empty_literal_has_none() {
     let (out, _) = run(&wrap(
         "println(List(2147483647, 2147483647).filter(x => x > 0).sum); println(List[Int]().sum)",
