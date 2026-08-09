@@ -913,7 +913,11 @@ impl Parser {
             if op != AssignOp::Assign {
                 self.advance();
                 let value = self.expression()?;
-                return Ok(StmtKind::PlaceAssign { place: e, op, value });
+                return Ok(StmtKind::PlaceAssign {
+                    place: e,
+                    op,
+                    value,
+                });
             }
         }
         // `a(i) = v` — Scala's element-assignment sugar for `a.update(i, v)`.
