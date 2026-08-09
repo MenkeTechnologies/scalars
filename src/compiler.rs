@@ -3541,9 +3541,32 @@ impl Compiler {
         self.classes.get(cls)?.member_widths.get(name).copied()
     }
 
+    /// Whether `e` could evaluate to an instance of a user-declared class.
+    ///
+    /// Answers `false` only where the receiver is something else for certain — a
+    /// literal of a built-in kind, or an expression whose numeric width is
+    /// already proven. Everything else is `true`, because a wrong `false` here
+    /// would let a stdlib rule outrank a user declaration, which is the bug
+    /// `member_width` exists to prevent.
+    fn could_be_user_instance(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Int(_)
+            | Expr::Long(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Char(_)
+            | Expr::Bool(_)
+            | Expr::Collection { .. }
+            | Expr::Tuple(_)
+            | Expr::Lambda { .. }
+            | Expr::Format { .. } => false,
+            Expr::Unary { rhs, .. } => self.could_be_user_instance(rhs),
+            _ => self.num_ty(e) == NumTy::Unknown,
+        }
+    }
+
     /// Whether ANY user-declared class names `name` as a member. A receiver
-    /// whose class could not be recovered may be an instance of that class, so
-    /// no stdlib width can be claimed for the call.
+    /// that could be an instance of that class cannot take a stdlib width.
     fn user_declares_member(&self, name: &str) -> bool {
         self.classes
             .values()
@@ -3589,10 +3612,12 @@ impl Compiler {
         {
             return w;
         }
-        // The same name declared by SOME user class, on a receiver whose class
-        // could not be recovered: the call may well land there, so the stdlib
-        // rule cannot be applied either way.
-        if self.user_declares_member(name) {
+        // The same name declared by SOME user class, on a receiver that could BE
+        // an instance of it: the call may land there, so no stdlib rule can be
+        // claimed. A receiver already known to be a primitive or a collection is
+        // exempt — otherwise one `class Thing { def abs: Int }` anywhere in the
+        // program would stop `(-2147483648).abs` from wrapping.
+        if self.could_be_user_instance(recv) && self.user_declares_member(name) {
             return NumTy::Unknown;
         }
         // `xs.sum` / `xs.product` — the ELEMENT type, which is the width Scala

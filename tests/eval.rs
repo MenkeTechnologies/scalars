@@ -3110,3 +3110,16 @@ fn a_declared_long_collection_keeps_sixty_four_bits_through_a_lambda() {
     ));
     assert_eq!(out, "8589934588\n");
 }
+
+#[test]
+fn a_user_member_name_does_not_disarm_narrowing_on_a_primitive() {
+    // A user declaration outranks a stdlib name-based width, but only on a
+    // receiver that could be that user type. A receiver already known to be a
+    // primitive is not, so one `def abs` anywhere in the program must not stop
+    // `Int.MinValue.abs` from wrapping.
+    let (out, _) = run(
+        "class Thing { def abs: Int = 5 }\n\
+         object T extends App { println((-2147483648).abs); println(\"abcd\".length * 2) }",
+    );
+    assert_eq!(out, "-2147483648\n8\n");
+}
