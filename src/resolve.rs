@@ -113,6 +113,9 @@ struct Lifted {
     /// The declared parameters' [`ParamSig`]s, carried through the lift so a
     /// nested `def` keeps its defaults / varargs / by-name parameters.
     sig: Vec<ParamSig>,
+    /// The declared return type, carried through the lift so a hoisted nested
+    /// `def` keeps the annotation its call sites' width analysis reads.
+    ret_ty: Option<String>,
     body: Vec<Stmt>,
     /// Enclosing-frame locals the body reads, in discovery order.
     captures: Vec<String>,
@@ -136,6 +139,7 @@ impl Lifted {
             name,
             params: self.params,
             sig: self.sig,
+            ret_ty: self.ret_ty,
             captured,
             body: self.body,
             is_abstract: false,
@@ -379,6 +383,7 @@ impl Resolver {
                     base: f.name.clone(),
                     params: f.params.clone(),
                     sig: f.sig.clone(),
+                    ret_ty: f.ret_ty.clone(),
                     body: Vec::new(),
                     captures: Vec::new(),
                     scope_base: 0,

@@ -50,6 +50,11 @@ pub struct ClassDecl {
     /// (the runtime is dynamically typed, so the `val`/`var`/private distinction
     /// is not enforced — a documented simplification).
     pub params: Vec<String>,
+    /// The declared type of each [`Self::params`] entry, same order and length.
+    /// Scala requires an annotation on every constructor parameter, so this is
+    /// the width of every field the primary constructor contributes — which is
+    /// what types `c.n * 2` at a use site and a bare `n * 2` inside a method.
+    pub param_tys: Vec<Option<String>>,
     /// The class body run as the constructor: `val`/`var` field declarations
     /// (their initializers may reference constructor params and earlier fields)
     /// and any side-effecting statements. `def`s are hoisted into `methods`.
@@ -113,6 +118,11 @@ pub struct Func {
     pub params: Vec<String>,
     /// One entry per [`Self::params`] entry, same order and length.
     pub sig: Vec<ParamSig>,
+    /// The declared return type, verbatim (`Some("Int")` for `def f(): Int`).
+    /// Scala infers a return type when it is omitted, which this frontend cannot
+    /// do, so an unannotated `def` answers `None` and its calls stay unnarrowed.
+    /// Consulted only by the compiler's width analysis.
+    pub ret_ty: Option<String>,
     /// How many TRAILING parameters are synthetic — the free variables that
     /// [`crate::resolve`] turned into parameters when it hoisted a nested `def`.
     /// A call site appends those arguments after the written ones, so argument

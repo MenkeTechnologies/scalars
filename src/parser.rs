@@ -276,6 +276,7 @@ impl Parser {
         }
         // Primary-constructor parameters (all become fields).
         let mut params = Vec::new();
+        let mut param_tys = Vec::new();
         if self.is(&Tok::LParen) {
             self.advance();
             self.skip_seps();
@@ -285,10 +286,12 @@ impl Parser {
                     self.advance();
                 }
                 let pname = self.ident()?;
+                let mut pty = None;
                 if self.is(&Tok::Colon) {
                     self.advance();
-                    self.type_ref()?;
+                    pty = Some(self.type_ref()?);
                 }
+                param_tys.push(pty);
                 // A default value (`x: Int = 0`) is parsed and ignored.
                 if self.is(&Tok::Assign) {
                     self.advance();
@@ -346,6 +349,7 @@ impl Parser {
             parents,
             super_args,
             params,
+            param_tys,
             body,
             field_names,
             methods,
@@ -446,9 +450,10 @@ impl Parser {
         // `(` is optional.
         let (params, sig) = self.param_list()?;
         // Optional `: ReturnType`.
+        let mut ret_ty = None;
         if self.is(&Tok::Colon) {
             self.advance();
-            self.type_ref()?;
+            ret_ty = Some(self.type_ref()?);
         }
         // No `= body` — an abstract declaration (`def area: Double` in a trait).
         if !self.is(&Tok::Assign) {
@@ -456,6 +461,7 @@ impl Parser {
                 name,
                 params,
                 sig,
+                ret_ty,
                 captured: 0,
                 body: Vec::new(),
                 is_abstract: true,
@@ -473,6 +479,7 @@ impl Parser {
             name,
             params,
             sig,
+            ret_ty,
             captured: 0,
             body,
             is_abstract: false,
@@ -782,22 +789,26 @@ impl Parser {
                     s.push('.');
                     self.advance();
                 }
+                // A type-argument clause. Its CONTENTS are kept, not just the
+                // brackets: `List[Int]` is the only place the element type of a
+                // collection is written down, and that element type is what
+                // types a lambda parameter traversing it and what `.sum`
+                // answers. Nested arguments (`List[List[Int]]`) nest verbatim.
                 Tok::LBracket => {
                     let mut depth = 0;
                     loop {
-                        match self.advance() {
+                        let t = self.advance();
+                        match &t {
                             Tok::LBracket => depth += 1,
-                            Tok::RBracket => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
+                            Tok::RBracket => depth -= 1,
                             Tok::Eof => break,
                             _ => {}
                         }
+                        s.push_str(&type_tok_text(&t));
+                        if depth == 0 {
+                            break;
+                        }
                     }
-                    s.push_str("[]");
                 }
                 // A function type: `Int => Int`, `(Int, Int) => Int`. The `=>`
                 // and its result type are consumed so the following `= <init>`
@@ -2487,6 +2498,22 @@ fn as_range(e: &Expr) -> Option<(Expr, Expr, bool, Option<Expr>)> {
 }
 
 /// Map a token to a compound-assignment operator, if it is one.
+/// Render one token of a type-argument clause back into the type string.
+///
+/// Only the spellings that can carry a width are reproduced — names, nesting,
+/// separators. Anything else (a variance annotation, a bound, a wildcard) is
+/// dropped, which leaves a string that names no width and so narrows nothing.
+fn type_tok_text(t: &Tok) -> String {
+    match t {
+        Tok::Ident(w) => w.clone(),
+        Tok::LBracket => "[".to_string(),
+        Tok::RBracket => "]".to_string(),
+        Tok::Comma => ",".to_string(),
+        Tok::Dot => ".".to_string(),
+        _ => String::new(),
+    }
+}
+
 fn assign_op(t: &Tok) -> Option<AssignOp> {
     Some(match t {
         Tok::Assign => AssignOp::Assign,

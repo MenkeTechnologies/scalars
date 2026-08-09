@@ -64,13 +64,13 @@ struct Compiler {
     /// Swapped out for a fresh map while a function body compiles so a `val`
     /// inside `main` cannot mask a `var` of the same name inside a `def`.
     vals: HashMap<String, bool>,
-    /// The statically known numeric WIDTH of each binding in scope:
-    /// `name → NumTy`. Populated from a declared type (`val n: Long`, and a
-    /// `def` parameter's mandatory annotation) or inferred from the initializer,
-    /// and consulted by [`Compiler::num_ty`] to decide whether an arithmetic
-    /// result wraps at 32 bits. Swapped out with [`Compiler::vals`] on entry to a
+    /// What the width analysis knows about each binding in scope — see
+    /// [`Width`]. Populated from a declared type (`val n: Long`, and a `def`
+    /// parameter's mandatory annotation) or inferred from the initializer, and
+    /// consulted by [`Compiler::num_ty`] to decide whether an arithmetic result
+    /// wraps at 32 bits. Swapped out with [`Compiler::vals`] on entry to a
     /// function body, so one frame's widths never leak into another's.
-    widths: HashMap<String, NumTy>,
+    widths: HashMap<String, Width>,
     /// `Some` while compiling a function body: maps that function's local names
     /// (parameters, then `val`/`var`/`for` locals) to frame slot indices, so
     /// each call frame gets its own copies and recursion is correct. `None` in
@@ -85,6 +85,18 @@ struct Compiler {
     /// rejects it. Reads never needed it: [`Compiler::resolve_place`] already
     /// falls back to `Place::Global`.
     global_binds: HashSet<String>,
+    /// The widths a lambda literal's parameters take if one is lowered right
+    /// now, positionally — set by [`Compiler::method`] from the receiver being
+    /// traversed (`xs.map(x => …)` types `x` as the element of `xs`) and
+    /// restored afterwards, so a nested traversal does not leak its element type
+    /// into the enclosing one.
+    lambda_param_widths: Vec<NumTy>,
+    /// Every user `def`'s declared return width, by name. Scala infers a `def`'s
+    /// result type from its body when the annotation is omitted; this frontend
+    /// does not, so an unannotated `def` is absent here and its calls stay
+    /// unnarrowed. Global, because [`crate::resolve`] has already hoisted every
+    /// nested `def` into one flat namespace by the time this is built.
+    def_widths: HashMap<String, NumTy>,
     /// Class metadata (`name → (ordered field names, is_case)`), for
     /// construction, `copy`, method dispatch, and constructor-pattern binding.
     classes: HashMap<String, ClassMeta>,
@@ -185,10 +197,13 @@ struct PendingClosure {
     /// The enclosing scope's numeric widths, captured when the body was queued.
     /// A lambda body compiles with a fresh scope, so without this an enclosing
     /// `var n = 0` would lose its `Int` width the moment a closure touched it and
-    /// `xs.foreach(_ => n += 1)` would stop wrapping. The lambda's own parameters
-    /// stay unknown — their type comes from the collection, which this frontend
-    /// does not infer.
-    widths: HashMap<String, NumTy>,
+    /// `xs.foreach(_ => n += 1)` would stop wrapping.
+    widths: HashMap<String, Width>,
+    /// The widths of this lambda's own PARAMETERS, positionally, as inferred at
+    /// the call site that took the lambda: `xs.map(x => …)` types `x` as the
+    /// element of `xs`. A parameter with no inferred width shadows any enclosing
+    /// binding of the same name with [`NumTy::Unknown`] rather than inheriting it.
+    param_widths: Vec<NumTy>,
 }
 
 /// Compile-time class shape.
@@ -214,6 +229,13 @@ struct ClassMeta {
     /// The method names this type *implements* itself — the `Owner$method`
     /// subroutines it owns, which is what `super.m` resolves against.
     own_methods: HashSet<String>,
+    /// The declared numeric width of every member — fields (constructor
+    /// parameters and body `val`/`var`s) and methods (by return type), own and
+    /// inherited. This is what types `c.n * 2` at a use site, and it is what
+    /// keeps a user member named like a stdlib one (`size`, `count`, `length`)
+    /// from being typed by the stdlib's rule. A member present here with
+    /// [`NumTy::Unknown`] is a member whose type is declared but is not integer.
+    member_widths: HashMap<String, NumTy>,
 }
 
 /// Compile-time singleton-object shape.
@@ -368,6 +390,32 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             .filter_map(|a| by_name.get(a.as_str()))
             .flat_map(|p| p.methods.iter().map(|m| m.name.clone()))
             .collect();
+        // Member widths, base-most first so a subclass override wins. These are
+        // read whenever the receiver's class is known — at a use site (`c.n * 2`)
+        // and for the bare field references inside the class's own methods.
+        let mut member_widths = HashMap::new();
+        for anc in mro.iter().rev().filter_map(|a| by_name.get(a.as_str())) {
+            for (p, ty) in anc.params.iter().zip(&anc.param_tys) {
+                member_widths.insert(p.clone(), declared_width(ty.as_deref().unwrap_or("")));
+            }
+            for s in &anc.body {
+                if let StmtKind::Local { name, ty, init, .. } = &s.kind {
+                    // A field's own initializer types it when no annotation
+                    // does, exactly as `val n = 0` types a local.
+                    let w = match ty {
+                        Some(t) => declared_width(t),
+                        None => init.as_ref().map_or(NumTy::Unknown, literal_width),
+                    };
+                    member_widths.insert(name.clone(), w);
+                }
+            }
+            for m in &anc.methods {
+                member_widths.insert(
+                    m.name.clone(),
+                    declared_width(m.ret_ty.as_deref().unwrap_or("")),
+                );
+            }
+        }
         class_meta.insert(
             cd.name.clone(),
             ClassMeta {
@@ -377,6 +425,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 is_trait: cd.is_trait,
                 supers: mro[1..].to_vec(),
                 responds,
+                member_widths,
                 own_methods: cd
                     .methods
                     .iter()
@@ -463,6 +512,15 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         by_name: HashSet::new(),
         vals: HashMap::new(),
         widths: HashMap::new(),
+        lambda_param_widths: Vec::new(),
+        def_widths: prog
+            .functions
+            .iter()
+            .filter_map(|f| {
+                let t = f.ret_ty.as_deref()?;
+                Some((f.name.clone(), declared_width(t)))
+            })
+            .collect(),
         scope: None,
         global_binds: HashSet::new(),
         classes: class_meta,
@@ -577,6 +635,7 @@ fn builtin_case1(name: &str, field: &str) -> ClassDecl {
         parents: Vec::new(),
         super_args: Vec::new(),
         params: vec![field.to_string()],
+        param_tys: vec![None],
         body: Vec::new(),
         field_names: vec![field.to_string()],
         methods: Vec::new(),
@@ -720,10 +779,7 @@ impl Compiler {
                 // The binding's numeric width: the declared type when there is
                 // one (`val n: Long = 1`), otherwise inferred from the
                 // initializer, which is how Scala itself types a bare `val`.
-                let w = match ty {
-                    Some(t) => declared_width(t),
-                    None => init.as_ref().map_or(NumTy::Unknown, |e| self.num_ty(e)),
-                };
+                let w = self.binding_width(ty.as_deref(), init.as_ref());
                 self.widths.insert(name.clone(), w);
                 // A `var` a closure assigns lives in a heap cell, allocated here
                 // even without an initializer so the closure has something to
@@ -830,7 +886,7 @@ impl Compiler {
                     if boxed {
                         self.b.emit(Op::CallBuiltin(crate::host::CELL_GET, 1), 0);
                     }
-                    let target = self.widths.get(name).copied().unwrap_or(NumTy::Unknown);
+                    let target = self.widths.get(name).map_or(NumTy::Unknown, |w| w.num);
                     self.compound_tail(*op, value, target)?;
                 }
                 self.unwind_check_dropping(1);
@@ -1377,6 +1433,7 @@ impl Compiler {
                     current_object: self.current_object.clone(),
                     by_name: self.by_name.clone(),
                     widths: self.widths.clone(),
+                    param_widths: self.lambda_param_widths.clone(),
                 });
                 Some(idx)
             }
@@ -1413,6 +1470,7 @@ impl Compiler {
             current_object: self.current_object.clone(),
             by_name: self.by_name.clone(),
             widths: self.widths.clone(),
+            param_widths: self.lambda_param_widths.clone(),
         });
         Ok(())
     }
@@ -1446,12 +1504,21 @@ impl Compiler {
         // The enclosing scope's widths travel into the body, so a captured
         // `var n = 0` is still known to be an `Int` here.
         let saved_widths = std::mem::replace(&mut self.widths, pc.widths);
-        for p in &pc.params {
+        for (i, p) in pc.params.iter().enumerate() {
             self.vals.insert(p.clone(), true);
-            // A parameter SHADOWS any enclosing binding of the same name, and its
-            // own type comes from the collection being traversed, which is not
-            // inferred — so it is unknown rather than inherited.
-            self.widths.remove(p);
+            // A parameter SHADOWS any enclosing binding of the same name. Its own
+            // width is the one the call site inferred from the collection being
+            // traversed (`xs.map(x => …)` over a `List[Int]` makes `x` an `Int`);
+            // where that could not be proven it is unknown rather than inherited,
+            // because inheriting would claim a width the parameter does not have.
+            match pc.param_widths.get(i) {
+                Some(&w) if w != NumTy::Unknown => {
+                    self.widths.insert(p.clone(), Width::num(w));
+                }
+                _ => {
+                    self.widths.remove(p);
+                }
+            }
         }
         let saved_class = std::mem::replace(&mut self.current_class, pc.current_class);
         let saved_object = std::mem::replace(&mut self.current_object, pc.current_object);
@@ -2518,11 +2585,40 @@ impl Compiler {
     /// spellings, and the generic `SMETHOD` fallback all funnel through here.
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
         let w = self.method_width(recv, name, args);
-        self.method_inner(recv, name, args, line)?;
+        // A lambda argument's parameters are typed by the traversal, so the
+        // widths are decided HERE — the lambda body itself is compiled much
+        // later, out of a queue, with no memory of the call it came from. Saved
+        // and restored so `xs.map(x => ys.filter(y => …))` gives each body its
+        // own element type instead of the innermost winning both.
+        let pw = self.traversal_param_widths(recv, name);
+        let saved = std::mem::replace(&mut self.lambda_param_widths, pw);
+        let r = self.method_inner(recv, name, args, line);
+        self.lambda_param_widths = saved;
+        r?;
         if NARROW_AFTER_METHODS.contains(&name) {
             self.narrow(w, line);
         }
         Ok(())
+    }
+
+    /// The widths a lambda passed to `recv.name(…)` binds its parameters to.
+    ///
+    /// Every traversal here hands the lambda ELEMENTS of the receiver, so one
+    /// element width types every parameter: `map`/`filter`/`forall` take one,
+    /// and `reduce` takes two of the same type. Deliberately absent are the
+    /// folds (`foldLeft`'s accumulator is the width of the seed, not of an
+    /// element) and `zip`ped traversals, whose parameter is a pair.
+    fn traversal_param_widths(&self, recv: &Expr, name: &str) -> Vec<NumTy> {
+        let arity = match name {
+            _ if ELEMENT_TRAVERSALS.contains(&name) => 1,
+            "reduce" | "reduceLeft" | "reduceRight" | "reduceOption" => 2,
+            _ => return Vec::new(),
+        };
+        let elem = self.elem_ty(recv);
+        if elem == NumTy::Unknown {
+            return Vec::new();
+        }
+        vec![elem; arity]
     }
 
     /// Lower postfix `recv.name(args)`. Dispatch order:
@@ -2813,7 +2909,11 @@ impl Compiler {
 
         let mut slots = HashMap::new();
         let saved_vals = std::mem::take(&mut self.vals);
-        let saved_widths = std::mem::take(&mut self.widths);
+        // The class's own fields are in scope by bare name for the whole
+        // constructor, so a later field's initializer (`val d = n * 2`) is typed
+        // by the parameter it reads.
+        let fw = self.class_field_widths(&cd.name);
+        let saved_widths = std::mem::replace(&mut self.widths, fw);
         for (i, p) in cd.params.iter().enumerate() {
             slots.insert(p.clone(), i as u16);
             self.vals.insert(p.clone(), true);
@@ -2897,11 +2997,26 @@ impl Compiler {
         let mut slots = HashMap::new();
         slots.insert("this".to_string(), 0u16);
         let saved_vals = std::mem::take(&mut self.vals);
-        let saved_widths = std::mem::take(&mut self.widths);
+        // A bare field reference inside a method resolves to `this.field`, so the
+        // field widths are the method body's starting widths — that is what makes
+        // `def twice: Int = n * 2` wrap when `n: Int`.
+        let fw = self.class_field_widths(&cd.name);
+        let saved_widths = std::mem::replace(&mut self.widths, fw);
         self.vals.insert("this".to_string(), true);
         for (i, p) in m.params.iter().enumerate() {
             slots.insert(p.clone(), (i + 1) as u16);
             self.vals.insert(p.clone(), true);
+            // A parameter shadows a field of the same name, so an unannotated one
+            // must clear the field's width rather than inherit it.
+            match m.sig.get(i).and_then(|s| s.ty.as_deref()) {
+                Some(t) => {
+                    let w = self.binding_width(Some(t), None);
+                    self.widths.insert(p.clone(), w);
+                }
+                None => {
+                    self.widths.remove(p);
+                }
+            }
         }
         self.scope = Some(Scope {
             slots,
@@ -3196,7 +3311,8 @@ impl Compiler {
             // Scala requires a type on every `def` parameter, so this is the one
             // place inside a function body where numeric widths are always known.
             if let Some(t) = f.sig.get(i).and_then(|s| s.ty.as_deref()) {
-                self.widths.insert(p.clone(), declared_width(t));
+                self.widths
+                    .insert(p.clone(), self.binding_width(Some(t), None));
             }
         }
         self.scope = Some(Scope {
@@ -3289,6 +3405,86 @@ impl Compiler {
         }
     }
 
+    /// Everything the width analysis can prove about a new binding, from its
+    /// declared type when it has one and from its initializer otherwise — which
+    /// is how Scala itself types a bare `val`. A declared type wins: `val n:
+    /// Long = 1` is a `Long`, not the `Int` the initializer alone would suggest.
+    fn binding_width(&self, ty: Option<&str>, init: Option<&Expr>) -> Width {
+        let (num, elem) = match ty {
+            Some(t) => (declared_width(t), declared_element_width(t)),
+            None => (
+                init.map_or(NumTy::Unknown, |e| self.num_ty(e)),
+                init.map_or(NumTy::Unknown, |e| self.elem_ty(e)),
+            ),
+        };
+        Width {
+            num,
+            elem,
+            cls: init.and_then(|e| self.class_of(e)),
+        }
+    }
+
+    /// The user-declared class of `e`, when it can be recovered. This is what
+    /// lets a field or method access on a value be typed: `val b = new Box(…)`
+    /// records `Box`, so `b.n` can read `Box`'s declared field width.
+    fn class_of(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::New { name, .. } => self.classes.contains_key(name).then(|| name.clone()),
+            // A `case class` is also constructed through its companion `apply`,
+            // written without `new`.
+            Expr::Call { name, .. } => self
+                .classes
+                .get(name)
+                .filter(|m| m.is_case)
+                .map(|_| name.clone()),
+            Expr::Var(n) => self.widths.get(n).and_then(|w| w.cls.clone()),
+            _ => None,
+        }
+    }
+
+    /// The width of the ELEMENTS of a collection-valued expression — the width
+    /// Scala reads off `List[Int]` and this frontend has to recover from the
+    /// syntax. It types a lambda parameter traversing the collection, and it is
+    /// the result width of `sum`/`product`/`max`/`min`.
+    fn elem_ty(&self, e: &Expr) -> NumTy {
+        match e {
+            Expr::Var(n) => self.widths.get(n).map_or(NumTy::Unknown, |w| w.elem),
+            // A collection literal is typed by its elements: `List(1, 2)` is a
+            // `List[Int]`, `List(1L, 2L)` a `List[Long]`, and a mixed or
+            // non-integer one answers `Unknown` through `combine`. An EMPTY
+            // literal has no element type here (`Nil`, `List()`), which is the
+            // conservative answer.
+            Expr::Collection { ctor, elems } if SEQ_CTORS.contains(&ctor.as_str()) => {
+                combine_all(elems.iter().map(|x| self.num_ty(x)))
+            }
+            Expr::Method {
+                recv, name, args, ..
+            } => self.method_elem_ty(recv, name, args),
+            _ => NumTy::Unknown,
+        }
+    }
+
+    /// The element width of a collection-valued method result.
+    fn method_elem_ty(&self, recv: &Expr, name: &str, args: &[Expr]) -> NumTy {
+        // `a to b` / `a until b` — a `Range` of the endpoints' width. Scala's
+        // `1 to 3` is a `Range` (an `Int` one); `1L to 3L` is a
+        // `NumericRange[Long]`, which does not wrap.
+        if args.len() == 1 && matches!(name, "to" | "until") {
+            return self.num_ty(recv).combine(self.num_ty(&args[0]));
+        }
+        // The combinators that return a collection of the SAME element type, so
+        // `xs.filter(…).sum` is still typed by `xs`. Not `map`: its element type
+        // is the width of the lambda BODY, which would have to be analysed with
+        // the parameter bound to a width the compiler is not holding yet (see
+        // BUGS.md).
+        if args.is_empty() && ELEM_PRESERVING_NILADIC.contains(&name)
+            || args.len() == 1 && ELEM_PRESERVING_MONADIC.contains(&name)
+        {
+            return self.elem_ty(recv);
+        }
+        NumTy::Unknown
+    }
+
     /// The statically known numeric width of `e` — see [`NumTy`]. Everything
     /// this cannot prove answers [`NumTy::Unknown`], which suppresses narrowing.
     fn num_ty(&self, e: &Expr) -> NumTy {
@@ -3298,7 +3494,7 @@ impl Compiler {
             // A `Char` widens to `Int` the moment it enters arithmetic: `'a' + 1`
             // is the `Int` 98, and `Char` itself has no arithmetic of its own.
             Expr::Char(_) => NumTy::Int,
-            Expr::Var(n) => self.widths.get(n).copied().unwrap_or(NumTy::Unknown),
+            Expr::Var(n) => self.widths.get(n).map_or(NumTy::Unknown, |w| w.num),
             // `-x` and `~x` keep their operand's width.
             Expr::Unary {
                 op: UnOp::Neg | UnOp::Complement,
@@ -3312,8 +3508,46 @@ impl Compiler {
             Expr::Method {
                 recv, name, args, ..
             } => self.method_width(recv, name, args),
+            // A call to a user `def` with a declared return type. This is the
+            // only width a call site can know: the body is compiled separately
+            // and its result is whatever the annotation promised.
+            Expr::Call { name, .. } => {
+                self.def_widths.get(name).copied().unwrap_or(NumTy::Unknown)
+            }
             _ => NumTy::Unknown,
         }
+    }
+
+    /// The widths a class's own body sees by bare name: every field of the class,
+    /// own and inherited. A constructor body and every method body start from
+    /// these, because a bare field reference in either resolves to `this.field`.
+    fn class_field_widths(&self, cls: &str) -> HashMap<String, Width> {
+        let Some(meta) = self.classes.get(cls) else {
+            return HashMap::new();
+        };
+        meta.field_names
+            .iter()
+            .filter_map(|f| {
+                let w = *meta.member_widths.get(f)?;
+                Some((f.clone(), Width::num(w)))
+            })
+            .collect()
+    }
+
+    /// The declared width of `cls`'s member `name`, or `None` when `cls` has no
+    /// such member — in which case the call is a stdlib one on the instance and
+    /// the name-based rules still apply.
+    fn member_width(&self, cls: &str, name: &str) -> Option<NumTy> {
+        self.classes.get(cls)?.member_widths.get(name).copied()
+    }
+
+    /// Whether ANY user-declared class names `name` as a member. A receiver
+    /// whose class could not be recovered may be an instance of that class, so
+    /// no stdlib width can be claimed for the call.
+    fn user_declares_member(&self, name: &str) -> bool {
+        self.classes
+            .values()
+            .any(|m| m.member_widths.contains_key(name))
     }
 
     /// The width of a method call's result. Split three ways: names that are
@@ -3340,6 +3574,34 @@ impl Compiler {
         }
         if name == "toLong" {
             return NumTy::Long;
+        }
+        // A member of a USER-DECLARED class is typed by that class's own
+        // declaration, and it takes priority over every name-based rule below.
+        // Without this, `case class FileRec(name: String, size: Long)` had
+        // `f.size` typed `Int` — because `size` is a stdlib `Int` method name —
+        // and `f.size * 2` wrapped a `Long` field to 32 bits. The receiver's
+        // width is not what was unproven there; the receiver was unproven and a
+        // width was claimed anyway, which is the one thing `NumTy::Unknown`
+        // exists to prevent.
+        if let Some(w) = self
+            .class_of(recv)
+            .and_then(|cls| self.member_width(&cls, name))
+        {
+            return w;
+        }
+        // The same name declared by SOME user class, on a receiver whose class
+        // could not be recovered: the call may well land there, so the stdlib
+        // rule cannot be applied either way.
+        if self.user_declares_member(name) {
+            return NumTy::Unknown;
+        }
+        // `xs.sum` / `xs.product` — the ELEMENT type, which is the width Scala
+        // reads off `List[Int]` and the reason `(1 to 100000).sum` answers
+        // 705082704 rather than 5000050000. `max`/`min` are the same rule; they
+        // cannot overflow, so they type an enclosing expression without being
+        // narrowed themselves.
+        if args.is_empty() && ELEM_RESULT_METHODS.contains(&name) {
+            return self.elem_ty(recv);
         }
         if INT_RESULT_METHODS.contains(&name) {
             return NumTy::Int;
@@ -3784,7 +4046,7 @@ fn companion_bound(owner: &str, member: &str) -> Option<i64> {
 /// is emitted as a shift pair, and a shift applied to a `Double` or a `String`
 /// would destroy it. So a width is claimed only where it is PROVEN, and an
 /// unproven expression keeps the 64-bit behaviour this frontend had before.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum NumTy {
     /// Provably a 32-bit `Int`: arithmetic on it wraps.
     Int,
@@ -3792,7 +4054,38 @@ enum NumTy {
     Long,
     /// A `Double`, a `String`, a collection, or a value whose type this frontend
     /// cannot recover. Never narrowed.
+    #[default]
     Unknown,
+}
+
+/// Everything the width analysis knows about one binding.
+///
+/// Scala reads a width off the static type, and most of the positions this
+/// frontend used to miss are ones where the width does not appear on the binding
+/// at all: it appears on the binding's ELEMENT (`xs: List[Int]`, which is what
+/// types `x` in `xs.map(x => …)` and what `xs.sum` answers) or on its CLASS
+/// (`c: Box`, which is what types `c.n`). Carrying all three together means the
+/// existing save/restore of [`Compiler::widths`] on entry to every function,
+/// method, constructor and lambda body keeps working untouched.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+struct Width {
+    /// The binding's own numeric width.
+    num: NumTy,
+    /// For a collection, the width of its ELEMENTS; [`NumTy::Unknown`] otherwise.
+    elem: NumTy,
+    /// For an instance of a user-declared class, that class's name, which is how
+    /// a field or method access on it recovers a width.
+    cls: Option<String>,
+}
+
+impl Width {
+    /// A binding whose only known property is its own width.
+    fn num(n: NumTy) -> Width {
+        Width {
+            num: n,
+            ..Width::default()
+        }
+    }
 }
 
 impl NumTy {
@@ -3808,6 +4101,140 @@ impl NumTy {
             _ => NumTy::Unknown,
         }
     }
+}
+
+/// Fold a sequence of operand widths under [`NumTy::combine`]. An EMPTY
+/// sequence answers [`NumTy::Unknown`]: `List()` and `Nil` name no element type,
+/// and claiming one would narrow whatever was later put in them.
+fn combine_all(mut widths: impl Iterator<Item = NumTy>) -> NumTy {
+    match widths.next() {
+        Some(first) => widths.fold(first, NumTy::combine),
+        None => NumTy::Unknown,
+    }
+}
+
+/// The collection literals whose elements are values (as opposed to `Map`'s
+/// key/value pairs, which have two widths and no single element type).
+const SEQ_CTORS: &[&str] = &[
+    "List",
+    "Seq",
+    "Vector",
+    "Array",
+    "IndexedSeq",
+    "Set",
+    "HashSet",
+    "ListBuffer",
+    "ArrayBuffer",
+    "Buffer",
+    "Iterable",
+];
+
+/// Niladic methods whose result is one ELEMENT of the receiver, so they take the
+/// receiver's element width. Only `sum` and `product` can leave the 32-bit range
+/// (see [`NARROW_AFTER_METHODS`]); the rest are here so they can type an
+/// enclosing expression.
+const ELEM_RESULT_METHODS: &[&str] = &[
+    "sum", "product", "max", "min", "head", "last", "headOption",
+];
+
+/// The width of an expression that carries its type on its face, with no
+/// bindings consulted. Used where a width is needed before any scope exists —
+/// class field initializers, indexed once at registration.
+fn literal_width(e: &Expr) -> NumTy {
+    match e {
+        Expr::Int(_) | Expr::Char(_) => NumTy::Int,
+        Expr::Long(_) => NumTy::Long,
+        Expr::Unary {
+            op: UnOp::Neg | UnOp::Complement,
+            rhs,
+        } => literal_width(rhs),
+        Expr::Binary {
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+            lhs,
+            rhs,
+        } => literal_width(lhs).combine(literal_width(rhs)),
+        _ => NumTy::Unknown,
+    }
+}
+
+/// Methods that call a one-parameter lambda once per ELEMENT of the receiver,
+/// so the parameter takes the receiver's element width.
+const ELEMENT_TRAVERSALS: &[&str] = &[
+    "map",
+    "flatMap",
+    "filter",
+    "filterNot",
+    "withFilter",
+    "foreach",
+    "exists",
+    "forall",
+    "count",
+    "find",
+    "takeWhile",
+    "dropWhile",
+    "sortBy",
+    "maxBy",
+    "minBy",
+    "groupBy",
+    "partition",
+    "span",
+    "indexWhere",
+    "lastIndexWhere",
+    "segmentLength",
+];
+
+/// Niladic combinators that answer a collection with the SAME element type.
+const ELEM_PRESERVING_NILADIC: &[&str] = &[
+    "reverse",
+    "sorted",
+    "distinct",
+    "tail",
+    "init",
+    "toList",
+    "toVector",
+    "toSeq",
+    "toArray",
+    "toSet",
+    "toBuffer",
+    "toIndexedSeq",
+    "flatten",
+];
+
+/// One-argument combinators that answer a collection with the SAME element type.
+/// `map` is deliberately absent — see [`Compiler::method_elem_ty`].
+const ELEM_PRESERVING_MONADIC: &[&str] = &[
+    "filter",
+    "filterNot",
+    "withFilter",
+    "take",
+    "drop",
+    "takeWhile",
+    "dropWhile",
+    "takeRight",
+    "dropRight",
+    "sortBy",
+    "sortWith",
+    "diff",
+    "intersect",
+];
+
+/// The element width a declared collection type names — the `Int` of
+/// `List[Int]`. Answers [`NumTy::Unknown`] for a type with no argument clause,
+/// for a `Map` (two widths, no single element), and for a nested collection.
+fn declared_element_width(ty: &str) -> NumTy {
+    let Some(open) = ty.find('[') else {
+        return NumTy::Unknown;
+    };
+    if !SEQ_CTORS.contains(&ty[..open].trim_start_matches("=>").trim()) {
+        return NumTy::Unknown;
+    }
+    let inner = ty[open + 1..].trim_end_matches(']');
+    // A comma means several type arguments and a `[` a nested collection;
+    // neither names one element width.
+    if inner.contains(',') || inner.contains('[') {
+        return NumTy::Unknown;
+    }
+    declared_width(inner)
 }
 
 /// The width a declared type name denotes, for `val x: Long = …` and a `def`
@@ -3858,9 +4285,13 @@ const WIDTH_COMBINING_METHODS: &[&str] =
 /// `Int`. Deliberately NOT every `Int`-typed method: a `length` or an `indexOf`
 /// cannot leave the range, and wrapping it would cost four ops on every call for
 /// no change in answer. These are the ones that genuinely overflow — the
-/// arithmetic operators in method spelling, `abs` (at `Int.MinValue`), and
-/// `toInt`, which is Scala's explicit narrowing conversion.
-const NARROW_AFTER_METHODS: &[&str] = &["toInt", "abs", "+", "-", "*", "/", "%"];
+/// arithmetic operators in method spelling, `abs` (at `Int.MinValue`), `toInt`,
+/// which is Scala's explicit narrowing conversion, and the two folds over a
+/// collection that accumulate — `sum` and `product` overflow on a long enough
+/// `List[Int]` however small its elements are.
+const NARROW_AFTER_METHODS: &[&str] = &[
+    "toInt", "abs", "+", "-", "*", "/", "%", "sum", "product",
+];
 
 /// Whether `e` names a math module — `math`/`scala.math` or `Math`/
 /// `java.lang.Math` — and which of the two. These are namespaces, not values, so

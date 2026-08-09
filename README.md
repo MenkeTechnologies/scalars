@@ -299,8 +299,13 @@ Implemented and checked against the reference `scala`:
   the expression so it does not wrap (`2147483647 + 1L` is `2147483648`) and
   `Long` itself wraps at 64. The runtime is dynamically typed, so the `Int`/`Long`
   split is decided statically from literals, declared types and the methods whose
-  result type is fixed; see `BUGS.md` for the positions where no width can be
-  proven and the 64-bit answer is kept instead of a guessed one.
+  result type is fixed — including the widths Scala supplies from context rather
+  than from the expression: a lambda parameter takes the element type of what it
+  traverses (`List(2147483647, 2).map(_ * 2)` is `List(-2, 4)`), a class field and
+  a `def` return annotation carry their declared widths to a use site, and
+  `.sum`/`.product` take the collection's element type, so `(1 to 100000).sum` is
+  `705082704`. See `BUGS.md` for the positions where no width can be proven and
+  the 64-bit answer is kept instead of a guessed one.
 - **Partial functions** — a `{ case … }` literal answers `isDefinedAt` as well
   as `apply`, which is what `collect`/`collectFirst` need to skip a
   non-matching element; `applyOrElse`, `lift`, `orElse`, `andThen` and

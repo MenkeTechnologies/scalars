@@ -2953,3 +2953,160 @@ fn reversing_an_ordering_twice_restores_it() {
     ));
     assert_eq!(out, "List(1, 2)\ntrue\n5\n");
 }
+
+// ── Widths Scala infers from context ────────────────────────────────────────
+// `Int` is 32 bits everywhere, including the positions where the width is never
+// written on the expression itself: it comes from the collection a lambda
+// parameter traverses, from a class's field declarations, from a `def`'s return
+// annotation, or from a collection's element type. Every expectation below was
+// diffed against `scala-cli` (Scala 3.8.4). The cases that must NOT wrap carry
+// as much weight as the ones that must: they are what fails if a width is
+// claimed for an expression whose type was never proven.
+
+#[test]
+fn a_lambda_parameter_takes_the_element_width_of_what_it_traverses() {
+    let (out, _) = run(&wrap(
+        "println(List(2147483647, 2).map(x => x * 2).mkString(\",\"))",
+    ));
+    assert_eq!(out, "-2,4\n");
+}
+
+#[test]
+fn a_placeholder_lambda_narrows_the_same_way_a_named_one_does() {
+    let (out, _) = run(&wrap(
+        "println(List(2147483647, 2).map(_ * 2).mkString(\",\"))",
+    ));
+    assert_eq!(out, "-2,4\n");
+}
+
+#[test]
+fn a_lambda_over_a_long_collection_keeps_sixty_four_bits() {
+    let (out, _) = run(&wrap(
+        "println(List(2147483647L, 2L).map(x => x * 2).mkString(\",\"))",
+    ));
+    assert_eq!(out, "4294967294,4\n");
+}
+
+#[test]
+fn a_lambda_over_a_non_integer_collection_is_left_alone() {
+    // The shift pair would truncate a `Double` and mangle a `String`, so an
+    // element type that is neither `Int` nor `Long` must narrow nothing.
+    let (out, _) = run(&wrap(
+        "println(List(1.5).map(d => d * 2.0).mkString(\",\") + \"|\" + List(\"a\").map(s => s + s).mkString(\",\"))",
+    ));
+    assert_eq!(out, "3.0|aa\n");
+}
+
+#[test]
+fn nested_lambdas_each_take_their_own_element_width() {
+    // The inner traversal is over a `List[Long]` and the outer over a
+    // `List[Int]`; neither may inherit the other's width.
+    let (out, _) = run(&wrap(
+        "println(List(2147483647).map(x => List(2L).map(y => y * 2).sum + x * 2).mkString(\",\"))",
+    ));
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn reduce_binds_both_of_its_parameters_to_the_element_width() {
+    let (out, _) = run(&wrap("println(List(2147483647, 2147483647).reduce((a, b) => a + b))"));
+    assert_eq!(out, "-2\n");
+}
+
+#[test]
+fn a_declared_collection_parameter_types_the_lambda_inside_the_def() {
+    let (out, _) = run(&wrap(
+        "def viaSig(zs: List[Int]): Int = zs.map(z => z * 2).head; println(viaSig(List(2147483647)))",
+    ));
+    assert_eq!(out, "-2\n");
+}
+
+#[test]
+fn a_constructor_field_carries_its_declared_width_to_a_use_site() {
+    let (out, _) = run(
+        "class Counter(val step: Int, val total: Long)\n\
+         object T extends App { val c = new Counter(2147483647, 2147483647L); println(c.step * 2); println(c.total * 2) }",
+    );
+    assert_eq!(out, "-2\n4294967294\n");
+}
+
+#[test]
+fn a_bare_field_reference_inside_a_method_narrows() {
+    let (out, _) = run(
+        "class Counter(val step: Int) { val doubled: Int = step * 2; def bump: Int = step * 2147483647 }\n\
+         object T extends App { val c = new Counter(2147483647); println(c.bump); println(c.doubled) }",
+    );
+    assert_eq!(out, "1\n-2\n");
+}
+
+#[test]
+fn an_inherited_field_carries_its_width_into_the_subclass() {
+    let (out, _) = run(
+        "class Base(val seed: Int)\n\
+         class Derived(s: Int) extends Base(s) { def grow: Int = seed * 1000000 }\n\
+         object T extends App { println(new Derived(2147483647).grow) }",
+    );
+    assert_eq!(out, "-1000000\n");
+}
+
+#[test]
+fn a_user_field_named_like_a_stdlib_int_method_keeps_its_declared_width() {
+    // `size` and `length` are `Int` on every stdlib receiver, and were typed
+    // `Int` here on ANY receiver — so a `case class` field of that name had its
+    // `Long` value wrapped to 32 bits. A name-based rule cannot outrank a
+    // declaration.
+    let (out, _) = run(
+        "case class FileRec(name: String, size: Long)\n\
+         case class Sample(name: String, length: Long)\n\
+         object T extends App { println(FileRec(\"a\", 10000000000L).size * 2); println(Sample(\"a\", 10000000000L).length + 1) }",
+    );
+    assert_eq!(out, "20000000000\n10000000001\n");
+}
+
+#[test]
+fn a_def_return_annotation_types_its_call_site() {
+    let (out, _) = run(&wrap(
+        "def mk(): Int = 2147483647; def mkL(): Long = 2147483647L; println(mk() * 2); println(mkL() * 2)",
+    ));
+    assert_eq!(out, "-2\n4294967294\n");
+}
+
+#[test]
+fn sum_and_product_wrap_over_an_int_collection() {
+    let (out, _) = run(&wrap(
+        "println(List(2147483647, 2147483647).sum); println(List(2147483647, 2).product)",
+    ));
+    assert_eq!(out, "-2\n-2\n");
+}
+
+#[test]
+fn summing_a_range_wraps_at_thirty_two_bits() {
+    // Every element is small; the ACCUMULATOR is what overflows, which is why
+    // `sum` has to narrow even when no operand is near the boundary.
+    let (out, _) = run(&wrap("println((1 to 100000).sum)"));
+    assert_eq!(out, "705082704\n");
+}
+
+#[test]
+fn summing_a_long_or_double_collection_does_not_wrap() {
+    let (out, _) = run(&wrap(
+        "println(List(2147483647L, 2147483647L).sum); println(List(1.5, 2.5).sum)",
+    ));
+    assert_eq!(out, "4294967294\n4.0\n");
+}
+
+#[test]
+fn an_element_width_survives_a_filter_but_an_empty_literal_has_none() {
+    let (out, _) = run(&wrap(
+        "println(List(2147483647, 2147483647).filter(x => x > 0).sum); println(List[Int]().sum)",
+    ));
+    assert_eq!(out, "-2\n0\n");
+}
+
+#[test]
+fn a_declared_long_collection_keeps_sixty_four_bits_through_a_lambda() {
+    let (out, _) = run(&wrap(
+        "val big: List[Long] = List(2147483647L, 2147483647L); println(big.map(x => x * 2).sum)",
+    ));
+    assert_eq!(out, "8589934588\n");
+}

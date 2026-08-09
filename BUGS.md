@@ -459,13 +459,21 @@ reported as parse/compile errors, never silently mis-run.
   What it CANNOT prove stays 64-bit, because the wrap is emitted as a shift pair
   that would destroy a `Double` or a `String`. An enclosing scope's widths travel
   into a lambda body, so a captured accumulator still wraps
-  (`var t = 0; xs.foreach(t += _)`); the residual gaps are the positions Scala
-  types from context this frontend does not model. A **lambda parameter** is the
-  main one — in `xs.map(x => x * 2147483647)` the element type comes from `xs`,
-  which is not inferred, so the multiply stays 64-bit. The same applies to a
-  **class field**, a `def`'s **return type** feeding a caller's arithmetic, and
-  `.sum`/`.product` over a collection whose element type is unknown. Each keeps
-  the pre-existing 64-bit answer rather than a wrongly narrowed one.
+  (`var t = 0; xs.foreach(t += _)`). The positions Scala types from CONTEXT are
+  modelled too: a **lambda parameter** takes the element width of what it
+  traverses (`xs.map(x => x * 2147483647)` over a `List[Int]` wraps), a **class
+  field** carries its declared width to a use site and to a bare reference inside
+  a method, a `def`'s **return annotation** types its call site, and
+  `.sum`/`.product` take the collection's element width — which is why
+  `(1 to 100000).sum` answers `705082704`. A collection's element width comes
+  from a literal's elements, a declared `List[Int]`, a range's endpoints, or an
+  element-preserving combinator (`filter`, `take`, `sorted`, …).
+  The residual gap is **`map`'s result element type**: `xs.map(f).sum` does not
+  know what `f` returns, because that would mean analysing the lambda body with
+  its parameter already bound. The elements themselves are still correct (the
+  body wraps); only a later `sum`/`product` over them stays 64-bit.
+  A `def` with no return annotation is also unproven — Scala infers one from the
+  body and this frontend does not.
 - **The `%x`/`%X`/`%o` format conversions pick their width from the VALUE, not
   the static type.** Java writes the two's-complement bit pattern at the width of
   the operand's type — `Int` is 32 bits (`"%x".format(-1)` is `ffffffff`), `Long`
