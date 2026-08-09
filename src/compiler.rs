@@ -50,6 +50,15 @@ struct Compiler {
     /// zero-parameter one is a paren-less call (Scala allows `def x = …; x`).
     /// Anything else stays on the FFI/compile-error path.
     func_arity: HashMap<String, usize>,
+    /// User-defined `def`s again, this time with the parameter NAMES and their
+    /// [`ParamSig`]s plus the synthetic-capture count, which is everything
+    /// [`Compiler::adapt_args`] needs to place named arguments, splice defaults,
+    /// and collect a repeated parameter at a call site.
+    func_sig: HashMap<String, (Vec<String>, Vec<ParamSig>, usize)>,
+    /// Parameter names currently bound BY NAME (`x: => Int`). A read of one of
+    /// these forces the thunk the caller passed, which is what makes a by-name
+    /// argument re-evaluate at every use.
+    by_name: HashSet<String>,
     /// Immutability of the bindings currently in scope: `name → is_val`.
     /// Reassigning a `val` (`true`) is a compile error (Scala rejects it too).
     /// Swapped out for a fresh map while a function body compiles so a `val`
@@ -153,6 +162,11 @@ struct PendingClosure {
     body: Expr,
     current_class: Option<(String, HashSet<String>)>,
     current_object: Option<String>,
+    /// The enclosing body's by-name parameters. A closure written inside a `def`
+    /// can read one, and the read must still force the thunk, so the set travels
+    /// with the queued body instead of being read from the compiler's cursor
+    /// (which has long since moved on by the time the body is emitted).
+    by_name: HashSet<String>,
 }
 
 /// Compile-time class shape.
@@ -258,6 +272,16 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         .functions
         .iter()
         .map(|f| (f.name.clone(), f.params.len()))
+        .collect();
+    let func_sig = prog
+        .functions
+        .iter()
+        .map(|f| {
+            (
+                f.name.clone(),
+                (f.params.clone(), f.sig.clone(), f.captured),
+            )
+        })
         .collect();
 
     // Classes to emit constructors/methods for: the user's, plus the built-in
@@ -413,6 +437,8 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         debug,
         has_ffi,
         func_arity,
+        func_sig,
+        by_name: HashSet::new(),
         vals: HashMap::new(),
         scope: None,
         classes: class_meta,
@@ -1104,6 +1130,13 @@ impl Compiler {
                 self.b.emit(Op::LoadConst(c), 0);
             }
             Expr::Var(name) => self.var_ref(name)?,
+            // `adapt_args` strips these off a `def` call; reaching the general
+            // lowering means the callee has no named parameter list to match.
+            Expr::NamedArg { name, .. } => {
+                return Err(format!(
+                    "scalars: named argument `{name} = …` is only supported on a `def` call"
+                ))
+            }
             Expr::Unary { op, rhs } => {
                 self.expr(rhs)?;
                 match op {
@@ -1223,6 +1256,8 @@ impl Compiler {
             // Scala 3 `Seq` is `List`; `IndexedSeq` is `Vector`.
             "List" | "Seq" => crate::host::MAKE_LIST,
             "Vector" | "IndexedSeq" => crate::host::MAKE_VECTOR,
+            // Only produced by the varargs collection in `adapt_args`.
+            "ArraySeq" => crate::host::MAKE_ARRAYSEQ,
             "Set" => crate::host::MAKE_SET,
             "Map" => crate::host::MAKE_MAP,
             "Array" => crate::host::MAKE_ARRAY,
@@ -1296,6 +1331,7 @@ impl Compiler {
                     body: test,
                     current_class: self.current_class.clone(),
                     current_object: self.current_object.clone(),
+                    by_name: self.by_name.clone(),
                 });
                 Some(idx)
             }
@@ -1330,6 +1366,7 @@ impl Compiler {
             body: body.clone(),
             current_class: self.current_class.clone(),
             current_object: self.current_object.clone(),
+            by_name: self.by_name.clone(),
         });
         Ok(())
     }
@@ -1365,6 +1402,13 @@ impl Compiler {
         }
         let saved_class = std::mem::replace(&mut self.current_class, pc.current_class);
         let saved_object = std::mem::replace(&mut self.current_object, pc.current_object);
+        // A parameter of this closure shadows an enclosing by-name parameter of
+        // the same name, and is an ordinary value.
+        let mut by_name = pc.by_name;
+        for p in &pc.params {
+            by_name.remove(p);
+        }
+        let saved_by_name = std::mem::replace(&mut self.by_name, by_name);
 
         // Prologue: pop the pushed params + captures (top-down) into their slots.
         for i in (0..total).rev() {
@@ -1385,6 +1429,7 @@ impl Compiler {
         self.vals = saved_vals;
         self.current_class = saved_class;
         self.current_object = saved_object;
+        self.by_name = saved_by_name;
         Ok(())
     }
 
@@ -1926,6 +1971,14 @@ impl Compiler {
             if self.is_boxed(name) {
                 self.b.emit(Op::CallBuiltin(crate::host::CELL_GET, 1), 0);
             }
+            // A by-name parameter's slot holds the caller's thunk, not a value.
+            // Forcing it HERE — at the use, not at the call — is the whole point:
+            // the argument runs once per read and not at all if never read.
+            if self.by_name.contains(name) {
+                // `APPLY`'s operand count excludes the callee itself, so a
+                // zero-argument force is `APPLY, 0`.
+                self.b.emit(Op::CallBuiltin(crate::host::APPLY, 0), 0);
+            }
             return Ok(());
         }
         // Inside a class method: a bare field is `this.field`; a bare sibling
@@ -2205,6 +2258,108 @@ impl Compiler {
         Ok(())
     }
 
+    /// Rewrite a written argument list into the exact positional list the
+    /// callee's frame expects.
+    ///
+    /// Four Scala parameter-list features all resolve here, because all four are
+    /// decided at the CALL site by the callee's signature:
+    ///
+    /// * a named argument (`f(b = 3, a = 4)`) moves to its parameter's position;
+    /// * an omitted parameter with a default gets the default expression
+    ///   spliced in — Scala evaluates it at the call site and only when the
+    ///   argument is missing, which is exactly what splicing the unevaluated
+    ///   expression here reproduces (Scala 3 forbids a default that reads
+    ///   another parameter of the same list, so there is nothing else it could
+    ///   depend on);
+    /// * the trailing arguments of a repeated parameter (`xs: Int*`) collapse
+    ///   into one `ArraySeq`, the class Scala hands a varargs method;
+    /// * a by-name argument (`x: => Int`) is wrapped in a zero-argument thunk,
+    ///   which [`Compiler::var_ref`] forces at each use inside the body.
+    ///
+    /// Trailing parameters synthesized by [`crate::resolve`]'s nested-`def`
+    /// lifting are passed through untouched: the caller already appended those
+    /// arguments, and they sit AFTER the written ones.
+    fn adapt_args(&self, name: &str, args: &[Expr], line: u32) -> Result<Vec<Expr>, String> {
+        let Some((params, sig, captured)) = self.func_sig.get(name) else {
+            return Ok(args.to_vec());
+        };
+        let plain = sig
+            .iter()
+            .all(|p| p.default.is_none() && !p.vararg && !p.by_name);
+        let named_any = args.iter().any(|a| matches!(a, Expr::NamedArg { .. }));
+        if plain && !named_any {
+            return Ok(args.to_vec());
+        }
+        // Split off the capture arguments the resolver appended.
+        let ncap = (*captured).min(args.len());
+        let (written, caps) = args.split_at(args.len() - ncap);
+        let visible = params.len() - captured;
+        let (params, sig) = (&params[..visible], &sig[..visible]);
+
+        let vararg_at = sig.iter().position(|p| p.vararg);
+        let mut slots: Vec<Option<Expr>> = vec![None; visible];
+        let mut rest: Vec<Expr> = Vec::new();
+        let mut pos = 0usize;
+        for a in written {
+            match a {
+                Expr::NamedArg { name: pn, value } => {
+                    let Some(i) = params.iter().position(|p| p == pn) else {
+                        return Err(format!(
+                            "scalars: {name} has no parameter named `{pn}` (line {line})"
+                        ));
+                    };
+                    if slots[i].is_some() {
+                        return Err(format!(
+                            "scalars: parameter `{pn}` of {name} is given twice (line {line})"
+                        ));
+                    }
+                    slots[i] = Some((**value).clone());
+                }
+                _ if vararg_at == Some(pos) => rest.push(a.clone()),
+                _ => {
+                    if pos >= visible {
+                        return Err(format!(
+                            "scalars: too many arguments for {name} (line {line})"
+                        ));
+                    }
+                    slots[pos] = Some(a.clone());
+                    pos += 1;
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(params.len() + ncap);
+        for (i, p) in sig.iter().enumerate() {
+            let e = if p.vararg {
+                Expr::Collection {
+                    ctor: "ArraySeq".to_string(),
+                    elems: std::mem::take(&mut rest),
+                }
+            } else {
+                match slots[i].take().or_else(|| p.default.clone()) {
+                    Some(e) => e,
+                    None => {
+                        return Err(format!(
+                            "scalars: missing argument for parameter `{}` of {name} (line {line})",
+                            params[i]
+                        ))
+                    }
+                }
+            };
+            out.push(if p.by_name {
+                Expr::Lambda {
+                    params: Vec::new(),
+                    body: Box::new(e),
+                    partial: false,
+                }
+            } else {
+                e
+            });
+        }
+        out.extend_from_slice(caps);
+        Ok(out)
+    }
+
     /// Lower `new <BuiltinThrowable>([message])` to the [`EXC_NEW`] builtin.
     /// The JVM's `Throwable` constructors this models are the no-arg one (whose
     /// `getMessage` is `null`) and the single-`String` one.
@@ -2349,6 +2504,13 @@ impl Compiler {
             if let Some(ctor) = mutable_ctor(name) {
                 return self.collection(ctor, args);
             }
+        }
+        // `String.format(fmt, args…)` — the JDK static, which is a namespace
+        // access rather than a receiver method. It is `fmt.format(args…)`, so it
+        // lowers to exactly that and shares the one formatter implementation.
+        if name == "format" && matches!(recv, Expr::Var(n) if n == "String") && !args.is_empty() {
+            let (fmt, rest) = args.split_first().expect("non-empty");
+            return self.method(fmt, "format", rest, line);
         }
         // `scala.math.<member>` / `math.<member>` / `Math.<member>` — the JDK
         // math module, which is a value namespace rather than a receiver.
@@ -2767,7 +2929,8 @@ impl Compiler {
         // the function's `sub_entry` frame. The callee prologue pops these args
         // into its slots (see `function_body`).
         if self.func_arity.contains_key(name) {
-            for a in args {
+            let args = self.adapt_args(name, args, line)?;
+            for a in &args {
                 self.expr(a)?;
             }
             let nidx = self.b.add_name(name);
@@ -2882,6 +3045,16 @@ impl Compiler {
             next_slot: f.params.len() as u16,
             boxed: boxed_vars(&f.body),
         });
+        // This body's by-name parameters hold thunks; every read forces one.
+        let saved_by_name = std::mem::replace(
+            &mut self.by_name,
+            f.params
+                .iter()
+                .zip(&f.sig)
+                .filter(|(_, s)| s.by_name)
+                .map(|(p, _)| p.clone())
+                .collect(),
+        );
 
         // Prologue: args arrive on the stack (deepest = param 0). Pop them into
         // their slots in reverse so each parameter lands in its own slot.
@@ -2898,6 +3071,7 @@ impl Compiler {
 
         self.scope = None;
         self.vals = saved_vals;
+        self.by_name = saved_by_name;
         Ok(())
     }
 
@@ -3045,6 +3219,7 @@ fn expr_any(e: &Expr, pred: &impl Fn(&Expr) -> bool) -> bool {
         return true;
     }
     match e {
+        Expr::NamedArg { value, .. } => expr_any(value, pred),
         Expr::Try {
             body,
             catches,
@@ -3814,6 +3989,7 @@ impl BoxScan {
 
     fn expr(&mut self, e: &Expr, in_lambda: bool) {
         match e {
+            Expr::NamedArg { value, .. } => self.expr(value, in_lambda),
             Expr::Lambda { body, .. } => self.expr(body, true),
             Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
                 let desugars = enums.iter().any(is_coll_gen);
@@ -3985,6 +4161,7 @@ fn fv_block(
 /// comprehension generators introduce their own bound names.
 fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     match e {
+        Expr::NamedArg { value, .. } => fv_expr(value, bound, out, seen),
         Expr::Var(name) => fv_note(name, bound, out, seen),
         Expr::Try {
             body,

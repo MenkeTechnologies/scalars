@@ -110,6 +110,9 @@ struct Lifted {
     base: String,
     /// Declared parameters (captures are appended by [`Lifted::into_func`]).
     params: Vec<String>,
+    /// The declared parameters' [`ParamSig`]s, carried through the lift so a
+    /// nested `def` keeps its defaults / varargs / by-name parameters.
+    sig: Vec<ParamSig>,
     body: Vec<Stmt>,
     /// Enclosing-frame locals the body reads, in discovery order.
     captures: Vec<String>,
@@ -123,10 +126,17 @@ struct Lifted {
 
 impl Lifted {
     fn into_func(mut self, name: String) -> Func {
+        // The captures become trailing parameters. They are ordinary by-value
+        // parameters with no default, and `Func::captured` records how many so a
+        // call site can tell them apart from the ones the user wrote.
+        let captured = self.captures.len();
         self.params.extend(self.captures);
+        self.sig.resize(self.params.len(), ParamSig::default());
         Func {
             name,
             params: self.params,
+            sig: self.sig,
+            captured,
             body: self.body,
             is_abstract: false,
         }
@@ -368,6 +378,7 @@ impl Resolver {
                     tag: tag.clone(),
                     base: f.name.clone(),
                     params: f.params.clone(),
+                    sig: f.sig.clone(),
                     body: Vec::new(),
                     captures: Vec::new(),
                     scope_base: 0,
@@ -455,6 +466,7 @@ impl Resolver {
 
     fn walk_expr(&mut self, e: &mut Expr) -> Result<(), String> {
         match e {
+            Expr::NamedArg { value, .. } => self.walk_expr(value),
             Expr::Var(name) => {
                 if let Some(g) = self.lookup(name) {
                     self.note_call(&g);
@@ -748,6 +760,7 @@ fn cs_block(stmts: &mut [Stmt], sigs: &HashMap<String, Sig>) {
 
 fn cs_expr(e: &mut Expr, sigs: &HashMap<String, Sig>) {
     match e {
+        Expr::NamedArg { value, .. } => cs_expr(value, sigs),
         Expr::Call { name, args, .. } => {
             for a in args.iter_mut() {
                 cs_expr(a, sigs);

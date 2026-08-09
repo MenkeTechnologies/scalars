@@ -444,26 +444,7 @@ impl Parser {
         }
         // Parameter list. Scala allows a parameterless `def name = …`, so the
         // `(` is optional.
-        let mut params = Vec::new();
-        if self.is(&Tok::LParen) {
-            self.advance();
-            self.skip_seps();
-            while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
-                let pname = self.ident()?;
-                if self.is(&Tok::Colon) {
-                    self.advance();
-                    self.type_ref()?;
-                }
-                params.push(pname);
-                if self.is(&Tok::Comma) {
-                    self.advance();
-                    self.skip_seps();
-                } else {
-                    break;
-                }
-            }
-            self.eat(&Tok::RParen)?;
-        }
+        let (params, sig) = self.param_list()?;
         // Optional `: ReturnType`.
         if self.is(&Tok::Colon) {
             self.advance();
@@ -474,6 +455,8 @@ impl Parser {
             return Ok(Func {
                 name,
                 params,
+                sig,
+                captured: 0,
                 body: Vec::new(),
                 is_abstract: true,
             });
@@ -489,9 +472,70 @@ impl Parser {
         Ok(Func {
             name,
             params,
+            sig,
+            captured: 0,
             body,
             is_abstract: false,
         })
+    }
+
+    /// Parse a `def`'s parameter list, returning the names and their
+    /// [`ParamSig`]s. The `(` is optional — Scala allows a parameterless
+    /// `def name = …`. A second parameter list (currying) is parsed and its
+    /// parameters appended, which is exact for a call written with both lists
+    /// supplied.
+    fn param_list(&mut self) -> Result<(Vec<String>, Vec<ParamSig>), String> {
+        let mut params = Vec::new();
+        let mut sig = Vec::new();
+        while self.is(&Tok::LParen) {
+            self.advance();
+            self.skip_seps();
+            while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
+                // `implicit`/`using` lead a parameter list, not a parameter.
+                if matches!(self.peek(), Tok::Ident(w) if w == "implicit" || w == "using")
+                    && !matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(Tok::Colon))
+                {
+                    self.advance();
+                    self.skip_seps();
+                    continue;
+                }
+                // `val`/`var` prefixes are legal on a class parameter.
+                if self.is(&Tok::Val) || self.is(&Tok::Var) {
+                    self.advance();
+                }
+                let pname = self.ident()?;
+                let mut ps = ParamSig::default();
+                if self.is(&Tok::Colon) {
+                    self.advance();
+                    // `x: => Int` — a by-name parameter. `type_ref` folds the
+                    // arrow into the type string, so the leading `=>` is the
+                    // marker.
+                    ps.by_name = self.is(&Tok::FatArrow);
+                    self.type_ref()?;
+                    // `xs: Int*` — a repeated parameter.
+                    if self.is(&Tok::Star) {
+                        self.advance();
+                        ps.vararg = true;
+                    }
+                }
+                // `b: Int = 10` — a default argument.
+                if self.is(&Tok::Assign) {
+                    self.advance();
+                    self.skip_seps();
+                    ps.default = Some(self.expression()?);
+                }
+                params.push(pname);
+                sig.push(ps);
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                    self.skip_seps();
+                } else {
+                    break;
+                }
+            }
+            self.eat(&Tok::RParen)?;
+        }
+        Ok((params, sig))
     }
 
     /// If the cursor is at `def main(…) [: Type] = <body>`, parse the body and
@@ -1640,6 +1684,53 @@ impl Parser {
                         partial: false,
                     });
                 }
+                // `scala.util.control.Breaks`. Scala ships `break`/`breakable` as
+                // ordinary methods, but they are the language's only loop-exit
+                // idiom, so they are recognized here rather than left to the
+                // generic call path: `breakable { … }` is a block-argument
+                // application, a shape this frontend does not otherwise parse.
+                //
+                // The desugar is exactly the library's own implementation —
+                // `break()` raises a `BreakControl` and `breakable` catches it —
+                // so `finally` blocks between the two still run, a `break` from
+                // inside a nested `def` still unwinds to the enclosing
+                // `breakable`, and an intervening `catch { case e: Exception }`
+                // still lets it through.
+                if name == "breakable" && matches!(next, Some(Tok::LBrace)) {
+                    self.advance(); // breakable
+                    self.advance(); // {
+                    let body = self.block()?;
+                    return Ok(Expr::Try {
+                        body,
+                        catches: vec![MatchArm {
+                            pat: Pattern::Typed {
+                                name: "_".to_string(),
+                                ty: "BreakControl".to_string(),
+                            },
+                            guard: None,
+                            body: Vec::new(),
+                        }],
+                        finalizer: None,
+                    });
+                }
+                // `break` and `break()` are the same expression; Scala types it
+                // `Nothing`, so it is legal in operand position.
+                if name == "break" && !matches!(next, Some(Tok::Dot)) {
+                    let line = self.line();
+                    self.advance();
+                    if self.is(&Tok::LParen) {
+                        self.advance();
+                        self.eat(&Tok::RParen)?;
+                    }
+                    return Ok(Expr::Throw {
+                        value: Box::new(Expr::New {
+                            name: "BreakControl".to_string(),
+                            args: Vec::new(),
+                            line,
+                        }),
+                        line,
+                    });
+                }
                 let line = self.line();
                 self.advance();
                 // Optional generic type arguments (`List[Int](…)`, `foo[T](…)`).
@@ -1706,20 +1797,7 @@ impl Parser {
     /// `name`/`line` are already consumed. Resolved in the compiler: either the
     /// `__rust_compile` FFI-block builtin or a call to an FFI-exported bareword.
     fn call(&mut self, name: String, line: u32) -> Result<Expr, String> {
-        self.eat(&Tok::LParen)?;
-        let mut args = Vec::new();
-        if !self.is(&Tok::RParen) {
-            loop {
-                args.push(wrap_placeholders(self.expression()?));
-                if self.is(&Tok::Comma) {
-                    self.advance();
-                    self.skip_seps();
-                } else {
-                    break;
-                }
-            }
-        }
-        self.eat(&Tok::RParen)?;
+        let args = self.arg_list()?;
         Ok(Expr::Call { name, args, line })
     }
 
@@ -1782,14 +1860,33 @@ impl Parser {
         Ok(Expr::New { name, args, line })
     }
 
-    /// Parse a parenthesized, comma-separated positional argument list (cursor on
-    /// `(`); consumes the closing `)`.
+    /// Parse a parenthesized, comma-separated argument list (cursor on `(`);
+    /// consumes the closing `)`. An argument written `name = value` is a NAMED
+    /// argument, kept as [`Expr::NamedArg`] for the call lowering to place. The
+    /// `name` must be a bare identifier followed by a single `=` — `a == b` and
+    /// `a += b` are ordinary expressions, and the lexer already gives those
+    /// their own tokens.
     fn arg_list(&mut self) -> Result<Vec<Expr>, String> {
         self.eat(&Tok::LParen)?;
         let mut args = Vec::new();
         if !self.is(&Tok::RParen) {
             loop {
-                let a = wrap_placeholders(self.expression()?);
+                let named = match (self.peek(), self.toks.get(self.pos + 1).map(|t| &t.kind)) {
+                    (Tok::Ident(w), Some(Tok::Assign)) if w != "_" => Some(w.clone()),
+                    _ => None,
+                };
+                let a = match named {
+                    Some(pname) => {
+                        self.advance(); // name
+                        self.advance(); // =
+                        self.skip_seps();
+                        Expr::NamedArg {
+                            name: pname,
+                            value: Box::new(wrap_placeholders(self.expression()?)),
+                        }
+                    }
+                    None => wrap_placeholders(self.expression()?),
+                };
                 args.push(a);
                 if self.is(&Tok::Comma) {
                     self.advance();

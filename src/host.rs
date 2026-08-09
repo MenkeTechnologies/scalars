@@ -182,6 +182,10 @@ pub const SMATH: u16 = 736;
 /// Builtin id for a `Vector(...)` literal: pops `argc` elements and returns the
 /// vector handle.
 pub const MAKE_VECTOR: u16 = 737;
+/// Build a `scala.collection.immutable.ArraySeq` from `argc` stacked elements.
+/// This is the class a Scala varargs method sees for its repeated parameter, so
+/// `def f(xs: Int*)` printing `xs` prints `ArraySeq(1, 2, 3)`.
+pub const MAKE_ARRAYSEQ: u16 = 753;
 /// Builtin id for a `Set(...)` literal: pops `argc` elements and returns the set
 /// handle (duplicates dropped; five or more elements make a `HashSet`).
 pub const MAKE_SET: u16 = 738;
@@ -373,6 +377,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_RANGE, b_make_range);
     vm.register_builtin(SMATH, b_math);
     vm.register_builtin(MAKE_VECTOR, b_make_vector);
+    vm.register_builtin(MAKE_ARRAYSEQ, b_make_arrayseq);
     vm.register_builtin(MAKE_SET, b_make_set);
     vm.register_builtin(MAKE_LISTBUFFER, b_make_listbuffer);
     vm.register_builtin(MAKE_ARRAYBUFFER, b_make_arraybuffer);
@@ -528,6 +533,14 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     ),
     ("NoSuchElementException", "java.util.NoSuchElementException"),
     ("MatchError", "scala.MatchError"),
+    // `scala.util.control.Breaks`. `break()` raises a `BreakControl` and
+    // `breakable { … }` catches it (see the desugar in [`crate::parser`]).
+    // `ControlThrowable` is its supertype and NOT a subtype of `Exception`,
+    // which is what makes a user's `catch { case e: Exception => … }` let a
+    // `break` pass through to its enclosing `breakable` — the behavior a
+    // `catch`-all handler would otherwise silently swallow.
+    ("ControlThrowable", "scala.util.control.ControlThrowable"),
+    ("BreakControl", "scala.util.control.BreakControl"),
 ];
 
 /// The JVM throwable hierarchy scalars models, as `(class, superclass)` simple
@@ -557,6 +570,11 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("UnsupportedOperationException", "RuntimeException"),
     ("NoSuchElementException", "RuntimeException"),
     ("MatchError", "RuntimeException"),
+    // Deliberately hangs off `Throwable`, not `Exception`: Scala's
+    // `ControlThrowable` is a direct `Throwable` so control-flow signals are not
+    // caught by ordinary `case e: Exception` handlers.
+    ("ControlThrowable", "Throwable"),
+    ("BreakControl", "ControlThrowable"),
 ];
 
 /// The fully-qualified name of a built-in throwable's simple name.
@@ -1408,6 +1426,10 @@ fn b_make_list(vm: &mut VM, argc: u8) -> Value {
 /// `Vector`.
 fn b_make_vector(vm: &mut VM, argc: u8) -> Value {
     new_seq(SeqKind::Vector, pop_n(vm, argc))
+}
+
+fn b_make_arrayseq(vm: &mut VM, argc: u8) -> Value {
+    new_seq(SeqKind::ArraySeq, pop_n(vm, argc))
 }
 
 /// `MAKE_SET` builtin — pop `argc` element values (deepest first) into a `Set`.
@@ -2565,6 +2587,55 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
 ///
 /// An unsupported conversion returns an error (the VM faults) rather than
 /// emitting something Java would not.
+/// `"…".format(args)` — walk a whole Java format string, delegating each
+/// conversion to [`format_one`]. `%%` is a literal percent and `%n` a newline;
+/// neither consumes an argument. A conversion with no argument left is Java's
+/// `MissingFormatArgumentException`, which a Scala program can catch.
+fn format_all(fmt: &str, args: &[Value]) -> Result<String, String> {
+    let b = fmt.as_bytes();
+    let mut out = String::with_capacity(fmt.len());
+    let (mut i, mut next) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i] != b'%' {
+            let start = i;
+            while i < b.len() && b[i] != b'%' {
+                i += 1;
+            }
+            // `%` is ASCII, so both ends land on a char boundary.
+            out.push_str(&fmt[start..i]);
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < b.len() && !b[i].is_ascii_alphabetic() && b[i] != b'%' {
+            i += 1;
+        }
+        if i >= b.len() {
+            return Err(format!(
+                "scalars: java.util.UnknownFormatConversionException: Conversion = '{}'",
+                &fmt[start + 1..]
+            ));
+        }
+        let conv = b[i] as char;
+        i += 1;
+        match conv {
+            '%' => out.push('%'),
+            'n' => out.push('\n'),
+            _ => {
+                let Some(v) = args.get(next) else {
+                    return Err(format!(
+                        "scalars: java.util.MissingFormatArgumentException: Format specifier '{}'",
+                        &fmt[start..i]
+                    ));
+                };
+                next += 1;
+                out.push_str(&format_one(&fmt[start..i], v)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn format_one(spec: &str, v: &Value) -> Result<String, String> {
     let sb = spec.as_bytes();
     if sb.first() != Some(&b'%') || sb.len() < 2 {
@@ -2617,11 +2688,22 @@ fn format_one(spec: &str, v: &Value) -> Result<String, String> {
             let digits = (n as i128).unsigned_abs().to_string();
             Ok(pad_num(digits, n < 0, left, zero, plus, space, width))
         }
-        'f' => {
+        'f' | 'F' => {
             let x = v.to_float();
             let p = prec.unwrap_or(6);
-            let digits = format!("{:.*}", p, x.abs());
-            Ok(pad_num(digits, x < 0.0, left, zero, plus, space, width))
+            let digits = match nonfinite(x, conv, plus, space) {
+                Some(t) => return Ok(pad_str(t, left, width)),
+                None => round_half_up(x.abs(), p),
+            };
+            Ok(pad_num(
+                digits,
+                x.is_sign_negative(),
+                left,
+                zero,
+                plus,
+                space,
+                width,
+            ))
         }
         // Radix conversions. Rust's `{:x}`/`{:X}`/`{:o}` on a signed integer
         // format the two's-complement bit pattern with no sign — identical to
@@ -2649,6 +2731,46 @@ fn format_one(spec: &str, v: &Value) -> Result<String, String> {
             }
             Ok(pad_str(s, left, width))
         }
+        // Scientific notation. Java always writes a sign and AT LEAST two
+        // exponent digits (`1.000000e+00`), where Rust's `{:e}` writes neither.
+        // The mantissa is rounded off the value's shortest round-tripping
+        // digits (see `round_half_up`) rather than off `a / 10^exp`, because
+        // that division is itself inexact and moves the tie: `1234.5` at
+        // `%.3e` is `1.235e+03`, not `1.234e+03`.
+        'e' | 'E' => {
+            let x = v.to_float();
+            let p = prec.unwrap_or(6);
+            if let Some(t) = nonfinite(x, conv, plus, space) {
+                return Ok(pad_str(t, left, width));
+            }
+            let full = format!("{:e}", x.abs());
+            let (mant, exp_s) = full.split_once('e').unwrap_or((full.as_str(), "0"));
+            let mut exp: i32 = exp_s.parse().unwrap_or(0);
+            let mut mantissa = round_half_up_str(mant, p);
+            // A carry out of the leading digit (`9.99` at `%.1e`) is one more
+            // power of ten, renormalized back to a single leading digit.
+            if mantissa.starts_with("10") {
+                exp += 1;
+                mantissa = round_half_up_str("1", p);
+            }
+            let body = format!(
+                "{mantissa}{}{}{:02}",
+                if conv == 'E' { "E" } else { "e" },
+                if exp < 0 { "-" } else { "+" },
+                exp.abs()
+            );
+            // `-0.0` keeps its sign through `%f`/`%e` (Java prints `-0.00`), so
+            // the test is the sign BIT, not `x < 0.0`.
+            Ok(pad_num(
+                body,
+                x.is_sign_negative(),
+                left,
+                zero,
+                plus,
+                space,
+                width,
+            ))
+        }
         'c' => {
             let ch = match v {
                 Value::Str(s) => s.chars().next().unwrap_or('\0'),
@@ -2658,6 +2780,86 @@ fn format_one(spec: &str, v: &Value) -> Result<String, String> {
         }
         other => Err(format!("scalars: unsupported format conversion `%{other}`")),
     }
+}
+
+/// Java's rendering of a non-finite double under a float conversion, or `None`
+/// for a finite one. Rust writes `inf`/`-inf` where Java writes
+/// `Infinity`/`-Infinity`; an UPPERCASE conversion (`%E`, `%F`) upper-cases the
+/// whole word, and the `+`/space flags apply to an infinity but not to `NaN`.
+fn nonfinite(x: f64, conv: char, plus: bool, space: bool) -> Option<String> {
+    let mut t = if x.is_nan() {
+        "NaN".to_string()
+    } else if x.is_infinite() {
+        let mut t = "Infinity".to_string();
+        if x < 0.0 {
+            t.insert(0, '-');
+        } else if plus {
+            t.insert(0, '+');
+        } else if space {
+            t.insert(0, ' ');
+        }
+        t
+    } else {
+        return None;
+    };
+    if conv.is_ascii_uppercase() {
+        t = t.to_uppercase();
+    }
+    Some(t)
+}
+
+/// `a` (non-negative, finite) rendered with exactly `p` fraction digits, rounded
+/// the way `java.util.Formatter` rounds.
+///
+/// Two things differ from Rust's `{:.*}`, and both are observable:
+///
+/// 1. Java rounds HALF_UP where Rust rounds half-to-even, so they disagree on
+///    every tie — `0.125` at `%.2f` is Java's `0.13` and Rust's `0.12`.
+/// 2. Java rounds the SHORTEST round-tripping decimal (the digits
+///    `Double.toString` would print), not the value's exact binary expansion.
+///    That is why `1.005` at `%.2f` is `1.01` even though the stored double is
+///    `1.00499999999999989…`, and why `0.15` at `%.1f` is `0.2`. Rounding the
+///    exact expansion instead answers `1.00`/`0.1` — right by IEEE, wrong by
+///    Java.
+///
+/// Rust's `{}` for `f64` is that same shortest round-tripping form, so it is
+/// the correct input, and the rounding is then done on the digit string.
+fn round_half_up(a: f64, p: usize) -> String {
+    round_half_up_str(&format!("{a}"), p)
+}
+
+/// Round a non-negative decimal STRING (`"12.345"`, no sign, no exponent) to `p`
+/// fraction digits, half away from zero. Digits past `p` are inspected only to
+/// decide the carry, so the caller must pass an exact expansion for the result
+/// to be exact.
+fn round_half_up_str(s: &str, p: usize) -> String {
+    let (int_part, frac) = s.split_once('.').unwrap_or((s, ""));
+    let mut digits: Vec<u8> = int_part.bytes().chain(frac.bytes()).take(int_part.len() + p).collect();
+    while digits.len() < int_part.len() + p {
+        digits.push(b'0');
+    }
+    if frac.as_bytes().get(p).is_some_and(|d| *d >= b'5') {
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                digits.insert(0, b'1');
+                break;
+            }
+            i -= 1;
+            if digits[i] == b'9' {
+                digits[i] = b'0';
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+    let out = String::from_utf8(digits).unwrap_or_default();
+    if p == 0 {
+        return out;
+    }
+    let cut = out.len() - p;
+    format!("{}.{}", &out[..cut], &out[cut..])
 }
 
 /// Pad a string body to `width` (left- or right-justified with spaces).
@@ -3513,6 +3715,16 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 .rposition(|x| value_eq(x, &args[0]))
                 .map_or(-1, |i| i as i64),
         )),
+        // `xs.padTo(len, elem)` — `xs` extended with `elem` up to `len`. A `len`
+        // at or below the current size returns the sequence unchanged.
+        ("padTo", 2) => {
+            let want = args[0].to_int().max(0) as usize;
+            let mut out = items.clone();
+            while out.len() < want {
+                out.push(args[1].clone());
+            }
+            Ok(same(out))
+        }
         ("zip", 1) => {
             let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
             Ok(same(
@@ -3667,6 +3879,29 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 }
             }
             Ok(Value::int(-1))
+        }
+        ("lastIndexWhere", 1) => {
+            for (i, it) in items.iter().enumerate().rev() {
+                if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(it))?) {
+                    return Ok(Value::int(i as i64));
+                }
+            }
+            Ok(Value::int(-1))
+        }
+        // The length of the longest PREFIX all of whose elements hold — it stops
+        // at the first failure rather than counting every match.
+        ("segmentLength", 1) => {
+            let mut n = 0usize;
+            while n < items.len()
+                && truthy(&invoke_closure(
+                    vm,
+                    &args[0],
+                    std::slice::from_ref(&items[n]),
+                )?)
+            {
+                n += 1;
+            }
+            Ok(Value::int(n as i64))
         }
         ("takeWhile" | "dropWhile", 1) => {
             let mut n = 0usize;
@@ -4928,6 +5163,14 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("stripPrefix", 1) => Ok(Value::str(
             s.strip_prefix(&*args[0].as_str_cow()).unwrap_or(s),
         )),
+        // `"…".format(args)` — Java's `Formatter` over a whole format string.
+        ("format", _) => Ok(Value::str(format_all(s, args)?)),
+        // `x.formatted(spec)` is the mirror image: the RECEIVER is the value and
+        // the argument is the format string.
+        ("formatted", 1) => Ok(Value::str(format_all(
+            &args[0].as_str_cow(),
+            std::slice::from_ref(&Value::str(s.to_string())),
+        )?)),
         ("stripSuffix", 1) => Ok(Value::str(
             s.strip_suffix(&*args[0].as_str_cow()).unwrap_or(s),
         )),
@@ -5722,6 +5965,10 @@ fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         (">>>", 1) => Ok(Value::int(i64::from(
             (n as u32).wrapping_shr(args[0].to_int() as u32 & 31) as i32,
         ))),
+        ("formatted", 1) => Ok(Value::str(format_all(
+            &args[0].as_str_cow(),
+            std::slice::from_ref(&Value::int(n)),
+        )?)),
         _ => Err(no_such_method(&Value::int(n), name)),
     }
 }
@@ -5754,6 +6001,11 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
             | "isInfinite" | "round",
             _,
         ) => Err(format!("scalars: Double.{name}: wrong number of arguments")),
+        // `x.formatted(spec)` on `Any` — the argument is the format string.
+        ("formatted", 1) => Ok(Value::str(format_all(
+            &args[0].as_str_cow(),
+            std::slice::from_ref(&Value::float(f)),
+        )?)),
         _ => Err(no_such_method(&Value::float(f), name)),
     }
 }

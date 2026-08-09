@@ -78,13 +78,42 @@ pub struct ObjectDecl {
     pub methods: Vec<Func>,
 }
 
+/// The parts of one parameter declaration that change how a CALL is lowered.
+/// Everything else about the type is diagnostic-only and dropped.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ParamSig {
+    /// `b: Int = 10` — the default. Scala evaluates it AT THE CALL SITE and only
+    /// when the argument is omitted, so it is stored as an unevaluated
+    /// expression and spliced into the argument list there. Scala 3 forbids a
+    /// default referring to another parameter of the same list, which is what
+    /// makes call-site splicing exact rather than an approximation.
+    pub default: Option<Expr>,
+    /// `xs: Int*` — a repeated parameter. Trailing arguments are collected into
+    /// an `ArraySeq` (the runtime class Scala hands a varargs method).
+    pub vararg: bool,
+    /// `x: => Int` — a by-name parameter. The argument is passed as a zero-arg
+    /// thunk and forced at EVERY use inside the body, so a by-name argument with
+    /// a side effect runs once per use (and not at all if never used).
+    pub by_name: bool,
+}
+
 /// A user-defined method: `def name(p0: T0, p1: T1, …): R = body`. Parameter and
 /// return types are parsed for diagnostics but do not gate the dynamically typed
-/// runtime, so only the parameter *names* are retained (bound to frame slots).
+/// runtime, so only the parameter *names* are retained (bound to frame slots) —
+/// plus the [`ParamSig`] bits that a call site has to honor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Func {
     pub name: String,
     pub params: Vec<String>,
+    /// One entry per [`Self::params`] entry, same order and length.
+    pub sig: Vec<ParamSig>,
+    /// How many TRAILING parameters are synthetic — the free variables that
+    /// [`crate::resolve`] turned into parameters when it hoisted a nested `def`.
+    /// A call site appends those arguments after the written ones, so argument
+    /// adaptation (named arguments, defaults, varargs) has to match the written
+    /// arguments against `params[..params.len() - captured]` and pass the rest
+    /// through untouched.
+    pub captured: usize,
     pub body: Vec<Stmt>,
     /// `true` for a declaration with no `= body` (`def area: Double` in a
     /// trait). No subroutine is emitted; a call dispatches to whichever subtype
@@ -256,6 +285,10 @@ pub enum Expr {
         args: Vec<Expr>,
         line: u32,
     },
+    /// `name = value` in an argument list — a named argument. Legal ONLY in
+    /// argument position: the compiler's call lowering matches it to the
+    /// callee's parameter of that name and never sees it anywhere else.
+    NamedArg { name: String, value: Box<Expr> },
     /// `recv.copy(field = e, …)` on a `case class` — a new instance with the
     /// named (or positional) fields overwritten and the rest copied from `recv`.
     /// `updates` pairs an optional field name (`None` = positional) with its
