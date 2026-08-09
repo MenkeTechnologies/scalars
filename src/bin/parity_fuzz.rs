@@ -1914,6 +1914,7 @@ enum Mode {
     Fmt,
     Apply,
     Overflow,
+    PlaceAssign,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1959,6 +1960,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Fmt => "fmt",
         Mode::Apply => "apply",
         Mode::Overflow => "overflow",
+        Mode::PlaceAssign => "placeassign",
     }
 }
 
@@ -2005,6 +2007,7 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "fmt" => Mode::Fmt,
         "apply" => Mode::Apply,
         "overflow" => Mode::Overflow,
+        "placeassign" => Mode::PlaceAssign,
         _ => return None,
     })
 }
@@ -2050,6 +2053,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Fmt,
     Mode::Apply,
     Mode::Overflow,
+    Mode::PlaceAssign,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -2373,6 +2377,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Fmt => g_fmt(r),
         Mode::Apply => g_apply(r),
         Mode::Overflow => g_overflow(r),
+        Mode::PlaceAssign => g_placeassign(r),
         Mode::All => unreachable!(),
     }
 }
@@ -2381,6 +2386,81 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
 fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
     let r = &mut Rng::new(seed);
     (0..n).map(|_| gen_probe(r, mode)).collect()
+}
+
+/// Compound assignment through a target that is not a plain name.
+///
+/// Every other mode that writes `+=` writes it on a bare variable, which is the
+/// ONE target shape the frontend used to parse — so a clean score across all of
+/// them said nothing about `a(i) += 1`, the form Scala programs actually count
+/// with. Scala resolves `l op= r` by preferring an `op=` MEMBER on `l` and
+/// falling back to `l = l op r` (SLS 6.12.4), which for an application target
+/// expands to `l.update(args, l.apply(args) op r)`. Both halves of that choice
+/// are generated: an `Int` element takes the arithmetic expansion, a `ListBuffer`
+/// element takes the member call and mutates in place.
+///
+/// The evaluation-order arm is the one that cannot be satisfied by guessing: a
+/// lowering that re-evaluates the target instead of parking it in a temporary
+/// runs the index expression twice, and only a probe whose index has a side
+/// effect can see the difference.
+fn g_placeassign(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    // Small operands: the wrap is the `overflow` mode's job, not this one.
+    let a = pick(r, &["1", "2", "3", "5", "7"]);
+    let b = pick(r, &["1", "2", "4", "6"]);
+    // Non-zero, so `/=` and `%=` stay outside the documented `/0` gap.
+    let d = pick(r, &["2", "3", "4"]);
+    match r.below(10) {
+        0 => format!(
+            "{{ val a = Array({a}, {b}, 9); a(0) += {b}; a(1) -= {a}; a(2) *= {d}; \
+               println(a(0)); println(a(1)); println(a(2)) }}"
+        ),
+        1 => format!(
+            "{{ val a = Array(20, 21); a(0) /= {d}; a(1) %= {d}; println(a(0)); println(a(1)) }}"
+        ),
+        2 => format!(
+            "{{ val b = mutable.ArrayBuffer({a}, {b}); b(0) += {d}; b(1) *= {d}; println(b) }}"
+        ),
+        3 => format!(
+            "{{ val b = mutable.ListBuffer({a}, {b}); b(1) -= {d}; println(b); println(b(1)) }}"
+        ),
+        // A `Map` whose values are `Int`: the arithmetic expansion, through
+        // `update`. A missing key would throw, so every key read is present.
+        4 => format!(
+            "{{ val m = mutable.Map(\"x\" -> {a}, \"y\" -> {b}); m(\"x\") += {d}; m(\"y\") *= {d}; \
+               println(m(\"x\")); println(m(\"y\")) }}"
+        ),
+        // A `Map` whose values are growable: the MEMBER call, in place.
+        5 => format!(
+            "{{ val m = mutable.Map(\"k\" -> mutable.ListBuffer({a})); m(\"k\") += {b}; \
+               m(\"k\") ++= List({a}, {d}); println(m(\"k\")) }}"
+        ),
+        // A selection target: `.head` is a method, not a field, so a lowering
+        // that assumed a record here would fault.
+        6 => format!(
+            "{{ val nb = mutable.ListBuffer(mutable.ListBuffer({a})); nb.head += {b}; \
+               nb.last ++= List({d}); println(nb) }}"
+        ),
+        // Nested indexing: the receiver of the outer target is itself an apply.
+        7 => format!(
+            "{{ val g = Array(Array({a}, {b}), Array({d}, 8)); g(0)(1) += {d}; g(1)(0) *= {a}; \
+               println(g(0)(1)); println(g(1)(0)) }}"
+        ),
+        // A `var` field and a growable field through an explicit receiver.
+        8 => format!(
+            "class P{u}(var n: Int, val items: mutable.ListBuffer[Int])\n{sep}\
+             {{ val p = new P{u}({a}, mutable.ListBuffer({b})); p.n += {d}; p.items += 9; \
+               p.n *= {a}; println(p.n); println(p.items) }}"
+        ),
+        // Evaluate-once: the index runs one side effect, so a re-evaluating
+        // lowering answers 2 where Scala answers 1.
+        _ => format!(
+            "{{ val log = mutable.ListBuffer[Int](); val a = Array({a}, {b}); \
+               def k{u}(): Int = {{ log += 1; 0 }}; a(k{u}()) += {d}; \
+               println(a(0)); println(log.size) }}"
+        ),
+    }
 }
 
 /// Separator inside a probe that carries its own top-level declarations: the
