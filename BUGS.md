@@ -693,3 +693,44 @@ separately (`harness-err`), excused from the divergence count, and once they
 exceed a tenth of the run the harness exits 2 rather than green, because those
 programs were never compared. An *oracle* exiting non-zero is deliberately NOT
 excused: "scala rejects a program we accept" is a real divergence.
+
+## A user member whose name collides with a stdlib one
+
+`method_width` refuses to narrow a receiver's width when any user class
+declares a member sharing the name (`class Thing { def abs: Int = 5 }` makes
+every `abs` suspect), because a stdlib width rule must not outrank a user
+declaration. Receivers that are literals, or whose numeric width is already
+proven, are exempt. Two costs of that rule are unfixed:
+
+**A receiver of unproven width answers the unnarrowed result.** The exemption
+is driven by `num_ty`, so a receiver it cannot prove — an `if`, for instance —
+stays poisoned and the result is not narrowed to 32 bits:
+
+    class Thing { def abs: Int = 5 }
+    println((if (true) -2147483648 else 0).abs)   // scala: -2147483648
+                                                  // scalars: 2147483648
+
+Declining to narrow is not the harmless direction it looks like: at the `Int`
+boundary `abs` is exactly where the two widths disagree. `(-2147483648).abs`
+and `x.abs` for a proven `x` are both correct; only the unproven receiver is
+wrong.
+
+**Compile time is exponential in the length of the method chain.** Deciding the
+exemption calls `num_ty` on the receiver, which re-enters `method_width` for a
+method-call receiver, which asks about *its* receiver in turn — so an `n`-link
+chain is walked about `2^n` times. Measured on a chain of `x.abs.abs…` with
+`Thing` declared:
+
+    depth 16   0.15s
+    depth 18   0.35s
+    depth 20   2.22s
+    depth 22   7.76s
+    depth 26   136s
+
+Roughly a doubling per link. Programs without a colliding member name are
+unaffected — the name is tested first and answers `false` before any receiver
+is walked — so this needs both a collision and a deep chain. The fix is to
+memoise the width walk or to prove the common receiver shapes without
+re-entering `num_ty`; simply treating every non-literal receiver as unprovable
+is NOT a fix, because it produces the wrong answer above for `(-2147483648 + 0).abs`
+as well.
