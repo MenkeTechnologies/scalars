@@ -5120,32 +5120,42 @@ fn java_str_cmp(a: &str, b: &str) -> Ordering {
 }
 
 thread_local! {
-    /// `(class, method) → subroutine entry`, memoized because resolving one is a
-    /// LINEAR scan of the chunk's name table and a `sorted` over a user-`Ordered`
-    /// class asks the same question once per comparison. A MISS is cached too:
-    /// sorting ordinary `case class`es asks about a `compare` that is not there,
-    /// once per comparison, and that scan is the one worth skipping. Cleared by
-    /// [`reset_heap`], which is also when a new program's chunk arrives.
-    static METHOD_ENTRIES: RefCell<HashMap<(Arc<str>, &'static str), Option<usize>>> =
+    /// `(class, method, argc) → subroutine entry`, memoized because resolving one
+    /// is a LINEAR scan of the chunk's name table and a `sorted` over a
+    /// user-`Ordered` class asks the same question once per comparison. A MISS is
+    /// cached too: sorting ordinary `case class`es asks about a `compare` that is
+    /// not there, once per comparison, and that scan is the one worth skipping.
+    /// Cleared by [`reset_heap`], which is also when a new program's chunk
+    /// arrives.
+    ///
+    /// `argc` is part of the key because an OVERLOADED method is registered
+    /// per-arity (`Class$m$1`), so `Class.m` is two different entries.
+    static METHOD_ENTRIES: RefCell<HashMap<(Arc<str>, &'static str, usize), Option<usize>>> =
         RefCell::new(HashMap::new());
 }
 
-/// The entry point of the user-defined method `Class$name`, when the program
-/// compiled one. `compiler::method_sub_name` registers every class method under
-/// that name, so the host can re-enter one exactly as [`invoke_body`] re-enters
-/// a closure body — no fusevm change, the name table is already public.
-fn user_method_entry(vm: &VM, class: &Arc<str>, name: &'static str) -> Option<usize> {
-    let key = (Arc::clone(class), name);
+/// The entry point of the user-defined `argc`-argument method `Class.name`, when
+/// the program compiled one. `compiler::Compiler::sub_name` registers every class
+/// method under `Class$name` — or `Class$name$argc` when the class overloads the
+/// name — so the host can re-enter one exactly as [`invoke_body`] re-enters a
+/// closure body: no fusevm change, the name table is already public.
+fn user_method_entry(vm: &VM, class: &Arc<str>, name: &'static str, argc: usize) -> Option<usize> {
+    let key = (Arc::clone(class), name, argc);
     if let Some(hit) = METHOD_ENTRIES.with(|t| t.borrow().get(&key).copied()) {
         return hit;
     }
-    let want = format!("{class}${name}");
-    let found = vm
-        .chunk
-        .names
-        .iter()
-        .position(|n| n == &want)
-        .and_then(|idx| vm.chunk.find_sub(idx as u16));
+    let find = |want: &str| {
+        vm.chunk
+            .names
+            .iter()
+            .position(|n| n == want)
+            .and_then(|idx| vm.chunk.find_sub(idx as u16))
+    };
+    let plain = format!("{class}${name}");
+    // The unoverloaded name first: it is what all but a handful of programs
+    // register, so the overload probe costs a second scan only when it is the
+    // one that can succeed.
+    let found = find(&plain).or_else(|| find(&format!("{plain}${argc}")));
     METHOD_ENTRIES.with(|t| t.borrow_mut().insert(key, found));
     found
 }
@@ -5167,7 +5177,7 @@ fn call_user_method(
     // `with_obj` is what restricts this to a class instance: a `Char`, tuple or
     // collection handle is also a `Value::Obj` but is not a record.
     let class = with_obj(recv, |o| Arc::clone(&o.class))?;
-    let entry = user_method_entry(vm, &class, name)?;
+    let entry = user_method_entry(vm, &class, name, args.len())?;
     let stack_base = vm.stack.len();
     vm.stack.push(recv.clone());
     for a in args {

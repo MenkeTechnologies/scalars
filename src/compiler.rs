@@ -109,6 +109,17 @@ struct Compiler {
     /// subroutine the call lands in, which differs whenever the method is
     /// inherited.
     method_index: HashMap<String, Vec<(String, String)>>,
+    /// `Owner$method → its declared arities`, for every owner declaring that
+    /// method MORE THAN ONCE — a Scala overload.
+    ///
+    /// The subroutine registry is keyed by NAME, and `Chunk::find_sub` takes the
+    /// FIRST entry under a name, so two `def g`s in one class both registered as
+    /// `C$g` would make every `g` call — whatever its argument count — land in
+    /// whichever was written first, with no diagnostic anywhere. An overloaded
+    /// name is therefore registered as `Owner$method$arity` instead (see
+    /// [`Compiler::sub_name`]), which is the only key the call site can pick
+    /// from what it statically knows.
+    overloads: HashMap<String, Vec<usize>>,
     /// `Some((name, fields))` while compiling a class method: the enclosing
     /// class's name and field-name set, so a bare identifier naming a field
     /// resolves to `this.field` and a bare sibling-method call to `this.m(...)`.
@@ -500,6 +511,47 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         v.sort();
     }
 
+    // Overload table. Built from exactly the method lists the emission loop
+    // below walks — a class's own concrete `def`s, and an object's after
+    // `inherit_into_objects` has spliced in the supertype ones it does not
+    // already have — so every subroutine actually emitted is accounted for.
+    let mut overloads: HashMap<String, Vec<usize>> = HashMap::new();
+    let declared = classes
+        .iter()
+        .map(|cd| {
+            let ms: Vec<&Func> = cd.methods.iter().filter(|m| !m.is_abstract).collect();
+            (&cd.name, ms)
+        })
+        .chain(
+            objects
+                .iter()
+                .map(|od| (&od.name, od.methods.iter().collect())),
+        );
+    for (owner, methods) in declared {
+        let mut arities: HashMap<&str, Vec<usize>> = HashMap::new();
+        for m in methods {
+            let seen = arities.entry(m.name.as_str()).or_default();
+            // Same name AND same arity: `Owner$m$n` would collide exactly as
+            // `Owner$m` did, so nothing here can tell the two apart. Scala picks
+            // by parameter TYPE, which this frontend does not model — say so
+            // rather than silently run the first one.
+            if seen.contains(&m.params.len()) {
+                return Err(format!(
+                    "scalars: {owner} declares `{}` twice with {} parameter(s); \
+                     overloads differing only in parameter type are not supported",
+                    m.name,
+                    m.params.len()
+                ));
+            }
+            seen.push(m.params.len());
+        }
+        for (name, ars) in arities {
+            if ars.len() > 1 {
+                overloads.insert(method_sub_name(owner, name), ars);
+            }
+        }
+    }
+
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         for_counter: 0,
@@ -526,6 +578,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         classes: class_meta,
         objects: obj_meta,
         method_index,
+        overloads,
         current_class: None,
         current_object: None,
         obj_counter: 0,
@@ -2165,7 +2218,8 @@ impl Compiler {
                     return Ok(());
                 }
                 if meta.methods.contains(name) {
-                    let nidx = self.b.add_name(&method_sub_name(&obj, name));
+                    let sub = self.sub_name(&obj, name, 0)?;
+                    let nidx = self.b.add_name(&sub);
                     self.b.emit(Op::Call(nidx, 0), 0);
                     return Ok(());
                 }
@@ -2262,7 +2316,8 @@ impl Compiler {
         for a in args {
             self.expr(a)?;
         }
-        let nidx = self.b.add_name(&method_sub_name(&owner, name));
+        let sub = self.sub_name(&owner, name, args.len())?;
+        let nidx = self.b.add_name(&sub);
         self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
         Ok(())
     }
@@ -2905,7 +2960,8 @@ impl Compiler {
                         self.expr(a)?;
                     }
                     let owner = self.object_method_owner(obj, name);
-                    let nidx = self.b.add_name(&method_sub_name(&owner, name));
+                    let sub = self.sub_name(&owner, name, args.len())?;
+                    let nidx = self.b.add_name(&sub);
                     self.b.emit(Op::Call(nidx, args.len() as u8), line);
                     return Ok(());
                 }
@@ -3078,7 +3134,8 @@ impl Compiler {
                 for a in args {
                     self.expr(a)?;
                 }
-                let nidx = self.b.add_name(&method_sub_name(owner, name));
+                let sub = self.sub_name(owner, name, args.len())?;
+                let nidx = self.b.add_name(&sub);
                 self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
                 return Ok(());
             }
@@ -3105,7 +3162,8 @@ impl Compiler {
             for a in args {
                 self.expr(a)?;
             }
-            let nidx = self.b.add_name(&method_sub_name(owner, name));
+            let sub = self.sub_name(owner, name, args.len())?;
+            let nidx = self.b.add_name(&sub);
             self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
             end_jumps.push(self.b.emit(Op::Jump(0), line));
             let next = self.b.current_pos();
@@ -3183,7 +3241,8 @@ impl Compiler {
             let jf = self.b.emit(Op::JumpIfFalse(0), 0);
             self.emit_load(t);
             self.emit_load(u);
-            let nidx = self.b.add_name(&method_sub_name(owner, "compare"));
+            let sub = self.sub_name(owner, "compare", 1)?;
+            let nidx = self.b.add_name(&sub);
             self.b.emit(Op::Call(nidx, 2), 0);
             let zero = self.b.add_constant(Value::int(0));
             self.b.emit(Op::LoadConst(zero), 0);
@@ -3316,11 +3375,43 @@ impl Compiler {
         Ok(())
     }
 
+    /// The subroutine name a call of `argc` arguments to `owner.method` lands
+    /// in, and the name that method's definition registers.
+    ///
+    /// `Owner$method` for the ordinary case, so the emitted bytecode and every
+    /// `Class$name` lookup in `host` are unchanged. When the owner OVERLOADS the
+    /// name it is `Owner$method$argc` instead: the subroutine registry is keyed
+    /// by name and answers the first entry, so one name for two bodies would
+    /// silently strand the second (see [`Compiler::overloads`]).
+    ///
+    /// Scala resolves an overload by argument TYPE, of which the argument COUNT
+    /// is the part this frontend can decide statically — so an `argc` no
+    /// overload declares is refused here rather than dispatched into a body that
+    /// takes a different number of arguments.
+    fn sub_name(&self, owner: &str, method: &str, argc: usize) -> Result<String, String> {
+        let plain = method_sub_name(owner, method);
+        let Some(arities) = self.overloads.get(&plain) else {
+            return Ok(plain);
+        };
+        if !arities.contains(&argc) {
+            let mut ars = arities.clone();
+            ars.sort_unstable();
+            let ars: Vec<String> = ars.iter().map(|a| a.to_string()).collect();
+            return Err(format!(
+                "scalars: no overload of `{owner}.{method}` takes {argc} argument(s) \
+                 (it is declared taking {})",
+                ars.join(" or ")
+            ));
+        }
+        Ok(format!("{plain}${argc}"))
+    }
+
     /// Emit a class method as the `Class$method` subroutine: an implicit leading
     /// `this` slot, then the declared params; the body compiles with the class's
     /// field set in scope (bare fields resolve to `this.field`).
     fn class_method(&mut self, cd: &ClassDecl, m: &Func) -> Result<(), String> {
-        let nidx = self.b.add_name(&method_sub_name(&cd.name, &m.name));
+        let sub = self.sub_name(&cd.name, &m.name, m.params.len())?;
+        let nidx = self.b.add_name(&sub);
         let ip = self.b.current_pos();
         self.b.add_sub_entry(nidx, ip);
 
@@ -3381,7 +3472,8 @@ impl Compiler {
     /// Emit an object method as the `Name$method` subroutine (no `this`); the
     /// body compiles with the object's `val`s reachable as `Name.val` globals.
     fn object_method(&mut self, od: &ObjectDecl, m: &Func) -> Result<(), String> {
-        let nidx = self.b.add_name(&method_sub_name(&od.name, &m.name));
+        let sub = self.sub_name(&od.name, &m.name, m.params.len())?;
+        let nidx = self.b.add_name(&sub);
         let ip = self.b.current_pos();
         self.b.add_sub_entry(nidx, ip);
 
@@ -3496,7 +3588,8 @@ impl Compiler {
                 for a in args {
                     self.expr(a)?;
                 }
-                let nidx = self.b.add_name(&method_sub_name(&obj, name));
+                let sub = self.sub_name(&obj, name, args.len())?;
+                let nidx = self.b.add_name(&sub);
                 self.b.emit(Op::Call(nidx, args.len() as u8), line);
                 return Ok(());
             }

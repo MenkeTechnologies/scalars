@@ -7,6 +7,14 @@ use std::process::Command;
 
 /// Run a Scala source string through the `scala` binary and return (stdout, ok).
 fn run(src: &str) -> (String, bool) {
+    let (out, _err, ok) = run_full(src);
+    (out, ok)
+}
+
+/// As [`run`], but keeping stderr — for the cases where the DIAGNOSTIC is the
+/// behaviour under test and a bare "it exited non-zero" would pass on any
+/// failure at all.
+fn run_full(src: &str) -> (String, String, bool) {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("scalars_test_{}.scala", fasthash(src)));
     std::fs::write(&path, src).unwrap();
@@ -17,6 +25,7 @@ fn run(src: &str) -> (String, bool) {
     let _ = std::fs::remove_file(&path);
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
         out.status.success(),
     )
 }
@@ -3622,6 +3631,134 @@ fn every_reference_corpus_entry_is_distinct() {
         "expected to scan the reference corpus, found {} entries",
         seen.len()
     );
+}
+
+// ── Overloads: the one name-keyed registry a USER PROGRAM can collide ───────
+//
+// The tables above are collided by an edit to this repo. `Class$method` is
+// collided by an edit to the SCALA program: two `def g`s in one class both
+// registered under `C$g`, and `Chunk::find_sub` answers the first, so every
+// `g` call landed in whichever was written first whatever its argument count —
+// `c.g(5)` and `c.g(5, 6)` both silently ran `def g()`. Every expected string
+// below was diffed byte-for-byte against `scala` 3.8.4.
+
+#[test]
+fn an_overload_dispatches_on_its_argument_count() {
+    let (out, ok) = run("class Box(val w: Int, val h: Int) {\n\
+         \x20 def g(): String = \"g0\"\n\
+         \x20 def g(x: Int): String = \"g1 \" + x\n\
+         \x20 def g(x: Int, y: Int): String = \"g2 \" + (x + y)\n\
+         }\n\
+         object Fmt {\n\
+         \x20 def show(): String = \"s0\"\n\
+         \x20 def show(x: Int): String = \"s1 \" + x\n\
+         \x20 def show(x: Int, y: Int): String = \"s2 \" + x + y\n\
+         \x20 def viaBare: String = show() + \"|\" + show(3) + \"|\" + show(4, 5)\n\
+         }\n\
+         object T extends App {\n\
+         \x20 val b = new Box(2, 3)\n\
+         \x20 println(b.g()); println(b.g(5)); println(b.g(5, 6))\n\
+         \x20 println(Fmt.show()); println(Fmt.show(1)); println(Fmt.show(1, 2))\n\
+         \x20 println(Fmt.viaBare)\n\
+         }\n");
+    assert!(ok);
+    assert_eq!(out, "g0\ng1 5\ng2 11\ns0\ns1 1\ns2 12\ns0|s1 3|s2 45\n");
+}
+
+#[test]
+fn an_overload_survives_override_super_and_upcast_dispatch() {
+    // Each of these reaches `Owner$method` by a DIFFERENT route — the direct
+    // call on a known class, `super.m` against the supertype that owns the
+    // implementation, the tag-test chain for a receiver typed as the base, an
+    // unqualified self-call inside a method body, and the same chain over a
+    // heterogeneous list. All five have to agree on which arity they mean.
+    let (out, ok) = run("class Base {\n\
+         \x20 def tag(): String = \"base0\"\n\
+         \x20 def tag(n: Int): String = \"base1 \" + n\n\
+         }\n\
+         class Derived extends Base {\n\
+         \x20 override def tag(): String = \"derived0/\" + super.tag()\n\
+         \x20 override def tag(n: Int): String = \"derived1 \" + n + \"/\" + super.tag(n)\n\
+         }\n\
+         class Acc(var n: Int) {\n\
+         \x20 def add(): Unit = { n += 1 }\n\
+         \x20 def add(k: Int): Unit = { n += k }\n\
+         \x20 def add(k: Int, j: Int): Unit = { n += k + j }\n\
+         \x20 def bump(): Int = { add(); add(2); add(3, 4); n }\n\
+         }\n\
+         object T extends App {\n\
+         \x20 val d = new Derived\n\
+         \x20 println(d.tag()); println(d.tag(7))\n\
+         \x20 val b: Base = d\n\
+         \x20 println(b.tag()); println(b.tag(8))\n\
+         \x20 println(new Acc(0).bump())\n\
+         \x20 println(List(new Derived, new Base).map(x => x.tag(1)))\n\
+         }\n");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "derived0/base0\nderived1 7/base1 7\nderived0/base0\nderived1 8/base1 8\n10\n\
+         List(derived1 1/base1 1, base1 1)\n"
+    );
+}
+
+#[test]
+fn an_overload_that_differs_only_in_parameter_type_is_refused() {
+    // Argument COUNT is the part of Scala's overload resolution this frontend
+    // can decide; `f(Int)` vs `f(String)` needs the argument TYPE. Both would
+    // register as `C$f$1`, so the collision is exactly the one the arity
+    // mangling removes — and the pre-fix behaviour was to run `f(Int)` for
+    // `c.f("a")` and print `int a`. Refusing says so; printing does not.
+    let (out, err, ok) = run_full(
+        "class C {\n\
+         \x20 def f(x: Int): String = \"int \" + x\n\
+         \x20 def f(x: String): String = \"str \" + x\n\
+         }\n\
+         object T extends App { println(new C().f(1)); println(new C().f(\"a\")) }\n",
+    );
+    assert!(!ok, "a type-only overload must be refused, not guessed");
+    assert_eq!(out, "", "nothing may run before the refusal");
+    assert!(
+        err.contains("declares `f` twice with 1 parameter(s)"),
+        "the diagnostic must name the colliding method, got: {err}"
+    );
+}
+
+#[test]
+fn a_call_matching_no_overload_arity_is_refused() {
+    // With `g` overloaded there is no unmangled `C$g` left to fall back to, so
+    // an unmatched arity has to be caught where it is compiled — otherwise it
+    // becomes a run-time "no such subroutine" naming a synthetic `C$g$2`.
+    let (_out, err, ok) = run_full(
+        "class C { def g(): Int = 0; def g(x: Int): Int = x }\n\
+         object T extends App { println(new C().g(1, 2)) }\n",
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("no overload of `C.g` takes 2 argument(s)")
+            && err.contains("declared taking 0 or 1"),
+        "the diagnostic must name the arities that DO exist, got: {err}"
+    );
+}
+
+#[test]
+fn an_overloaded_compare_still_reaches_the_hosts_ordering_path() {
+    // `host::user_method_entry` resolves `Class$compare` by NAME to run a user
+    // `Ordered` from inside `sorted`. Overloading `compare` renames the real one
+    // to `V$compare$1`, so the host has to probe the arity-mangled name too or
+    // every user ordering silently falls back to the structural order — which
+    // for `V(3), V(1), V(2)` sorts ASCENDING and looks plausible.
+    let (out, ok) = run("case class V(n: Int) extends Ordered[V] {\n\
+         \x20 def compare(that: V): Int = that.n - n\n\
+         \x20 def compare(a: Int, b: Int): Int = a - b\n\
+         }\n\
+         object T extends App {\n\
+         \x20 println(List(V(3), V(1), V(2)).sorted)\n\
+         \x20 println(V(1) < V(2))\n\
+         \x20 println(V(1).compare(5, 4))\n\
+         }\n");
+    assert!(ok);
+    assert_eq!(out, "List(V(3), V(2), V(1))\nfalse\n1\n");
 }
 
 // ── Compound assignment to a target that is not a plain name ────────────────
