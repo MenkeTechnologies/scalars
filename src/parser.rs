@@ -17,6 +17,12 @@ use crate::lexer::{Tok, Token};
 /// [`crate::compiler`] to the zero-filling array builtin.
 pub const NEW_ARRAY: &str = "$new_array";
 
+/// The reserved collection constructor that marks a varargs SPREAD argument
+/// (`f(xs: _*)`). It holds the one spread operand. `Compiler::adapt_args`
+/// strips it at a call site whose parameter is repeated; anywhere else it
+/// reaches `Compiler::collection`, which rejects it by name.
+pub const SPREAD: &str = "$spread";
+
 /// Parse Scala `src` into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
     let tokens = crate::lexer::lex(src)?;
@@ -1493,9 +1499,19 @@ impl Parser {
             // argument list into the one call. A brace group takes the place of a
             // parenthesized single argument (`xs.map { x => … }`), including the
             // trailing one of a curried call (`xs.foldLeft(0) { (a, b) => … }`).
+            //
+            // A `scala.collection.mutable` FACTORY is the exception: it is not
+            // curried, so a second group is an `apply` on the collection it just
+            // built (`mutable.ArrayBuffer(1,2,3)(1)` is the element `2`). Without
+            // this the flattening would silently append the index as a fourth
+            // element.
+            let factory = is_mutable_pkg(&e) && mutable_factory_name(&name);
             let mut args = Vec::new();
             while self.is(&Tok::LParen) {
                 args.extend(self.arg_list()?);
+                if factory {
+                    break;
+                }
             }
             if self.is(&Tok::LBrace) {
                 args.push(self.brace_arg()?);
@@ -1899,6 +1915,27 @@ impl Parser {
     /// `name` must be a bare identifier followed by a single `=` — `a == b` and
     /// `a += b` are ordinary expressions, and the lexer already gives those
     /// their own tokens.
+    /// `e: _*` — a varargs SPREAD, which is legal in an argument position only.
+    /// It hands `e` itself to a repeated parameter instead of making it one
+    /// element of one. Marked with the reserved [`SPREAD`] collection ctor so
+    /// every generic expression walker still recurses into the operand, and
+    /// stripped by `Compiler::adapt_args` at the call site that consumes it.
+    fn spread_or(&mut self, e: Expr) -> Result<Expr, String> {
+        let spread = self.is(&Tok::Colon)
+            && matches!(self.peek_at(1), Tok::Ident(w) if w == "_")
+            && matches!(self.peek_at(2), Tok::Star);
+        if !spread {
+            return Ok(e);
+        }
+        self.advance(); // `:`
+        self.advance(); // `_`
+        self.advance(); // `*`
+        Ok(Expr::Collection {
+            ctor: SPREAD.to_string(),
+            elems: vec![e],
+        })
+    }
+
     fn arg_list(&mut self) -> Result<Vec<Expr>, String> {
         self.eat(&Tok::LParen)?;
         let mut args = Vec::new();
@@ -1918,7 +1955,10 @@ impl Parser {
                             value: Box::new(wrap_arg_placeholders(self.expression()?)),
                         }
                     }
-                    None => wrap_arg_placeholders(self.expression()?),
+                    None => {
+                        let e = wrap_arg_placeholders(self.expression()?);
+                        self.spread_or(e)?
+                    }
                 };
                 args.push(a);
                 if self.is(&Tok::Comma) {
@@ -2589,10 +2629,47 @@ fn binop(t: &Tok) -> Option<(BinOp, u8)> {
 /// through. `new` takes a type name, so the prefix is consumed and discarded.
 const MUTABLE_PREFIXES: &[&str] = &["scala", "collection", "mutable"];
 
+/// Whether `e` is the `scala.collection.mutable` package path — spelled
+/// `mutable`, `collection.mutable` or `scala.collection.mutable`. The compiler's
+/// `mutable_module` makes the same test on the lowering side; this one exists so
+/// the PARSER can tell a factory call apart from a curried method call.
+fn is_mutable_pkg(e: &Expr) -> bool {
+    match e {
+        Expr::Var(n) => n == "mutable",
+        Expr::Method {
+            recv, name, args, ..
+        } if args.is_empty() && name == "mutable" => {
+            matches!(&**recv, Expr::Var(p) if p == "collection")
+                || matches!(&**recv, Expr::Method { recv, name, args, .. }
+                    if args.is_empty() && name == "collection"
+                        && matches!(&**recv, Expr::Var(p) if p == "scala"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a member of that package names a collection FACTORY (`mutable.Set`,
+/// `mutable.Queue`, …) rather than something curried.
+fn mutable_factory_name(name: &str) -> bool {
+    mutable_buffer_ctor(name).is_some() || matches!(name, "Set" | "HashSet" | "Map" | "HashMap")
+}
+
 fn mutable_buffer_ctor(name: &str) -> Option<&'static str> {
     Some(match name {
         "ListBuffer" => "ListBuffer",
         "ArrayBuffer" | "Buffer" => "ArrayBuffer",
+        // `Queue`/`Stack`/`ArrayDeque`/`LinkedHash*` also name immutable or
+        // package-qualified types, but none of them is in Scala's default scope,
+        // so an unqualified use can only have come from a `scala.collection
+        // .mutable` import — which is skipped rather than tracked (see BUGS.md).
+        "Queue" => "Queue",
+        "Stack" => "Stack",
+        "ArrayDeque" => "ArrayDeque",
+        "LinkedHashSet" => "LinkedHashSet",
+        "LinkedHashMap" => "LinkedHashMap",
+        // `StringBuilder` IS in the default scope (`scala.StringBuilder`), so
+        // this spelling is exactly Scala's.
+        "StringBuilder" => "StringBuilder",
         _ => return None,
     })
 }

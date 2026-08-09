@@ -131,19 +131,95 @@ reported as parse/compile errors, never silently mis-run.
   `updated`/`removed`/`+`/`-`/`++`, and its closure-taking methods pass the
   `Tuple2` Scala does, so `m.map { case (k, v) => … }` works.
 - **Mutable collections.** `mutable.ListBuffer`, `mutable.ArrayBuffer`
-  (also `mutable.Buffer`), `mutable.Set`/`mutable.HashSet` and
-  `mutable.Map`/`mutable.HashMap`, spelled `mutable.X`,
+  (also `mutable.Buffer`), `mutable.Queue`, `mutable.Stack`,
+  `mutable.ArrayDeque`, `mutable.Set`/`mutable.HashSet`,
+  `mutable.Map`/`mutable.HashMap`, `mutable.LinkedHashSet` and
+  `mutable.LinkedHashMap`, spelled `mutable.X`,
   `collection.mutable.X`, `scala.collection.mutable.X`, `new …[T]()`, or —
-  for `ListBuffer`/`ArrayBuffer`/`Buffer`, whose names cannot also mean an
-  immutable collection — unqualified. They ride the same host heap and answer
+  for the names that cannot also mean an immutable collection in default
+  scope — unqualified. They ride the same host heap and answer
   the same read combinators as the immutable ones, plus the mutators
   `+=`/`-=`/`++=`/`--=`, `add`/`addOne`/`addAll`, `append`/`prepend`/
   `appendAll`/`prependAll`, `insert`/`insertAll`, `remove`, `subtractOne`/
   `subtractAll`, `clear`, and — on a `Map` — `put`, `update` (`m(k) = v`),
   `getOrElseUpdate` and `remove`. Each prints with its own prefix
-  (`ListBuffer(…)`, `ArrayBuffer(…)`, and `HashSet(…)`/`HashMap(…)` at every
-  size), and a derived collection keeps the receiver's kind, so
-  `ListBuffer(1,2).map(_ * 2)` is a `ListBuffer`.
+  (`ListBuffer(…)`, `ArrayBuffer(…)`, `Queue(…)`, `Stack(…)`,
+  `ArrayDeque(…)`, `LinkedHashSet(…)`/`LinkedHashMap(…)`, and
+  `HashSet(…)`/`HashMap(…)` at every size), and a derived collection keeps the
+  receiver's kind, so `ListBuffer(1,2).map(_ * 2)` is a `ListBuffer`.
+  A **user type of the same name shadows the built-in one**: these constructors
+  are recognized by name, so a program that declares its own `class Stack` or
+  `case class Queue` constructs that instead.
+- **The end-taking buffers, and where each end is.** `Queue.enqueue` appends and
+  `dequeue`/`front` read the head; `Stack.push` PREPENDS and `pop`/`top` read the
+  head, because a `Stack`'s head is its top; `ArrayDeque` grows at both ends
+  (`prepend`/`append`, `removeHead`/`removeLast`). `+=` is `Growable.addOne` on
+  all three and therefore always APPENDS — `Stack(1,2,3) += 8` is
+  `Stack(1, 2, 3, 8)` where `push(8)` is `Stack(8, 1, 2, 3)`. A removal from an
+  empty one raises `java.util.NoSuchElementException: empty collection`; an empty
+  `top`/`front` raises `head of empty Stack`/`head of empty Queue`.
+- **`LinkedHashSet`/`LinkedHashMap` keep INSERTION order.** They are their own
+  representation, never an alias for the table-ordered ones: the stored order is
+  the linked list Scala threads through the table, so an add appends, a re-added
+  element keeps its original position, and one removed and re-added moves to the
+  end. They print `LinkedHashSet(…)`/`LinkedHashMap(…)` at every size.
+- **`StringBuilder`.** `new StringBuilder`, `new StringBuilder(s)` and
+  `StringBuilder(s)`. It is a growable `Seq[Char]` whose `toString` is its
+  CONTENTS with no wrapper, so `println(b)` prints the text. `append` takes
+  `String.valueOf` of any value (`b.append(7)` appends `'7'`), `+=` takes a
+  `Char` and `++=` a `String` or a `Char` sequence; `insert`, `setCharAt`,
+  `deleteCharAt`, `setLength`, `clear` and `result()` mutate or freeze it, and
+  the `CharSequence` members `substring`/`indexOf`/`lastIndexOf`/`charAt` work
+  alongside every sequence one. A SELECTING op (`take`, `filter`, `reverse`)
+  answers another `StringBuilder` through `fromSpecific`; `map`, whose element
+  type may change, reads `mutable.IndexedSeq`'s factory and so answers an
+  `ArrayBuffer` — exactly as Scala does.
+- **An explicit `Ordering`.** `Ordering.Int` and its siblings (the natural
+  ordering), `.reverse`, `Ordering.by(f)`, `Ordering.fromLessThan(lt)`,
+  `Ordering[T]` and `ord.on(f)`, plus the value's own `compare`, `lt`, `gt`,
+  `lteq`, `gteq`, `equiv`, `max` and `min`. Scala passes it in a second
+  (implicit) parameter list, which this frontend flattens into the same call, so
+  `xs.sorted(ord)` arrives with one argument and `xs.sortBy(f)(ord)` with two;
+  `sorted`, `sortBy`, `max`, `min`, `maxBy` and `minBy` all take it. The sort is
+  stable and the comparison may run a user closure, so it is an insertion merge
+  rather than `slice::sort_by` (which would panic on an inconsistent
+  comparator). The NAMED orderings all collapse onto the one natural ordering,
+  because there are no static types here to tell `Ordering.Int` from
+  `Ordering.String` at a call site and nothing observable distinguishes them
+  once applied to values of that type.
+- **Boxed-primitive and `String` companion statics.** `scala.Int`'s
+  `MaxValue`/`MinValue` family (and `Double`'s `MinPositiveValue`,
+  `PositiveInfinity`, `NegativeInfinity`, `NaN`), and the `java.lang` boxes'
+  statics: `Integer.parseInt`/`parseLong` (with an optional radix), `valueOf`,
+  `toString(i, radix)`, `toBinaryString`/`toHexString`/`toOctalString`,
+  `compare`, `max`, `min`, `sum`, `signum`, `bitCount`, `MAX_VALUE`/`MIN_VALUE`;
+  `Double.parseDouble`/`isNaN`/`isInfinite`; `Boolean.parseBoolean`;
+  `Character.isDigit`/`isLetter`/`isLetterOrDigit`/`isWhitespace`/`isUpperCase`/
+  `isLowerCase`/`toUpperCase`/`toLowerCase`/`getNumericValue`; and
+  `String.valueOf`. The two namespaces stay APART, exactly as Scala's do —
+  `Double.parseDouble` really is "not a member of object Double" there — and a
+  fixed-width rendering follows its box, so `Integer.toHexString(-1)` is
+  `ffffffff` and `java.lang.Long.toHexString(-1L)` is `ffffffffffffffff`.
+- **`getClass`.** Answers a `java.lang.Class` carrying `getName` and
+  `getSimpleName`, and printing as `class <name>` (a reference type) or the bare
+  name (`int`, `double`, `boolean`, `char`). Modeled for a `String`, the
+  primitives, a user `class`/`case class`/`object` (whose JVM class takes the
+  `$` suffix Scala appends to an object) and a throwable — which is the usual
+  reason to call it, `e.getClass.getSimpleName`.
+- **`f(xs: _*)` — the varargs spread.** The sequence is handed STRAIGHT to the
+  repeated parameter rather than collected into a one-element `ArraySeq`, so
+  `def f(xs: Int*) = xs.sum; f(List(1,2,3): _*)` is `6`. Every collection
+  FACTORY is varargs too, so `List(xs: _*)`, `mutable.Queue(xs: _*)` and
+  `Map(ps: _*)` work and each answers its own kind; the element count is not a
+  compile-time constant there, so those go through
+  [`crate::host::FROM_SEQ`] rather than the fixed-arity `MAKE_*` builtins. A
+  spread aimed at a parameter that is not repeated is a compile error, as it is
+  in Scala.
+- **Selection and application alternate in a postfix chain.** `"abc"(1).toInt`
+  is an apply and then a selection, and so is `List(List(1,2))(0)(1)`. A
+  `scala.collection.mutable` FACTORY is not curried either, so the second group
+  of `mutable.ArrayBuffer(1,2,3)(1)` is an INDEX (answering `2`) rather than a
+  fourth element.
 - **A mutable `Set`/`Map` prints in its hash *table's* order.** Nothing like the
   immutable CHAMP trie: `scala.collection.mutable.HashSet`/`HashMap` are a flat,
   separately chained table, and `src/host.rs` ports it from the 2.13 sources —
@@ -302,17 +378,24 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **`LinkedHashSet`/`LinkedHashMap`, and the rest of
-  `scala.collection.mutable`.** The linked forms keep insertion order rather
-  than the table's, so they are deliberately *not* aliased onto the hash-table
-  ones — they are an unresolved name, not a silent mis-run. `Queue`, `Stack`,
-  `PriorityQueue`, `ArrayDeque` and `StringBuilder` are likewise absent.
+- **`scala.collection.mutable.PriorityQueue`.** It is the one mutable collection
+  still absent. Its `toString` and its iteration are the raw order of the binary
+  HEAP ARRAY behind it (`PriorityQueue(3,1,4,1,5,9,2,6)` prints
+  `PriorityQueue(9, 6, 4, 1, 5, 3, 2, 1)`), which no ad-hoc implementation
+  reproduces — matching it needs a faithful port of the library's own
+  `addAll`/`heapify`/`fixUp`/`fixDown`, not just a max-heap. Until that port
+  exists the name stays unresolved rather than answering a plausible-looking
+  wrong order.
 - **An unqualified `Set`/`Map` always means the immutable one.** `import` lines
   are skipped, not tracked, so `import scala.collection.mutable.Set` followed by
   a bare `Set(1, 2)` builds the immutable set. Write `mutable.Set(1, 2)`.
 - **`x += e` in expression position.** `println(buf += 1)` — Scala's `+=` is an
   expression whose value is the buffer. Here `+=` is a statement, so it is a
   parse error rather than a mis-run. `buf += 1` on its own line works.
+- **`xs: _*` outside an argument position.** The spread is parsed where Scala
+  allows it — as an argument — and rejected everywhere else, which is also what
+  Scala does. A spread handed to a parameter that is not repeated is a compile
+  error on both sides.
 - **Lazy views and a real `Iterator`.** `.view` and `LazyList`. `.iterator` and
   `.reverseIterator` answer a STRICT `Iterable` carrying the same elements, so
   every downstream combinator (`.toList`, `.map`, `.size`, …) matches; only
@@ -329,16 +412,11 @@ reported as parse/compile errors, never silently mis-run.
   still escapes both checks is a *counted `for` loop* whose endpoints are BOTH
   `Char` variables (`val a = 'a'; val z = 'z'; for (c <- a to z)`), which lowers
   to inline loop bytecode rather than through either builtin.
-- **`Ordering` beyond the companion instances and `reverse`.** `sorted(ord)`,
-  `max(ord)`/`min(ord)` and the `Ordering` predicates (`compare`, `lt`, `gt`,
-  `lteq`, `gteq`, `equiv`, `max`, `min`) work for `Ordering.Int` and its sibling
-  companion members, in either direction. What is missing is an ordering built
-  from a function — `Ordering.by(f)`, `Ordering.fromLessThan(f)`, `ord.on(f)` —
-  and `Ordered`/`Comparable` on a user class. Note also that every companion
-  member names the SAME natural order here, since the element type it selects in
-  Scala is erased; the underlying comparison covers numbers, `String`, `Boolean`
-  and tuples of those, and anything else compares equal, which a stable sort
-  leaves in input order.
+- **`Ordered`/`Comparable` on a user class.** An explicit `Ordering` IS supported
+  (see below), but a class that defines its own `compare`/`compareTo` is not
+  consulted by the implicit ordering: the built-in one covers numbers, `String`,
+  `Boolean` and tuples of those, and anything else compares equal, which a stable
+  sort leaves in input order. Pass `sortBy`/`sortWith`/an explicit `Ordering`.
 - **Symbolic operators beyond the wired set.** `/:`, `:\` and user-defined
   symbolic method names.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
@@ -352,10 +430,17 @@ reported as parse/compile errors, never silently mis-run.
   Exception` will not catch it.
 - **Named regex groups.** `(?<name>…)` and `${name}` in a replacement are not
   modeled; numbered groups (`$1`, `Match.group(1)`, `case r(a, b)`) are.
-- **`String.valueOf` and the other `java.lang.String` statics.** There is no
-  `String` companion, so `String.valueOf(x)` answers "not a member"; use
-  `"" + x` or `x.toString` (which differ on `null` only in that `toString` on a
-  `null` would NPE in Scala too).
+- **`getClass` on a collection, a tuple, a function or an `Array`.** Those
+  runtime classes are private implementation details — `List(1).getClass.getName`
+  is `scala.collection.immutable.$colon$colon`, a one-element `Vector` is
+  `Vector1`, and `(1, 2)` carries the specialization suffix `Tuple2$mcII$sp` —
+  so naming them would mean modelling Scala's class hierarchy AND its
+  `@specialized` naming. They stay an error; `getClass` on a `String`, a
+  primitive, a user `class`/`case class`/`object` or a throwable works (see
+  above).
+- **`Float`'s single-precision rendering.** There is one `Double` numeric type,
+  so `Float.MaxValue` (which Scala prints `3.4028235E38`, at `Float` precision)
+  is not answered. Every other value-class companion bound is.
 - **By-name params, `given`/`using`, `@main` (Scala 3 annotation entry).**
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
@@ -448,6 +533,14 @@ reported as parse/compile errors, never silently mis-run.
 - **`grouped`/`sliding` answer a `List` of windows**, not an `Iterator`. Every
   consumption Scala programs use (`.toList`, `.foreach`, `.map`) matches;
   printing the un-consumed result does not (Scala prints `<iterator>`).
+- **A SUBNORMAL `Double` renders one digit shorter than the JVM's.**
+  `host::format_double` takes its digits from Rust's shortest round-tripping
+  representation, which agrees with `java.lang.Double.toString` over the whole
+  normal range. The JVM's legacy `FloatingDecimal` is not shortest-round-trip in
+  the subnormal range, though: it prints `Double.MinPositiveValue` as
+  `4.9E-324` where the shortest form is `5.0E-324`. Matching it there needs a
+  port of `FloatingDecimal.dtoa`'s digit count, which no ordinary magnitude
+  reaches — every `|x| >= 2.2250738585072014E-308` already agrees byte for byte.
 - **Integer arithmetic narrows to 32 bits only where the width is PROVEN.**
   `Int` overflow now wraps — `2147483647 + 1` is `-2147483648` — and a `Long`
   anywhere in an expression promotes it so it does not

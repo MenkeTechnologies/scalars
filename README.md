@@ -99,10 +99,13 @@ immutable collections `List`/`Seq`/`Vector`/`Set`/`Map` (the full combinator set
 `HashSet`/`HashMap` trie ordering past four entries — including for a set or map
 keyed by another collection, through the ported `MurmurHash3` seq/set/map
 hashes), the mutable collections
-(`ListBuffer`, `ArrayBuffer`, `mutable.Set`/`Map` with their hash table's own
-iteration order, and the `+=`/`-=`/`++=` mutators), `Array`, first-class `Range`
-values and `scala.math` are modeled host-side too. The wider standard library is
-the next wave (see [`BUGS.md`](BUGS.md)).
+(`ListBuffer`, `ArrayBuffer`, `Queue`, `Stack`, `ArrayDeque` and `StringBuilder`;
+`mutable.Set`/`Map` with their hash table's own iteration order and the
+insertion-ordered `LinkedHashSet`/`LinkedHashMap`; the `+=`/`-=`/`++=`
+mutators), `Array`, first-class `Range` values, an explicit `Ordering`, the
+boxed-primitive statics (`Int.MaxValue`, `Integer.parseInt`, `Character.isDigit`,
+`String.valueOf`), `getClass` and `scala.math` are modeled host-side too. The
+wider standard library is the next wave (see [`BUGS.md`](BUGS.md)).
 Nothing is faked — an unsupported construct is a parse error or an honest runtime
 throw, not a silent mis-run.
 
@@ -310,12 +313,28 @@ Implemented and checked against the reference `scala`:
   as `apply`, which is what `collect`/`collectFirst` need to skip a
   non-matching element; `applyOrElse`, `lift`, `orElse`, `andThen` and
   `compose` compose function values.
-- **`scala.collection.mutable`** — `ListBuffer`, `ArrayBuffer`, `mutable.Set`
-  and `mutable.Map`, with `+=`/`-=`/`++=`/`--=`, `append`/`prepend`/`insert`/
-  `remove`/`clear`, `put`/`update`/`getOrElseUpdate`, and the same combinator
-  set. A mutable `Set`/`Map` prints in its **hash table's** order, which is a
-  different algorithm from the immutable trie and is ported from the 2.13
-  sources down to the table sizing that decides it.
+- **`scala.collection.mutable`** — `ListBuffer`, `ArrayBuffer`, `Queue`,
+  `Stack`, `ArrayDeque`, `StringBuilder`, `mutable.Set`/`Map` and the
+  insertion-ordered `LinkedHashSet`/`LinkedHashMap`, with `+=`/`-=`/`++=`/`--=`,
+  `append`/`prepend`/`insert`/`remove`/`clear`,
+  `put`/`update`/`getOrElseUpdate`, `enqueue`/`dequeue`, `push`/`pop`/`top`,
+  `removeHead`/`removeLast`, and the same combinator set. A mutable `Set`/`Map`
+  prints in its **hash table's** order, which is a different algorithm from the
+  immutable trie and is ported from the 2.13 sources down to the table sizing
+  that decides it; the linked forms print in insertion order instead. `+=` is
+  `Growable.addOne` everywhere, so it appends even on a `Stack` (whose `push`
+  prepends, because a `Stack`'s head is its top).
+- **An explicit `Ordering`** — `Ordering.Int` and its siblings, `.reverse`,
+  `Ordering.by(f)`, `Ordering.fromLessThan(lt)`, `Ordering[T]` and `ord.on(f)`,
+  driving `sorted`, `sortBy`, `max`, `min`, `maxBy` and `minBy`, plus the
+  value's own `compare`/`lt`/`gt`/`lteq`/`gteq`/`equiv`/`max`/`min`.
+- **The boxed-primitive and `String` statics** — `scala.Int`'s
+  `MaxValue`/`MinValue` family and `java.lang.Integer`/`Long`/`Double`/
+  `Boolean`/`Character`'s `parseInt`, `toHexString`, `bitCount`, `isDigit`,
+  `String.valueOf` and the rest. The two namespaces stay apart exactly as
+  Scala's do, and a fixed-width rendering follows its box.
+- **`getClass`** — a `java.lang.Class` answering `getName`/`getSimpleName` for a
+  `String`, a primitive, a user type or a throwable (`e.getClass.getSimpleName`).
 - **`scala.math`** — `abs`, `signum`, `min`/`max`, `round`/`floor`/`ceil`/`rint`,
   `sqrt`/`cbrt`/`exp`/`log`/`log10`/`pow`/`hypot`, the trig family, `atan2`,
   `toRadians`/`toDegrees`, `Pi`, `E`, under the `math`, `scala.math`, `Math` and
@@ -496,12 +515,14 @@ to report a clean score — now exits 2 instead of green.
 Next waves, in priority order:
 
 1. **Lazy views** — `.view` and `LazyList` (`.iterator` is wired, but strictly).
-2. **The broader standard library** — `scala.io`, `scala.collection.*` as a
-   namespace, and an `Ordering` built from a function (`Ordering.by`).
-
-3. **The rest of `scala.collection.mutable`** — the insertion-ordered
-   `LinkedHashSet`/`LinkedHashMap`, `Queue`, `Stack` and `ArrayDeque`.
-4. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement.
+2. **The broader standard library** — `scala.io`, `scala.util.Try`/`Random`,
+   `BigInt`, and `scala.collection.*` as a namespace.
+3. **`mutable.PriorityQueue`** — the last absent mutable collection. Its
+   `toString` is the raw binary-heap array order, so it needs a faithful port of
+   the library's `addAll`/`heapify`/`fixUp`/`fixDown` rather than any max-heap.
+4. **`Ordered`/`Comparable` on a user class** — an explicit `Ordering` works, but
+   a class's own `compare` is not yet consulted by the implicit one.
+5. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

@@ -3009,7 +3009,9 @@ fn nested_lambdas_each_take_their_own_element_width() {
 
 #[test]
 fn reduce_binds_both_of_its_parameters_to_the_element_width() {
-    let (out, _) = run(&wrap("println(List(2147483647, 2147483647).reduce((a, b) => a + b))"));
+    let (out, _) = run(&wrap(
+        "println(List(2147483647, 2147483647).reduce((a, b) => a + b))",
+    ));
     assert_eq!(out, "-2\n");
 }
 
@@ -3041,11 +3043,9 @@ fn a_bare_field_reference_inside_a_method_narrows() {
 
 #[test]
 fn an_inherited_field_carries_its_width_into_the_subclass() {
-    let (out, _) = run(
-        "class Base(val seed: Int)\n\
+    let (out, _) = run("class Base(val seed: Int)\n\
          class Derived(s: Int) extends Base(s) { def grow: Int = seed * 1000000 }\n\
-         object T extends App { println(new Derived(2147483647).grow) }",
-    );
+         object T extends App { println(new Derived(2147483647).grow) }");
     assert_eq!(out, "-1000000\n");
 }
 
@@ -3132,9 +3132,244 @@ fn a_user_member_name_does_not_disarm_narrowing_on_a_primitive() {
     // receiver that could be that user type. A receiver already known to be a
     // primitive is not, so one `def abs` anywhere in the program must not stop
     // `Int.MinValue.abs` from wrapping.
-    let (out, _) = run(
-        "class Thing { def abs: Int = 5 }\n\
-         object T extends App { println((-2147483648).abs); println(\"abcd\".length * 2) }",
-    );
+    let (out, _) = run("class Thing { def abs: Int = 5 }\n\
+         object T extends App { println((-2147483648).abs); println(\"abcd\".length * 2) }");
     assert_eq!(out, "-2147483648\n8\n");
+}
+
+// ── scala.collection.mutable: Queue / Stack / ArrayDeque / LinkedHash* /
+//    StringBuilder ───────────────────────────────────────────────────────────
+
+#[test]
+fn queue_stack_and_arraydeque_mutate_at_the_ends_scala_does() {
+    // The three buffers differ only in WHICH end each operation touches, and
+    // that is the whole point of having them: `Queue.enqueue` appends while
+    // `Stack.push` prepends (a `Stack`'s head is its top), yet `+=` is
+    // `Growable.addOne` on both and therefore appends on both — so
+    // `Stack(1,2,3) += 8` is `Stack(1, 2, 3, 8)` where `push(8)` would have been
+    // `Stack(8, 1, 2, 3)`. Getting that backwards is the mistake this pins.
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  val q = mutable.Queue(1, 2, 3)\n  q.enqueue(4); println(q); println(q.dequeue()); println(q.front); println(q)\n  q += 9; println(q); println(q.map(_ * 2))\n  val s = mutable.Stack(1, 2, 3)\n  s.push(4); println(s); println(s.pop()); println(s.top)\n  s += 8; println(s)\n  val d = mutable.ArrayDeque(1, 2, 3)\n  d.prepend(0); d += 4; println(d)\n  println(d.removeHead()); println(d.removeLast()); println(d)\n  d(1) = 9; println(d)\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Queue(1, 2, 3, 4)\n1\n2\nQueue(2, 3, 4)\nQueue(2, 3, 4, 9)\nQueue(4, 6, 8, 18)\nStack(4, 1, 2, 3)\n4\n1\nStack(1, 2, 3, 8)\nArrayDeque(0, 1, 2, 3, 4)\n0\n4\nArrayDeque(1, 2, 3)\nArrayDeque(1, 9, 3)\n"
+    );
+}
+
+#[test]
+fn a_removal_from_an_empty_buffer_raises_the_jdk_message() {
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  try { mutable.Queue[Int]().dequeue() } catch { case e: Throwable => println(e) }\n  try { mutable.Stack[Int]().pop() } catch { case e: Throwable => println(e) }\n  try { mutable.Stack[Int]().top } catch { case e: Throwable => println(e) }\n  try { mutable.Queue[Int]().front } catch { case e: Throwable => println(e) }\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "java.util.NoSuchElementException: empty collection\njava.util.NoSuchElementException: empty collection\njava.util.NoSuchElementException: head of empty Stack\njava.util.NoSuchElementException: head of empty Queue\n"
+    );
+}
+
+#[test]
+fn linked_hash_collections_keep_insertion_order_not_table_order() {
+    // The whole reason `LinkedHashSet`/`LinkedHashMap` are not aliases for the
+    // table-ordered ones: `LinkedHashSet(3, 1, 2)` prints in the order it was
+    // given, a re-added element keeps its ORIGINAL position, and an element
+    // removed and re-added moves to the END. A `mutable.HashSet` of the same
+    // elements would print in bucket order instead.
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  val s = mutable.LinkedHashSet(3, 1, 2)\n  s += 9; s += 1; println(s); println(s.toList); println(s.map(_ * 2))\n  s -= 1; println(s); s += 1; println(s)\n  val m = mutable.LinkedHashMap(3 -> \"c\", 1 -> \"a\")\n  m(2) = \"b\"; println(m); println(m.toList)\n  m -= 3; println(m); println(m.filter(_._1 > 1))\n  println(mutable.LinkedHashSet[Int]()); println(mutable.LinkedHashMap[Int, String]())\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "LinkedHashSet(3, 1, 2, 9)\nList(3, 1, 2, 9)\nLinkedHashSet(6, 2, 4, 18)\nLinkedHashSet(3, 2, 9)\nLinkedHashSet(3, 2, 9, 1)\nLinkedHashMap(3 -> c, 1 -> a, 2 -> b)\nList((3,c), (1,a), (2,b))\nLinkedHashMap(1 -> a, 2 -> b)\nLinkedHashMap(2 -> b)\nLinkedHashSet()\nLinkedHashMap()\n"
+    );
+}
+
+#[test]
+fn stringbuilder_is_a_char_sequence_that_prints_its_contents() {
+    // `StringBuilder` wears two faces at once and the test pins both: it is a
+    // `Seq[Char]` (`length`, `apply`, `take`, `mkString`) AND a `CharSequence`
+    // (`substring`, `indexOf`), its `toString` is the CONTENTS with no
+    // `StringBuilder(…)` wrapper, `append` takes `String.valueOf` of anything
+    // (so `append(7)` appends the digit), and `map` — whose element type can
+    // change — falls back to `mutable.IndexedSeq`'s builder and so answers an
+    // `ArrayBuffer` where the selecting `take` answers a `StringBuilder`.
+    let (out, ok) = run(
+        "object T extends App {\n  val b = new StringBuilder\n  b.append(\"ab\"); b += 'c'; b ++= \"de\"; b.append(7)\n  println(b); println(b.length); println(b(0)); println(b.reverse)\n  println(b.take(2)); println(b.map(_.toUpper)); println(b.indexOf(\"cd\"))\n  println(b.substring(1, 3)); println(b.mkString(\"-\")); println(b.result())\n  val c = new StringBuilder(\"abc\")\n  println(c.insert(1, \"ZZ\")); println(c.setCharAt(0, 'Q')); println(c.deleteCharAt(1))\n  c.setLength(2); println(c); println(c.isEmpty)\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "abcde7\n6\na\n7edcba\nab\nArrayBuffer(A, B, C, D, E, 7)\n2\nbc\na-b-c-d-e-7\nabcde7\naZZbc\nQZZbc\nQZbc\nQZ\nfalse\n"
+    );
+}
+
+#[test]
+fn a_user_type_shadows_the_built_in_collection_of_the_same_name() {
+    // The parser recognizes these constructors by NAME, so a program with its
+    // own `Stack`/`Queue` must construct that one — not silently build the
+    // library collection.
+    let (out, ok) = run(
+        "case class Stack(top: Int)\nclass Queue(val n: Int)\nobject T extends App {\n  println(Stack(1)); println(Stack(1).top); println(new Queue(2).n)\n}",
+    );
+    assert!(ok);
+    assert_eq!(out, "Stack(1)\n1\n2\n");
+}
+
+// ── Boxed-primitive / `String` companion statics ───────────────────────────
+
+#[test]
+fn boxed_primitive_companions_answer_their_own_namespaces_members() {
+    // `scala.Int` and `java.lang.Integer` are different objects with disjoint
+    // members, and the width a rendering uses follows the box: `Integer
+    // .toHexString(-1)` is 32 bits and `Long.toHexString(-1)` is 64.
+    let (out, ok) = run(
+        "object T extends App {\n  println(Int.MaxValue); println(Long.MinValue); println(Short.MaxValue); println(Byte.MinValue)\n  println(Double.MaxValue); println(Double.PositiveInfinity); println(Char.MaxValue.toInt)\n  println(Integer.MAX_VALUE); println(Integer.parseInt(\"42\")); println(Integer.parseInt(\"ff\", 16))\n  println(Integer.toBinaryString(-1)); println(Integer.toHexString(255)); println(Integer.toString(255, 16))\n  println(java.lang.Long.toHexString(-1L)); println(Integer.compare(1, 2)); println(Integer.bitCount(7))\n  println(java.lang.Double.parseDouble(\"1.5\")); println(Character.isDigit('5')); println(Character.toUpperCase('a'))\n  println(Character.getNumericValue('7')); println(String.valueOf(42)); println(String.valueOf(List(1, 2)))\n  try { Integer.parseInt(\"zz\") } catch { case e: Throwable => println(e) }\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "2147483647\n-9223372036854775808\n32767\n-128\n1.7976931348623157E308\nInfinity\n65535\n2147483647\n42\n255\n11111111111111111111111111111111\nff\nff\nffffffffffffffff\n-1\n3\n1.5\ntrue\nA\n7\n42\nList(1, 2)\njava.lang.NumberFormatException: For input string: \"zz\"\n"
+    );
+}
+
+#[test]
+fn a_member_of_the_other_boxed_namespace_is_rejected() {
+    // `Double.parseDouble` really is "not a member of object Double" in Scala —
+    // the split between the two namespaces is faithful, not a superset.
+    let (out, ok) = run(&wrap(r#"println(Double.parseDouble("1.5"))"#));
+    assert!(!ok);
+    assert_eq!(out, "");
+}
+
+// ── `getClass` ─────────────────────────────────────────────────────────────
+
+#[test]
+fn getclass_names_the_receivers_class() {
+    // `Class.toString` is `class <name>` for a reference type and the bare name
+    // for a primitive, and an exception's is the fully-qualified JDK name —
+    // which is the reason to model `getClass` at all.
+    let (out, ok) = run(
+        "case class P(n: String, a: Int)\nclass Q\nobject T extends App {\n  println(\"x\".getClass); println(\"x\".getClass.getName); println(\"x\".getClass.getSimpleName)\n  println(1.getClass); println(1.5.getClass); println(true.getClass); println('c'.getClass)\n  println(P(\"x\", 1).getClass); println(P(\"x\", 1).getClass.getSimpleName); println(new Q().getClass)\n  try { 1 / 0 } catch { case e: Throwable => println(e.getClass.getName); println(e.getClass.getSimpleName) }\n  try { \"z\".toInt } catch { case e: Throwable => println(e.getClass.getSimpleName) }\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "class java.lang.String\njava.lang.String\nString\nint\ndouble\nboolean\nchar\nclass P\nP\nclass Q\njava.lang.ArithmeticException\nArithmeticException\nNumberFormatException\n"
+    );
+}
+
+#[test]
+fn getclass_on_a_collection_is_an_error_rather_than_a_guess() {
+    // A collection's runtime class is a private implementation detail
+    // (`$colon$colon`, `Vector1`, `Tuple2$mcII$sp`), so it fails loudly instead
+    // of answering something plausible and wrong.
+    let (out, ok) = run(&wrap("println(List(1).getClass.getName)"));
+    assert!(!ok);
+    assert_eq!(out, "");
+}
+
+// ── An explicit `Ordering` ─────────────────────────────────────────────────
+
+#[test]
+fn an_explicit_ordering_drives_sorted_max_min_and_sortby() {
+    // Scala passes the `Ordering` in a second (implicit) parameter list, which
+    // this frontend flattens into the same call — so `xs.sorted(ord)` arrives
+    // with one argument and `xs.sortBy(f)(ord)` with two, and both must find it.
+    let (out, ok) = run(
+        "case class P(n: String, a: Int)\nobject T extends App {\n  val xs = List(3, 1, 2)\n  println(xs.sorted(Ordering.Int.reverse)); println(xs.sorted(Ordering.Int))\n  println(List(\"b\", \"a\").sorted(Ordering.String.reverse))\n  println(xs.sortBy(x => x)(Ordering.Int.reverse))\n  println(Ordering.Int.compare(1, 2)); println(Ordering.Int.reverse.compare(1, 2))\n  println(xs.max(Ordering.Int.reverse)); println(xs.min(Ordering.Int.reverse))\n  println(xs.sorted(Ordering.by((x: Int) => -x)))\n  println(Ordering[Int].compare(2, 1)); println(Ordering.Int.lt(1, 2))\n  println(List(P(\"x\", 2), P(\"y\", 1)).sortBy(_.a)(Ordering.Int.reverse))\n  println(xs.sorted(Ordering.fromLessThan[Int](_ > _)))\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(3, 2, 1)\nList(1, 2, 3)\nList(b, a)\nList(3, 2, 1)\n-1\n1\n1\n3\nList(3, 2, 1)\n1\ntrue\nList(P(x,2), P(y,1))\nList(3, 2, 1)\n"
+    );
+}
+
+// ── Varargs spread, and an apply on a literal ──────────────────────────────
+
+#[test]
+fn a_varargs_spread_hands_the_sequence_to_the_repeated_parameter() {
+    // `f(xs: _*)` must pass `xs` ITSELF, not an `ArraySeq` holding it — the
+    // difference shows up immediately in `xs.sum` and in the empty case.
+    let (out, ok) = run(
+        "object T extends App {\n  def f(xs: Int*) = xs.sum\n  def g(a: Int, xs: String*) = a + xs.mkString\n  def h(xs: Int*) = xs\n  println(f(List(1, 2, 3): _*)); println(f(1, 2, 3)); println(f(List(): _*))\n  println(g(1, List(\"a\", \"b\"): _*)); println(h(Vector(1, 2): _*))\n}",
+    );
+    assert!(ok);
+    assert_eq!(out, "6\n6\n0\n1ab\nVector(1, 2)\n");
+}
+
+#[test]
+fn a_spread_outside_a_repeated_parameter_is_rejected() {
+    // Scala: "Sequence argument type annotation `*` cannot be used here: the
+    // corresponding parameter has type Int which is not a repeated parameter
+    // type." Both sides refuse to compile it.
+    let (out, ok) = run(&wrap("def k(a: Int) = a; println(k(List(1): _*))"));
+    assert!(!ok);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn an_apply_on_a_literal_continues_the_selector_chain() {
+    // Selection and application ALTERNATE, so `"abc"(1).toInt` is an apply and
+    // then a selection. A `mutable` FACTORY is also not curried, so its second
+    // group is an index rather than three more elements.
+    let (out, ok) = run(
+        "object T extends App {\n  println(\"abc\"(1).toInt); println(List(1, 2, 3)(1).toString)\n  println(scala.collection.mutable.ArrayBuffer(1, 2, 3)(1))\n  println(List(List(1, 2))(0)(1))\n}",
+    );
+    assert!(ok);
+    assert_eq!(out, "98\n2\n2\n2\n");
+}
+
+#[test]
+fn a_collection_factory_takes_a_spread_too() {
+    // Every collection factory is varargs in Scala, so `List(xs: _*)` is legal —
+    // but the element count is only known at run time, so it cannot go through
+    // the fixed-arity `MAKE_*` builtins. Each kind must still come out as
+    // itself, and a `Map` factory must still see `(k, v)` pairs.
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  val xs = List(3, 1, 2)\n  println(List(xs: _*)); println(Vector(xs: _*)); println(Set(xs: _*))\n  println(mutable.ListBuffer(xs: _*)); println(mutable.Queue(xs: _*)); println(mutable.Stack(xs: _*))\n  println(mutable.ArrayDeque(xs: _*)); println(mutable.LinkedHashSet(xs: _*))\n  println(mutable.LinkedHashMap(xs.map(i => (i, i)): _*))\n  println(Map(xs.map(i => (i, i)): _*)); println(List(List(): _*))\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(3, 1, 2)\nVector(3, 1, 2)\nSet(3, 1, 2)\nListBuffer(3, 1, 2)\nQueue(3, 1, 2)\nStack(3, 1, 2)\nArrayDeque(3, 1, 2)\nLinkedHashSet(3, 1, 2)\nLinkedHashMap(3 -> 3, 1 -> 1, 2 -> 2)\nMap(3 -> 3, 1 -> 1, 2 -> 2)\nList()\n"
+    );
+}
+
+#[test]
+fn every_builtin_id_is_distinct() {
+    // Builtin ids are hand-assigned `pub const`s, and two slices adding one at
+    // the same time pick the same number without any conflict marker: the file
+    // merges cleanly and the later `register_builtin` silently REPLACES the
+    // earlier handler. That is how `MAKE_QUEUE` and `MAKE_ORDERING` both became
+    // 754 — `mutable.Queue(1, 2)` started answering "value 2 is not a member of
+    // object Ordering". Nothing else in the build catches it, so this does.
+    let src = include_str!("../src/host.rs");
+    let mut seen: Vec<(u16, &str)> = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some((name, tail)) = rest.split_once(": u16 = ") else {
+            continue;
+        };
+        let Some(num) = tail.strip_suffix(';') else {
+            continue;
+        };
+        let Ok(id) = num.parse::<u16>() else { continue };
+        if let Some((_, other)) = seen.iter().find(|(n, _)| *n == id) {
+            panic!("builtin id {id} is used by both `{other}` and `{name}`");
+        }
+        seen.push((id, name));
+    }
+    // A guard that found nothing would pass silently forever.
+    assert!(
+        seen.len() > 50,
+        "expected to scan the builtin id table, found {} consts",
+        seen.len()
+    );
 }

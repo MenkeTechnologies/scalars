@@ -188,7 +188,7 @@ pub const MAKE_VECTOR: u16 = 737;
 pub const MAKE_ARRAYSEQ: u16 = 753;
 /// Build a `scala.math.Ordering` — the value `sorted(ord)` / `max(ord)` /
 /// `min(ord)` take. Every `Ordering.Int` / `Ordering.String` / … names the same
-/// NATURAL order here, because [`value_cmp`] already compares each of those
+/// NATURAL order here, because `value_cmp` already compares each of those
 /// types the way Scala's instance does; what the companion member selects in
 /// Scala is the element TYPE, which a dynamically typed runtime does not need.
 /// The only state an ordering carries is therefore its direction, which
@@ -213,6 +213,36 @@ pub const MAKE_MUTSET: u16 = 742;
 /// Builtin id for a `mutable.Map(...)` literal: pops `argc` `Tuple2` pairs into
 /// a `mutable.HashMap`, sized as `HashMap.from` would.
 pub const MAKE_MUTMAP: u16 = 743;
+/// Builtin id for a boxed-primitive / `String` companion member — pops the
+/// `Module.member` name and, beneath it, its arguments (the [`SMATH`] shape).
+/// The MODULE travels with the name because the two namespaces are disjoint:
+/// `Int.MaxValue` is `scala.Int`'s and `Integer.parseInt` is
+/// `java.lang.Integer`'s, and `Integer.toHexString(-1)` renders at 32 bits where
+/// `java.lang.Long.toHexString(-1)` renders at 64.
+pub const BOXED: u16 = 760;
+/// Builtin id for a collection literal whose arguments are a varargs SPREAD
+/// (`List(xs: _*)`, `mutable.Queue(xs: _*)`). Every collection factory is
+/// varargs in Scala, so a spread is legal there too — but the element count is
+/// only known at run time, which the fixed-`argc` `MAKE_*` builtins cannot
+/// express. This pops the constructor name and then the source collection, and
+/// builds the named collection from that collection's elements.
+pub const FROM_SEQ: u16 = 762;
+/// Builtin id for a `mutable.Queue(...)` literal: pops `argc` elements.
+pub const MAKE_QUEUE: u16 = 763;
+/// Builtin id for a `mutable.Stack(...)` literal: pops `argc` elements. The
+/// factory's order is the stored order, so `Stack(1,2,3)` has `1` on top.
+pub const MAKE_STACK: u16 = 764;
+/// Builtin id for a `mutable.ArrayDeque(...)` literal: pops `argc` elements.
+pub const MAKE_ARRAYDEQUE: u16 = 765;
+/// Builtin id for a `StringBuilder` literal or `new StringBuilder(s)`: pops
+/// `argc` values and appends each one's `String.valueOf` characters.
+pub const MAKE_STRINGBUILDER: u16 = 766;
+/// Builtin id for a `mutable.LinkedHashSet(...)` literal: pops `argc` elements
+/// into an insertion-ordered set.
+pub const MAKE_LINKEDSET: u16 = 767;
+/// Builtin id for a `mutable.LinkedHashMap(...)` literal: pops `argc` `Tuple2`
+/// pairs into an insertion-ordered map.
+pub const MAKE_LINKEDMAP: u16 = 768;
 /// Builtin id for the run-time half of `x += e` / `x -= e`: pops one value and
 /// answers whether it is a collection that mutates in place. `true` sends the
 /// compiler-emitted branch to `x.+=(e)`, `false` to `x = x + e` — Scala makes
@@ -248,13 +278,13 @@ pub const CELL_GET: u16 = 749;
 /// value, stores it, and answers `Unit`.
 pub const CELL_SET: u16 = 750;
 /// Builtin id for `Char` construction: pops a code point and pushes the interned
-/// [`HeapVal::Char`] handle for it (see [`make_char`]).
+/// `HeapVal::Char` handle for it (see [`make_char`]).
 pub const CHAR_NEW: u16 = 751;
 /// Builtin id for an extractor pattern whose name is a *value* rather than a
 /// type — `case p(a, b)` where `p` is a `Regex`. Pops the expected group count,
 /// the scrutinee and the extractor, and pushes either the bound values as an
 /// `Array` or `Value::Undef` when the pattern does not match (see
-/// [`b_unapply_seq`]).
+/// `b_unapply_seq`).
 pub const UNAPPLY_SEQ: u16 = 752;
 
 thread_local! {
@@ -391,6 +421,15 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_ARRAYBUFFER, b_make_arraybuffer);
     vm.register_builtin(MAKE_MUTSET, b_make_mutset);
     vm.register_builtin(MAKE_MUTMAP, b_make_mutmap);
+    vm.register_builtin(BOXED, b_boxed);
+    vm.register_builtin(MAKE_ORDERING, b_make_ordering);
+    vm.register_builtin(FROM_SEQ, b_from_seq);
+    vm.register_builtin(MAKE_QUEUE, b_make_queue);
+    vm.register_builtin(MAKE_STACK, b_make_stack);
+    vm.register_builtin(MAKE_ARRAYDEQUE, b_make_arraydeque);
+    vm.register_builtin(MAKE_STRINGBUILDER, b_make_stringbuilder);
+    vm.register_builtin(MAKE_LINKEDSET, b_make_linkedset);
+    vm.register_builtin(MAKE_LINKEDMAP, b_make_linkedmap);
     vm.register_builtin(IS_GROWABLE, b_is_growable);
     vm.register_builtin(MAKE_OPTION, b_make_option);
     vm.register_builtin(NLR_RAISE, b_nlr_raise);
@@ -779,9 +818,16 @@ enum HeapVal {
     /// A built-in throwable (`new RuntimeException("…")`, or one raised by the
     /// runtime itself) — see [`ExcObj`].
     Exc(ExcObj),
-    /// A `scala.math.Ordering` — see [`MAKE_ORDERING`]. `reversed` is the whole
-    /// of its state: the natural direction, or the one `.reverse` answers.
-    Ordering { reversed: bool },
+    /// A `scala.math.Ordering` — see [`MAKE_ORDERING`]. `reversed` is the
+    /// direction, flipped by `.reverse`. `key` and `lt` are `Value::Undef` for
+    /// the natural ordering the companion members name, and hold the function
+    /// an `Ordering.by(f)` / `ord.on(f)` extracts with, or the `<` test an
+    /// `Ordering.fromLessThan(lt)` was built from.
+    Ordering {
+        key: Value,
+        lt: Value,
+        reversed: bool,
+    },
     /// A `scala.util.matching.Regex` (`"…".r`). The *source* pattern is stored,
     /// which is what `toString`/`regex` answer; the compiled automaton lives in
     /// the [`REGEX_CACHE`] keyed by that source.
@@ -827,6 +873,13 @@ enum HashRep {
     /// The table length rides along because the order depends on it and it grows
     /// with the collection (see [`mut_ordered`]).
     Mutable(u32),
+    /// A `scala.collection.mutable.LinkedHashSet`/`LinkedHashMap` — a hash table
+    /// whose entries are additionally threaded on a doubly-linked list in
+    /// INSERTION order, which is the order it iterates and prints in. There is
+    /// therefore no table order to reproduce: the stored `Vec` already is the
+    /// linked list, so an add appends and a remove unlinks. It prints
+    /// `LinkedHashSet(…)`/`LinkedHashMap(…)` at every size.
+    Linked,
 }
 
 /// The rendered prefix of a [`HeapVal::Seq`].
@@ -849,6 +902,22 @@ enum SeqKind {
     /// `scala.collection.mutable.ArrayBuffer` (also `Buffer`/`Seq` under the
     /// mutable namespace) — a growable indexed sequence.
     ArrayBuffer,
+    /// `scala.collection.mutable.Queue` — a growable FIFO. `enqueue` appends and
+    /// `dequeue` takes from the head, so the stored order is front-to-back.
+    Queue,
+    /// `scala.collection.mutable.Stack` — a growable LIFO whose HEAD is the top:
+    /// `push` prepends, `pop`/`top` read the head. `+=` is still `Growable.addOne`
+    /// and therefore APPENDS, which is why `Stack(1,2,3) += 8` prints
+    /// `Stack(1, 2, 3, 8)` where `push(8)` would print `Stack(8, 1, 2, 3)`.
+    Stack,
+    /// `scala.collection.mutable.ArrayDeque` — growable at both ends
+    /// (`prepend`/`append`, `removeHead`/`removeLast`).
+    ArrayDeque,
+    /// `scala.collection.mutable.StringBuilder` — a growable sequence of `Char`.
+    /// It is a `Seq[Char]` (so `length`, `apply`, `map`, `mkString` all work off
+    /// the same element vector) but its `toString` is the CONTENTS, with no
+    /// `StringBuilder(…)` wrapper.
+    StrBuf,
     /// An integer `Range` as a first-class value. Its elements are materialized
     /// like any other sequence; the bounds are kept because `Range.toString`
     /// prints them (`Range 1 to 10 by 3`) rather than the elements.
@@ -867,11 +936,16 @@ impl SeqKind {
             SeqKind::Vector => "Vector",
             SeqKind::Set(HashRep::Small) => "Set",
             SeqKind::Set(HashRep::Hashed | HashRep::Mutable(_)) => "HashSet",
+            SeqKind::Set(HashRep::Linked) => "LinkedHashSet",
             SeqKind::Iterable => "Iterable",
             SeqKind::ArraySeq => "ArraySeq",
             SeqKind::Array => "Array",
             SeqKind::ListBuffer => "ListBuffer",
             SeqKind::ArrayBuffer => "ArrayBuffer",
+            SeqKind::Queue => "Queue",
+            SeqKind::Stack => "Stack",
+            SeqKind::ArrayDeque => "ArrayDeque",
+            SeqKind::StrBuf => "StringBuilder",
             SeqKind::Range { .. } => "Range",
         }
     }
@@ -880,17 +954,22 @@ impl SeqKind {
     fn is_mutable(self) -> bool {
         matches!(
             self,
-            SeqKind::Array
-                | SeqKind::ListBuffer
-                | SeqKind::ArrayBuffer
-                | SeqKind::Set(HashRep::Mutable(_))
-        )
+            SeqKind::Array | SeqKind::Set(HashRep::Mutable(_) | HashRep::Linked)
+        ) || self.is_buffer()
     }
 
     /// Whether this kind is a growable buffer (`+=`, `append`, `remove`) — an
     /// `Array` is mutable but fixed-length, so it is not one.
     fn is_buffer(self) -> bool {
-        matches!(self, SeqKind::ListBuffer | SeqKind::ArrayBuffer)
+        matches!(
+            self,
+            SeqKind::ListBuffer
+                | SeqKind::ArrayBuffer
+                | SeqKind::Queue
+                | SeqKind::Stack
+                | SeqKind::ArrayDeque
+                | SeqKind::StrBuf
+        )
     }
 
     /// Whether this kind is a `Set` (any representation). A `Set` is `Iterable`
@@ -1079,6 +1158,29 @@ pub fn make_char(c: char) -> Value {
     })
 }
 
+/// The characters of `v`'s `String.valueOf`, as interned `Char` values — the
+/// elements a `StringBuilder` addition contributes.
+fn str_chars(v: &Value) -> Vec<Value> {
+    scala_str(v).chars().map(make_char).collect()
+}
+
+/// `java.util.NoSuchElementException: empty collection` — what a `Queue`/`Stack`
+/// / `ArrayDeque` removal raises with nothing to remove.
+fn empty_collection() -> String {
+    "scalars: java.util.NoSuchElementException: empty collection".into()
+}
+
+/// The peek (`Stack.top`, `Queue.front`) counterpart, which names the receiver.
+fn empty_head_of(label: &str) -> String {
+    format!("scalars: java.util.NoSuchElementException: head of empty {label}")
+}
+
+/// `java.lang.StringBuilder`'s out-of-range message, which reports the length
+/// rather than the max index.
+fn string_index_len(i: i64, len: usize) -> String {
+    format!("scalars: java.lang.StringIndexOutOfBoundsException: index {i}, length {len}")
+}
+
 /// The `char` behind `v`, if `v` is a `Char`. This is the exact test that the
 /// old one-character-`String` model could only approximate.
 fn as_char(v: &Value) -> Option<char> {
@@ -1113,63 +1215,143 @@ fn unit_value() -> Value {
     heap_push(HeapVal::Tuple(Vec::new()))
 }
 
-/// [`MAKE_ORDERING`] — build the natural `Ordering`.
-fn b_make_ordering(_vm: &mut VM, _argc: u8) -> Value {
-    heap_push(HeapVal::Ordering { reversed: false })
+/// Build an `Ordering` value. `key`/`lt` are `Value::Undef` for the natural one.
+fn make_ordering(key: Value, lt: Value, reversed: bool) -> Value {
+    heap_push(HeapVal::Ordering { key, lt, reversed })
+}
+
+/// [`MAKE_ORDERING`] — build an `Ordering` from a companion member. A member
+/// name arrives beneath its arguments only for the two FACTORIES that take a
+/// function; every other member names the natural ordering and is called with
+/// no arguments at all.
+fn b_make_ordering(vm: &mut VM, argc: u8) -> Value {
+    if argc == 0 {
+        return make_ordering(Value::Undef, Value::Undef, false);
+    }
+    let name = vm.pop().as_str_cow().into_owned();
+    let n = (argc as usize).saturating_sub(1);
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    match (name.as_str(), args.len()) {
+        ("by", 1) => make_ordering(args[0].clone(), Value::Undef, false),
+        ("fromLessThan", 1) => make_ordering(Value::Undef, args[0].clone(), false),
+        // Every other companion member names the natural ordering, for the
+        // reason `MAKE_ORDERING` gives: the member picks the element TYPE, which
+        // is erased here.
+        (_, 0) => make_ordering(Value::Undef, Value::Undef, false),
+        _ => fault(
+            vm,
+            format!("scalars: value {name} is not a member of object Ordering"),
+        ),
+    }
 }
 
 /// `scala.math.Ordering`'s methods. `reverse` flips the direction and `compare`
 /// answers the three-way result; `lt`/`gt`/`lteq`/`gteq`/`equiv` are the
 /// predicates Scala derives from `compare`, and `max`/`min` pick under it.
-fn ordering_method(reversed: bool, name: &str, args: &[Value]) -> Result<Value, String> {
-    let cmp = |a: &Value, b: &Value| {
-        let o = value_cmp(a, b);
-        if reversed {
-            o.reverse()
-        } else {
-            o
-        }
-    };
-    match (name, args.len()) {
-        ("reverse", 0) => Ok(heap_push(HeapVal::Ordering {
-            reversed: !reversed,
-        })),
-        ("compare", 2) => Ok(Value::int(match cmp(&args[0], &args[1]) {
-            Ordering::Less => -1,
-            Ordering::Equal => 0,
-            Ordering::Greater => 1,
-        })),
-        ("lt", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) == Ordering::Less)),
-        ("gt", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) == Ordering::Greater)),
-        ("lteq", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) != Ordering::Greater)),
-        ("gteq", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) != Ordering::Less)),
-        ("equiv", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) == Ordering::Equal)),
-        // Scala's `Ordering.max`/`min` keep the FIRST argument on a tie.
-        ("max", 2) => Ok(if cmp(&args[0], &args[1]) == Ordering::Less {
-            args[1].clone()
-        } else {
-            args[0].clone()
+/// `on(f)` derives an ordering that compares by `f`'s result.
+///
+/// Takes the VM because a keyed or `fromLessThan` ordering runs a user closure
+/// to compare.
+fn ordering_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let (key, lt, reversed) = as_ordering(recv)?;
+    let cmp = |vm: &mut VM| ordering_cmp(vm, recv, &args[0], &args[1]);
+    Some(match (name, args.len()) {
+        ("reverse", 0) => Ok(make_ordering(key, lt, !reversed)),
+        // `ord.on(f)` sorts by `f`'s result under `ord`. Composing two key
+        // functions is not modeled, so an `on` over an already-keyed ordering is
+        // rejected rather than silently dropping one of them.
+        ("on", 1) => match key {
+            Value::Undef => Ok(make_ordering(args[0].clone(), lt, reversed)),
+            _ => Err("scalars: Ordering.on over an already-keyed Ordering is not modeled".into()),
+        },
+        // `Ordering.Double.TotalOrdering` / `.IeeeOrdering` select an ordering of
+        // NaN. `value_cmp` has one total order, which is `TotalOrdering`'s.
+        ("TotalOrdering" | "IeeeOrdering", 0) => Ok(recv.clone()),
+        ("compare", 2) => cmp(vm).map(|o| {
+            Value::int(match o {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            })
         }),
-        ("min", 2) => Ok(if cmp(&args[1], &args[0]) == Ordering::Less {
-            args[1].clone()
-        } else {
-            args[0].clone()
+        ("lt", 2) => cmp(vm).map(|o| Value::bool(o == Ordering::Less)),
+        ("gt", 2) => cmp(vm).map(|o| Value::bool(o == Ordering::Greater)),
+        ("lteq", 2) => cmp(vm).map(|o| Value::bool(o != Ordering::Greater)),
+        ("gteq", 2) => cmp(vm).map(|o| Value::bool(o != Ordering::Less)),
+        ("equiv", 2) => cmp(vm).map(|o| Value::bool(o == Ordering::Equal)),
+        // Scala's `Ordering.max`/`min` keep the FIRST argument on a tie.
+        ("max", 2) => cmp(vm).map(|o| {
+            if o == Ordering::Less {
+                args[1].clone()
+            } else {
+                args[0].clone()
+            }
+        }),
+        ("min", 2) => cmp(vm).map(|o| {
+            if o == Ordering::Greater {
+                args[1].clone()
+            } else {
+                args[0].clone()
+            }
         }),
         _ => Err(format!("scalars: value {name} is not a member of Ordering")),
-    }
+    })
 }
 
-/// The direction of `v` when it is an `Ordering`, for the collection methods
-/// that take one (`sorted`, `max`, `min`, `maxBy`, `minBy`, `sortBy`).
-fn as_ordering(v: &Value) -> Option<bool> {
+/// The `(key, lt, reversed)` state of `v` when it is an `Ordering`, for the
+/// collection methods that take one (`sorted`, `max`, `min`, `maxBy`, `minBy`,
+/// `sortBy`).
+fn as_ordering(v: &Value) -> Option<(Value, Value, bool)> {
     if let Value::Obj(id) = v {
         HEAP.with(|h| match h.borrow().get(*id as usize) {
-            Some(HeapVal::Ordering { reversed }) => Some(*reversed),
+            Some(HeapVal::Ordering { key, lt, reversed }) => {
+                Some((key.clone(), lt.clone(), *reversed))
+            }
             _ => None,
         })
     } else {
         None
     }
+}
+
+/// Compare `a` and `b` under `ord`: extract the sort keys, apply the ordering's
+/// own comparison, then flip for a `reverse`. Only this path needs the VM,
+/// because a keyed or `fromLessThan` ordering runs a user closure.
+fn ordering_cmp(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Ordering, String> {
+    let Some((key, lt, reversed)) = as_ordering(ord) else {
+        return Err("scalars: expected an Ordering".into());
+    };
+    let (a, b) = match key {
+        Value::Undef => (a.clone(), b.clone()),
+        f => (
+            invoke_closure(vm, &f, std::slice::from_ref(a))?,
+            invoke_closure(vm, &f, std::slice::from_ref(b))?,
+        ),
+    };
+    let base = match lt {
+        Value::Undef => value_cmp(&a, &b),
+        // `Ordering.fromLessThan(lt)` is defined by its `lt` alone: equal when
+        // neither side is less than the other.
+        f => {
+            if truthy(&invoke_closure(vm, &f, &[a.clone(), b.clone()])?) {
+                Ordering::Less
+            } else if truthy(&invoke_closure(vm, &f, &[b, a])?) {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+    };
+    Ok(if reversed { base.reverse() } else { base })
 }
 
 /// Scala's `toChar`: the value truncated to 16 bits. An unpaired surrogate is
@@ -1526,6 +1708,107 @@ fn b_make_arraybuffer(vm: &mut VM, argc: u8) -> Value {
     new_seq(SeqKind::ArrayBuffer, pop_n(vm, argc))
 }
 
+/// `FROM_SEQ` builtin — pop the constructor name and the source collection, and
+/// build that constructor's collection from the source's elements.
+fn b_from_seq(vm: &mut VM, _argc: u8) -> Value {
+    let ctor = vm.pop().as_str_cow().into_owned();
+    let src = vm.pop();
+    // A `Map`-shaped source spreads as its `(k, v)` pairs, matching what
+    // `Map(m.toList: _*)` hands the factory.
+    let items = match as_seq_or_tuple(&src) {
+        Some(xs) => xs,
+        None => match as_map(&src) {
+            Some(m) => m.into_iter().map(new_pair_of).collect(),
+            None => vec![src.clone()],
+        },
+    };
+    let pairs = |vm: &mut VM| -> Option<Vec<(Value, Value)>> {
+        let mut out = Vec::with_capacity(items.len());
+        for p in &items {
+            match as_seq_or_tuple(p) {
+                Some(t) if t.len() == 2 => out.push((t[0].clone(), t[1].clone())),
+                _ => {
+                    fault(vm, "scalars: Map(...) expects `key -> value` pairs");
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    };
+    match ctor.as_str() {
+        "List" => new_seq(SeqKind::List, items),
+        "Vector" => new_seq(SeqKind::Vector, items),
+        "ArraySeq" => new_seq(SeqKind::ArraySeq, items),
+        "Array" => new_seq(SeqKind::Array, items),
+        "ListBuffer" => new_seq(SeqKind::ListBuffer, items),
+        "ArrayBuffer" => new_seq(SeqKind::ArrayBuffer, items),
+        "Queue" => new_seq(SeqKind::Queue, items),
+        "Stack" => new_seq(SeqKind::Stack, items),
+        "ArrayDeque" => new_seq(SeqKind::ArrayDeque, items),
+        "StringBuilder" => new_seq(SeqKind::StrBuf, items.iter().flat_map(str_chars).collect()),
+        "Set" => new_set(HashRep::Small, items),
+        "LinkedHashSet" => new_set(HashRep::Linked, items),
+        "mutable.Set" => mut_set_from(mut_initial_len(items.len()), items),
+        "Map" => match pairs(vm) {
+            Some(e) => new_map(HashRep::Small, e),
+            None => Value::Undef,
+        },
+        "LinkedHashMap" => match pairs(vm) {
+            Some(e) => new_map(HashRep::Linked, e),
+            None => Value::Undef,
+        },
+        "mutable.Map" => match pairs(vm) {
+            Some(e) => mut_map_from(mut_initial_len(items.len()), e),
+            None => Value::Undef,
+        },
+        other => fault(
+            vm,
+            format!("scalars: unknown collection constructor `{other}`"),
+        ),
+    }
+}
+
+/// `MAKE_QUEUE` / `MAKE_STACK` / `MAKE_ARRAYDEQUE` builtins — pop `argc`
+/// elements into the matching `scala.collection.mutable` buffer.
+fn b_make_queue(vm: &mut VM, argc: u8) -> Value {
+    new_seq(SeqKind::Queue, pop_n(vm, argc))
+}
+
+fn b_make_stack(vm: &mut VM, argc: u8) -> Value {
+    new_seq(SeqKind::Stack, pop_n(vm, argc))
+}
+
+fn b_make_arraydeque(vm: &mut VM, argc: u8) -> Value {
+    new_seq(SeqKind::ArrayDeque, pop_n(vm, argc))
+}
+
+/// `MAKE_STRINGBUILDER` builtin — pop `argc` values and seed the builder with
+/// each one's characters, so `new StringBuilder("ab")` starts at `ab` and the
+/// no-argument `new StringBuilder` starts empty.
+fn b_make_stringbuilder(vm: &mut VM, argc: u8) -> Value {
+    let seeds = pop_n(vm, argc);
+    new_seq(SeqKind::StrBuf, seeds.iter().flat_map(str_chars).collect())
+}
+
+/// `MAKE_LINKEDSET` builtin — pop `argc` elements into an insertion-ordered
+/// `mutable.LinkedHashSet`.
+fn b_make_linkedset(vm: &mut VM, argc: u8) -> Value {
+    new_set(HashRep::Linked, pop_n(vm, argc))
+}
+
+/// `MAKE_LINKEDMAP` builtin — the `mutable.LinkedHashMap` counterpart.
+fn b_make_linkedmap(vm: &mut VM, argc: u8) -> Value {
+    let pairs = pop_n(vm, argc);
+    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
+    for p in &pairs {
+        match as_seq_or_tuple(p) {
+            Some(t) if t.len() == 2 => entries.push((t[0].clone(), t[1].clone())),
+            _ => return fault(vm, "scalars: Map(...) expects `key -> value` pairs"),
+        }
+    }
+    new_map(HashRep::Linked, entries)
+}
+
 /// `MAKE_MUTSET` builtin — pop `argc` elements into a `mutable.HashSet` whose
 /// table starts where `HashSet.from` would put it for `argc` inputs.
 fn b_make_mutset(vm: &mut VM, argc: u8) -> Value {
@@ -1549,7 +1832,10 @@ fn b_make_mutmap(vm: &mut VM, argc: u8) -> Value {
 fn b_is_growable(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
     let mutable_seq = seq_kind_items(&v).is_some_and(|(k, _)| k.is_mutable());
-    let mutable_map = matches!(map_rep_entries(&v), Some((HashRep::Mutable(_), _)));
+    let mutable_map = matches!(
+        map_rep_entries(&v),
+        Some((HashRep::Mutable(_) | HashRep::Linked, _))
+    );
     Value::bool(mutable_seq || mutable_map)
 }
 
@@ -2034,6 +2320,115 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     }
 }
 
+/// The class tag of the record a `getClass` answers.
+const CLASS_CLASS: &str = "java.lang.Class";
+
+/// `xs.sortBy(f)(ord)` — sort by `f`'s result under `ord`, i.e. `ord.on(f)`.
+fn make_keyed_ordering(vm: &mut VM, f: &Value, ord: &Value) -> Result<Value, String> {
+    match ordering_method(vm, ord, "on", std::slice::from_ref(f)) {
+        Some(r) => r,
+        None => Err("scalars: expected an Ordering".into()),
+    }
+}
+
+/// `xs.max(ord)` / `xs.min(ord)` and their `By` forms: the extreme element under
+/// `ord`. Ties keep the FIRST element, as Scala's `reduceLeft`-based `max` does.
+fn best_by_ordering(
+    vm: &mut VM,
+    ord: &Value,
+    items: &[Value],
+    name: &str,
+) -> Result<Value, String> {
+    let Some(first) = items.first() else {
+        return Err(format!(
+            "scalars: java.lang.UnsupportedOperationException: empty.{name}"
+        ));
+    };
+    let want = if name.starts_with("max") {
+        Ordering::Greater
+    } else {
+        Ordering::Less
+    };
+    let mut best = first.clone();
+    for it in &items[1..] {
+        if ordering_cmp(vm, ord, it, &best)? == want {
+            best = it.clone();
+        }
+    }
+    Ok(best)
+}
+
+/// Sort `items` under `ord`, stably. Written as an insertion merge rather than
+/// `sort_by` because the comparison runs a user closure, which may raise and
+/// which `slice::sort_by` would panic on if it were inconsistent.
+fn sort_by_ordering(vm: &mut VM, ord: &Value, items: &[Value]) -> Result<Vec<Value>, String> {
+    let mut out: Vec<Value> = Vec::with_capacity(items.len());
+    for it in items {
+        let mut at = out.len();
+        while at > 0 && ordering_cmp(vm, ord, it, &out[at - 1])? == Ordering::Less {
+            at -= 1;
+        }
+        out.insert(at, it.clone());
+    }
+    Ok(out)
+}
+
+/// `x.getClass` — a `java.lang.Class` record carrying the two names a program
+/// reads off it. The names are stored as FIELDS called `getName`/`getSimpleName`
+/// so the ordinary paren-less field read in [`obj_method`] answers them.
+///
+/// Only the receivers whose JVM class this frontend can name faithfully are
+/// answered. A collection's runtime class is a private implementation detail
+/// (`List(1).getClass.getName` is `scala.collection.immutable.$colon$colon`, a
+/// `Vector` of one is `Vector1`, and a `Tuple2[Int, Int]` carries the
+/// specialization suffix `Tuple2$mcII$sp`) — reproducing those would mean
+/// modelling Scala's class hierarchy and its `@specialized` naming, so they stay
+/// an error rather than becoming a plausible-looking wrong answer.
+fn class_of(recv: &Value) -> Result<Value, String> {
+    // `(name, simple, primitive)`. A primitive's `Class.toString` is the bare
+    // name (`int`); a reference type's is `class java.lang.String`.
+    let (name, simple, primitive) = match recv {
+        Value::Str(_) => ("java.lang.String".to_string(), "String".to_string(), false),
+        Value::Int(_) => ("int".to_string(), "int".to_string(), true),
+        Value::Float(_) => ("double".to_string(), "double".to_string(), true),
+        Value::Bool(_) => ("boolean".to_string(), "boolean".to_string(), true),
+        Value::Undef => ("void".to_string(), "void".to_string(), true),
+        Value::Obj(_) if as_char(recv).is_some() => ("char".to_string(), "char".to_string(), true),
+        // A built-in throwable knows its own fully-qualified JDK name.
+        Value::Obj(_) if as_exc(recv).is_some() => {
+            let n = as_exc(recv).expect("just matched").class.to_string();
+            let simple = n.rsplit('.').next().unwrap_or(&n).to_string();
+            (n, simple, false)
+        }
+        // A user `class`/`case class`/`object`. There are no packages here, so
+        // the qualified and simple names coincide — except for an `object`,
+        // whose JVM class carries the `$` suffix Scala appends.
+        Value::Obj(_) => {
+            let Some((class, is_object)) = with_obj(recv, |o| (o.class.to_string(), o.is_object))
+            else {
+                return Err(no_such_method(recv, "getClass"));
+            };
+            let n = if is_object {
+                format!("{class}$")
+            } else {
+                class
+            };
+            (n.clone(), n, false)
+        }
+        _ => return Err(no_such_method(recv, "getClass")),
+    };
+    Ok(heap_alloc(ScalaObj {
+        class: Arc::from(CLASS_CLASS),
+        is_case: false,
+        is_object: false,
+        fields: vec![
+            (Arc::from("getName"), Value::str(name)),
+            (Arc::from("getSimpleName"), Value::str(simple)),
+            (Arc::from("isPrimitive"), Value::bool(primitive)),
+        ],
+    }))
+}
+
 /// The primary-constructor prefix of a record's fields — exactly what Scala's
 /// derived `Product`/`unapply`/`toString` expose (an inherited or body-declared
 /// field is not a product element).
@@ -2058,6 +2453,23 @@ fn obj_to_string(v: &Value) -> String {
         let h = h.borrow();
         match h.get(id as usize) {
             Some(HeapVal::Record(o)) => {
+                // `java.lang.Class.toString` is `class <name>` for a reference
+                // type and the bare name for a primitive (`int`, `void`).
+                if &*o.class == CLASS_CLASS {
+                    let field = |n: &str| {
+                        o.fields
+                            .iter()
+                            .find(|(f, _)| &**f == n)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Value::Undef)
+                    };
+                    let name = scala_str(&field("getName"));
+                    return if truthy(&field("isPrimitive")) {
+                        name
+                    } else {
+                        format!("class {name}")
+                    };
+                }
                 if o.is_case && o.is_object {
                     // A `case object` prints as its bare name (`None`), not `None()`.
                     o.class.to_string()
@@ -2085,6 +2497,10 @@ fn obj_to_string(v: &Value) -> String {
                 },
                 items,
             )) => range_to_string(*start, *end, *inclusive, *step, items.is_empty()),
+            // `StringBuilder.toString` is the contents, not a rendered sequence.
+            Some(HeapVal::Seq(SeqKind::StrBuf, items)) => {
+                items.iter().map(scala_str).collect::<String>()
+            }
             Some(HeapVal::Seq(kind, items)) => {
                 let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(", ");
                 format!("{}({inner})", kind.label())
@@ -2097,6 +2513,7 @@ fn obj_to_string(v: &Value) -> String {
                     .join(", ");
                 let label = match rep {
                     HashRep::Hashed | HashRep::Mutable(_) => "HashMap",
+                    HashRep::Linked => "LinkedHashMap",
                     HashRep::Small => "Map",
                 };
                 format!("{label}({inner})")
@@ -3072,6 +3489,11 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
                 None => Value::Undef,
             },
             "toString" => Value::str(exc_to_string(&e)),
+            // The usual way a program names an exception's type.
+            "getClass" => match class_of(&recv) {
+                Ok(v) => v,
+                Err(msg) => fault(vm, msg),
+            },
             _ => fault(
                 vm,
                 format!("scalars: value {name} is not a member of {}", e.class),
@@ -3089,6 +3511,15 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
                 Err(e) => fault(vm, e),
             };
         }
+    }
+
+    // An `Ordering`'s surface. Dispatched here rather than in `obj_method`
+    // because `compare`/`lt`/… may run the key function, which needs the VM.
+    if let Some(r) = ordering_method(vm, &recv, &name, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(e) => fault(vm, e),
+        };
     }
 
     // `Option`'s surface. Dispatched here rather than in `obj_method` because
@@ -3275,14 +3706,31 @@ fn mut_seq_method(
         SeqKind::Set(HashRep::Mutable(n)) => Some(n as usize),
         _ => None,
     };
-    let is_set = set_len.is_some();
+    // A `LinkedHashSet` is mutable but has no table order to replay: it iterates
+    // its insertion list, so an add appends and a remove unlinks.
+    let linked_set = matches!(kind, SeqKind::Set(HashRep::Linked));
+    let is_set = set_len.is_some() || linked_set;
     let buffer = kind.is_buffer();
+    let strbuf = kind == SeqKind::StrBuf;
     let me = || Ok(recv.clone());
     // Whether `args[0]` is a collection of elements (`++=`) or one element.
     let all = matches!(
         name,
         "++=" | "addAll" | "appendAll" | "prependAll" | "--=" | "subtractAll"
     );
+    // What a `StringBuilder` addition contributes: the characters of a `Char`
+    // sequence for the `All` forms (`sb ++= List('a','b')`), and otherwise the
+    // characters of the argument's `String.valueOf` — which is why
+    // `sb.append(7)` appends `'7'` and `sb.append(List(1,2))` appends
+    // `List(1, 2)`.
+    let chars_of = |v: &Value| -> Vec<Value> {
+        if all {
+            if let Some(elems) = as_seq_or_tuple(v) {
+                return elems.iter().flat_map(str_chars).collect();
+            }
+        }
+        str_chars(v)
+    };
 
     match (name, args.len()) {
         // Additions. `+=`/`++=` answer the receiver; `add` answers whether the
@@ -3290,11 +3738,28 @@ fn mut_seq_method(
         ("+=" | "++=" | "addOne" | "addAll" | "append" | "appendAll" | "add", 1)
             if is_set || buffer =>
         {
-            let adds = spread(&args[0], all);
-            if let Some(len) = set_len {
+            let adds = if strbuf {
+                chars_of(&args[0])
+            } else {
+                spread(&args[0], all)
+            };
+            if is_set {
                 let absent = !items.iter().any(|u| value_eq(u, &args[0]));
-                let hint = all.then(|| known_size(&args[0])).flatten();
-                mut_set_add(recv, len, items, &adds, hint);
+                match set_len {
+                    Some(len) => {
+                        let hint = all.then(|| known_size(&args[0])).flatten();
+                        mut_set_add(recv, len, items, &adds, hint);
+                    }
+                    None => {
+                        let mut out = items.to_vec();
+                        for a in adds {
+                            if !out.iter().any(|u| value_eq(u, &a)) {
+                                out.push(a);
+                            }
+                        }
+                        set_seq_items(recv, kind, out);
+                    }
+                }
                 return Some(if name == "add" {
                     Ok(Value::bool(absent))
                 } else {
@@ -3307,8 +3772,88 @@ fn mut_seq_method(
             Some(me())
         }
         ("+=:" | "prepend" | "prependAll", 1) if buffer => {
-            let mut out = spread(&args[0], all);
+            let mut out = if strbuf {
+                chars_of(&args[0])
+            } else {
+                spread(&args[0], all)
+            };
             out.extend_from_slice(items);
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
+        // `Queue.enqueue` appends; `Stack.push` PREPENDS, because a `Stack`'s
+        // head is its top.
+        ("enqueue" | "enqueueAll", 1) if kind == SeqKind::Queue => {
+            let mut out = items.to_vec();
+            out.extend(spread(&args[0], name == "enqueueAll"));
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
+        ("push", 1) if kind == SeqKind::Stack => {
+            let mut out = vec![args[0].clone()];
+            out.extend_from_slice(items);
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
+        // The head-and-tail removals: `Queue.dequeue`, `Stack.pop` and
+        // `ArrayDeque.removeHead`/`removeLast` all answer the element they took.
+        ("dequeue" | "pop" | "removeHead" | "removeLast", 0) if buffer => {
+            if items.is_empty() {
+                return Some(Err(empty_collection()));
+            }
+            let mut out = items.to_vec();
+            let gone = if name == "removeLast" {
+                out.pop().expect("non-empty")
+            } else {
+                out.remove(0)
+            };
+            set_seq_items(recv, kind, out);
+            Some(Ok(gone))
+        }
+        // `Stack.top` / `Queue.front` peek without removing.
+        ("top" | "front", 0) if buffer => match items.first() {
+            Some(v) => Some(Ok(v.clone())),
+            None => Some(Err(empty_head_of(kind.label()))),
+        },
+        // `StringBuilder`'s own character-level mutators.
+        ("deleteCharAt", 1) | ("setCharAt", 2) if strbuf => {
+            let i = args[0].to_int();
+            if i < 0 || i as usize >= items.len() {
+                return Some(Err(string_index_len(i, items.len())));
+            }
+            let mut out = items.to_vec();
+            if name == "setCharAt" {
+                out[i as usize] = args[1].clone();
+            } else {
+                out.remove(i as usize);
+            }
+            set_seq_items(recv, kind, out);
+            // Both answer the builder (`this.type`), so they chain.
+            Some(me())
+        }
+        // `setLength` truncates, or pads with NUL as `java.lang.StringBuilder`
+        // does.
+        ("setLength", 1) if strbuf => {
+            let n = args[0].to_int();
+            if n < 0 {
+                return Some(Err(string_index_len(n, items.len())));
+            }
+            let mut out = items.to_vec();
+            out.resize(n as usize, make_char('\0'));
+            set_seq_items(recv, kind, out);
+            Some(Ok(Value::Undef))
+        }
+        // `result()` freezes the builder's contents into a `String`.
+        ("result", 0) if strbuf => Some(Ok(Value::str(
+            items.iter().map(scala_str).collect::<String>(),
+        ))),
+        ("insert", 2) if strbuf => {
+            let i = args[0].to_int();
+            if i < 0 || i as usize > items.len() {
+                return Some(Err(string_index_len(i, items.len())));
+            }
+            let mut out = items.to_vec();
+            out.splice(i as usize..i as usize, str_chars(&args[1]));
             set_seq_items(recv, kind, out);
             Some(me())
         }
@@ -3372,24 +3917,34 @@ fn mut_seq_method(
     }
 }
 
-/// Replace the contents (and table length) of the `mutable.Map` behind `recv`.
-fn set_map_entries(recv: &Value, len: usize, entries: Vec<(Value, Value)>) {
-    let ordered = mut_ordered(&entries, len, |(k, _)| k.clone()).unwrap_or(entries);
+/// Replace the contents (and, for a `HashMap`, the table length) of the mutable
+/// map behind `recv`. A `LinkedHashMap` iterates its insertion list, so its
+/// entries are stored exactly as given; a `HashMap` is re-sorted into the
+/// iteration order a table of `len` buckets produces.
+fn set_map_entries(recv: &Value, into: HashRep, entries: Vec<(Value, Value)>) {
+    let ordered = match into {
+        HashRep::Mutable(len) => {
+            mut_ordered(&entries, len as usize, |(k, _)| k.clone()).unwrap_or(entries)
+        }
+        _ => entries,
+    };
     if let Value::Obj(id) = recv {
         HEAP.with(|h| {
             if let Some(HeapVal::Map(rep, m)) = h.borrow_mut().get_mut(*id as usize) {
-                *rep = HashRep::Mutable(len as u32);
+                *rep = into;
                 *m = ordered;
             }
         });
     }
 }
 
-/// Put `adds` into the `mutable.HashMap` behind `recv`, replaying `put0`'s
-/// growth. Answers the value a repeated key displaced, for `put`.
+/// Put `adds` into the mutable map behind `recv`. On a `HashMap` this replays
+/// `put0`'s table growth; on a `LinkedHashMap` there is no table order, so the
+/// insertion list is simply appended to. Answers the value a repeated key
+/// displaced, for `put`.
 fn mut_map_put(
     recv: &Value,
-    len: usize,
+    rep: HashRep,
     entries: &[(Value, Value)],
     adds: &[(Value, Value)],
     hint: Option<usize>,
@@ -3410,8 +3965,15 @@ fn mut_map_put(
             }
         }
     }
-    let len = mut_grown(mut_size_hint(len, hint), entries.len(), &flags);
-    set_map_entries(recv, len, cur);
+    let into = match rep {
+        HashRep::Mutable(len) => {
+            HashRep::Mutable(
+                mut_grown(mut_size_hint(len as usize, hint), entries.len(), &flags) as u32,
+            )
+        }
+        other => other,
+    };
+    set_map_entries(recv, into, cur);
     displaced
 }
 
@@ -3419,7 +3981,7 @@ fn mut_map_put(
 /// read-only implementation.
 fn mut_map_method(
     recv: &Value,
-    len: usize,
+    rep: HashRep,
     entries: &[(Value, Value)],
     name: &str,
     args: &[Value],
@@ -3449,7 +4011,7 @@ fn mut_map_method(
             Some(adds) => {
                 mut_map_put(
                     recv,
-                    len,
+                    rep,
                     entries,
                     &adds,
                     all.then(|| known_size(&args[0])).flatten(),
@@ -3461,7 +4023,7 @@ fn mut_map_method(
         ("update", 2) => {
             mut_map_put(
                 recv,
-                len,
+                rep,
                 entries,
                 &[(args[0].clone(), args[1].clone())],
                 None,
@@ -3471,7 +4033,7 @@ fn mut_map_method(
         ("put", 2) => {
             let old = mut_map_put(
                 recv,
-                len,
+                rep,
                 entries,
                 &[(args[0].clone(), args[1].clone())],
                 None,
@@ -3483,7 +4045,7 @@ fn mut_map_method(
             None => {
                 mut_map_put(
                     recv,
-                    len,
+                    rep,
                     entries,
                     &[(args[0].clone(), args[1].clone())],
                     None,
@@ -3504,11 +4066,11 @@ fn mut_map_method(
                 .filter(|(k, _)| !drop.iter().any(|d| value_eq(d, k)))
                 .cloned()
                 .collect();
-            set_map_entries(recv, len, kept);
+            set_map_entries(recv, rep, kept);
             Some(if name == "remove" { Ok(opt(old)) } else { me() })
         }
         ("clear", 0) => {
-            set_map_entries(recv, len, Vec::new());
+            set_map_entries(recv, rep, Vec::new());
             Some(Ok(Value::Undef))
         }
         _ => None,
@@ -3530,12 +4092,35 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // A transforming op keeps the receiver's collection kind (`List.map` → `List`,
     // a range-derived `Vector.map` → `Vector`).
     let same = |v: Vec<Value>| derive_seq(kind, v);
+    // A transforming op whose element type may change takes its builder from
+    // `iterableFactory` rather than `fromSpecific`. Every kind here rebuilds
+    // itself except `StringBuilder`, which is a `mutable.IndexedSeq` and so
+    // falls back to that trait's factory: `sb.map(_.toUpper)` is an
+    // `ArrayBuffer`, where the selecting `sb.filter(…)` is a `StringBuilder`.
+    let mapped = |v: Vec<Value>| match kind {
+        SeqKind::StrBuf => new_seq(SeqKind::ArrayBuffer, v),
+        _ => derive_seq(kind, v),
+    };
     // In-place mutation (`+=`, `clear()`, …) — before the pure paths, because
     // several names (`+`, `-`, `++`) mean "mutate me" on a mutable receiver and
     // "build a new one" on an immutable one.
     if kind.is_mutable() {
         if let Some(r) = mut_seq_method(recv, kind, &items, name, args) {
             return r;
+        }
+    }
+    // A `StringBuilder` is a `CharSequence` as well as a `Seq[Char]`, and the
+    // text-shaped members it forwards to `java.lang.StringBuilder` are not
+    // sequence operations at all. `indexOf`/`lastIndexOf` are overloaded on both
+    // sides, so only a STRING argument takes the text one — a `Char` argument
+    // still means `SeqOps.indexOf(elem)`.
+    if kind == SeqKind::StrBuf {
+        let text_arg = matches!(args.first(), Some(Value::Str(_)));
+        if matches!(name, "substring" | "charAt")
+            || (text_arg && matches!(name, "indexOf" | "lastIndexOf"))
+        {
+            let text: String = items.iter().map(scala_str).collect();
+            return string_method(&text, name, args);
         }
     }
     // The pure slice/reorder methods first — they share one body.
@@ -3585,12 +4170,10 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             ))
         }
         // In-place element assignment (`a(i) = v`), the desugar target of
-        // `Array.update`. Only an `Array` is mutable in Scala.
+        // `Array.update`. Only a `mutable.Seq` answers it — an `Array` or one of
+        // the growable buffers.
         ("update", 2) => {
-            if !matches!(
-                kind,
-                SeqKind::Array | SeqKind::ListBuffer | SeqKind::ArrayBuffer
-            ) {
+            if !(kind == SeqKind::Array || kind.is_buffer()) {
                 return Err(no_such_method(recv, name));
             }
             let i = args[0].to_int();
@@ -3609,12 +4192,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(Value::Undef)
         }
-        // `max`/`min`, with or without an explicit `Ordering`. A reversed one
-        // swaps which end they pick, so `xs.max(Ordering.Int.reverse)` is the
-        // minimum.
-        ("min", 0) | ("max", 0) | ("min", 1) | ("max", 1) => {
-            let flip = args.first().and_then(as_ordering).unwrap_or(false);
-            let want = if (name == "max") != flip {
+        // `max`/`min` under the implicit ordering. The explicit-`Ordering` form
+        // runs a user closure when the ordering is keyed, so it is answered on
+        // the VM-aware arm below.
+        ("min", 0) | ("max", 0) => {
+            let want = if name == "max" {
                 Ordering::Greater
             } else {
                 Ordering::Less
@@ -3684,7 +4266,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             for it in &items {
                 out.push(invoke_closure(vm, &args[0], std::slice::from_ref(it))?);
             }
-            Ok(same(out))
+            Ok(mapped(out))
         }
         ("flatMap", 1) => {
             let mut out = Vec::new();
@@ -3695,7 +4277,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     None => return Err("scalars: flatMap function must return a collection".into()),
                 }
             }
-            Ok(same(out))
+            Ok(mapped(out))
         }
         ("filter" | "filterNot" | "withFilter", 1) => {
             let keep_if = name != "filterNot";
@@ -3725,7 +4307,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     out.push(invoke_closure(vm, &args[0], std::slice::from_ref(it))?);
                 }
             }
-            Ok(same(out))
+            Ok(mapped(out))
         }
         ("collectFirst", 1) => {
             for it in &items {
@@ -3970,6 +4552,24 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             idx.sort_by(|&a, &b| value_cmp(&ks[a], &ks[b]));
             Ok(same(idx.into_iter().map(|i| items[i].clone()).collect()))
         }
+        // An EXPLICIT `Ordering`. Scala passes it as a second (implicit)
+        // parameter list, which this frontend flattens into the same call, so
+        // `xs.sorted(ord)` arrives with one argument and `xs.sortBy(f)(ord)`
+        // with two.
+        ("sorted", 1) if as_ordering(&args[0]).is_some() => {
+            Ok(same(sort_by_ordering(vm, &args[0], &items)?))
+        }
+        ("sortBy", 2) if as_ordering(&args[1]).is_some() => {
+            let keyed = make_keyed_ordering(vm, &args[0], &args[1])?;
+            Ok(same(sort_by_ordering(vm, &keyed, &items)?))
+        }
+        ("max" | "min", 1) if as_ordering(&args[0]).is_some() => {
+            best_by_ordering(vm, &args[0], &items, name)
+        }
+        ("maxBy" | "minBy", 2) if as_ordering(&args[1]).is_some() => {
+            let keyed = make_keyed_ordering(vm, &args[0], &args[1])?;
+            best_by_ordering(vm, &keyed, &items, name)
+        }
         ("sortWith", 1) => {
             // A user `lt` may be inconsistent, and `sort_by` panics on a bad
             // comparator, so the merge is written out (stably) instead.
@@ -4171,8 +4771,8 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         .collect();
     // In-place mutation, before the pure paths: on a `mutable.Map` the names
     // `+`/`-`/`++` still build a new map, but `+=`/`-=`/`update`/`put` mutate.
-    if let HashRep::Mutable(len) = rep {
-        if let Some(r) = mut_map_method(recv, len as usize, &entries, name, args) {
+    if matches!(rep, HashRep::Mutable(_) | HashRep::Linked) {
+        if let Some(r) = mut_map_method(recv, rep, &entries, name, args) {
             return r;
         }
     }
@@ -4566,19 +5166,6 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
             out.sort_by(value_cmp);
             out
         }
-        // `sorted(ord)` — the explicit `Ordering`. Scala's sort is stable, and
-        // `sort_by` is too, so a reversed ordering keeps equal elements in
-        // their original order rather than flipping them.
-        ("sorted", 1) if as_ordering(&args[0]) == Some(true) => {
-            let mut out = items.to_vec();
-            out.sort_by(|a, b| value_cmp(a, b).reverse());
-            out
-        }
-        ("sorted", 1) if as_ordering(&args[0]) == Some(false) => {
-            let mut out = items.to_vec();
-            out.sort_by(value_cmp);
-            out
-        }
         ("flatten", 0) => {
             let mut out = Vec::new();
             for it in items {
@@ -4687,6 +5274,201 @@ fn b_math(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
+/// `BOXED` builtin — pop the `Module.member` name, then its arguments.
+fn b_boxed(vm: &mut VM, argc: u8) -> Value {
+    let qualified = vm.pop().as_str_cow().into_owned();
+    let n = (argc as usize).saturating_sub(1);
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let (module, member) = qualified
+        .rsplit_once('.')
+        .expect("the compiler always emits `Module.member`");
+    match boxed_member(module, member, &args) {
+        Ok(v) => v,
+        Err(e) => fault(vm, e),
+    }
+}
+
+/// `java.lang.NumberFormatException`'s message, which quotes the input.
+fn number_format(s: &str) -> String {
+    format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
+}
+
+/// `java.lang.Integer.toString(i, radix)` — the digits of `i` in `radix`, with a
+/// leading `-` for a negative value (the JDK renders the SIGN, not the two's
+/// complement; only the fixed-width `toBinaryString`/`toHexString`/
+/// `toOctalString` render the bit pattern).
+fn to_radix(mut v: i64, radix: u32) -> String {
+    if !(2..=36).contains(&radix) {
+        // The JDK silently falls back to base 10 for an out-of-range radix.
+        return v.to_string();
+    }
+    if v == 0 {
+        return "0".to_string();
+    }
+    let neg = v < 0;
+    let mut digits = Vec::new();
+    while v != 0 {
+        let d = (v % radix as i64).unsigned_abs() as u32;
+        digits.push(std::char::from_digit(d, radix).expect("digit below radix"));
+        v /= radix as i64;
+    }
+    if neg {
+        digits.push('-');
+    }
+    digits.iter().rev().collect()
+}
+
+/// A boxed-primitive or `String` companion member. The Scala companions
+/// (`Int`, `Double`, …) carry only the `MaxValue`-family constants; the
+/// `java.lang` boxes (`java.Integer`, `java.Character`, …) carry the JDK
+/// statics. The split is Scala's own — `Double.parseDouble` really is "not a
+/// member of object Double" there — so an unknown pairing is an error here too
+/// rather than a quietly accepted superset.
+fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, String> {
+    let unknown = || Err(format!("scalars: value {name} is not a member of {module}"));
+    let i = |k: usize| args[k].to_int();
+    // The JDK's fixed-width renderings show the two's-complement bit pattern at
+    // the box's own width, so `Integer.toHexString(-1)` is 8 digits and
+    // `Long.toHexString(-1)` is 16.
+    let unsigned = |v: i64| -> u64 {
+        if module == "java.Long" {
+            v as u64
+        } else {
+            v as i32 as u32 as u64
+        }
+    };
+    match (module, name, args.len()) {
+        // ── The Scala companions' constants ──────────────────────────────────
+        ("Int", "MaxValue", 0) => Ok(Value::int(i32::MAX as i64)),
+        ("Int", "MinValue", 0) => Ok(Value::int(i32::MIN as i64)),
+        ("Long", "MaxValue", 0) => Ok(Value::int(i64::MAX)),
+        ("Long", "MinValue", 0) => Ok(Value::int(i64::MIN)),
+        ("Short", "MaxValue", 0) => Ok(Value::int(i16::MAX as i64)),
+        ("Short", "MinValue", 0) => Ok(Value::int(i16::MIN as i64)),
+        ("Byte", "MaxValue", 0) => Ok(Value::int(i8::MAX as i64)),
+        ("Byte", "MinValue", 0) => Ok(Value::int(i8::MIN as i64)),
+        ("Char", "MaxValue", 0) => Ok(make_char('\u{ffff}')),
+        ("Char", "MinValue", 0) => Ok(make_char('\0')),
+        ("Double", "MaxValue", 0) => Ok(Value::float(f64::MAX)),
+        ("Double", "MinValue", 0) => Ok(Value::float(f64::MIN)),
+        ("Double", "MinPositiveValue", 0) => Ok(Value::float(f64::from_bits(1))),
+        ("Double", "PositiveInfinity", 0) => Ok(Value::float(f64::INFINITY)),
+        ("Double", "NegativeInfinity", 0) => Ok(Value::float(f64::NEG_INFINITY)),
+        ("Double", "NaN", 0) => Ok(Value::float(f64::NAN)),
+        // ── The `java.lang` boxes' constants ─────────────────────────────────
+        ("java.Integer", "MAX_VALUE", 0) => Ok(Value::int(i32::MAX as i64)),
+        ("java.Integer", "MIN_VALUE", 0) => Ok(Value::int(i32::MIN as i64)),
+        ("java.Long", "MAX_VALUE", 0) => Ok(Value::int(i64::MAX)),
+        ("java.Long", "MIN_VALUE", 0) => Ok(Value::int(i64::MIN)),
+        ("java.Short", "MAX_VALUE", 0) => Ok(Value::int(i16::MAX as i64)),
+        ("java.Short", "MIN_VALUE", 0) => Ok(Value::int(i16::MIN as i64)),
+        ("java.Byte", "MAX_VALUE", 0) => Ok(Value::int(i8::MAX as i64)),
+        ("java.Byte", "MIN_VALUE", 0) => Ok(Value::int(i8::MIN as i64)),
+        ("java.Double", "MAX_VALUE", 0) => Ok(Value::float(f64::MAX)),
+        ("java.Double", "MIN_VALUE", 0) => Ok(Value::float(f64::from_bits(1))),
+        ("java.Double", "NaN", 0) => Ok(Value::float(f64::NAN)),
+        ("java.Double", "POSITIVE_INFINITY", 0) => Ok(Value::float(f64::INFINITY)),
+        ("java.Double", "NEGATIVE_INFINITY", 0) => Ok(Value::float(f64::NEG_INFINITY)),
+        // ── Parsing ──────────────────────────────────────────────────────────
+        // The JDK does NOT trim, so `Integer.parseInt(" 1")` throws where
+        // `" 1".trim.toInt` does not.
+        (
+            "java.Integer" | "java.Long" | "java.Short" | "java.Byte",
+            "parseInt" | "parseLong" | "parseShort" | "parseByte" | "valueOf" | "decode",
+            1,
+        ) if matches!(args[0], Value::Str(_)) => {
+            let s = args[0].as_str_cow();
+            s.parse::<i64>()
+                .map(Value::int)
+                .map_err(|_| number_format(&s))
+        }
+        ("java.Integer" | "java.Long", "parseInt" | "parseLong" | "valueOf", 2) => {
+            let s = args[0].as_str_cow();
+            i64::from_str_radix(&s, i(1) as u32)
+                .map(Value::int)
+                .map_err(|_| number_format(&s))
+        }
+        ("java.Integer" | "java.Long" | "java.Short" | "java.Byte", "valueOf", 1) => {
+            Ok(Value::int(i(0)))
+        }
+        ("java.Double" | "java.Float", "parseDouble" | "parseFloat" | "valueOf", 1) => {
+            let s = args[0].as_str_cow();
+            match &args[0] {
+                Value::Str(_) => s
+                    .trim()
+                    .parse::<f64>()
+                    .map(Value::float)
+                    .map_err(|_| number_format(&s)),
+                other => Ok(Value::float(other.to_float())),
+            }
+        }
+        ("java.Boolean", "parseBoolean" | "valueOf", 1) => Ok(Value::bool(
+            args[0].as_str_cow().eq_ignore_ascii_case("true"),
+        )),
+        ("java.Double" | "java.Float", "isNaN", 1) => Ok(Value::bool(args[0].to_float().is_nan())),
+        ("java.Double" | "java.Float", "isInfinite", 1) => {
+            Ok(Value::bool(args[0].to_float().is_infinite()))
+        }
+        // ── Rendering ────────────────────────────────────────────────────────
+        ("java.Integer" | "java.Long", "toBinaryString", 1) => {
+            Ok(Value::str(format!("{:b}", unsigned(i(0)))))
+        }
+        ("java.Integer" | "java.Long", "toHexString", 1) => {
+            Ok(Value::str(format!("{:x}", unsigned(i(0)))))
+        }
+        ("java.Integer" | "java.Long", "toOctalString", 1) => {
+            Ok(Value::str(format!("{:o}", unsigned(i(0)))))
+        }
+        ("java.Integer" | "java.Long" | "java.Short" | "java.Byte", "toString", 1) => {
+            Ok(Value::str(i(0).to_string()))
+        }
+        ("java.Integer" | "java.Long", "toString", 2) => {
+            Ok(Value::str(to_radix(i(0), i(1) as u32)))
+        }
+        ("java.String", "valueOf", 1) => Ok(Value::str(scala_str(&args[0]))),
+        // ── Arithmetic statics ───────────────────────────────────────────────
+        ("java.Integer" | "java.Long", "compare", 2) => Ok(Value::int(match i(0).cmp(&i(1)) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        })),
+        ("java.Integer" | "java.Long", "max", 2) => Ok(Value::int(i(0).max(i(1)))),
+        ("java.Integer" | "java.Long", "min", 2) => Ok(Value::int(i(0).min(i(1)))),
+        ("java.Integer" | "java.Long", "sum", 2) => Ok(Value::int(i(0) + i(1))),
+        ("java.Integer" | "java.Long", "signum", 1) => Ok(Value::int(i(0).signum())),
+        ("java.Integer", "bitCount", 1) => Ok(Value::int((i(0) as i32).count_ones() as i64)),
+        ("java.Long", "bitCount", 1) => Ok(Value::int(i(0).count_ones() as i64)),
+        // ── `java.lang.Character` ────────────────────────────────────────────
+        ("java.Character", _, 1) => {
+            let c = as_char(&args[0])
+                .or_else(|| char::from_u32(args[0].to_int() as u32))
+                .ok_or_else(|| format!("scalars: {name} expects a Char"))?;
+            match name {
+                "isDigit" => Ok(Value::bool(c.is_numeric())),
+                "isLetter" => Ok(Value::bool(c.is_alphabetic())),
+                "isLetterOrDigit" => Ok(Value::bool(c.is_alphanumeric())),
+                "isWhitespace" | "isSpaceChar" => Ok(Value::bool(c.is_whitespace())),
+                "isUpperCase" => Ok(Value::bool(c.is_uppercase())),
+                "isLowerCase" => Ok(Value::bool(c.is_lowercase())),
+                "toUpperCase" => Ok(make_char(c.to_ascii_uppercase())),
+                "toLowerCase" => Ok(make_char(c.to_ascii_lowercase())),
+                // `getNumericValue` answers -1 for a non-alphanumeric character
+                // and 10..35 for `a`..`z`, as the JDK does.
+                "getNumericValue" => Ok(Value::int(match c.to_digit(36) {
+                    Some(d) => d as i64,
+                    None => -1,
+                })),
+                _ => unknown(),
+            }
+        }
+        _ => unknown(),
+    }
+}
+
 /// `scala.math` / `java.lang.Math` members. Integer-preserving where Scala's
 /// overloads are (`abs`/`min`/`max`/`signum` on two `Int`s stay `Int`); every
 /// other member is the `Double` overload, as the JDK defines it.
@@ -4774,6 +5556,11 @@ fn new_set(rep: HashRep, items: Vec<Value>) -> Value {
             uniq.push(it);
         }
     }
+    // A `LinkedHashSet` iterates its insertion list, so the deduplicated order
+    // IS the order — nothing to reorder and no size threshold to cross.
+    if rep == HashRep::Linked {
+        return heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Linked), uniq));
+    }
     let rep = hash_rep(rep, uniq.len());
     if rep == HashRep::Hashed {
         if let Some(ordered) = champ_sorted(&uniq, Clone::clone) {
@@ -4827,6 +5614,18 @@ fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
         return mut_map_from(mut_table_size_for(MUT_INITIAL_CAPACITY), entries);
     }
     let mut entries = entries;
+    // A `LinkedHashMap` keeps its insertion list: a repeated key holds its
+    // original position and takes the later value, exactly as `put` does.
+    if rep == HashRep::Linked {
+        let mut uniq: Vec<(Value, Value)> = Vec::with_capacity(entries.len());
+        for (k, v) in entries {
+            match uniq.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
+                Some(slot) => slot.1 = v,
+                None => uniq.push((k, v)),
+            }
+        }
+        return heap_push(HeapVal::Map(HashRep::Linked, uniq));
+    }
     let rep = hash_rep(rep, entries.len());
     if rep == HashRep::Hashed {
         if let Some(ordered) = champ_sorted(&entries, |(k, _)| k.clone()) {
@@ -4841,6 +5640,9 @@ fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
 /// A mutable receiver stays mutable — [`new_set`]/[`new_map`] intercept it
 /// before this is reached.
 fn hash_rep(rep: HashRep, len: usize) -> HashRep {
+    if rep == HashRep::Linked {
+        return HashRep::Linked;
+    }
     if rep == HashRep::Hashed || len > 4 {
         HashRep::Hashed
     } else {
@@ -5018,6 +5820,11 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     if name == "toString" && args.is_empty() {
         return Ok(Value::str(scala_str(recv)));
     }
+    // `getClass` is likewise on every value — for the receivers whose JVM class
+    // this frontend can name faithfully (see [`class_of`]).
+    if name == "getClass" && args.is_empty() {
+        return class_of(recv);
+    }
     // A `Regex`/`Regex.Match` handle is not a record, so it is answered before
     // the record dispatcher below.
     if let Some(r) = regex_method(recv, name, args) {
@@ -5031,8 +5838,11 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     }
     // An `Ordering` handle is likewise not a record; `.reverse` on one must not
     // reach the sequence dispatcher, which would try to reverse a collection.
-    if let Some(reversed) = as_ordering(recv) {
-        return ordering_method(reversed, name, args);
+    // Its members can run a user closure, so they are answered on the VM-aware
+    // path in `b_smethod`; reaching this PURE one means the name is not one of
+    // them, and it stops here rather than falling through.
+    if as_ordering(recv).is_some() {
+        return Err(format!("scalars: value {name} is not a member of Ordering"));
     }
     // Scala's operators ARE methods, so the dotted spelling (`n.+(1)`, `"a".*(3)`)
     // is legal wherever the infix one is. Only the primitive receivers route here:

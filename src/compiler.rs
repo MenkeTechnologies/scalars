@@ -1349,6 +1349,31 @@ impl Compiler {
     /// Lower a `List`/`Seq`/`Vector`/`Set`/`Map`/`Array` literal to its host
     /// constructor builtin.
     fn collection(&mut self, ctor: &str, elems: &[Expr]) -> Result<(), String> {
+        // A user type of the same name SHADOWS the built-in collection: the
+        // parser recognizes these constructors by name alone, so a program that
+        // declares its own `class Stack` / `case class Queue` must construct
+        // that rather than silently build the library one.
+        if self.classes.contains_key(ctor) || self.objects.contains_key(ctor) {
+            return self.construct(ctor, elems, 0);
+        }
+        // A spread that no repeated parameter consumed. Scala rejects `: _*`
+        // anywhere but a varargs argument position, and so does this.
+        if ctor == crate::parser::SPREAD {
+            return Err(
+                "scalars: a `: _*` argument is only allowed for a repeated parameter".to_string(),
+            );
+        }
+        // Every collection factory IS varargs, so `List(xs: _*)` is legal — but
+        // the element count is only known at run time, so it goes through
+        // [`crate::host::FROM_SEQ`] instead of the fixed-`argc` `MAKE_*`
+        // builtin.
+        if let Some(src) = spread_operand(elems) {
+            self.expr(&src)?;
+            let cc = self.b.add_constant(Value::str(ctor));
+            self.b.emit(Op::LoadConst(cc), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::FROM_SEQ, 2), 0);
+            return Ok(());
+        }
         for el in elems {
             self.expr(el)?;
         }
@@ -1365,6 +1390,12 @@ impl Compiler {
             "ArrayBuffer" => crate::host::MAKE_ARRAYBUFFER,
             "mutable.Set" => crate::host::MAKE_MUTSET,
             "mutable.Map" => crate::host::MAKE_MUTMAP,
+            "Queue" => crate::host::MAKE_QUEUE,
+            "Stack" => crate::host::MAKE_STACK,
+            "ArrayDeque" => crate::host::MAKE_ARRAYDEQUE,
+            "StringBuilder" => crate::host::MAKE_STRINGBUILDER,
+            "LinkedHashSet" => crate::host::MAKE_LINKEDSET,
+            "LinkedHashMap" => crate::host::MAKE_LINKEDMAP,
             _ => return Err(format!("scalars: unknown collection constructor `{ctor}`")),
         };
         self.b.emit(Op::CallBuiltin(id, elems.len() as u8), 0);
@@ -2256,12 +2287,7 @@ impl Compiler {
     /// `target` is the width of the binding being updated; the result's width is
     /// that combined with the operand's, exactly as for the `x = x op e` form
     /// Scala expands this to.
-    fn compound_tail(
-        &mut self,
-        op: AssignOp,
-        value: &Expr,
-        target: NumTy,
-    ) -> Result<(), String> {
+    fn compound_tail(&mut self, op: AssignOp, value: &Expr, target: NumTy) -> Result<(), String> {
         let w = target.combine(self.num_ty(value));
         if !matches!(op, AssignOp::Add | AssignOp::Sub) {
             self.expr(value)?;
@@ -2466,9 +2492,17 @@ impl Compiler {
         let mut out = Vec::with_capacity(params.len() + ncap);
         for (i, p) in sig.iter().enumerate() {
             let e = if p.vararg {
-                Expr::Collection {
-                    ctor: "ArraySeq".to_string(),
-                    elems: std::mem::take(&mut rest),
+                let rest = std::mem::take(&mut rest);
+                // `f(xs: _*)` hands the sequence STRAIGHT to the repeated
+                // parameter — the whole point of the spread is that `xs` is not
+                // collected into a one-element `ArraySeq`. Scala allows it only
+                // as the sole argument in that position.
+                match spread_operand(&rest) {
+                    Some(e) => e,
+                    None => Expr::Collection {
+                        ctor: "ArraySeq".to_string(),
+                        elems: rest,
+                    },
                 }
             } else {
                 match slots[i].take().or_else(|| p.default.clone()) {
@@ -2660,7 +2694,8 @@ impl Compiler {
             && matches!(recv, Expr::Var(o) if o == "Ordering")
             && ORDERING_MEMBERS.contains(&name)
         {
-            self.b.emit(Op::CallBuiltin(crate::host::MAKE_ORDERING, 0), line);
+            self.b
+                .emit(Op::CallBuiltin(crate::host::MAKE_ORDERING, 0), line);
             return Ok(());
         }
         // `Int.MaxValue` and friends — the numeric companion objects' bounds.
@@ -2731,6 +2766,54 @@ impl Compiler {
         if name == "format" && matches!(recv, Expr::Var(n) if n == "String") && !args.is_empty() {
             let (fmt, rest) = args.split_first().expect("non-empty");
             return self.method(fmt, "format", rest, line);
+        }
+        // `Ordering.Int` / `Ordering.by(f)` / `Ordering[Int].compare(a, b)` —
+        // the `scala.math.Ordering` companion. A FACTORY member builds the
+        // ordering value; any other member is a method on the natural ordering
+        // `Ordering[T]` denotes, so it is emitted as a call on that.
+        if is_ordering_module(recv) {
+            let factory = matches!(name, "by" | "on" | "fromLessThan") || args.is_empty();
+            let member = if factory { name } else { "Int" };
+            if factory {
+                for a in args {
+                    self.expr(a)?;
+                }
+            }
+            let mc = self.b.add_constant(Value::str(member));
+            self.b.emit(Op::LoadConst(mc), line);
+            let argc = if factory { args.len() as u8 + 1 } else { 1 };
+            self.b
+                .emit(Op::CallBuiltin(crate::host::MAKE_ORDERING, argc), line);
+            if factory {
+                return Ok(());
+            }
+            for a in args {
+                self.expr(a)?;
+            }
+            let nc = self.b.add_constant(Value::str(name.to_string()));
+            self.b.emit(Op::LoadConst(nc), line);
+            self.b.emit(
+                Op::CallBuiltin(crate::host::SMETHOD, args.len() as u8 + 2),
+                line,
+            );
+            return Ok(());
+        }
+        // `Int.MaxValue` / `Integer.parseInt(…)` / `Character.isDigit(c)` /
+        // `String.valueOf(x)` — a boxed-primitive or `String` COMPANION, which
+        // like `math` is a namespace rather than a receiver. The module name
+        // travels with the member so the host can keep `scala.Int`'s members
+        // apart from `java.lang.Integer`'s.
+        if let Some(module) = boxed_module(recv) {
+            for a in args {
+                self.expr(a)?;
+            }
+            let nc = self.b.add_constant(Value::str(format!("{module}.{name}")));
+            self.b.emit(Op::LoadConst(nc), line);
+            self.b.emit(
+                Op::CallBuiltin(crate::host::BOXED, args.len() as u8 + 1),
+                line,
+            );
+            return Ok(());
         }
         // `scala.math.<member>` / `math.<member>` / `Math.<member>` — the JDK
         // math module, which is a value namespace rather than a receiver.
@@ -3511,9 +3594,7 @@ impl Compiler {
             // A call to a user `def` with a declared return type. This is the
             // only width a call site can know: the body is compiled separately
             // and its result is whatever the annotation promised.
-            Expr::Call { name, .. } => {
-                self.def_widths.get(name).copied().unwrap_or(NumTy::Unknown)
-            }
+            Expr::Call { name, .. } => self.def_widths.get(name).copied().unwrap_or(NumTy::Unknown),
             _ => NumTy::Unknown,
         }
     }
@@ -3965,9 +4046,29 @@ fn program_any(
             .any(|o| scan(&o.body) || o.methods.iter().any(|m| scan(&m.body)))
 }
 
+/// The operand of a lone `xs: _*` spread argument, if that is what `args` is.
+fn spread_operand(args: &[Expr]) -> Option<Expr> {
+    match args {
+        [Expr::Collection { ctor, elems }] if ctor == crate::parser::SPREAD => {
+            elems.first().cloned()
+        }
+        _ => None,
+    }
+}
+
 /// Whether a collection-literal constructor names a mutable collection.
 fn mutable_buffer_literal(ctor: &str) -> bool {
-    matches!(ctor, "ListBuffer" | "ArrayBuffer")
+    matches!(
+        ctor,
+        "ListBuffer"
+            | "ArrayBuffer"
+            | "Queue"
+            | "Stack"
+            | "ArrayDeque"
+            | "StringBuilder"
+            | "LinkedHashSet"
+            | "LinkedHashMap"
+    )
 }
 
 /// Whether a constructor pattern names a *sequence* extractor (`case List(a, b)`)
@@ -4035,8 +4136,18 @@ fn range_test(inclusive: bool, descending: bool) -> Op {
 /// `host::value_cmp` already orders each of these types the way Scala's instance
 /// does; the member only picks the element TYPE, which is erased here.
 const ORDERING_MEMBERS: &[&str] = &[
-    "Int", "Long", "Short", "Byte", "Double", "Float", "String", "Char", "Boolean", "Unit",
-    "BigInt", "BigDecimal",
+    "Int",
+    "Long",
+    "Short",
+    "Byte",
+    "Double",
+    "Float",
+    "String",
+    "Char",
+    "Boolean",
+    "Unit",
+    "BigInt",
+    "BigDecimal",
 ];
 
 /// The bound named by a numeric companion object — `Int.MaxValue`,
@@ -4162,9 +4273,8 @@ const SEQ_CTORS: &[&str] = &[
 /// receiver's element width. Only `sum` and `product` can leave the 32-bit range
 /// (see [`NARROW_AFTER_METHODS`]); the rest are here so they can type an
 /// enclosing expression.
-const ELEM_RESULT_METHODS: &[&str] = &[
-    "sum", "product", "max", "min", "head", "last", "headOption",
-];
+const ELEM_RESULT_METHODS: &[&str] =
+    &["sum", "product", "max", "min", "head", "last", "headOption"];
 
 /// The width of an expression that carries its type on its face, with no
 /// bindings consulted. Used where a width is needed before any scope exists —
@@ -4307,8 +4417,7 @@ const WIDTH_PRESERVING_METHODS: &[&str] = &["abs", "unary_~", "<<", ">>", ">>>"]
 
 /// Method names whose result takes the WIDER of the receiver and the argument —
 /// the numeric operators in their method spelling (`n.+(1)`, `a max b`).
-const WIDTH_COMBINING_METHODS: &[&str] =
-    &["+", "-", "*", "/", "%", "max", "min", "&", "|", "^"];
+const WIDTH_COMBINING_METHODS: &[&str] = &["+", "-", "*", "/", "%", "max", "min", "&", "|", "^"];
 
 /// Method names whose result must be wrapped back to 32 bits when it is an
 /// `Int`. Deliberately NOT every `Int`-typed method: a `length` or an `indexOf`
@@ -4318,9 +4427,7 @@ const WIDTH_COMBINING_METHODS: &[&str] =
 /// which is Scala's explicit narrowing conversion, and the two folds over a
 /// collection that accumulate — `sum` and `product` overflow on a long enough
 /// `List[Int]` however small its elements are.
-const NARROW_AFTER_METHODS: &[&str] = &[
-    "toInt", "abs", "+", "-", "*", "/", "%", "sum", "product",
-];
+const NARROW_AFTER_METHODS: &[&str] = &["toInt", "abs", "+", "-", "*", "/", "%", "sum", "product"];
 
 /// Whether `e` names a math module — `math`/`scala.math` or `Math`/
 /// `java.lang.Math` — and which of the two. These are namespaces, not values, so
@@ -4380,8 +4487,67 @@ fn mutable_ctor(name: &str) -> Option<&'static str> {
         "ArrayBuffer" | "Buffer" => "ArrayBuffer",
         "Set" | "HashSet" => "mutable.Set",
         "Map" | "HashMap" => "mutable.Map",
+        "Queue" => "Queue",
+        "Stack" => "Stack",
+        "ArrayDeque" => "ArrayDeque",
+        "StringBuilder" => "StringBuilder",
+        // The linked forms keep INSERTION order rather than the hash table's, so
+        // they are their own representation ([`crate::host`]'s `HashRep::Linked`)
+        // and never an alias for the table-ordered ones.
+        "LinkedHashSet" => "LinkedHashSet",
+        "LinkedHashMap" => "LinkedHashMap",
         _ => return None,
     })
+}
+
+/// Whether `e` names the `scala.math.Ordering` companion — spelled `Ordering`,
+/// `math.Ordering` or `scala.math.Ordering`.
+fn is_ordering_module(e: &Expr) -> bool {
+    match e {
+        Expr::Var(n) => n == "Ordering",
+        Expr::Method {
+            recv, name, args, ..
+        } => args.is_empty() && name == "Ordering" && math_module(recv) == Some(false),
+        _ => false,
+    }
+}
+
+/// The boxed-primitive / `String` companion `e` names, if it is one. Scala's own
+/// two namespaces stay apart: a bare `Int`/`Long`/`Double`/… is the SCALA
+/// companion (which has `MaxValue` but no `parseInt`), while `Integer`,
+/// `Character` and anything under `java.lang` are the JDK boxes (which have
+/// `MAX_VALUE` and the statics). A `java.`-prefixed answer marks the latter.
+fn boxed_module(e: &Expr) -> Option<String> {
+    /// The Scala value-class companions.
+    const SCALA: &[&str] = &[
+        "Int", "Long", "Short", "Byte", "Char", "Double", "Float", "Boolean",
+    ];
+    /// The `java.lang` boxes, plus `String`.
+    const JAVA: &[&str] = &[
+        "Integer",
+        "Long",
+        "Short",
+        "Byte",
+        "Character",
+        "Double",
+        "Float",
+        "Boolean",
+        "String",
+    ];
+    match e {
+        // `Integer`, `Character` and `String` name no Scala companion, so an
+        // unqualified use of one can only be the `java.lang` box.
+        Expr::Var(n) if n == "Integer" || n == "Character" || n == "String" => {
+            Some(format!("java.{n}"))
+        }
+        Expr::Var(n) if SCALA.contains(&n.as_str()) => Some(n.clone()),
+        Expr::Method {
+            recv, name, args, ..
+        } if args.is_empty() && is_java_lang(recv) && JAVA.contains(&name.as_str()) => {
+            Some(format!("java.{name}"))
+        }
+        _ => None,
+    }
 }
 
 /// Whether `e` is the `java.lang` package prefix.

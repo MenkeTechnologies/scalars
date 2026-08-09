@@ -267,7 +267,6 @@ fn g_overflow(r: &mut Rng) -> String {
     }
 }
 
-
 fn g_intdiv(r: &mut Rng) -> String {
     let a = pick(r, INTS);
     let b = pick(r, DIVS);
@@ -2763,7 +2762,11 @@ fn main() {
         // Either side failing to start is not a match — nothing was compared —
         // so it gets its own status rather than passing as green.
         if harness_failed(&mo) || harness_failed(&mr) {
-            let which = if harness_failed(&mo) { "scala(ref)" } else { "scalars" };
+            let which = if harness_failed(&mo) {
+                "scala(ref)"
+            } else {
+                "scalars"
+            };
             println!("--- HARNESS ERROR ({which} never ran; nothing compared) ---");
             std::process::exit(2);
         }

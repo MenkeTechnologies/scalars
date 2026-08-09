@@ -524,7 +524,7 @@ println(List(1, 2).find(_ &gt; 9))   // =&gt; None</code></pre>
         </article>
         <article class="doc-entry" id="doc-collection-constructors-15">
           <h3><a class="doc-anchor" href="#doc-collection-constructors-15">#</a> <code>mutable</code></h3>
-          <p>The `scala.collection.mutable` package prefix: `mutable.ListBuffer`, `mutable.ArrayBuffer`, `mutable.Set` and `mutable.Map`. It is recognized whether or not it was imported, and `scala.collection.mutable.X` is accepted too.</p>
+          <p>The `scala.collection.mutable` package prefix: `mutable.ListBuffer`, `mutable.ArrayBuffer`, `mutable.Queue`, `mutable.Stack`, `mutable.ArrayDeque`, `mutable.Set`, `mutable.Map`, `mutable.LinkedHashSet` and `mutable.LinkedHashMap`. It is recognized whether or not it was imported, and `scala.collection.mutable.X` is accepted too.</p>
           <pre><code class="lang-scala">mutable.Kind(e, …)
 val s = mutable.Set(1, 2, 3)
 s += 4
@@ -569,7 +569,65 @@ m("b") = 2
 println(m)   // =&gt; HashMap(a -&gt; 1, b -&gt; 2)</code></pre>
         </article>
         <article class="doc-entry" id="doc-collection-constructors-21">
-          <h3><a class="doc-anchor" href="#doc-collection-constructors-21">#</a> <code>PartialFunction</code></h3>
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-21">#</a> <code>Queue</code></h3>
+          <p>The growable mutable FIFO. `enqueue` appends, `dequeue` takes the head and answers it, `front` peeks. `+=` is `Growable.addOne` and so also appends.</p>
+          <pre><code class="lang-scala">mutable.Queue(e, …): Queue[A]
+val q = mutable.Queue(1, 2)
+q.enqueue(3)
+println(q.dequeue())   // =&gt; 1
+println(q)             // =&gt; Queue(2, 3)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-constructors-22">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-22">#</a> <code>Stack</code></h3>
+          <p>The growable mutable LIFO, whose HEAD is its top: `push` prepends, `pop` takes the head and answers it, `top` peeks. `+=` is still `Growable.addOne`, so it APPENDS — `Stack(1,2,3) += 8` is `Stack(1, 2, 3, 8)` where `push(8)` would be `Stack(8, 1, 2, 3)`.</p>
+          <pre><code class="lang-scala">mutable.Stack(e, …): Stack[A]
+val s = mutable.Stack(1, 2)
+s.push(3)
+println(s.pop())   // =&gt; 3
+println(s)         // =&gt; Stack(1, 2)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-constructors-23">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-23">#</a> <code>ArrayDeque</code></h3>
+          <p>The mutable sequence that grows at BOTH ends: `append`/`+=`, `prepend`, `removeHead` and `removeLast`, plus indexed `d(i)` reads and `d(i) = v` writes.</p>
+          <pre><code class="lang-scala">mutable.ArrayDeque(e, …): ArrayDeque[A]
+val d = mutable.ArrayDeque(1, 2)
+d.prepend(0)
+println(d.removeLast())   // =&gt; 2
+println(d)                // =&gt; ArrayDeque(0, 1)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-constructors-24">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-24">#</a> <code>LinkedHashSet</code></h3>
+          <p>The mutable set that iterates and prints in INSERTION order rather than the hash table's. A re-added element keeps its original position; one removed and re-added moves to the end.</p>
+          <pre><code class="lang-scala">mutable.LinkedHashSet(e, …): LinkedHashSet[A]
+val s = mutable.LinkedHashSet(3, 1, 2)
+s += 9
+println(s)   // =&gt; LinkedHashSet(3, 1, 2, 9)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-constructors-25">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-25">#</a> <code>LinkedHashMap</code></h3>
+          <p>The mutable map that iterates and prints in INSERTION order. A repeated key keeps its position and takes the later value; the mutators are `mutable.Map`'s.</p>
+          <pre><code class="lang-scala">mutable.LinkedHashMap(k -&gt; v, …): LinkedHashMap[K, V]
+val m = mutable.LinkedHashMap(3 -&gt; "c", 1 -&gt; "a")
+m(2) = "b"
+println(m)   // =&gt; LinkedHashMap(3 -&gt; c, 1 -&gt; a, 2 -&gt; b)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-constructors-26">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-26">#</a> <code>StringBuilder</code></h3>
+          <p>The growable `Seq[Char]` whose `toString` is its CONTENTS rather than a rendered collection. `append` takes `String.valueOf` of any value, `+=` a `Char` and `++=` a `String` or `Char` sequence; `insert`, `setCharAt`, `deleteCharAt`, `setLength`, `clear` and `result()` mutate or freeze it, and it answers the `CharSequence` members `substring`/`indexOf`/`charAt` alongside every sequence one. A selecting op (`take`, `filter`, `reverse`) answers another `StringBuilder`; `map`, whose element type may change, answers an `ArrayBuffer`.</p>
+          <pre><code class="lang-scala">new StringBuilder(s?): StringBuilder
+val b = new StringBuilder("ab")
+b += 'c'
+b.append(7)
+println(b)   // =&gt; abc7</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-constructors-27">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-27">#</a> <code>Ordering</code></h3>
+          <p>An explicit comparison for `sorted`/`sortBy`/`max`/`min`/`maxBy`/`minBy`. `Ordering.Int` and its siblings are the natural ordering, `.reverse` flips it, `Ordering.by(f)` sorts by `f`'s result, `Ordering.fromLessThan(lt)` builds one from a `&lt;` test, and the value itself answers `compare`, `lt`, `gt`, `lteq`, `gteq`, `equiv`, `max`, `min` and `on`.</p>
+          <pre><code class="lang-scala">Ordering.Int | Ordering.by(f) | ord.reverse
+println(List(3, 1, 2).sorted(Ordering.Int.reverse))   // =&gt; List(3, 2, 1)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-constructors-28">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-28">#</a> <code>PartialFunction</code></h3>
           <p>A function defined only on some arguments — what a `{ case … }` literal builds. Beyond `apply` it answers `isDefinedAt`, which is what `collect`/`collectFirst` use to skip a non-matching element, and it composes through `applyOrElse`, `lift`, `orElse`, `andThen` and `compose`.</p>
           <pre><code class="lang-scala">val pf: PartialFunction[A, B] = { case … =&gt; … }
 val pf: PartialFunction[Int, String] = { case 1 =&gt; "one" }
@@ -1227,19 +1285,82 @@ b.clear()
 println(b)   // =&gt; ListBuffer()</code></pre>
         </article>
         <article class="doc-entry" id="doc-sequence-methods-102">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-102">#</a> <code>toString</code></h3>
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-102">#</a> <code>enqueue</code></h3>
+          <p>Append to a `mutable.Queue` and answer it. `enqueueAll` appends a whole collection.</p>
+          <pre><code class="lang-scala">q.enqueue(e: A): q.type
+val q = mutable.Queue(1)
+q.enqueue(2)
+println(q)   // =&gt; Queue(1, 2)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-103">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-103">#</a> <code>dequeue</code></h3>
+          <p>Remove a `mutable.Queue`'s head and answer it. Raises `java.util.NoSuchElementException: empty collection` on an empty queue.</p>
+          <pre><code class="lang-scala">q.dequeue(): A
+val q = mutable.Queue(1, 2)
+println(q.dequeue())   // =&gt; 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-104">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-104">#</a> <code>push</code></h3>
+          <p>PREPEND to a `mutable.Stack` and answer it — a `Stack`'s head is its top, which is why this is not the same as `+=`.</p>
+          <pre><code class="lang-scala">s.push(e: A): s.type
+val s = mutable.Stack(1)
+s.push(2)
+println(s)   // =&gt; Stack(2, 1)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-105">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-105">#</a> <code>pop</code></h3>
+          <p>Remove a `mutable.Stack`'s head (its top) and answer it. Raises `java.util.NoSuchElementException: empty collection` on an empty stack.</p>
+          <pre><code class="lang-scala">s.pop(): A
+val s = mutable.Stack(1, 2)
+println(s.pop())   // =&gt; 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-106">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-106">#</a> <code>top</code></h3>
+          <p>Peek at a `mutable.Stack`'s top without removing it; `front` is the `mutable.Queue` spelling. Raises `head of empty Stack`/`head of empty Queue` when there is nothing to peek at.</p>
+          <pre><code class="lang-scala">s.top: A
+println(mutable.Stack(1, 2).top)   // =&gt; 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-107">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-107">#</a> <code>removeHead</code></h3>
+          <p>Remove a `mutable.ArrayDeque`'s first element and answer it; `removeLast` takes the last one instead.</p>
+          <pre><code class="lang-scala">d.removeHead(): A
+val d = mutable.ArrayDeque(1, 2)
+println(d.removeLast())   // =&gt; 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-108">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-108">#</a> <code>result</code></h3>
+          <p>Freeze a `StringBuilder`'s contents into a `String`.</p>
+          <pre><code class="lang-scala">b.result(): String
+println(new StringBuilder("ab").result())   // =&gt; ab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-109">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-109">#</a> <code>setCharAt</code></h3>
+          <p>Replace one character of a `StringBuilder` and answer the builder; `deleteCharAt` removes one and `setLength` truncates (or pads with NUL). An out-of-range index raises `java.lang.StringIndexOutOfBoundsException: index i, length n`.</p>
+          <pre><code class="lang-scala">b.setCharAt(i: Int, c: Char): b.type
+val b = new StringBuilder("abc")
+b.setCharAt(0, 'Q')
+println(b)   // =&gt; Qbc</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-110">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-110">#</a> <code>getClass</code></h3>
+          <p>The receiver's runtime class, answering `getName` and `getSimpleName`. Modeled for the receivers whose JVM class can be named faithfully — `String`, the primitives, a user `class`/`case class`/`object`, and a throwable (the usual reason to call it). A collection's runtime class is a private implementation detail, so it stays an error rather than a plausible-looking guess.</p>
+          <pre><code class="lang-scala">x.getClass: Class[_]
+try { 1 / 0 } catch { case e: Throwable =&gt; println(e.getClass.getSimpleName) }   // =&gt; ArithmeticException</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-111">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-111">#</a> <code>toString</code></h3>
           <p>The Scala rendering of the collection, which is what `println` prints: `List(1, 2)`, `Set(…)`/`HashSet(…)` by representation, `Range a to b by s` for a range, `(a,b)` for a tuple.</p>
           <pre><code class="lang-scala">xs.toString: String
 println(List(1, 2).toString)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-103">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-103">#</a> <code>equals</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-112">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-112">#</a> <code>equals</code></h3>
           <p>Structural equality — the method `==` calls. Two collections are equal when their elements are pairwise equal; a plain (non-case) class instance compares by identity instead.</p>
           <pre><code class="lang-scala">xs.equals(other: Any): Boolean
 println(List(1, 2) == List(1, 2))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-104">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-104">#</a> <code>hashCode</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-113">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-113">#</a> <code>hashCode</code></h3>
           <p>The MurmurHash3 sequence, set or map hash Scala computes — the same value that decides a `HashSet`'s print order. An `Array` and a function value keep an identity hash instead, which is not reproducible across runs.</p>
           <pre><code class="lang-scala">xs.hashCode: Int
 println(List(1, 2).hashCode == List(1, 2).hashCode)   // =&gt; true</code></pre>
@@ -1862,80 +1983,110 @@ println('a'.isLetter)   // =&gt; true</code></pre>
 println(-3.abs)   // =&gt; 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-int-methods-2">
-          <h3><a class="doc-anchor" href="#doc-int-methods-2">#</a> <code>toInt</code></h3>
+          <h3><a class="doc-anchor" href="#doc-int-methods-2">#</a> <code>MaxValue</code></h3>
+          <p>A Scala value-class companion's bound: `Int`, `Long`, `Short`, `Byte`, `Char` and `Double` all answer `MaxValue`/`MinValue`, and `Double` adds `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`. These are `scala.Int`'s members, NOT `java.lang.Integer`'s — the two namespaces stay apart, so `Double.parseDouble` is an error here exactly as it is in Scala.</p>
+          <pre><code class="lang-scala">Int.MaxValue: Int
+println(Int.MaxValue)   // =&gt; 2147483647</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-int-methods-3">
+          <h3><a class="doc-anchor" href="#doc-int-methods-3">#</a> <code>parseInt</code></h3>
+          <p>A `java.lang.Integer` static: `parseInt`/`parseLong` (with an optional radix), `valueOf`, `toString`, `compare`, `max`, `min`, `sum`, `signum` and `bitCount`, plus `MAX_VALUE`/`MIN_VALUE`. A malformed input raises `java.lang.NumberFormatException`. `java.lang.Double.parseDouble` and `java.lang.Boolean.parseBoolean` are the other boxes' parsers.</p>
+          <pre><code class="lang-scala">Integer.parseInt(s: String, radix?: Int): Int
+println(Integer.parseInt("ff", 16))   // =&gt; 255</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-int-methods-4">
+          <h3><a class="doc-anchor" href="#doc-int-methods-4">#</a> <code>toHexString</code></h3>
+          <p>The two's-complement bit pattern in base 16, at the BOX's width: `Integer.toHexString(-1)` is 8 digits and `java.lang.Long.toHexString(-1L)` is 16. `toBinaryString` and `toOctalString` are the other two; the signed `Integer.toString(i, radix)` renders a `-` instead.</p>
+          <pre><code class="lang-scala">Integer.toHexString(i: Int): String
+println(Integer.toHexString(-1))   // =&gt; ffffffff</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-int-methods-5">
+          <h3><a class="doc-anchor" href="#doc-int-methods-5">#</a> <code>isDigit</code></h3>
+          <p>A `java.lang.Character` static: `isDigit`, `isLetter`, `isLetterOrDigit`, `isWhitespace`, `isUpperCase`, `isLowerCase`, `toUpperCase`, `toLowerCase` and `getNumericValue`.</p>
+          <pre><code class="lang-scala">Character.isDigit(c: Char): Boolean
+println(Character.isDigit('5'))   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-int-methods-6">
+          <h3><a class="doc-anchor" href="#doc-int-methods-6">#</a> <code>valueOf</code></h3>
+          <p>`java.lang.String.valueOf` — any value's `toString`, which is what `String.valueOf(x)` answers. `String.format(fmt, …)` is the other `String` static.</p>
+          <pre><code class="lang-scala">String.valueOf(x: Any): String
+println(String.valueOf(42))   // =&gt; 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-int-methods-7">
+          <h3><a class="doc-anchor" href="#doc-int-methods-7">#</a> <code>toInt</code></h3>
           <p>The receiver unchanged — the identity conversion.</p>
           <pre><code class="lang-scala">n.toInt: Int
 println(5.toInt)   // =&gt; 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-3">
-          <h3><a class="doc-anchor" href="#doc-int-methods-3">#</a> <code>toLong</code></h3>
+        <article class="doc-entry" id="doc-int-methods-8">
+          <h3><a class="doc-anchor" href="#doc-int-methods-8">#</a> <code>toLong</code></h3>
           <p>The receiver as a `Long`. Integers are already held at 64 bits here, so this is the identity.</p>
           <pre><code class="lang-scala">n.toLong: Long
 println(5.toLong)   // =&gt; 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-4">
-          <h3><a class="doc-anchor" href="#doc-int-methods-4">#</a> <code>toDouble</code></h3>
+        <article class="doc-entry" id="doc-int-methods-9">
+          <h3><a class="doc-anchor" href="#doc-int-methods-9">#</a> <code>toDouble</code></h3>
           <p>The integer widened to a `Double`, which is how it then prints.</p>
           <pre><code class="lang-scala">n.toDouble: Double
 println(7.toDouble)   // =&gt; 7.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-5">
-          <h3><a class="doc-anchor" href="#doc-int-methods-5">#</a> <code>toFloat</code></h3>
+        <article class="doc-entry" id="doc-int-methods-10">
+          <h3><a class="doc-anchor" href="#doc-int-methods-10">#</a> <code>toFloat</code></h3>
           <p>The integer widened to floating point. There is no distinct 32-bit float, so this is `toDouble`.</p>
           <pre><code class="lang-scala">n.toFloat: Double
 println(7.toFloat)   // =&gt; 7.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-6">
-          <h3><a class="doc-anchor" href="#doc-int-methods-6">#</a> <code>max</code></h3>
+        <article class="doc-entry" id="doc-int-methods-11">
+          <h3><a class="doc-anchor" href="#doc-int-methods-11">#</a> <code>max</code></h3>
           <p>The larger of the receiver and the argument, staying an `Int`.</p>
           <pre><code class="lang-scala">n.max(other: Int): Int
 println(5.max(9))   // =&gt; 9</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-7">
-          <h3><a class="doc-anchor" href="#doc-int-methods-7">#</a> <code>min</code></h3>
+        <article class="doc-entry" id="doc-int-methods-12">
+          <h3><a class="doc-anchor" href="#doc-int-methods-12">#</a> <code>min</code></h3>
           <p>The smaller of the receiver and the argument, staying an `Int`.</p>
           <pre><code class="lang-scala">n.min(other: Int): Int
 println(5.min(9))   // =&gt; 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-8">
-          <h3><a class="doc-anchor" href="#doc-int-methods-8">#</a> <code>&amp; (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-13">
+          <h3><a class="doc-anchor" href="#doc-int-methods-13">#</a> <code>&amp; (Int)</code></h3>
           <p>Bitwise AND of two integers.</p>
           <pre><code class="lang-scala">n &amp; (other: Int): Int
 println(6 &amp; 3)   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-9">
-          <h3><a class="doc-anchor" href="#doc-int-methods-9">#</a> <code>| (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-14">
+          <h3><a class="doc-anchor" href="#doc-int-methods-14">#</a> <code>| (Int)</code></h3>
           <p>Bitwise OR of two integers.</p>
           <pre><code class="lang-scala">n | (other: Int): Int
 println(6 | 3)   // =&gt; 7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-10">
-          <h3><a class="doc-anchor" href="#doc-int-methods-10">#</a> <code>^ (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-15">
+          <h3><a class="doc-anchor" href="#doc-int-methods-15">#</a> <code>^ (Int)</code></h3>
           <p>Bitwise XOR of two integers.</p>
           <pre><code class="lang-scala">n ^ (other: Int): Int
 println(6 ^ 3)   // =&gt; 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-11">
-          <h3><a class="doc-anchor" href="#doc-int-methods-11">#</a> <code>unary_~</code></h3>
+        <article class="doc-entry" id="doc-int-methods-16">
+          <h3><a class="doc-anchor" href="#doc-int-methods-16">#</a> <code>unary_~</code></h3>
           <p>Bitwise complement, computed at 32-bit width as Scala does. Parenthesize a negative operand — Scala lexes `~-` as a single operator name.</p>
           <pre><code class="lang-scala">~n: Int
 println(~6)   // =&gt; -7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-12">
-          <h3><a class="doc-anchor" href="#doc-int-methods-12">#</a> <code>&lt;&lt; (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-17">
+          <h3><a class="doc-anchor" href="#doc-int-methods-17">#</a> <code>&lt;&lt; (Int)</code></h3>
           <p>Left shift at `Int` width: the distance masks to five bits and the result wraps at 32 bits, so `1 &lt;&lt; 33` is `2`, not `8589934592`.</p>
           <pre><code class="lang-scala">n &lt;&lt; (dist: Int): Int
 println(1 &lt;&lt; 4)    // =&gt; 16
 println(1 &lt;&lt; 33)   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-13">
-          <h3><a class="doc-anchor" href="#doc-int-methods-13">#</a> <code>&gt;&gt; (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-18">
+          <h3><a class="doc-anchor" href="#doc-int-methods-18">#</a> <code>&gt;&gt; (Int)</code></h3>
           <p>Arithmetic right shift at `Int` width: the sign bit is replicated, so a negative value stays negative.</p>
           <pre><code class="lang-scala">n &gt;&gt; (dist: Int): Int
 println(-16 &gt;&gt; 2)   // =&gt; -4</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-14">
-          <h3><a class="doc-anchor" href="#doc-int-methods-14">#</a> <code>&gt;&gt;&gt; (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-19">
+          <h3><a class="doc-anchor" href="#doc-int-methods-19">#</a> <code>&gt;&gt;&gt; (Int)</code></h3>
           <p>Logical right shift at `Int` width: zeros are shifted in, so a negative value becomes a large positive one.</p>
           <pre><code class="lang-scala">n &gt;&gt;&gt; (dist: Int): Int
 println(-16 &gt;&gt;&gt; 2)   // =&gt; 1073741820</code></pre>
