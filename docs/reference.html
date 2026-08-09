@@ -872,362 +872,374 @@ println(List(1, 2, 3).foldRight(0)((a, b) =&gt; a - b))   // =&gt; 2</code></pre
 println(List(1, 2, 3).fold(0)((a, b) =&gt; a + b))   // =&gt; 6</code></pre>
         </article>
         <article class="doc-entry" id="doc-sequence-methods-49">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-49">#</a> <code>reduce</code></h3>
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-49">#</a> <code>scanLeft</code></h3>
+          <p>The `foldLeft` that keeps every intermediate accumulator, so the result is one longer than the receiver and starts with the seed — an empty receiver still answers the one-element `List(z)`.</p>
+          <pre><code class="lang-scala">xs.scanLeft(z: B)(op: (B, A) =&gt; B): Repr[B]
+println(List(1, 2, 3).scanLeft(0)((a, b) =&gt; a + b))   // =&gt; List(0, 1, 3, 6)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-50">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-50">#</a> <code>scanRight</code></h3>
+          <p>The `foldRight` that keeps every intermediate accumulator; the result ends with the seed.</p>
+          <pre><code class="lang-scala">xs.scanRight(z: B)(op: (A, B) =&gt; B): Repr[B]
+println(List(1, 2, 3).scanRight(0)((a, b) =&gt; a + b))   // =&gt; List(6, 5, 3, 0)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-51">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-51">#</a> <code>reduce</code></h3>
           <p>Combine the elements pairwise with no initial value, left to right. An empty receiver raises `UnsupportedOperationException: empty.reduceLeft`.</p>
           <pre><code class="lang-scala">xs.reduce(op: (A, A) =&gt; A): A
 println(List(1, 2, 3).reduce((a, b) =&gt; a + b))   // =&gt; 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-50">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-50">#</a> <code>reduceLeft</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-52">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-52">#</a> <code>reduceLeft</code></h3>
           <p>The explicit left-to-right `reduce`; the same implementation.</p>
           <pre><code class="lang-scala">xs.reduceLeft(op: (A, A) =&gt; A): A
 println(List(1, 2, 3).reduceLeft((a, b) =&gt; a - b))   // =&gt; -4</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-51">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-51">#</a> <code>reduceRight</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-53">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-53">#</a> <code>reduceRight</code></h3>
           <p>Combine pairwise from the right, the operator receiving `(element, accumulator)`. An empty receiver raises `UnsupportedOperationException: empty.reduceRight`.</p>
           <pre><code class="lang-scala">xs.reduceRight(op: (A, A) =&gt; A): A
 println(List(1, 2, 3).reduceRight((a, b) =&gt; a - b))   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-52">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-52">#</a> <code>sum</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-54">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-54">#</a> <code>sum</code></h3>
           <p>Add the elements. The result is an `Int` when every element is an `Int`, otherwise a `Double`. An empty receiver answers `0`.</p>
           <pre><code class="lang-scala">xs.sum: A
 println(List(1, 2, 3).sum)   // =&gt; 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-53">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-53">#</a> <code>product</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-55">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-55">#</a> <code>product</code></h3>
           <p>Multiply the elements, with the same `Int`/`Double` result rule as `sum`. An empty receiver answers `1`.</p>
           <pre><code class="lang-scala">xs.product: A
 println(List(1, 2, 3).product)   // =&gt; 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-54">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-54">#</a> <code>min</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-56">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-56">#</a> <code>min</code></h3>
           <p>The smallest element under the `sorted` ordering. An empty receiver raises `UnsupportedOperationException: empty.min`.</p>
           <pre><code class="lang-scala">xs.min: A
 println(List(3, 1, 2).min)   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-55">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-55">#</a> <code>max</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-57">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-57">#</a> <code>max</code></h3>
           <p>The largest element under the `sorted` ordering. An empty receiver raises `UnsupportedOperationException: empty.max`.</p>
           <pre><code class="lang-scala">xs.max: A
 println(List(3, 1, 2).max)   // =&gt; 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-56">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-56">#</a> <code>minBy</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-58">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-58">#</a> <code>minBy</code></h3>
           <p>The element whose computed key is smallest; ties keep the earliest. An empty receiver raises `UnsupportedOperationException: empty.minBy`.</p>
           <pre><code class="lang-scala">xs.minBy(f: A =&gt; K): A
 println(List("bbb", "a").minBy(_.length))   // =&gt; a</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-57">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-57">#</a> <code>maxBy</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-59">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-59">#</a> <code>maxBy</code></h3>
           <p>The element whose computed key is largest; ties keep the earliest.</p>
           <pre><code class="lang-scala">xs.maxBy(f: A =&gt; K): A
 println(List("bbb", "a").maxBy(_.length))   // =&gt; bbb</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-58">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-58">#</a> <code>count</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-60">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-60">#</a> <code>count</code></h3>
           <p>How many elements satisfy the predicate. It tests every element.</p>
           <pre><code class="lang-scala">xs.count(p: A =&gt; Boolean): Int
 println(List(1, 2, 3).count(_ &gt; 1))   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-59">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-59">#</a> <code>exists</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-61">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-61">#</a> <code>exists</code></h3>
           <p>Whether any element satisfies the predicate, short-circuiting on the first hit.</p>
           <pre><code class="lang-scala">xs.exists(p: A =&gt; Boolean): Boolean
 println(List(1, 2).exists(_ &gt; 1))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-60">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-60">#</a> <code>forall</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-62">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-62">#</a> <code>forall</code></h3>
           <p>Whether every element satisfies the predicate, short-circuiting on the first failure. An empty receiver answers true.</p>
           <pre><code class="lang-scala">xs.forall(p: A =&gt; Boolean): Boolean
 println(List(1, 2).forall(_ &gt; 0))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-61">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-61">#</a> <code>find</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-63">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-63">#</a> <code>find</code></h3>
           <p>The first element satisfying the predicate as `Some(x)`, or `None`. It stops at the first hit.</p>
           <pre><code class="lang-scala">xs.find(p: A =&gt; Boolean): Option[A]
 println(List(1, 2, 3).find(_ &gt; 1))   // =&gt; Some(2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-62">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-62">#</a> <code>mkString</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-64">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-64">#</a> <code>mkString</code></h3>
           <p>Render the elements as one string. With no argument they are concatenated; with one they are separator-joined; with three the join is wrapped in a prefix and a suffix.</p>
           <pre><code class="lang-scala">xs.mkString[(sep)|(pre, sep, post)]: String
 println(List(1, 2, 3).mkString(","))            // =&gt; 1,2,3
 println(List(1, 2, 3).mkString("[", ",", "]"))   // =&gt; [1,2,3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-63">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-63">#</a> <code>toList</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-65">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-65">#</a> <code>toList</code></h3>
           <p>The elements as a `List`, whatever the receiver's kind was.</p>
           <pre><code class="lang-scala">xs.toList: List[A]
 println(Set(1, 2).toList)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-64">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-64">#</a> <code>toSeq</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-66">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-66">#</a> <code>toSeq</code></h3>
           <p>The elements as a `Seq`, which is a `List` here.</p>
           <pre><code class="lang-scala">xs.toSeq: List[A]
 println(Array(1, 2).toSeq)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-65">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-65">#</a> <code>toIterable</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-67">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-67">#</a> <code>toIterable</code></h3>
           <p>The elements as an `Iterable`, which is also a `List` here — `immutable.Iterable`'s own factory is `List`.</p>
           <pre><code class="lang-scala">xs.toIterable: List[A]
 println(List(1, 2).toIterable)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-66">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-66">#</a> <code>toVector</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-68">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-68">#</a> <code>toVector</code></h3>
           <p>The elements as a `Vector`.</p>
           <pre><code class="lang-scala">xs.toVector: Vector[A]
 println(List(1, 2).toVector)   // =&gt; Vector(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-67">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-67">#</a> <code>toArray</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-69">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-69">#</a> <code>toArray</code></h3>
           <p>The elements as a mutable `Array`, copied out of the receiver.</p>
           <pre><code class="lang-scala">xs.toArray: Array[A]
 println(List(1, 2).toArray)   // =&gt; Array(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-68">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-68">#</a> <code>toSet</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-70">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-70">#</a> <code>toSet</code></h3>
           <p>The elements as an immutable `Set`, duplicates dropped and the representation chosen by size as for any `Set`.</p>
           <pre><code class="lang-scala">xs.toSet: Set[A]
 println(List(1, 2, 2).toSet)   // =&gt; Set(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-69">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-69">#</a> <code>toMap</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-71">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-71">#</a> <code>toMap</code></h3>
           <p>A sequence of pairs as a `Map`, later duplicates of a key overwriting earlier ones. A non-pair element is an error.</p>
           <pre><code class="lang-scala">xs.toMap: Map[K, V]
 println(List((1, 2), (3, 4)).toMap)   // =&gt; Map(1 -&gt; 2, 3 -&gt; 4)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-70">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-70">#</a> <code>union</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-72">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-72">#</a> <code>union</code></h3>
           <p>The receiver's elements followed by the argument's. On a `Set` the result is re-deduplicated; on a sequence it is a plain concatenation.</p>
           <pre><code class="lang-scala">xs.union(ys: Seq[A]): Repr
 println(Set(1, 2).union(Set(2, 3)))   // =&gt; Set(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-71">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-71">#</a> <code>intersect</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-73">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-73">#</a> <code>intersect</code></h3>
           <p>The receiver's elements that also occur in the argument, in the receiver's order.</p>
           <pre><code class="lang-scala">xs.intersect(ys: Seq[A]): Repr
 println(Set(1, 2, 3).intersect(Set(2, 3, 4)))   // =&gt; Set(2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-72">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-72">#</a> <code>diff</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-74">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-74">#</a> <code>diff</code></h3>
           <p>The receiver's elements that do not occur in the argument. Unlike a buffer's `-=`, it removes every occurrence.</p>
           <pre><code class="lang-scala">xs.diff(ys: Seq[A]): Repr
 println(List(1, 2, 3).diff(List(2)))   // =&gt; List(1, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-73">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-73">#</a> <code>subsetOf</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-75">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-75">#</a> <code>subsetOf</code></h3>
           <p>Whether every element of the receiver occurs in the argument.</p>
           <pre><code class="lang-scala">xs.subsetOf(ys: Set[A]): Boolean
 println(Set(1, 2).subsetOf(Set(1, 2, 3)))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-74">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-74">#</a> <code>incl</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-76">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-76">#</a> <code>incl</code></h3>
           <p>A `Set` with one element added — the method `set + e` calls. The result re-deduplicates and may change representation.</p>
           <pre><code class="lang-scala">set.incl(e: A): Set[A]
 println(Set(1, 2).incl(5))   // =&gt; Set(1, 2, 5)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-75">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-75">#</a> <code>excl</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-77">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-77">#</a> <code>excl</code></h3>
           <p>A `Set` with one element removed — the method `set - e` calls.</p>
           <pre><code class="lang-scala">set.excl(e: A): Set[A]
 println(Set(1, 2).excl(1))   // =&gt; Set(2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-76">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-76">#</a> <code>removedAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-78">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-78">#</a> <code>removedAll</code></h3>
           <p>Every element of the argument removed — the same implementation as `diff` and `--`.</p>
           <pre><code class="lang-scala">xs.removedAll(ys: Seq[A]): Repr
 println(Set(1, 2, 3).removedAll(Set(2)))   // =&gt; Set(1, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-77">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-77">#</a> <code>concat</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-79">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-79">#</a> <code>concat</code></h3>
           <p>The receiver's elements followed by the argument's — the named form of `++`.</p>
           <pre><code class="lang-scala">xs.concat(ys: Seq[A]): Repr
 println(List(1, 2).concat(List(3)))   // =&gt; List(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-78">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-78">#</a> <code>appended</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-80">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-80">#</a> <code>appended</code></h3>
           <p>A copy with one element added at the end — the named form of `:+`.</p>
           <pre><code class="lang-scala">xs.appended(e: A): Repr
 println(List(1, 2).appended(3))   // =&gt; List(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-79">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-79">#</a> <code>prepended</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-81">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-81">#</a> <code>prepended</code></h3>
           <p>A copy with one element added at the front — the named form of `+:`.</p>
           <pre><code class="lang-scala">xs.prepended(e: A): Repr
 println(List(1, 2).prepended(0))   // =&gt; List(0, 1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-80">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-80">#</a> <code>by (Range)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-82">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-82">#</a> <code>by (Range)</code></h3>
           <p>Rebuild a `Range` with a new step. Only a `Range` receiver answers it; a zero step raises `IllegalArgumentException: step cannot be 0.`.</p>
           <pre><code class="lang-scala">(a to b).by(step: Int): Range
 println((1 to 10 by 3).toList)   // =&gt; List(1, 4, 7, 10)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-81">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-81">#</a> <code>update</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-83">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-83">#</a> <code>update</code></h3>
           <p>In-place element assignment — the desugar target of `xs(i) = v`. Only an `Array`, `ListBuffer` or `ArrayBuffer` accepts it; an out-of-range index raises `ArrayIndexOutOfBoundsException`.</p>
           <pre><code class="lang-scala">xs.update(i: Int, v: A): Unit
 val a = Array(1, 2, 3)
 a(0) = 9
 println(a.mkString(","))   // =&gt; 9,2,3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-82">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-82">#</a> <code>+= (mutable)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-84">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-84">#</a> <code>+= (mutable)</code></h3>
           <p>Add one element in place to a buffer or a `mutable.Set` and answer the receiver, so calls chain. On an immutable receiver `+` builds a new collection instead.</p>
           <pre><code class="lang-scala">xs += (e: A): xs.type
 val b = mutable.ListBuffer(1, 2)
 b += 3
 println(b)   // =&gt; ListBuffer(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-83">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-83">#</a> <code>++= (mutable)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-85">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-85">#</a> <code>++= (mutable)</code></h3>
           <p>Add every element of the argument in place and answer the receiver.</p>
           <pre><code class="lang-scala">xs ++= (ys: Seq[A]): xs.type
 val a = mutable.ArrayBuffer(1, 2)
 a ++= List(3, 4)
 println(a)   // =&gt; ArrayBuffer(1, 2, 3, 4)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-84">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-84">#</a> <code>-= (mutable)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-86">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-86">#</a> <code>-= (mutable)</code></h3>
           <p>Remove one element in place. A buffer drops only the first occurrence; a `mutable.Set` drops the element outright.</p>
           <pre><code class="lang-scala">xs -= (e: A): xs.type
 val b = mutable.ArrayBuffer(1, 2, 1)
 b -= 1
 println(b)   // =&gt; ArrayBuffer(2, 1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-85">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-85">#</a> <code>--= (mutable)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-87">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-87">#</a> <code>--= (mutable)</code></h3>
           <p>Remove every element of the argument in place, one occurrence each for a buffer.</p>
           <pre><code class="lang-scala">xs --= (ys: Seq[A]): xs.type
 val b = mutable.ListBuffer(1, 2, 3)
 b --= List(1, 3)
 println(b)   // =&gt; ListBuffer(2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-86">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-86">#</a> <code>+=:</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-88">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-88">#</a> <code>+=:</code></h3>
           <p>Prepend in place, the right-associative operator form of `prepend`. It is implemented but unreachable from source: the lexer reads `+=` as its own token, so `0 +=: b` does not parse. Use `b.prepend(0)`.</p>
           <pre><code class="lang-scala">b.prepend(e: A): b.type   // the reachable spelling
 val b = mutable.ListBuffer(1, 2)
 b.prepend(0)
 println(b)   // =&gt; ListBuffer(0, 1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-87">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-87">#</a> <code>add</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-89">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-89">#</a> <code>add</code></h3>
           <p>Add one element to a `mutable.Set` and answer whether it was absent — unlike `+=`, which answers the set.</p>
           <pre><code class="lang-scala">s.add(e: A): Boolean
 val s = mutable.Set(1, 2)
 println(s.add(3))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-88">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-88">#</a> <code>addOne</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-90">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-90">#</a> <code>addOne</code></h3>
           <p>The named form of `+=`: add one element in place and answer the receiver.</p>
           <pre><code class="lang-scala">xs.addOne(e: A): xs.type
 val b = mutable.ListBuffer(1)
 b.addOne(2)
 println(b)   // =&gt; ListBuffer(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-89">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-89">#</a> <code>addAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-91">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-91">#</a> <code>addAll</code></h3>
           <p>The named form of `++=`: add every element of the argument in place.</p>
           <pre><code class="lang-scala">xs.addAll(ys: Seq[A]): xs.type
 val b = mutable.ListBuffer(1)
 b.addAll(List(2, 3))
 println(b)   // =&gt; ListBuffer(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-90">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-90">#</a> <code>append</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-92">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-92">#</a> <code>append</code></h3>
           <p>Add one element at the end of a buffer in place.</p>
           <pre><code class="lang-scala">b.append(e: A): b.type
 val b = mutable.ListBuffer(1)
 b.append(2)
 println(b)   // =&gt; ListBuffer(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-91">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-91">#</a> <code>appendAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-93">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-93">#</a> <code>appendAll</code></h3>
           <p>Add every element of the argument at the end of a buffer in place.</p>
           <pre><code class="lang-scala">b.appendAll(ys: Seq[A]): b.type
 val b = mutable.ListBuffer(1, 2)
 b.appendAll(List(3))
 println(b)   // =&gt; ListBuffer(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-92">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-92">#</a> <code>prepend</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-94">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-94">#</a> <code>prepend</code></h3>
           <p>Add one element at the front of a buffer in place. This is the reachable spelling of `+=:`.</p>
           <pre><code class="lang-scala">b.prepend(e: A): b.type
 val b = mutable.ArrayBuffer(1, 2)
 b.prepend(0)
 println(b)   // =&gt; ArrayBuffer(0, 1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-93">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-93">#</a> <code>prependAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-95">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-95">#</a> <code>prependAll</code></h3>
           <p>Add every element of the argument at the front of a buffer in place, keeping their order.</p>
           <pre><code class="lang-scala">b.prependAll(ys: Seq[A]): b.type
 val b = mutable.ListBuffer(3)
 b.prependAll(List(1, 2))
 println(b)   // =&gt; ListBuffer(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-94">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-94">#</a> <code>insert</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-96">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-96">#</a> <code>insert</code></h3>
           <p>Insert one element at an index, shifting the rest right. An index past the end raises `IndexOutOfBoundsException`; an index equal to the length appends.</p>
           <pre><code class="lang-scala">b.insert(i: Int, e: A): Unit
 val b = mutable.ListBuffer(1, 2)
 b.insert(1, 9)
 println(b)   // =&gt; ListBuffer(1, 9, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-95">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-95">#</a> <code>insertAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-97">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-97">#</a> <code>insertAll</code></h3>
           <p>Insert every element of the argument at an index, keeping their order.</p>
           <pre><code class="lang-scala">b.insertAll(i: Int, ys: Seq[A]): Unit
 val b = mutable.ListBuffer(1, 2)
 b.insertAll(1, List(7, 8))
 println(b)   // =&gt; ListBuffer(1, 7, 8, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-96">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-96">#</a> <code>remove</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-98">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-98">#</a> <code>remove</code></h3>
           <p>On a buffer, remove the element at an index and answer it. On a `mutable.Set`, remove the element and answer whether it was present.</p>
           <pre><code class="lang-scala">b.remove(i: Int): A   |   s.remove(e: A): Boolean
 val b = mutable.ListBuffer(1, 2)
 println(b.remove(0))   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-97">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-97">#</a> <code>subtractOne</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-99">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-99">#</a> <code>subtractOne</code></h3>
           <p>The named form of `-=`: remove one element (one occurrence, on a buffer) in place.</p>
           <pre><code class="lang-scala">xs.subtractOne(e: A): xs.type
 val b = mutable.ListBuffer(1, 2)
 b.subtractOne(1)
 println(b)   // =&gt; ListBuffer(2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-98">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-98">#</a> <code>subtractAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-100">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-100">#</a> <code>subtractAll</code></h3>
           <p>The named form of `--=`: remove every element of the argument in place.</p>
           <pre><code class="lang-scala">xs.subtractAll(ys: Seq[A]): xs.type
 val b = mutable.ListBuffer(1, 2, 3)
 b.subtractAll(List(1, 2))
 println(b)   // =&gt; ListBuffer(3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-99">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-99">#</a> <code>clear</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-101">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-101">#</a> <code>clear</code></h3>
           <p>Drop every element in place. A `mutable.Set` keeps the hash-table length it had grown to, matching the JVM's `Arrays.fill`, so later insertion order is unaffected by the clear.</p>
           <pre><code class="lang-scala">xs.clear(): Unit
 val b = mutable.ListBuffer(1, 2)
 b.clear()
 println(b)   // =&gt; ListBuffer()</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-100">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-100">#</a> <code>toString</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-102">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-102">#</a> <code>toString</code></h3>
           <p>The Scala rendering of the collection, which is what `println` prints: `List(1, 2)`, `Set(…)`/`HashSet(…)` by representation, `Range a to b by s` for a range, `(a,b)` for a tuple.</p>
           <pre><code class="lang-scala">xs.toString: String
 println(List(1, 2).toString)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-101">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-101">#</a> <code>equals</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-103">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-103">#</a> <code>equals</code></h3>
           <p>Structural equality — the method `==` calls. Two collections are equal when their elements are pairwise equal; a plain (non-case) class instance compares by identity instead.</p>
           <pre><code class="lang-scala">xs.equals(other: Any): Boolean
 println(List(1, 2) == List(1, 2))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-102">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-102">#</a> <code>hashCode</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-104">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-104">#</a> <code>hashCode</code></h3>
           <p>The MurmurHash3 sequence, set or map hash Scala computes — the same value that decides a `HashSet`'s print order. An `Array` and a function value keep an identity hash instead, which is not reproducible across runs.</p>
           <pre><code class="lang-scala">xs.hashCode: Int
 println(List(1, 2).hashCode == List(1, 2).hashCode)   // =&gt; true</code></pre>
@@ -1736,9 +1748,10 @@ println("(\\d+)".r.findFirstIn("ab12"))   // =&gt; Some(12)</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-14">
           <h3><a class="doc-anchor" href="#doc-string-methods-14">#</a> <code>toList</code></h3>
-          <p>The characters as a `List` of one-character strings — there is no distinct `Char` value here.</p>
-          <pre><code class="lang-scala">s.toList: List[String]
-println("abc".toList)   // =&gt; List(a, b, c)</code></pre>
+          <p>The characters as a `List[Char]`. The elements are real `Char`s, so they answer `Char`'s numeric surface (`_.toInt` is the code point, not a parse).</p>
+          <pre><code class="lang-scala">s.toList: List[Char]
+println("abc".toList)   // =&gt; List(a, b, c)
+println("abc".toList.map(_.toInt))   // =&gt; List(97, 98, 99)</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-15">
           <h3><a class="doc-anchor" href="#doc-string-methods-15">#</a> <code>toSeq</code></h3>
@@ -1794,6 +1807,49 @@ println("abc".endsWith("c"))   // =&gt; true</code></pre>
           <pre><code class="lang-scala">s.substring(begin: Int[, end: Int]): String
 println("abc".substring(1))      // =&gt; bc
 println("abc".substring(1, 2))   // =&gt; b</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-char-methods">
+        <h2>Char Methods</h2>
+        <article class="doc-entry" id="doc-char-methods-1">
+          <h3><a class="doc-anchor" href="#doc-char-methods-1">#</a> <code>toInt</code></h3>
+          <p>The character's code point. This is `Char`'s conversion, not `String`'s parse: `'5'.toInt` is 53 where `"5".toInt` is 5.</p>
+          <pre><code class="lang-scala">c.toInt: Int
+println('a'.toInt)   // =&gt; 97
+println('5'.toInt)   // =&gt; 53</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-methods-2">
+          <h3><a class="doc-anchor" href="#doc-char-methods-2">#</a> <code>toChar</code></h3>
+          <p>The `Char` for a code point, truncated to 16 bits — the round trip back from `Char`'s arithmetic, which produces an `Int`.</p>
+          <pre><code class="lang-scala">n.toChar: Char
+println(('a' + 1).toChar)   // =&gt; b</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-methods-3">
+          <h3><a class="doc-anchor" href="#doc-char-methods-3">#</a> <code>asDigit</code></h3>
+          <p>The numeric value of a digit character (`Character.digit` at radix 36, so the hex letters count too), or -1 when it is not one.</p>
+          <pre><code class="lang-scala">c.asDigit: Int
+println('5'.asDigit)   // =&gt; 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-methods-4">
+          <h3><a class="doc-anchor" href="#doc-char-methods-4">#</a> <code>toUpper</code></h3>
+          <p>The upper-case `Char`. Answers a `Char`, which is what keeps `s.map(_.toUpper)` a `String`.</p>
+          <pre><code class="lang-scala">c.toUpper: Char
+println('a'.toUpper)   // =&gt; A
+println("abc".map(_.toUpper))   // =&gt; ABC</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-methods-5">
+          <h3><a class="doc-anchor" href="#doc-char-methods-5">#</a> <code>toLower</code></h3>
+          <p>The lower-case `Char`.</p>
+          <pre><code class="lang-scala">c.toLower: Char
+println('Z'.toLower)   // =&gt; z</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-char-methods-6">
+          <h3><a class="doc-anchor" href="#doc-char-methods-6">#</a> <code>isDigit</code></h3>
+          <p>Whether the character is an ASCII decimal digit. `isLetter`, `isLetterOrDigit`, `isUpper`, `isLower` and `isWhitespace` are the companions.</p>
+          <pre><code class="lang-scala">c.isDigit: Boolean
+println('5'.isDigit)   // =&gt; true
+println('a'.isLetter)   // =&gt; true</code></pre>
         </article>
       </section>
 

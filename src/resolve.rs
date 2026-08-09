@@ -572,7 +572,7 @@ impl Resolver {
                             let n = name.clone();
                             self.bind_value(&n);
                         }
-                        ForEnum::GenColl { pat, coll } => {
+                        ForEnum::GenColl { pat, coll, .. } => {
                             self.walk_expr(coll)?;
                             let mut names = HashSet::new();
                             pattern_binds(pat, &mut names);
@@ -610,6 +610,7 @@ impl Resolver {
             Expr::Int(_)
             | Expr::Float(_)
             | Expr::Str(_)
+            | Expr::Char(_)
             | Expr::Bool(_)
             | Expr::Null
             | Expr::Placeholder => Ok(()),
@@ -877,6 +878,7 @@ fn cs_expr(e: &mut Expr, sigs: &HashMap<String, Sig>) {
         Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)
+        | Expr::Char(_)
         | Expr::Bool(_)
         | Expr::Null
         | Expr::Placeholder => {}

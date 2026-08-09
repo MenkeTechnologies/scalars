@@ -1013,7 +1013,13 @@ impl Parser {
     /// One `pat <- source` generator. A parenthesized binder is a destructuring
     /// (tuple) pattern; a bare identifier is the usual binding.
     fn for_generator(&mut self) -> Result<ForEnum, String> {
-        let pat = if self.is(&Tok::LParen) {
+        // Scala 3's `for (case pat <- xs)`: the pattern may fail, and a failing
+        // element is filtered out rather than raising.
+        let filtering = self.is(&Tok::Case);
+        if filtering {
+            self.advance();
+        }
+        let pat = if filtering || self.is(&Tok::LParen) {
             self.pattern()?
         } else {
             Pattern::Bind(self.ident()?)
@@ -1025,14 +1031,20 @@ impl Parser {
         // generator desugared to `.map`/`.flatMap`.
         let src = self.expression()?;
         match (&pat, as_range(&src)) {
-            (Pattern::Bind(name), Some((start, end, inclusive, step))) => Ok(ForEnum::Gen {
-                name: name.clone(),
-                start,
-                end,
-                inclusive,
-                step,
+            (Pattern::Bind(name), Some((start, end, inclusive, step))) if !filtering => {
+                Ok(ForEnum::Gen {
+                    name: name.clone(),
+                    start,
+                    end,
+                    inclusive,
+                    step,
+                })
+            }
+            _ => Ok(ForEnum::GenColl {
+                pat,
+                coll: src,
+                filtering,
             }),
-            _ => Ok(ForEnum::GenColl { pat, coll: src }),
         }
     }
 
@@ -1136,6 +1148,7 @@ impl Parser {
                 Tok::Int(_)
                     | Tok::Float(_)
                     | Tok::Str(_)
+                    | Tok::Char(_)
                     | Tok::InterpStr { .. }
                     | Tok::Ident(_)
                     | Tok::True
@@ -1504,6 +1517,10 @@ impl Parser {
             Tok::Str(s) => {
                 self.advance();
                 Ok(Expr::Str(s))
+            }
+            Tok::Char(c) => {
+                self.advance();
+                Ok(Expr::Char(c))
             }
             Tok::True => {
                 self.advance();
@@ -2049,6 +2066,10 @@ impl Parser {
             Tok::Str(s) => {
                 self.advance();
                 Ok(Pattern::Literal(Expr::Str(s)))
+            }
+            Tok::Char(c) => {
+                self.advance();
+                Ok(Pattern::Literal(Expr::Char(c)))
             }
             Tok::True => {
                 self.advance();

@@ -1089,6 +1089,12 @@ impl Compiler {
                 let c = self.b.add_constant(Value::str(s.clone()));
                 self.b.emit(Op::LoadConst(c), 0);
             }
+            // A `Char` is a host-interned value, so the literal loads its code
+            // point and lets `CHAR_NEW` hand back the shared handle.
+            Expr::Char(c) => {
+                self.b.emit(Op::LoadInt(*c as u32 as i64), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::CHAR_NEW, 1), 0);
+            }
             Expr::Bool(b) => {
                 self.b
                     .emit(if *b { Op::LoadTrue } else { Op::LoadFalse }, 0);
@@ -1719,9 +1725,13 @@ impl Compiler {
                     None if seq_pattern_ctor(name) => {
                         return self.match_seq_pattern(name, elems, vplace, fail_jumps)
                     }
-                    None => {
-                        return Err(format!("scalars: not found: constructor pattern `{name}`"))
-                    }
+                    // Not a type — so it is an extractor named by a *value*,
+                    // Scala's stable-identifier pattern. The only one here is a
+                    // `Regex` (`val p = "…".r; case p(a, b) => …`), and which
+                    // value it is can only be known at run time, so the match
+                    // becomes an `unapplySeq` call. A name that turns out not to
+                    // be an extractor reports the same message from the host.
+                    None => return self.match_extractor_pattern(name, elems, vplace, fail_jumps),
                 };
                 if elems.len() != fields.len() {
                     return Err(format!(
@@ -1749,6 +1759,50 @@ impl Compiler {
                     self.match_pattern(elem, fp, fail_jumps)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A constructor pattern whose name is a value rather than a type — Scala's
+    /// stable-identifier extractor, `case p(a, b) =>` where `p` is a `Regex`.
+    ///
+    /// Emits `UNAPPLY_SEQ(p, scrut, arity)`, which answers the bound values or
+    /// `null` for no match, tests that, and binds each sub-pattern from the
+    /// result. The extractor is loaded as an ordinary variable read, so it
+    /// follows the same scoping as any other reference to `p`.
+    fn match_extractor_pattern(
+        &mut self,
+        name: &str,
+        elems: &[Pattern],
+        vplace: Place,
+        fail_jumps: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        self.var_ref(name)?;
+        self.emit_load(vplace);
+        self.b.emit(Op::LoadInt(elems.len() as i64), 0);
+        // The source name, so a non-extractor reports the identifier written.
+        let nc = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(nc), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::UNAPPLY_SEQ, 4), 0);
+        self.obj_counter += 1;
+        let rp = self.declare_place(&format!(" unapp_{}", self.obj_counter));
+        self.emit_store(rp);
+        // No match is `null`; anything else is the tuple of bound values.
+        self.emit_load(rp);
+        self.b.emit(Op::LoadUndef, 0);
+        self.b.emit(Op::NumNe, 0);
+        fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+        // Bound positions come back as a tuple, read through the same `_1`..
+        // accessors a tuple pattern uses.
+        for (i, elem) in elems.iter().enumerate() {
+            self.emit_load(rp);
+            let acc = self.b.add_constant(Value::str(format!("_{}", i + 1)));
+            self.b.emit(Op::LoadConst(acc), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+            self.obj_counter += 1;
+            let ep = self.declare_place(&format!(" unappel_{}", self.obj_counter));
+            self.emit_store(ep);
+            self.match_pattern(elem, ep, fail_jumps)?;
         }
         Ok(())
     }
@@ -2116,6 +2170,16 @@ impl Compiler {
         if !self.classes.contains_key(name) {
             if let Some(fqn) = crate::host::throwable_fqn(name) {
                 return self.construct_throwable(name, fqn, args, line);
+            }
+            // `new Regex("…")` is the constructor spelling of `"…".r`; both make
+            // the same `Regex` value, so it lowers to the same `r` method. The
+            // second parameter list (group names) is not modeled.
+            if name == "Regex" && args.len() == 1 {
+                self.expr(&args[0])?;
+                let m = self.b.add_constant(Value::str("r".to_string()));
+                self.b.emit(Op::LoadConst(m), line);
+                self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), line);
+                return Ok(());
             }
         }
         let arity = match self.classes.get(name) {
@@ -3023,6 +3087,7 @@ fn expr_any(e: &Expr, pred: &impl Fn(&Expr) -> bool) -> bool {
         Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)
+        | Expr::Char(_)
         | Expr::Bool(_)
         | Expr::Null
         | Expr::Placeholder
@@ -3354,10 +3419,23 @@ fn is_coll_gen(e: &ForEnum) -> bool {
 /// * `for (x <- e) b`      (foreach)   → `e.foreach(x => b)`
 /// * `for (x <- e if g; …) …`          → `e.withFilter(x => g)` then continue
 /// * `for (x <- e; rest…) yield b`     → `e.flatMap(x => <for rest yield b>)`
+/// * `for (case p <- e) …`             → `e.withFilter(<p matches>)` then continue
 ///
 /// A range generator (`i <- a to b`) is materialized to a `List` first.
 fn desugar_for(enums: &[ForEnum], body: &Expr, is_yield: bool) -> Expr {
     let (pat, mut src) = gen_source(&enums[0]);
+    // A `case` generator's pattern is refutable, so Scala filters the source by
+    // it before binding — that is what makes a non-matching element skipped
+    // rather than a `MatchError`.
+    if matches!(
+        enums[0],
+        ForEnum::GenColl {
+            filtering: true,
+            ..
+        }
+    ) {
+        src = method(src, "withFilter", vec![pattern_test(&pat)]);
+    }
     // Guards immediately after the generator become `withFilter` on its source.
     let mut i = 1;
     while let Some(ForEnum::Guard(g)) = enums.get(i) {
@@ -3377,6 +3455,10 @@ fn desugar_for(enums: &[ForEnum], body: &Expr, is_yield: bool) -> Expr {
         let mut rewritten = vec![ForEnum::GenColl {
             pat: Pattern::Tuple(vec![pat.clone(), Pattern::Bind(name.clone())]),
             coll: method(src, "map", vec![lambda1(&pat, paired)]),
+            // The rewrite re-destructures the pair with the SAME pattern, so a
+            // refutable one has already been filtered out by the `withFilter`
+            // above and cannot fail here.
+            filtering: false,
         }];
         rewritten.extend_from_slice(&enums[i + 1..]);
         return desugar_for(&rewritten, body, is_yield);
@@ -3390,6 +3472,33 @@ fn desugar_for(enums: &[ForEnum], body: &Expr, is_yield: bool) -> Expr {
         // Nested yield collects via `flatMap`; nested foreach nests `foreach`.
         let m = if is_yield { "flatMap" } else { "foreach" };
         method(src, m, vec![lambda1(&pat, inner)])
+    }
+}
+
+/// A one-argument predicate answering whether its argument matches `pat` —
+/// `x => x match { case pat => true; case _ => false }`.
+///
+/// This is the `withFilter` a `for (case pat <- xs)` generator runs before
+/// binding, and it is why the pattern may fail without raising: the wildcard arm
+/// answers `false` for exactly the elements a non-`case` generator would have
+/// hit a `MatchError` on.
+fn pattern_test(pat: &Pattern) -> Expr {
+    let name = "$forpat".to_string();
+    let arm = |p: Pattern, v: bool| MatchArm {
+        pat: p,
+        guard: None,
+        body: vec![Stmt {
+            line: 0,
+            kind: StmtKind::Expr(Expr::Bool(v)),
+        }],
+    };
+    Expr::Lambda {
+        params: vec![name.clone()],
+        body: Box::new(Expr::Match {
+            scrut: Box::new(Expr::Var(name)),
+            arms: vec![arm(pat.clone(), true), arm(Pattern::Wildcard, false)],
+        }),
+        partial: false,
     }
 }
 
@@ -3408,7 +3517,7 @@ fn gen_elem_expr(pat: &Pattern) -> Expr {
 /// generator is wrapped in the `$range_list` materialization call.
 fn gen_source(e: &ForEnum) -> (Pattern, Expr) {
     match e {
-        ForEnum::GenColl { pat, coll } => (pat.clone(), coll.clone()),
+        ForEnum::GenColl { pat, coll, .. } => (pat.clone(), coll.clone()),
         ForEnum::Gen {
             name,
             start,
@@ -3469,22 +3578,49 @@ fn yields_pairs(body: &Expr) -> bool {
 
 /// The compile-time facts about a lambda body, packed into the single operand
 /// `MAKE_CLOSURE`/`MAKE_PARTIAL` carries: bit 0 is [`yields_pairs`], bit 1 is
-/// [`yields_strings`]. One operand means a new fact costs no change to the
-/// closure's stack layout.
+/// [`yields_chars`], bit 2 is [`yields_strings`]. One operand means a new fact
+/// costs no change to the closure's stack layout.
 fn body_flags(body: &Expr) -> i64 {
-    i64::from(yields_pairs(body)) | (i64::from(yields_strings(body)) << 1)
+    i64::from(yields_pairs(body))
+        | (i64::from(yields_chars(body)) << 1)
+        | (i64::from(yields_strings(body)) << 2)
+}
+
+/// Whether this function body answers a `Char`.
+///
+/// `Char` is its own runtime type, so `String.map`/`collect` normally read
+/// Scala's `Char => Char` vs `Char => B` overload split straight off the
+/// results. The one case with no results to read is an EMPTY receiver, where
+/// Scala still answers by static type — `"".map(_.toUpper)` is `""` but
+/// `"".map(_.toString)` is `ArraySeq()`. Only the syntax can settle that, so
+/// these are the shapes whose result type is `Char`: the element itself, a
+/// `Char` literal, and the `Char`-returning methods.
+fn yields_chars(body: &Expr) -> bool {
+    match body {
+        // The element flows straight through (`c => c`, `_`).
+        Expr::Var(_) | Expr::Placeholder => true,
+        Expr::Char(_) => true,
+        Expr::Method { name, .. } => matches!(name.as_str(), "toUpper" | "toLower" | "toChar"),
+        Expr::Block(stmts) => match stmts.last().map(|s| &s.kind) {
+            Some(StmtKind::Expr(e)) => yields_chars(e),
+            _ => false,
+        },
+        Expr::Match { arms, .. } => arms.iter().all(|a| match a.body.last().map(|s| &s.kind) {
+            Some(StmtKind::Expr(e)) => yields_chars(e),
+            _ => false,
+        }),
+        Expr::If { then, els, .. } => {
+            yields_chars(then) && els.as_ref().is_some_and(|e| yields_chars(e))
+        }
+        _ => false,
+    }
 }
 
 /// Whether every value this function body can answer is statically a `String`.
 ///
-/// `String.map` needs Scala's `Char => Char` / `Char => B` overload split, and
-/// `Char` is modeled here as a one-char `String` — so a body answering a one-char
-/// `String` is ambiguous at run time and only the SYNTAX resolves it. The shapes
-/// recognized are the ones whose Scala result type is `String` no matter what
-/// the receiver is: a string literal, an interpolation (which lowers to a
-/// concatenation with a literal), and `toString`/`mkString`. Any other
-/// String-typed body still falls back to the runtime rule, which is right for
-/// every result that is not exactly one character long.
+/// `String.flatMap` has the same empty-receiver problem as [`yields_chars`], but
+/// splits on `Char => String` (concatenate) vs `Char => IterableOnce[B]` (build
+/// a `Vector`), so it needs the `String` side rather than the `Char` side.
 fn yields_strings(body: &Expr) -> bool {
     match body {
         Expr::Str(_) => true,
@@ -3769,6 +3905,7 @@ impl BoxScan {
             Expr::Int(_)
             | Expr::Float(_)
             | Expr::Str(_)
+            | Expr::Char(_)
             | Expr::Bool(_)
             | Expr::Null
             | Expr::Placeholder
@@ -3945,7 +4082,7 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
                         }
                         b.insert(name.clone());
                     }
-                    ForEnum::GenColl { pat, coll } => {
+                    ForEnum::GenColl { pat, coll, .. } => {
                         fv_expr(coll, &b, out, seen);
                         pattern_binds(pat, &mut b);
                     }
@@ -3975,6 +4112,7 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
         Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)
+        | Expr::Char(_)
         | Expr::Bool(_)
         | Expr::Null
         | Expr::Placeholder => {}

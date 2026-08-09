@@ -2253,8 +2253,9 @@ fn a_replacement_referencing_a_missing_group_throws_like_java() {
 #[test]
 fn string_map_picks_its_result_type_from_the_functions_static_type() {
     // `Char => Char` rebuilds a `String`; `Char => B` answers an `ArraySeq`.
-    // `_.toString` is the shape the results alone cannot classify, because a
-    // `Char` is modeled as a one-character `String`.
+    // `Char` is its own runtime type, so the results classify themselves; the
+    // empty receiver is the one case with no results to read, and falls back to
+    // the body's static type.
     let (out, ok) = run(&wrap(
         r##"println("abc".map(_.toUpper)); println("abc".map(_.toString)); println("abc".map(c => c + "!")); println("".map(_.toString)); println("abc".filter(_ != 'b'))"##,
     ));
@@ -2308,4 +2309,75 @@ fn a_for_value_definition_carries_a_destructuring_generator_through() {
     ));
     assert!(ok);
     assert_eq!(out, "List(a10, b20)\nList(5, 10)\nList(6)\n");
+}
+
+#[test]
+fn a_char_dispatches_as_a_number_and_prints_as_text() {
+    // The two faces of `Char`, and the distinction a one-character `String`
+    // could not encode: `'5'.toInt` is the CODE POINT 53 where `"5".toInt`
+    // PARSES to 5. `+` stays concatenation as soon as a `String` is involved.
+    let (out, ok) = run(&wrap(
+        "println('5'.toInt); println(\"5\".toInt); println('5'.asDigit)\nprintln('a' + 1); println('a' + \"b\"); println(\"a\" + 'b')",
+    ));
+    assert!(ok);
+    assert_eq!(out, "53\n5\n5\n98\nab\nab\n");
+}
+
+#[test]
+fn char_ness_survives_a_lambda_and_a_collection() {
+    // No static type reaches inside these lambdas, so the element must carry
+    // its own type: `_.toUpper` keeps a `String`, `_.toInt` answers code points
+    // through a `List` the host built and through a `List` the user wrote.
+    let (out, ok) = run(&wrap(
+        "println(\"abc\".map(_.toUpper))\nprintln(\"abc\".toList.map(_.toInt))\nprintln(List('a', 'b').map(_.toInt))\nprintln(\"abc\".head.toInt)\nprintln(('a' + 2).toChar)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "ABC\nList(97, 98, 99)\nList(97, 98)\n97\nc\n");
+}
+
+#[test]
+fn an_empty_string_combinator_falls_back_to_the_bodys_static_type() {
+    // With no results to classify, only the syntax of the body says whether the
+    // overload was `Char => Char` (a `String`) or `Char => B` (a sequence) —
+    // and `flatMap` splits on the `String` side rather than the `Char` side.
+    let (out, ok) = run(&wrap(
+        "println(\"\".map(_.toUpper))\nprintln(\"\".map(_.toString))\nprintln(\"\".collect { case c => c })\nprintln(\"\".flatMap(c => List(c)))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "\nArraySeq()\n\nVector()\n");
+}
+
+#[test]
+fn a_regex_in_pattern_position_matches_the_whole_input() {
+    // `Regex.unapplySeq` is anchored: `"a1"` does NOT match `"([0-9]+)".r`
+    // even though it contains a digit run. A group that did not participate
+    // binds `null`.
+    let (out, ok) = run(&wrap(
+        "val n = \"([0-9]+)\".r\nprintln(\"a1\" match { case n(x) => x; case _ => \"none\" })\nprintln(\"123\" match { case n(x) => x; case _ => \"none\" })\nval o = \"([0-9]+)?-([0-9]+)\".r\nprintln(\"-5\" match { case o(a, b) => \"\" + a + \"|\" + b; case _ => \"no\" })",
+    ));
+    assert!(ok);
+    assert_eq!(out, "none\n123\nnull|5\n");
+}
+
+#[test]
+fn a_case_generator_filters_instead_of_raising() {
+    // Scala 3's `for (case pat <- xs)`: the refutable pattern desugars to a
+    // `withFilter`, so a non-matching element is SKIPPED rather than raising a
+    // `MatchError`. An irrefutable tuple binder still needs no `case`.
+    let (out, ok) = run(&wrap(
+        "val n = \"([0-9]+)\".r\nprintln(for (case Some(x) <- List(Some(1), None, Some(3))) yield x * 2)\nprintln(for (case n(x) <- List(\"a1\", \"22\", \"zz\", \"7\")) yield x)\nprintln(for ((k, v) <- List((1, 2), (3, 4))) yield k + v)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(2, 6)\nList(22, 7)\nList(3, 7)\n");
+}
+
+#[test]
+fn a_triple_quoted_literal_is_taken_verbatim() {
+    // No escape processing, which is why a Scala regex is written this way; the
+    // literal closes at the LAST of a run of quotes, so `"""a""""` is `a"`.
+    let (out, ok) = run(&wrap(
+        "println(\"\"\"(\\w+)@(\\w+)\"\"\")\nprintln(\"\"\"(\\d+)\"\"\".length)\nprintln(\"\"\"a\"b\"\"\")\nval p = \"\"\"(\\d+)-(\\d+)\"\"\".r\nprintln(\"1-2\" match { case p(a, b) => a + b; case _ => \"no\" })",
+    ));
+    assert!(ok);
+    assert_eq!(out, "(\\w+)@(\\w+)\n5\na\"b\n12\n");
 }

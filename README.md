@@ -188,7 +188,8 @@ Implemented and checked against the reference `scala`:
   two blocks may each declare `def f`, an inner one shadows an outer one, and
   the enclosing-frame locals a local `def` reads are lambda-lifted into extra
   parameters every call site passes (`src/resolve.rs`).
-- **Expressions** — integer / floating / string / char / boolean / `null`
+- **Expressions** — integer / floating / string (including the triple-quoted
+  `"""…"""` form, taken verbatim) / char / boolean / `null`
   literals and the unit literal `()`; the binary operators `+ - * / %`,
   `== != < > <= >=`, `&& ||` (short-circuiting); unary `-` and `!`;
   parenthesised grouping and type ascription (`(e: T)`, with the numeric
@@ -395,10 +396,14 @@ first-class `Range` values and `scala.math`**; the **full pattern grammar** —
 trailing `_*`, and pattern definitions (`val (a, b) = pair`); **`scala.Option`'s
 method surface** plus the `Option(x)` factory and `Either`'s `Left`/`Right`;
 `Product` on every case class and tuple; a wider `String`/`StringOps` surface
-including the closure-taking combinators; and **non-local `return`** — a
+including the closure-taking combinators; **non-local `return`** — a
 `return` inside a lambda (or inside the closures a `for` desugars to) leaves the
 enclosing method, running every `finally` on the way out, lowered exactly as
-Scala lowers it.
+Scala lowers it; and **`Char` as its own type** — a value that dispatches as a
+number in arithmetic (`'a' + 1 == 98`) and as text when printed
+(`println('a')` is `a`), carrying its type through lambdas and collections so
+`"abc".toList.map(_.toInt)` is the code points while `"abc".map(_.toUpper)` is
+still a `String`.
 
 ### Differential parity fuzzer
 
@@ -413,7 +418,7 @@ dispatch, `Range` values, `Array`, and the `scala.math` overload split) and diff
 probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
-`nlr`, `ascribe`, `forval`, `regex`, `capture`, …). It needs a real `scala` on
+`nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -425,19 +430,19 @@ The `nlr` mode found two control-flow bugs in this release: a `return` inside a
 and a `return` out of a `try` skipped the `finally` entirely. The new `regex`
 mode found `String.split` iterating matches by the Rust rule instead of
 `java.util.regex.Matcher.find`'s, which dropped a field from
-`"xx9".split("x*")`.
+`"xx9".split("x*")`. The new `char` mode found `"".sortWith(_ > _)` answering a
+`Vector` instead of `""` — a comparator's result type says nothing about the
+elements — and `"abc".toList` still handing out one-character `String`s, which
+silently made `"abc".toList.map(_.toInt)` a parse instead of the code points.
 
 Next waves, in priority order:
 
-1. **`Char` as its own type.** `'a'` is modeled as a one-character `String`, so
-   `Char`'s predicates and case conversions work but its numeric surface does
-   not (`'a'.toInt` is a `NumberFormatException`, `'a' + 1` concatenates). This
-   is a representation question in the front end, not a fusevm one.
-2. **Lazy views** — `.view` and `LazyList` (`.iterator` is wired, but strictly).
-3. **The broader standard library** — `scala.io`, `scala.collection.*` as a
+1. **Lazy views** — `.view` and `LazyList` (`.iterator` is wired, but strictly).
+2. **The broader standard library** — `scala.io`, `scala.collection.*` as a
    namespace, and user `Ordering`s.
-4. **The rest of `scala.collection.mutable`** — the insertion-ordered
+3. **The rest of `scala.collection.mutable`** — the insertion-ordered
    `LinkedHashSet`/`LinkedHashMap`, `Queue`, `Stack` and `ArrayDeque`.
+4. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

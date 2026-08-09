@@ -34,10 +34,13 @@ reported as parse/compile errors, never silently mis-run.
   more pair each.
 - **Regular expressions (`java.util.regex` / `scala.util.matching`).**
   `String.matches`/`replaceAll`/`replaceFirst`, and the regex-based
-  `String.split`; `"…".r` building a `Regex` that answers `findFirstIn`,
-  `findAllIn`, `findFirstMatchIn`, `findAllMatchIn`, `replaceAllIn`,
-  `replaceFirstIn`, `matches`, `split` and `regex`; and `Regex.Match` with
-  `group`/`subgroups`/`matched`. A replacement's `$N` splices are Java's,
+  `String.split`; `"…".r` and `new Regex(…)` building a `Regex` that answers
+  `findFirstIn`, `findAllIn`, `findFirstMatchIn`, `findAllMatchIn`,
+  `replaceAllIn`, `replaceFirstIn`, `matches`, `split` and `regex`; and
+  `Regex.Match` with `group`/`subgroups`/`matched`. A `Regex` also works in
+  PATTERN position via `unapplySeq` — `case r(a, b) => …`, which matches the
+  WHOLE input (so `"a1"` does not match `"([0-9]+)".r`) and binds `null` for a
+  group that did not participate. A replacement's `$N` splices are Java's,
   including its "longest group number that exists" rule and its
   `IndexOutOfBoundsException` for a group the pattern does not have. The match
   scan follows `java.util.regex.Matcher.find` rather than the Rust iterator: Java
@@ -210,11 +213,24 @@ reported as parse/compile errors, never silently mis-run.
   `takeRight`/`dropRight`/`slice`/`splitAt` (clamped, never throwing),
   `head`/`last`/`init`/`tail`, `apply(i)`, `distinct`, `sorted`, `mkString`
   (0/1/3-arg), `toCharArray`, `zipWithIndex`, and the closure-taking
-  combinators `map`, `filter`/`filterNot`, `takeWhile`/`dropWhile`, `count`,
-  `exists`/`forall`, `foreach`, `find`, `indexWhere`, `partition` and `span`.
-  `Char` is modeled as a one-char `String` (which is what `'a'` lexes to), so
-  `Char`'s predicates — `toUpper`, `toLower`, `isLetter`, `isDigit`,
-  `isLetterOrDigit`, `isUpper`, `isLower`, `isWhitespace` — live on `String`.
+  combinators `map`, `flatMap`, `collect`, `filter`/`filterNot`,
+  `takeWhile`/`dropWhile`, `count`, `exists`/`forall`, `foreach`, `find`,
+  `indexWhere`, `partition`, `span`, `foldLeft`/`foldRight`, `reduce`,
+  `scanLeft`, `sortWith`/`sortBy`, `maxBy`/`minBy`, `groupBy`, `zip`, and the
+  conversions `toList`/`toVector`/`toArray`/`toSet`. Every accessor that hands
+  out an element hands out a `Char` (`head`, `last`, `apply`/`charAt`,
+  `headOption`/`lastOption`, `min`/`max`, and the elements of `toList` and
+  friends), which is what makes `"abc".toList.map(_.toInt)` the code points.
+- **`Char` as its own type.** `'a'` is a distinct runtime value that dispatches
+  as a NUMBER in arithmetic (`'a' + 1 == 98`, `'a' / 2 == 48`, `-'a' == -97`)
+  and as TEXT everywhere string conversion applies (`println('a')` is `a`,
+  `List('a')` is `List(a)`). Its numeric conversions answer the code point
+  (`'a'.toInt == 97`, and `'5'.toInt == 53` where `"5".toInt` parses to `5`),
+  `toChar` rounds back from an `Int`, and `asDigit`, `toUpper`/`toLower`,
+  `isLetter`/`isDigit`/`isLetterOrDigit`/`isUpper`/`isLower`/`isWhitespace`,
+  `compare`, `max`/`min` and `hashCode` (the code point) are all present. `+`
+  against a `String` stays concatenation (`'a' + "b" == "ab"`), which is the one
+  place the numeric face gives way.
 - **The bitwise and shift operators.** `&`, `|`, `^`, `~`, `<<`, `>>` and `>>>`
   on `Int`; `&`, `|` and `^` on `Boolean` (Scala's non-short-circuiting forms);
   and `&`/`|`/`&~` on `Set` (intersection, union, difference). Hexadecimal
@@ -226,7 +242,11 @@ reported as parse/compile errors, never silently mis-run.
   collection generators; several generators (nesting through `flatMap`);
   `if` guards, trailing or standing alone; both the `for (…)` and the `for { … }`
   enumerator groups; and a destructuring generator (`for ((k, v) <- m)`), which
-  desugars to a pattern-matching anonymous function.
+  desugars to a pattern-matching anonymous function. A *refutable* generator
+  pattern takes Scala 3's `case` spelling — `for (case Some(x) <- opts)`, which
+  desugars to a `withFilter` on the pattern and so SKIPS a non-matching element
+  rather than raising. Scala 3 requires the keyword (bare `for (Some(x) <- opts)`
+  is a compile error there), so it is required here too.
 - **General infix method syntax.** `a m b` is `a.m(b)` for any single-argument
   method — `xs contains 2`, `s startsWith "a"`, `1 to n`. An alphanumeric
   operator binds looser than every symbolic one (`1 to n - 1` is `1 to (n - 1)`)
@@ -298,31 +318,19 @@ reported as parse/compile errors, never silently mis-run.
   above. The `args` parameter of `main` is parsed and ignored.
 - **`case NonFatal(e)` and other extractor patterns in `catch`.** Only
   `case e: Type`, `case _: Type`, `case e` and `case _` arms are modeled.
-- **A constructor pattern as a `for` generator binder.** `for (Some(x) <- opts)`
-  — Scala reads a *refutable* generator pattern as a filter plus a
-  destructuring. A generator binder here is a name or a parenthesized tuple
-  pattern (`for ((k, v) <- m)`), so the constructor form is a parse error.
-  Filter first (`opts.flatten`), or match inside the body.
 - **User exception classes inside the hierarchy.** `class MyErr(m: String)
   extends Exception` can be thrown and caught *by its own name*, but the JDK
   throwables are not part of the registered class hierarchy, so `case e:
   Exception` will not catch it.
-- **`Char` as its own type.** `'a'` lexes to a one-char `String`, so `Char`'s
-  predicates and case conversions work but its NUMERIC surface does not:
-  `'a'.toInt` answers a `NumberFormatException` rather than `97`, `'a' + 1` is a
-  concatenation rather than `98`, and there is no `.toChar`. This is a
-  *representation* decision in this front end, not a limit of the VM: it needs a
-  value that dispatches as a number for arithmetic and as text for printing,
-  which is a change to how every `String` method here decides its receiver — not
-  something a width-tagged integer would supply. Two consequences are already
-  documented above: `String.map`'s overload split, and `String.toSeq`.
-- **`String.flatMap` and `String.collect`.** The other `StringOps` combinators
-  (`map`/`filter`/`takeWhile`/`partition`/…) are wired; these two are not, and
-  answer "not a member" rather than a wrong result. `String.toVector` likewise.
-- **A `Regex` in a pattern.** `case r(a, b) => …` needs `Regex.unapplySeq`, which
-  is not modeled; use `findFirstMatchIn` and `Match.group` instead. `new
-  Regex(…)` (as opposed to `"…".r`) is also absent, as are named groups
-  (`(?<name>…)` and `${name}` in a replacement).
+- **Named regex groups.** `(?<name>…)` and `${name}` in a replacement are not
+  modeled; numbered groups (`$1`, `Match.group(1)`, `case r(a, b)`) are.
+- **`String.valueOf` and the other `java.lang.String` statics.** There is no
+  `String` companion, so `String.valueOf(x)` answers "not a member"; use
+  `"" + x` or `x.toString` (which differ on `null` only in that `toString` on a
+  `null` would NPE in Scala too).
+- **A method chained onto `apply` on a literal receiver.** `"abc"(1)` parses, but
+  `"abc"(1).toInt` does not — the parser does not continue a selector chain after
+  an apply directly on a literal. Bind the receiver first (`val s = "abc"; s(1).toInt`).
 - **By-name params, `given`/`using`, `@main` (Scala 3 annotation entry).**
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
@@ -337,20 +345,21 @@ reported as parse/compile errors, never silently mis-run.
   `ClassCastException` and never performs a numeric conversion. A class's
   `val`/private access modifiers are parsed but not enforced (every field is
   reachable).
-- **`String.map`'s result type is decided from the results, plus one
-  compile-time flag.** With `Char` modeled as a one-char `String`, there is no
-  runtime way to tell Scala's `Char => Char` overload (which answers a `String`)
-  from `Char => B` (which answers an `ArraySeq`) when `B` is itself `String`. The
-  rule is: a body whose result is STATICALLY a `String` — a string literal, a
-  concatenation with one, `toString`, `mkString` (`compiler::yields_strings`,
-  carried on the closure next to `yields_pairs`) — answers an `ArraySeq`;
-  otherwise all-one-char results rebuild a `String` and anything else answers an
-  `ArraySeq`. That covers `s.map(_.toUpper)`, `s.map(_.toString)` and
-  `s.map(c => c + "!")`. A body that answers a one-character `String` some OTHER
-  way — a call, a variable — still takes the runtime rule and rebuilds a
-  `String` where Scala would answer an `ArraySeq`.
-  `filter`/`takeWhile`/`dropWhile`/`partition`/`span` are unaffected — their
-  result is always a `String`.
+- **A `String` combinator's result type is decided from the results, except on an
+  empty receiver.** Scala reads `map`/`collect`'s `Char => Char` overload (which
+  answers a `String`) apart from `Char => B` (which answers an `IndexedSeq`) off
+  the function's static result type. `Char` is its own runtime type here, so the
+  results themselves answer it exactly — `s.map(_.toUpper)` is a `String`,
+  `s.map(_.toString)` and `s.map(c => c + "!")` are sequences. The one case with
+  no results to read is an EMPTY receiver, where the decision falls back to the
+  syntax of the body (`compiler::yields_chars` / `yields_strings`, carried on the
+  closure next to `yields_pairs`): the element itself, a `Char` literal, or
+  `toUpper`/`toLower`/`toChar` counts as `Char`-valued, and `flatMap` asks the
+  `String` side instead. An empty receiver with a body outside those shapes —
+  a call, a variable — takes the sequence branch, which is right for every `B`
+  but `Char`. `filter`/`takeWhile`/`dropWhile`/`partition`/`span`/`sortWith`/
+  `sortBy` are unaffected: they only select or reorder, so their result is
+  always a `String`.
 - **A `catch` arm cannot see a non-local return, even as `Throwable`.** Scala's
   `NonLocalReturnControl` extends `ControlThrowable`, so `case e: Exception`
   misses it but a bare `case e =>` (i.e. `Throwable`) would catch it. Here the
@@ -387,7 +396,10 @@ reported as parse/compile errors, never silently mis-run.
 - **`==` on non-numbers compares by value** (structural), which matches Scala's
   `==`/`equals` for the strings and booleans this frontend handles. Reference
   identity (`eq`) is not modeled.
-- **`char` literals are one-character strings**, not an integer `Char` type.
+- **A `Char` is an interned heap value**, not a width-tagged integer. It compares
+  and hashes by code point (so `'a' == 97` and a `Char` key lands in the same
+  CHAMP slot its `Int` code point would), and arithmetic on one leaves the native
+  integer fast path for the host's numeric hook — `Int` arithmetic is untouched.
 - **`~-1` parses here and does not in Scala.** Scala lexes a run of symbolic
   characters as one operator name, so `~-1` is the undefined prefix operator
   `~-`; this lexer takes `~` and `-1`. Write `~(-1)`. This is a case of

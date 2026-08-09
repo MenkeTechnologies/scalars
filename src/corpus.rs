@@ -788,6 +788,18 @@ pub const CORPUS: &[Entry] = &[
         "xs.fold(z: A)(op: (A, A) => A): A\nprintln(List(1, 2, 3).fold(0)((a, b) => a + b))   // => 6",
     ),
     (
+        "scanLeft",
+        "Sequence Methods",
+        "The `foldLeft` that keeps every intermediate accumulator, so the result is one longer than the receiver and starts with the seed — an empty receiver still answers the one-element `List(z)`.",
+        "xs.scanLeft(z: B)(op: (B, A) => B): Repr[B]\nprintln(List(1, 2, 3).scanLeft(0)((a, b) => a + b))   // => List(0, 1, 3, 6)",
+    ),
+    (
+        "scanRight",
+        "Sequence Methods",
+        "The `foldRight` that keeps every intermediate accumulator; the result ends with the seed.",
+        "xs.scanRight(z: B)(op: (A, B) => B): Repr[B]\nprintln(List(1, 2, 3).scanRight(0)((a, b) => a + b))   // => List(6, 5, 3, 0)",
+    ),
+    (
         "reduce",
         "Sequence Methods",
         "Combine the elements pairwise with no initial value, left to right. An empty receiver raises `UnsupportedOperationException: empty.reduceLeft`.",
@@ -1587,8 +1599,44 @@ pub const CORPUS: &[Entry] = &[
     (
         "toList",
         "String Methods",
-        "The characters as a `List` of one-character strings — there is no distinct `Char` value here.",
-        "s.toList: List[String]\nprintln(\"abc\".toList)   // => List(a, b, c)",
+        "The characters as a `List[Char]`. The elements are real `Char`s, so they answer `Char`'s numeric surface (`_.toInt` is the code point, not a parse).",
+        "s.toList: List[Char]\nprintln(\"abc\".toList)   // => List(a, b, c)\nprintln(\"abc\".toList.map(_.toInt))   // => List(97, 98, 99)",
+    ),
+    (
+        "toInt",
+        "Char Methods",
+        "The character's code point. This is `Char`'s conversion, not `String`'s parse: `'5'.toInt` is 53 where `\"5\".toInt` is 5.",
+        "c.toInt: Int\nprintln('a'.toInt)   // => 97\nprintln('5'.toInt)   // => 53",
+    ),
+    (
+        "toChar",
+        "Char Methods",
+        "The `Char` for a code point, truncated to 16 bits — the round trip back from `Char`'s arithmetic, which produces an `Int`.",
+        "n.toChar: Char\nprintln(('a' + 1).toChar)   // => b",
+    ),
+    (
+        "asDigit",
+        "Char Methods",
+        "The numeric value of a digit character (`Character.digit` at radix 36, so the hex letters count too), or -1 when it is not one.",
+        "c.asDigit: Int\nprintln('5'.asDigit)   // => 5",
+    ),
+    (
+        "toUpper",
+        "Char Methods",
+        "The upper-case `Char`. Answers a `Char`, which is what keeps `s.map(_.toUpper)` a `String`.",
+        "c.toUpper: Char\nprintln('a'.toUpper)   // => A\nprintln(\"abc\".map(_.toUpper))   // => ABC",
+    ),
+    (
+        "toLower",
+        "Char Methods",
+        "The lower-case `Char`.",
+        "c.toLower: Char\nprintln('Z'.toLower)   // => z",
+    ),
+    (
+        "isDigit",
+        "Char Methods",
+        "Whether the character is an ASCII decimal digit. `isLetter`, `isLetterOrDigit`, `isUpper`, `isLower` and `isWhitespace` are the companions.",
+        "c.isDigit: Boolean\nprintln('5'.isDigit)   // => true\nprintln('a'.isLetter)   // => true",
     ),
     (
         "toSeq",

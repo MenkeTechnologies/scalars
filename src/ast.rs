@@ -165,7 +165,16 @@ pub enum ForEnum {
     /// `pat` is a plain [`Pattern::Bind`] for the usual `x <- xs`, and a
     /// [`Pattern::Tuple`] for a destructuring generator (`(k, v) <- m`), which
     /// desugars to a pattern-matching anonymous function.
-    GenColl { pat: Pattern, coll: Expr },
+    /// `filtering` marks Scala 3's `for (case pat <- xs)` spelling: a REFUTABLE
+    /// pattern, where an element that does not match is skipped instead of
+    /// raising a `MatchError`. Scala 3 requires the `case` keyword for this —
+    /// `for (Some(x) <- opts)` is a compile error, `for (case Some(x) <- opts)`
+    /// filters — so it is a distinct form, not an inference.
+    GenColl {
+        pat: Pattern,
+        coll: Expr,
+        filtering: bool,
+    },
     /// `if cond` — a filter that skips the remaining (inner) enumerators when the
     /// condition is false, desugaring to `withFilter`.
     Guard(Expr),
@@ -196,6 +205,10 @@ pub enum Expr {
     Int(i64),
     Float(f64),
     Str(String),
+    /// A `Char` literal. Distinct from [`Expr::Str`]: a `Char` is its own type,
+    /// so it answers `Char`'s methods (`toInt` is the code point, not a parse)
+    /// and enters arithmetic as a number.
+    Char(char),
     Bool(bool),
     /// The `null` literal.
     Null,

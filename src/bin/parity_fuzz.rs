@@ -900,6 +900,202 @@ fn g_regex(r: &mut Rng) -> String {
     }
 }
 
+/// `Char` as its own type: a value that dispatches as a NUMBER in arithmetic and
+/// as TEXT when printed.
+///
+/// The two faces are what make this worth fuzzing — `'a' + 1` is the `Int` 98
+/// while `'a' + "b"` is the `String` `"ab"`, `'5'.toInt` is the code point 53
+/// while `"5".toInt` parses to 5, and `"abc".map(_.toUpper)` is a `String` while
+/// `"abc".map(_.toInt)` is an `ArraySeq`. Every probe crosses at least one of
+/// those boundaries, including the ones a `Char` reaches only through a lambda
+/// or a collection, where no static type is left to recover it from.
+fn g_char(r: &mut Rng) -> String {
+    let c = *pick(r, &["'a'", "'z'", "'A'", "'5'", "'0'", "' '", "'~'"]);
+    let d = *pick(r, &["'b'", "'a'", "'Z'", "'9'"]);
+    let s = *pick(r, &["\"abc\"", "\"\"", "\"aabbc\"", "\"xyz\"", "\"a1b2\""]);
+    let n = *pick(r, &["0", "1", "2", "7", "-1"]);
+    match r.below(21) {
+        // The text face: printing, interpolation, and as a collection element.
+        0 => println_all(&[
+            c.to_string(),
+            format!("{c}.toString"),
+            format!("s\"[${{{c}}}]\""),
+        ]),
+        1 => println_all(&[
+            format!("List({c}, {d})"),
+            format!("Some({c})"),
+            format!("({c}, {n})"),
+        ]),
+        // The numeric face.
+        2 => println_all(&[
+            format!("{c}.toInt"),
+            format!("{c}.toLong"),
+            format!("{c}.toDouble"),
+        ]),
+        3 => println_all(&[
+            format!("{c} + {n}"),
+            format!("{n} + {c}"),
+            format!("{c} + {d}"),
+        ]),
+        4 => println_all(&[format!("{c} - {d}"), format!("{c} * 2"), format!("-{c}")]),
+        // `/` and `%` are integer division on the code points (a `Char` divisor
+        // is never 0, so this stays outside the documented /0 gap).
+        5 => println_all(&[format!("{c} / {d}"), format!("{c} % {d}")]),
+        // `+` against a String is concatenation, NOT arithmetic — the one case
+        // where the numeric face gives way.
+        6 => println_all(&[format!("{c} + {s}"), format!("{s} + {c}")]),
+        7 => println_all(&[
+            format!("{c} < {d}"),
+            format!("{c} == {d}"),
+            format!("{c}.compare({d})"),
+        ]),
+        8 => println_all(&[
+            format!("{c}.toUpper"),
+            format!("{c}.toLower"),
+            format!("{c}.toChar"),
+        ]),
+        9 => println_all(&[
+            format!("{c}.isDigit"),
+            format!("{c}.isLetter"),
+            format!("{c}.isWhitespace"),
+        ]),
+        // The round trip through the code point and back.
+        10 => println_all(&[
+            format!("({c} + {n}).toChar"),
+            format!("{c}.toInt.toChar"),
+            format!("{c}.hashCode"),
+        ]),
+        // Char-ness surviving a lambda: `_.toUpper` keeps a String, `_.toInt`
+        // does not.
+        11 => println_all(&[
+            format!("{s}.map(_.toUpper)"),
+            format!("{s}.map(_.toInt)"),
+            format!("{s}.map(_.toString)"),
+        ]),
+        // …and surviving a collection.
+        12 => println_all(&[
+            format!("{s}.toList"),
+            format!("{s}.toVector"),
+            format!("{s}.toList.map(_.toInt)"),
+        ]),
+        13 => println_all(&[
+            format!("{s}.filter(_ != {d})"),
+            format!("{s}.count(_ == {c})"),
+            format!("{s}.exists(_ == {d})"),
+        ]),
+        14 => println_all(&[
+            format!("{s}.indexOf({d})"),
+            format!("{s}.contains({d})"),
+            format!("{s}.headOption"),
+        ]),
+        15 => println_all(&[
+            format!("{s}.foldLeft(0)((a, ch) => a + ch.toInt)"),
+            format!("{s}.sortWith(_ > _)"),
+        ]),
+        // `Char` as a hashed key — its `hashCode` is the code point, which is
+        // what puts it in the right CHAMP slot.
+        16 => println_all(&[
+            format!("{s}.groupBy(ch => ch)"),
+            format!("{s}.toSet"),
+            format!("Set({c}, {d})"),
+        ]),
+        17 => println_all(&[
+            format!("{s}.flatMap(ch => List(ch, ch))"),
+            format!("{s}.collect {{ case ch if ch != {d} => ch }}"),
+        ]),
+        18 => println_all(&[
+            format!("{s}.zipWithIndex"),
+            format!("{s}.reverse"),
+            format!("{s}.distinct"),
+        ]),
+        19 => println_all(&[
+            format!("{c}.max({d})"),
+            format!("{c}.min({d})"),
+            format!("{c}.equals({d})"),
+        ]),
+        // A `val` whose line ENDS with a char literal, so the next line has to
+        // be inferred as a new statement. Every other probe buries its literal
+        // inside a `println(…)`, which never exercises the newline rule — and a
+        // `Char` token missing from it silently glued two statements together.
+        _ => {
+            let u = r.next_u64() % 100_000;
+            format!("val ch{u} = {c}\nprintln(ch{u})\nprintln(ch{u}.toInt)")
+        }
+    }
+}
+
+/// A `Regex` in PATTERN position — `case p(a, b) =>` — plus the `case`
+/// generator that filters on a refutable pattern.
+///
+/// `Regex.unapplySeq` matches the WHOLE input, so `"a1"` does not match
+/// `"([0-9]+)".r` even though it contains a digit run; a group that did not
+/// participate binds `null`. Scala 3 requires the `case` keyword on a refutable
+/// generator (`for (Some(x) <- xs)` does not compile), and that form filters
+/// non-matching elements rather than raising.
+fn g_patregex(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let two = *pick(
+        r,
+        &[
+            "\"([a-z]+)@([a-z]+)\"",
+            "\"([0-9]+)-([0-9]+)\"",
+            "\"(a+)(b+)\"",
+        ],
+    );
+    let one = *pick(r, &["\"([0-9]+)\"", "\"([a-z]+)\"", "\"(x*)\""]);
+    let subj = *pick(
+        r,
+        &[
+            "\"me@host\"",
+            "\"12-34\"",
+            "\"aabb\"",
+            "\"123\"",
+            "\"a1\"",
+            "\"\"",
+            "\"abc\"",
+        ],
+    );
+    match r.below(8) {
+        // Two-group extraction, and the `case _` fallback that a whole-input
+        // mismatch must reach.
+        0 => format!(
+            "val p{u} = {two}.r; println({subj} match {{ case p{u}(a, b) => a + \"/\" + b; case _ => \"no\" }})"
+        ),
+        1 => format!(
+            "val p{u} = {one}.r; println({subj} match {{ case p{u}(a) => \"[\" + a + \"]\"; case _ => \"no\" }})"
+        ),
+        // A group that did not participate binds `null`.
+        2 => format!(
+            "val p{u} = \"([0-9]+)?-([0-9]+)\".r; println({subj} match {{ case p{u}(a, b) => \"\" + a + \"|\" + b; case _ => \"no\" }})"
+        ),
+        // The constructor spelling of `"…".r`.
+        3 => println_all(&[
+            format!("new Regex({one}).findFirstIn({subj})"),
+            format!("new Regex({one})"),
+        ]),
+        // A `case` generator over a refutable extractor: only whole-input
+        // matches survive.
+        4 => format!(
+            "val p{u} = {one}.r; println(for (case p{u}(a) <- List({subj}, \"22\", \"zz\")) yield a)"
+        ),
+        // …and over a constructor pattern.
+        5 => format!(
+            "println(for (case Some(x) <- List(Some(1), None, Some({}))) yield x * 2)",
+            r.below(9) + 1
+        ),
+        6 => format!(
+            "for (case Some(x) <- List(None, Some({}), None)) println(x)",
+            r.below(9) + 1
+        ),
+        // An irrefutable pattern needs no `case`, and must keep working.
+        _ => format!(
+            "println(for ((k, v) <- List((1, {}), (2, {}))) yield k + v)",
+            r.below(5),
+            r.below(5)
+        ),
+    }
+}
+
 /// A closure that ASSIGNS a `var` of the frame that declares it — the shape that
 /// only works if the binding is boxed rather than captured by value. The result
 /// is always read back from the enclosing frame, so a write that never arrived
@@ -1601,6 +1797,8 @@ enum Mode {
     ForVal,
     Regex,
     Capture,
+    Char,
+    PatRegex,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1639,6 +1837,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::ForVal => "forval",
         Mode::Regex => "regex",
         Mode::Capture => "capture",
+        Mode::Char => "char",
+        Mode::PatRegex => "patregex",
     }
 }
 
@@ -1678,6 +1878,8 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "forval" => Mode::ForVal,
         "regex" => Mode::Regex,
         "capture" => Mode::Capture,
+        "char" => Mode::Char,
+        "patregex" => Mode::PatRegex,
         _ => return None,
     })
 }
@@ -1716,6 +1918,8 @@ const CONCRETE: &[Mode] = &[
     Mode::ForVal,
     Mode::Regex,
     Mode::Capture,
+    Mode::Char,
+    Mode::PatRegex,
 ];
 
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
@@ -1758,6 +1962,8 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::ForVal => g_forval(r),
         Mode::Regex => g_regex(r),
         Mode::Capture => g_capture(r),
+        Mode::Char => g_char(r),
+        Mode::PatRegex => g_patregex(r),
         Mode::All => unreachable!(),
     }
 }
@@ -1789,11 +1995,14 @@ fn build_program(probes: &[String]) -> String {
         body.push_str(stmt);
         body.push('\n');
     }
-    // The `mutable` prefix is in scope for every program: it costs an unused
-    // import in the modes that never mention it, and lets the `mutable` mode
-    // write the idiomatic `mutable.ListBuffer(…)` rather than the fully
-    // qualified spelling.
-    format!("import scala.collection.mutable\n{top}object T extends App {{\n{body}}}\n")
+    // The `mutable` prefix and the `Regex` type are in scope for every program:
+    // they cost an unused import in the modes that never mention them, and let
+    // the `mutable`/`patregex` modes write the idiomatic `mutable.ListBuffer(…)`
+    // and `new Regex(…)` rather than the fully qualified spellings.
+    format!(
+        "import scala.collection.mutable\nimport scala.util.matching.Regex\n\
+         {top}object T extends App {{\n{body}}}\n"
+    )
 }
 
 // ───────────────────────── process invocation ──────────────────────────────

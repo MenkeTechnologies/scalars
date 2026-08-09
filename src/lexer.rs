@@ -28,6 +28,11 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
+    /// A `Char` literal (`'a'`, `'\n'`). Separate from [`Tok::Str`] because
+    /// `Char` is its own Scala type: it dispatches as a *number* in arithmetic
+    /// (`'a' + 1 == 98`) and as *text* when printed (`println('a')` is `a`),
+    /// and `'5'.toInt` (53) differs from `"5".toInt` (5).
+    Char(char),
     /// An interpolated string literal — `s"…"`, `f"…"`, or `raw"…"`. Carries the
     /// literal segments (`parts`, length `exprs.len() + 1`), the raw source of
     /// each `$id` / `${expr}` splice (`exprs`), and, for the `f` interpolator,
@@ -127,6 +132,7 @@ impl Tok {
             Tok::Int(_)
                 | Tok::Float(_)
                 | Tok::Str(_)
+                | Tok::Char(_)
                 | Tok::InterpStr { .. }
                 | Tok::Ident(_)
                 | Tok::True
@@ -149,6 +155,7 @@ impl Tok {
             Tok::Int(_)
                 | Tok::Float(_)
                 | Tok::Str(_)
+                | Tok::Char(_)
                 | Tok::InterpStr { .. }
                 | Tok::Ident(_)
                 | Tok::True
@@ -376,6 +383,31 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
+        // Triple-quoted string literals. Everything up to the closing `"""` is
+        // taken verbatim — no escape processing — which is why Scala regexes are
+        // conventionally written this way (`"""(\d+)"""` needs no `\\d`). Must
+        // be tested before the single-quote form, which would otherwise read the
+        // opening `"""` as an empty string followed by a new literal.
+        if src[i..].starts_with("\"\"\"") {
+            let start_line = line;
+            i += 3;
+            let body_start = i;
+            let end = src[i..].find("\"\"\"").ok_or_else(|| {
+                format!("scalars: unterminated string literal on line {start_line}")
+            })?;
+            let body = &src[body_start..body_start + end];
+            line += body.matches('\n').count() as u32;
+            i = body_start + end;
+            // Scala closes at the LAST of a run of quotes, so `"""a""""` is
+            // `a"`; skip any extra quotes beyond the closing three.
+            while src[i..].starts_with("\"\"\"\"") {
+                i += 1;
+            }
+            i += 3;
+            push!(Tok::Str(src[body_start..i - 3].to_string()), start_line);
+            continue;
+        }
+
         // string literals
         if c == '"' {
             let start_line = line;
@@ -406,7 +438,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // char literals — modeled as a one-char string
+        // char literals — a distinct token, so `Char` stays its own type
         if c == '\'' {
             i += 1;
             let ch = if bytes[i] == b'\\' {
@@ -423,7 +455,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 return Err(format!("scalars: unterminated char literal on line {line}"));
             }
             i += 1;
-            push!(Tok::Str(ch.to_string()), line);
+            push!(Tok::Char(ch), line);
             continue;
         }
 

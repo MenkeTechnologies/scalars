@@ -235,6 +235,15 @@ pub const CELL_GET: u16 = 749;
 /// Builtin id for writing a boxed `var`: pops the cell handle (top) and then the
 /// value, stores it, and answers `Unit`.
 pub const CELL_SET: u16 = 750;
+/// Builtin id for `Char` construction: pops a code point and pushes the interned
+/// [`HeapVal::Char`] handle for it (see [`make_char`]).
+pub const CHAR_NEW: u16 = 751;
+/// Builtin id for an extractor pattern whose name is a *value* rather than a
+/// type — `case p(a, b)` where `p` is a `Regex`. Pops the expected group count,
+/// the scrutinee and the extractor, and pushes either the bound values as an
+/// `Array` or `Value::Undef` when the pattern does not match (see
+/// [`b_unapply_seq`]).
+pub const UNAPPLY_SEQ: u16 = 752;
 
 thread_local! {
     /// `type name → (linearized supertypes, primary-constructor arity)`,
@@ -376,6 +385,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(CELL_NEW, b_cell_new);
     vm.register_builtin(CELL_GET, b_cell_get);
     vm.register_builtin(CELL_SET, b_cell_set);
+    vm.register_builtin(CHAR_NEW, b_char_new);
+    vm.register_builtin(UNAPPLY_SEQ, b_unapply_seq);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -756,6 +767,17 @@ enum HeapVal {
     /// every closure that captured it (see [`CELL_NEW`]). Never user-visible: the
     /// compiler emits a `CELL_GET`/`CELL_SET` around every access.
     Cell(Value),
+    /// A `Char`. Scala's `Char` is neither an `Int` nor a `String`: it prints as
+    /// one character but enters arithmetic as its 16-bit code point, and
+    /// `'5'.toInt` (53) must differ from `"5".toInt` (5). A one-character
+    /// `String` cannot encode that difference, and a bare `Value::Int` cannot
+    /// print as text, so `Char` carries its own runtime tag — which also lets
+    /// Char-ness survive a lambda or a collection (`"abc".toList.map(_.toInt)`),
+    /// where no static type is available to recover it.
+    ///
+    /// Handles are interned by [`make_char`], so this costs no arena growth in a
+    /// per-character loop and makes handle identity match value equality.
+    Char(char),
 }
 
 /// Which representation an immutable `Set`/`Map` has. Scala's factories return
@@ -937,11 +959,11 @@ struct Closure {
     /// `Map.map`/`Map.collect` produced **no** results, where the run-time shape
     /// of the results cannot pick the builder.
     pair_body: bool,
-    /// Whether every value the body can answer is statically a `String` rather
-    /// than a `Char` (see `compiler::yields_strings`). `String.map` picks its
-    /// result type from Scala's `Char => Char` vs `Char => B` overload split,
-    /// which the run-time results cannot distinguish for a body like
-    /// `_.toString` — a one-char `String` either way.
+    /// Whether the body's static result type is `Char`, and whether it is
+    /// `String` (see `compiler::yields_chars` / `compiler::yields_strings`).
+    /// Consulted only when a `String` combinator produced **no** results, where
+    /// there is nothing to read the overload off of.
+    char_body: bool,
     string_body: bool,
 }
 
@@ -987,6 +1009,8 @@ thread_local! {
 /// Clear the object arena. Called by the runner before each program run.
 pub fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
+    // The intern table holds arena indices, which the clear above invalidates.
+    CHARS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -1002,6 +1026,116 @@ fn heap_push(o: HeapVal) -> Value {
 /// Allocate a class/case record and return its handle.
 fn heap_alloc(o: ScalaObj) -> Value {
     heap_push(HeapVal::Record(o))
+}
+
+thread_local! {
+    /// `char → arena handle`, so every occurrence of a character shares one
+    /// [`HeapVal::Char`]. The arena is append-only within a run, so without this
+    /// a loop over a long string would allocate one entry per character read.
+    static CHARS: RefCell<HashMap<char, u32>> = RefCell::new(HashMap::new());
+}
+
+/// The interned `Char` value for `c`.
+pub fn make_char(c: char) -> Value {
+    CHARS.with(|t| {
+        if let Some(id) = t.borrow().get(&c) {
+            return Value::Obj(*id);
+        }
+        let v = heap_push(HeapVal::Char(c));
+        if let Value::Obj(id) = v {
+            t.borrow_mut().insert(c, id);
+        }
+        v
+    })
+}
+
+/// The `char` behind `v`, if `v` is a `Char`. This is the exact test that the
+/// old one-character-`String` model could only approximate.
+fn as_char(v: &Value) -> Option<char> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Char(c)) => Some(*c),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// A `Char`'s code point, for the numeric positions Scala's `Char` participates
+/// in (arithmetic, comparison, `toInt`).
+fn char_code(v: &Value) -> Option<i64> {
+    as_char(v).map(|c| c as u32 as i64)
+}
+
+/// `Char` construction builtin ([`CHAR_NEW`]): pops a code point, pushes the
+/// interned `Char`.
+fn b_char_new(vm: &mut VM, _argc: u8) -> Value {
+    let code = vm.pop().to_int();
+    make_char(char_of_code(code))
+}
+
+/// Scala's `toChar`: the value truncated to 16 bits. An unpaired surrogate is
+/// not a Rust `char`, so it stands in as U+FFFD rather than aborting.
+fn char_of_code(code: i64) -> char {
+    char::from_u32(code as u32 & 0xFFFF).unwrap_or('\u{FFFD}')
+}
+
+/// [`UNAPPLY_SEQ`] — apply a value-position extractor to the scrutinee.
+///
+/// Only `Regex` is one today: `Regex.unapplySeq` succeeds when the pattern
+/// matches the **entire** input (`"a1"` does NOT match `"""(\d+)""".r`, `"123"`
+/// does) and binds one value per capture group, with a group that did not
+/// participate binding `null`.
+///
+/// Pushes the bound values as a tuple, or `Value::Undef` for no match — the
+/// compiler tests that and jumps to the next `case`. The pattern's source NAME
+/// rides along so a name that is not an extractor reports the identifier the
+/// user wrote rather than whatever value it held.
+fn b_unapply_seq(vm: &mut VM, _argc: u8) -> Value {
+    let pat_name = vm.pop();
+    let want = vm.pop().to_int();
+    let scrutinee = vm.pop();
+    let extractor = vm.pop();
+    let Some(pat) = (match &extractor {
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Regex(p)) => Some(p.clone()),
+            _ => None,
+        }),
+        _ => None,
+    }) else {
+        // Preserves the compile-time message for a name that is not an
+        // extractor at all (an undefined one reads back as `Undef`).
+        return fault(
+            vm,
+            format!(
+                "scalars: not found: constructor pattern `{}`",
+                scala_str(&pat_name)
+            ),
+        );
+    };
+    // `unapplySeq` is a whole-input match, as `Regex`'s is (the non-capturing
+    // wrapper keeps the user's own group numbers intact).
+    let re = match regex_compile(&format!("\\A(?:{pat})\\z")) {
+        Ok(re) => re,
+        Err(e) => return fault(vm, e),
+    };
+    let s = scala_str(&scrutinee);
+    let Ok(Some(caps)) = re.captures(&s) else {
+        return Value::Undef;
+    };
+    // Group 0 is the whole match; the bindings are the explicit groups. They
+    // come back as a tuple so the compiler can read them with the same `_1`..
+    // accessors a tuple pattern uses.
+    let mut out = Vec::with_capacity(want as usize);
+    for i in 1..=want as usize {
+        out.push(match caps.get(i) {
+            Some(m) => Value::str(m.as_str().to_string()),
+            // A group that did not participate binds Scala's `null`.
+            None => Value::Undef,
+        });
+    }
+    heap_push(HeapVal::Tuple(out))
 }
 
 /// Run `f` against the record `v` points to, or `None` if `v` is not a live
@@ -1255,7 +1389,8 @@ fn make_closure(vm: &mut VM, argc: u8, partial: bool) -> Value {
         captures,
         defined_idx,
         pair_body: flags & 1 != 0,
-        string_body: flags & 2 != 0,
+        char_body: flags & 2 != 0,
+        string_body: flags & 4 != 0,
     }))
 }
 
@@ -1853,6 +1988,10 @@ fn obj_to_string(v: &Value) -> String {
             // matched text (both as in Scala/`java.util.regex`).
             Some(HeapVal::Regex(p)) => p.to_string(),
             Some(HeapVal::Match { matched, .. }) => matched.to_string(),
+            // A `Char` renders as its one character, everywhere text conversion
+            // applies: `println`, `toString`, interpolation, and as a collection
+            // element (`List('a')` is `List(a)`).
+            Some(HeapVal::Char(c)) => c.to_string(),
             // A boxed `var` is compiler-internal — every access goes through
             // `CELL_GET`/`CELL_SET`, so a cell handle never reaches user code.
             // Rendering the value it holds keeps a diagnostic dump readable.
@@ -2027,6 +2166,9 @@ fn scala_hash(v: &Value) -> Option<i32> {
         Value::Obj(id) => {
             let hv = HEAP.with(|h| h.borrow().get(*id as usize).cloned())?;
             match hv {
+                // `Char.hashCode` is the code point, as `java.lang.Character`'s
+                // is — so a `Char` and its `Int` code point hash alike.
+                HeapVal::Char(c) => Some(c as u32 as i32),
                 HeapVal::Tuple(items) => product_hash(&format!("Tuple{}", items.len()), &items),
                 HeapVal::Record(o) if o.is_case => {
                     let n = ctor_arity(&o.class, o.fields.len());
@@ -2690,6 +2832,9 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 // any of the routed dispatchers, so it needs no kind of its own.
                 HeapVal::Regex(_) | HeapVal::Match { .. } => 6,
                 HeapVal::Cell(_) => 7,
+                // A `Char` is answered by `char_method` ahead of the routed
+                // dispatchers, so it needs no kind of its own.
+                HeapVal::Char(_) => 8,
             })
         })
     } else {
@@ -3285,6 +3430,29 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 acc = invoke_closure(vm, &args[1], &[it.clone(), acc])?;
             }
             Ok(acc)
+        }
+        // `scanLeft`/`scanRight` are the folds that keep every intermediate
+        // accumulator, so the result is one longer than the receiver and always
+        // starts (`scanLeft`) or ends (`scanRight`) with the seed — an empty
+        // receiver still answers the one-element `List(seed)`.
+        ("scanLeft", 2) => {
+            let mut acc = args[0].clone();
+            let mut out = vec![acc.clone()];
+            for it in &items {
+                acc = invoke_closure(vm, &args[1], &[acc, it.clone()])?;
+                out.push(acc.clone());
+            }
+            Ok(new_seq(kind, out))
+        }
+        ("scanRight", 2) => {
+            let mut acc = args[0].clone();
+            let mut out = vec![acc.clone()];
+            for it in items.iter().rev() {
+                acc = invoke_closure(vm, &args[1], &[it.clone(), acc])?;
+                out.push(acc.clone());
+            }
+            out.reverse();
+            Ok(new_seq(kind, out))
         }
         ("reduce" | "reduceLeft", 1) => {
             if items.is_empty() {
@@ -3908,6 +4076,11 @@ fn value_cmp(a: &Value, b: &Value) -> Ordering {
             .to_float()
             .partial_cmp(&b.to_float())
             .unwrap_or(Ordering::Equal),
+        // `Char` orders by code point, so a `Seq[Char]` sorts like the `String`
+        // of the same characters does.
+        (Value::Obj(_), Value::Obj(_)) if as_char(a).is_some() && as_char(b).is_some() => {
+            as_char(a).cmp(&as_char(b))
+        }
         (Value::Obj(_), Value::Obj(_)) => match (as_seq_or_tuple(a), as_seq_or_tuple(b)) {
             (Some(xs), Some(ys)) => xs
                 .iter()
@@ -4433,6 +4606,12 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     if let Some(r) = regex_method(recv, name, args) {
         return r;
     }
+    // Likewise a `Char`: its handle is not a record, and its methods must win
+    // over the `String` ones it would otherwise fall back to (`'5'.toInt` is the
+    // code point 53, where `"5".toInt` parses to 5).
+    if let Some(c) = as_char(recv) {
+        return char_method(c, name, args);
+    }
     // Scala's operators ARE methods, so the dotted spelling (`n.+(1)`, `"a".*(3)`)
     // is legal wherever the infix one is. Only the primitive receivers route here:
     // `+`/`-` on a `Set`/`Map` mean set inclusion/removal and stay with the
@@ -4449,6 +4628,141 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         Value::Bool(b) => bool_method(*b, name, args),
         Value::Obj(_) => obj_method(recv, name, args),
         _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// `Char`'s methods.
+///
+/// `Char` is a numeric type wearing a text face: every conversion answers the
+/// *code point* (`'a'.toInt == 97`), the classification and case methods come
+/// from `java.lang.Character`, and only `toString` renders the character. The
+/// case methods answer a `Char` again, so `"abc".map(_.toUpper)` stays a
+/// `String`.
+///
+/// Anything unrecognized falls through to [`string_method`] on the one-character
+/// string, which is where the shared `Any`/comparison methods live.
+fn char_method(c: char, name: &str, args: &[Value]) -> Result<Value, String> {
+    let code = c as u32 as i64;
+    // `Character` classification is defined over the whole code point, but
+    // `isDigit` is Java's ASCII-and-Unicode-decimal test, not `is_numeric`.
+    let cls = |b: bool| Ok(Value::bool(b));
+    match (name, args.len()) {
+        // Numeric conversions — the code point, never a parse of the text.
+        ("toInt" | "toLong" | "toShort" | "toByte", 0) => Ok(Value::int(code)),
+        ("toDouble" | "toFloat", 0) => Ok(Value::float(code as f64)),
+        ("toChar", 0) => Ok(make_char(c)),
+        // `Char.hashCode` is the code point (as `java.lang.Character`'s is).
+        ("hashCode", 0) => Ok(Value::int(code)),
+        ("equals", 1) => Ok(Value::bool(as_char(&args[0]) == Some(c))),
+        // `asDigit` is the *numeric value* of a digit character, so '5' is 5;
+        // it also accepts the hex letters, as `Character.digit(c, 36)` does.
+        ("asDigit", 0) => Ok(Value::int(c.to_digit(36).map(|d| d as i64).unwrap_or(-1))),
+        ("toUpper", 0) => Ok(make_char(c.to_ascii_uppercase())),
+        ("toLower", 0) => Ok(make_char(c.to_ascii_lowercase())),
+        ("isDigit", 0) => cls(c.is_ascii_digit()),
+        ("isLetter", 0) => cls(c.is_alphabetic()),
+        ("isLetterOrDigit", 0) => cls(c.is_alphanumeric()),
+        ("isUpper", 0) => cls(c.is_uppercase()),
+        ("isLower", 0) => cls(c.is_lowercase()),
+        ("isWhitespace" | "isSpaceChar", 0) => cls(c.is_whitespace()),
+        // Ordering is by code point. Scala's `Char.compare` answers the
+        // difference, exactly as `Character.compare` does.
+        ("compare" | "compareTo", 1) => match char_code(&args[0]) {
+            Some(o) => Ok(Value::int(code - o)),
+            None => Err(no_such_method(&make_char(c), name)),
+        },
+        // `max`/`min` on two `Char`s answer a `Char` (`'a'.max('b')` is `b`).
+        ("max" | "min", 1) if as_char(&args[0]).is_some() => {
+            let o = as_char(&args[0]).unwrap();
+            Ok(make_char(if (name == "max") == (c > o) { c } else { o }))
+        }
+        // The operators, in their dotted spelling (`'a'.+(1)`). The infix form
+        // reaches `numeric_hook` instead; both share `char_binop`.
+        (_, 1) if CHAR_OPS.contains(&name) => char_binop(name, &make_char(c), &args[0]),
+        _ => string_method(&c.to_string(), name, args),
+    }
+}
+
+/// The binary operators `Char` participates in, for both the dotted spelling
+/// ([`char_method`]) and the infix one ([`numeric_hook`]).
+const CHAR_OPS: &[&str] = &["+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!="];
+
+/// One binary operation with at least one `Char` operand.
+///
+/// A `Char` enters arithmetic and comparison as its code point — `'a' + 1` is
+/// the `Int` 98 and `'a' < 'b'` compares code points — with one exception:
+/// `Char` defines `+(String): String`, so a `String` operand makes `+`
+/// concatenation (`'a' + "b" == "ab"`), which is why this is not a plain
+/// numeric coercion.
+fn char_binop(op: &str, a: &Value, b: &Value) -> Result<Value, String> {
+    if op == "+" && (matches!(a, Value::Str(_)) || matches!(b, Value::Str(_))) {
+        return Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b))));
+    }
+    // A `Double` operand promotes the whole operation, as it does for any other
+    // integral type (`'a' + 1.5 == 98.5`).
+    if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
+        if let (Some(x), Some(y)) = (float_of(a), float_of(b)) {
+            return Ok(match op {
+                "+" => Value::float(x + y),
+                "-" => Value::float(x - y),
+                "*" => Value::float(x * y),
+                "/" => Value::float(x / y),
+                "%" => Value::float(x % y),
+                "<" => Value::bool(x < y),
+                ">" => Value::bool(x > y),
+                "<=" => Value::bool(x <= y),
+                ">=" => Value::bool(x >= y),
+                "==" => Value::bool(x == y),
+                _ => Value::bool(x != y),
+            });
+        }
+    }
+    // Equality against a non-numeric, non-Char operand is `false` rather than an
+    // error: Scala's `==` is universal even where arithmetic is not.
+    let (Some(x), Some(y)) = (num_of(a), num_of(b)) else {
+        return match op {
+            "==" => Ok(Value::bool(scala_eq(a, b))),
+            "!=" => Ok(Value::bool(!scala_eq(a, b))),
+            _ => Err(format!(
+                "scalars: `{op}` is not defined between `{}` and `{}`",
+                scala_str(a),
+                scala_str(b)
+            )),
+        };
+    };
+    Ok(match op {
+        "+" => Value::int(x + y),
+        "-" => Value::int(x - y),
+        "*" => Value::int(x * y),
+        "/" if y == 0 => return Err("scalars: java.lang.ArithmeticException: / by zero".into()),
+        "/" => Value::int(x / y),
+        "%" if y == 0 => return Err("scalars: java.lang.ArithmeticException: / by zero".into()),
+        "%" => Value::int(x.wrapping_rem(y)),
+        "<" => Value::bool(x < y),
+        ">" => Value::bool(x > y),
+        "<=" => Value::bool(x <= y),
+        ">=" => Value::bool(x >= y),
+        "==" => Value::bool(x == y),
+        _ => Value::bool(x != y),
+    })
+}
+
+/// The integer an operand contributes to `Char` arithmetic: a `Char`'s code
+/// point or an `Int`'s value. `None` for everything else (including a `Double`,
+/// which would make the result a `Double` — see [`char_binop`]'s callers, which
+/// only reach it when no `Double` is involved).
+fn num_of(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(n) => Some(*n),
+        _ => char_code(v),
+    }
+}
+
+/// The same operand as an `f64`, for the `Double`-promoted path.
+fn float_of(v: &Value) -> Option<f64> {
+    match v {
+        Value::Float(f) => Some(*f),
+        _ => num_of(v).map(|n| n as f64),
     }
 }
 
@@ -4527,6 +4841,23 @@ fn operator_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Va
 /// `StringOps`). Lengths/indices are in `char`s — matching Scala for the BMP
 /// text this frontend handles.
 fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
+    // Every `String` method that accepts a `Char` (`indexOf`, `contains`,
+    // `split`, `replace`, …) uses it as text, and Scala overloads them for both,
+    // so a `Char` argument becomes its one-character `String` once here rather
+    // than at each call site.
+    let coerced: Vec<Value>;
+    let args = if args.iter().any(|a| as_char(a).is_some()) {
+        coerced = args
+            .iter()
+            .map(|a| match as_char(a) {
+                Some(c) => Value::str(c.to_string()),
+                None => a.clone(),
+            })
+            .collect();
+        &coerced[..]
+    } else {
+        args
+    };
     let arity_err = || format!("scalars: String.{name}: wrong number of arguments");
     match (name, args.len()) {
         ("length" | "size", 0) => Ok(Value::int(s.chars().count() as i64)),
@@ -4546,9 +4877,10 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("replaceFirst", 2) => regex_replace(s, &args[0].as_str_cow(), &args[1].as_str_cow(), true),
         // `"…".r` — `StringOps.r`, the `scala.util.matching.Regex` builder.
         ("r", 0) => Ok(heap_push(HeapVal::Regex(Arc::from(s)))),
-        ("toList", 0) => Ok(new_list(
-            s.chars().map(|c| Value::str(c.to_string())).collect(),
-        )),
+        // The elements of a `String` are `Char`s, so every accessor that hands
+        // one out hands out a `Char` — that is what makes `"abc".toList.map(_.toInt)`
+        // the code points rather than a parse of each character.
+        ("toList", 0) => Ok(new_list(s.chars().map(make_char).collect())),
         // `"abc".toSeq` is a `WrappedString` — a VIEW of the same characters,
         // which prints as the string itself (`abc`, not `List(a, b, c)`) and
         // answers every `Seq` operation through `StringOps`. The string is
@@ -4571,7 +4903,7 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                     chars.len()
                 ))
             } else {
-                Ok(Value::str(chars[i as usize].to_string()))
+                Ok(make_char(chars[i as usize]))
             }
         }
         ("contains", 1) => Ok(Value::bool(s.contains(&*args[0].as_str_cow()))),
@@ -4642,20 +4974,31 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 Value::str(char_slice(s, n, s.chars().count() as i64)),
             ])))
         }
-        ("head", 0) => s
-            .chars()
-            .next()
-            .map(|c| Value::str(c.to_string()))
-            .ok_or_else(|| {
-                "scalars: java.util.NoSuchElementException: head of empty String".to_string()
-            }),
-        ("last", 0) => s
-            .chars()
-            .next_back()
-            .map(|c| Value::str(c.to_string()))
-            .ok_or_else(|| {
-                "scalars: java.lang.UnsupportedOperationException: last of empty String".to_string()
-            }),
+        ("head", 0) => s.chars().next().map(make_char).ok_or_else(|| {
+            "scalars: java.util.NoSuchElementException: head of empty String".to_string()
+        }),
+        ("last", 0) => s.chars().next_back().map(make_char).ok_or_else(|| {
+            "scalars: java.lang.UnsupportedOperationException: last of empty String".to_string()
+        }),
+        ("headOption", 0) => Ok(match s.chars().next() {
+            Some(c) => make_some(make_char(c)),
+            None => make_none(),
+        }),
+        ("lastOption", 0) => Ok(match s.chars().next_back() {
+            Some(c) => make_some(make_char(c)),
+            None => make_none(),
+        }),
+        // `min`/`max` over the characters — by code point, answering a `Char`.
+        ("min" | "max", 0) => {
+            let pick = if name == "max" {
+                s.chars().max()
+            } else {
+                s.chars().min()
+            };
+            pick.map(make_char).ok_or_else(|| {
+                format!("scalars: java.lang.UnsupportedOperationException: empty.{name}")
+            })
+        }
         ("init", 0) => Ok(Value::str(char_slice(s, 0, s.chars().count() as i64 - 1))),
         ("tail", 0) => Ok(Value::str(char_slice(s, 1, s.chars().count() as i64))),
         ("apply", 1) => string_method(s, "charAt", args),
@@ -4689,26 +5032,20 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 .join(&args[1].as_str_cow()),
             args[2].as_str_cow()
         ))),
-        ("toCharArray", 0) => Ok(new_seq(
-            SeqKind::Array,
-            s.chars().map(|c| Value::str(c.to_string())).collect(),
-        )),
+        ("toCharArray", 0) => Ok(new_seq(SeqKind::Array, s.chars().map(make_char).collect())),
         // `StringOps.zipWithIndex` answers an `IndexedSeq`, printed `Vector(…)`.
         ("zipWithIndex", 0) => Ok(new_seq(
             SeqKind::Vector,
             s.chars()
                 .enumerate()
-                .map(|(i, c)| {
-                    heap_push(HeapVal::Tuple(vec![
-                        Value::str(c.to_string()),
-                        Value::int(i as i64),
-                    ]))
-                })
+                .map(|(i, c)| heap_push(HeapVal::Tuple(vec![make_char(c), Value::int(i as i64)])))
                 .collect(),
         )),
-        // A one-char string stands in for `Char` (the lexer gives `'a'` that
-        // shape), so `Char`'s predicates live here. `String` has none of these
-        // names, so a valid Scala program can never reach them on a real string.
+        // `Char`'s predicates. A `Char` answers these from [`char_method`], which
+        // wins before any `String` dispatch, so these arms are reached only by
+        // calling one on an actual `String` — which Scala rejects outright
+        // (`"ab".isDigit` does not compile). Keeping them is over-acceptance of
+        // the same kind as the unchecked types, never a different answer.
         ("toUpper", 0) => Ok(Value::str(s.to_uppercase())),
         ("toLower", 0) => Ok(Value::str(s.to_lowercase())),
         ("isLetter", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_alphabetic))),
@@ -5038,19 +5375,19 @@ fn substring(s: &str, begin: i64, end: i64) -> Result<Value, String> {
 /// `StringOps`' combinators that take a function. Returns `None` when `name` is
 /// not one of them, so the caller falls through to the pure [`string_method`].
 ///
-/// The element type is a one-char `String` (this frontend's `Char` model).
-/// `map` therefore decides its result type by inspecting the results: all
-/// one-char strings rebuild a `String` (Scala's `Char => Char` overload), and
-/// anything else answers an `IndexedSeq`, printed `Vector(…)`. The one shape
-/// that model gets wrong is `s.map(_.toString)`, whose Scala result is a
-/// `Vector` of one-char strings — recorded in `BUGS.md`.
+/// The element type is [`HeapVal::Char`], so `map` decides its result type by
+/// asking whether every result *is* a `Char`: if so it rebuilds a `String`
+/// (Scala's `Char => Char` overload), otherwise it answers an `IndexedSeq`,
+/// printed `ArraySeq(…)`. That test is exact, so `s.map(_.toString)` — whose
+/// results are one-character `String`s, not `Char`s — now correctly answers a
+/// sequence rather than a `String`.
 fn string_fn_method(
     vm: &mut VM,
     s: &str,
     name: &str,
     args: &[Value],
 ) -> Option<Result<Value, String>> {
-    let chars: Vec<Value> = s.chars().map(|c| Value::str(c.to_string())).collect();
+    let chars: Vec<Value> = s.chars().map(make_char).collect();
     macro_rules! call {
         ($x:expr) => {
             match invoke_closure(vm, &args[0], std::slice::from_ref($x)) {
@@ -5060,41 +5397,165 @@ fn string_fn_method(
         };
     }
     // Re-join a char run into the `String` the receiver's type implies.
-    let join = |xs: &[Value]| {
-        Value::str(
-            xs.iter()
-                .map(|v| v.as_str_cow().into_owned())
-                .collect::<String>(),
-        )
-    };
+    let join = |xs: &[Value]| Value::str(xs.iter().map(scala_str).collect::<String>());
+
+    // `flatMap` picks its result type from the function's, not from the
+    // elements': `Char => String` concatenates into a `String`
+    // (`"abc".flatMap(c => c.toString * 2)` is `aabbcc`), while
+    // `Char => IterableOnce[B]` builds an `IndexedSeq[B]` — so
+    // `"abc".flatMap(c => List(c, c))` is a `Vector` of `Char`, NOT a `String`.
+    if name == "flatMap" && args.len() == 1 {
+        let mut parts = Vec::with_capacity(chars.len());
+        for c in &chars {
+            parts.push(call!(c));
+        }
+        let all_str = if parts.is_empty() {
+            as_closure(&args[0]).is_some_and(|c| c.string_body)
+        } else {
+            parts.iter().all(|v| matches!(v, Value::Str(_)))
+        };
+        return Some(Ok(if all_str {
+            join(&parts)
+        } else {
+            let mut out = Vec::new();
+            for p in &parts {
+                match as_seq_or_tuple(p) {
+                    Some(items) => out.extend(items),
+                    None => out.push(p.clone()),
+                }
+            }
+            new_seq(SeqKind::Vector, out)
+        }));
+    }
+
+    // The remaining `StringOps` combinators are the sequence ones over the
+    // receiver's characters, so they run on a `Vector[Char]` rather than being
+    // reimplemented here (the same delegation `Map` uses for its pair methods).
+    //
+    // Scala's builder then decides the result type. `sortWith`/`sortBy` only
+    // REORDER, so their elements are still `Char`s and the result is always a
+    // `String` (`"abc".sortWith(_ > _)` is `cba`, and `""` sorted is `""` — note
+    // their function is a comparator/key, so its own result type says nothing
+    // about the elements). `collect` is the one that can change the element type,
+    // so it answers a `String` only when every result is still a `Char`
+    // (`"abc".collect { … => c.toInt }` is `Vector(97, 99)`). The rest keep the
+    // sequence they build even though their elements ARE `Char`s — `toVector`,
+    // `zip` and `scanLeft` are `Vector`s, not `String`s.
+    const ALWAYS_STRING: &[&str] = &["sortWith", "sortBy"];
+    const REBUILDS_STRING: &[&str] = &["collect"];
+    const PASSES_THROUGH: &[&str] = &[
+        "foldLeft",
+        "foldRight",
+        "fold",
+        "reduce",
+        "reduceLeft",
+        "reduceRight",
+        "scanLeft",
+        "maxBy",
+        "minBy",
+        "zip",
+        "toVector",
+        "toArray",
+        "toSet",
+        "collectFirst",
+        "flatten",
+        "lastIndexWhere",
+        "segmentLength",
+    ];
+    if ALWAYS_STRING.contains(&name)
+        || REBUILDS_STRING.contains(&name)
+        || PASSES_THROUGH.contains(&name)
+    {
+        let seq = new_seq(SeqKind::Vector, chars.clone());
+        // `zip`'s operand is itself iterated, so a `String` there is its
+        // characters (`"abc".zip("xy")`). Everywhere else a `String` argument is
+        // an ordinary value — `foldRight("")` seeds the fold with the empty
+        // string — so this coercion is confined to the collection-taking ops.
+        let zipped;
+        let args = match (name, args.first()) {
+            ("zip", Some(Value::Str(t))) => {
+                zipped = [new_seq(SeqKind::Vector, t.chars().map(make_char).collect())];
+                &zipped[..]
+            }
+            _ => args,
+        };
+        let out = match seq_method(vm, &seq, name, args) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        if PASSES_THROUGH.contains(&name) {
+            return Some(Ok(out));
+        }
+        let always = ALWAYS_STRING.contains(&name);
+        // `Char`-valued result → back to a `String`; anything else keeps the
+        // sequence the builder produced. An empty `collect` has nothing to read,
+        // so it falls back to the body's static type.
+        return Some(Ok(match as_seq_or_tuple(&out) {
+            Some(items) if always => join(&items),
+            Some(items) if items.is_empty() => {
+                if args
+                    .first()
+                    .and_then(as_closure)
+                    .is_some_and(|c| c.char_body)
+                {
+                    join(&items)
+                } else {
+                    out
+                }
+            }
+            Some(items) if items.iter().all(|v| as_char(v).is_some()) => join(&items),
+            _ => out,
+        }));
+    }
+
+    // `groupBy` keys the characters by the function, and each group is itself a
+    // `String` (`"aabbc".groupBy(identity)` maps `a` to `"aa"`).
+    //
+    // Unlike `List.groupBy` — which is a `HashMap` at every size — this one is
+    // an ordinary immutable `Map`, so up to four groups it is an
+    // insertion-ordered `Map1`..`Map4` and only beyond that a CHAMP `HashMap`.
+    // Building the groups in first-appearance order and handing them to
+    // [`new_map`] applies exactly that rule.
+    if name == "groupBy" && args.len() == 1 {
+        let mut entries: Vec<(Value, Vec<Value>)> = Vec::new();
+        for c in &chars {
+            let k = call!(c);
+            match entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
+                Some((_, group)) => group.push(c.clone()),
+                None => entries.push((k, vec![c.clone()])),
+            }
+        }
+        return Some(Ok(new_map(
+            HashRep::Small,
+            entries.into_iter().map(|(k, g)| (k, join(&g))).collect(),
+        )));
+    }
+
     if args.len() != 1 {
         return None;
     }
     Some(match name {
         // `StringOps.map` has two overloads: `Char => Char` rebuilds a `String`,
         // `Char => B` builds an `IndexedSeq[B]`. Scala reads that off the
-        // function's static result type. With `Char` modeled as a one-char
-        // `String` the results alone cannot tell the two apart when `B` is
-        // itself `String` (`_.toString`), so a body whose result is statically a
-        // `String` is flagged at compile time (`compiler::yields_strings`) and
-        // takes the `Char => B` branch; everything else reads the results.
+        // function's static result type; since `Char` is its own runtime type
+        // here, the results themselves answer it exactly.
         "map" => {
-            let string_body = as_closure(&args[0]).is_some_and(|c| c.string_body);
             let mut out = Vec::with_capacity(chars.len());
             for c in &chars {
                 out.push(call!(c));
             }
-            Ok(
-                if !string_body
-                    && out
-                        .iter()
-                        .all(|v| matches!(v, Value::Str(t) if one_char(t).is_some()))
-                {
-                    join(&out)
-                } else {
-                    new_seq(SeqKind::ArraySeq, out)
-                },
-            )
+            // With no results there is nothing to read the overload off of, so
+            // an empty receiver falls back to the body's static type.
+            let chars_out = if out.is_empty() {
+                as_closure(&args[0]).is_some_and(|c| c.char_body)
+            } else {
+                out.iter().all(|v| as_char(v).is_some())
+            };
+            Ok(if chars_out {
+                join(&out)
+            } else {
+                new_seq(SeqKind::ArraySeq, out)
+            })
         }
         "filter" | "filterNot" | "withFilter" => {
             let keep = name != "filterNot";
@@ -5237,6 +5698,8 @@ fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("abs", 0) => Ok(Value::int(n.wrapping_abs())),
         ("toDouble" | "toFloat", 0) => Ok(Value::float(n as f64)),
         ("toInt" | "toLong", 0) => Ok(Value::int(n)),
+        // `('a' + 1).toChar` — the round trip back from code point to `Char`.
+        ("toChar", 0) => Ok(make_char(char_of_code(n))),
         ("max", 1) => Ok(Value::int(n.max(args[0].to_int()))),
         ("min", 1) => Ok(Value::int(n.min(args[0].to_int()))),
         ("abs" | "toDouble" | "toFloat" | "toInt" | "toLong" | "max" | "min", _) => {
@@ -5281,6 +5744,7 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
     match (name, args.len()) {
         ("abs", 0) => Ok(Value::float(f.abs())),
         ("toInt" | "toLong", 0) => Ok(Value::int(f as i64)),
+        ("toChar", 0) => Ok(make_char(char_of_code(f as i64))),
         ("toDouble" | "toFloat", 0) => Ok(Value::float(f)),
         ("isNaN", 0) => Ok(Value::bool(f.is_nan())),
         ("isInfinity" | "isInfinite", 0) => Ok(Value::bool(f.is_infinite())),
@@ -5360,6 +5824,14 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
     if unwinding() {
         return Value::Undef;
     }
+    // A `Char` divides as its code point, so `'a' / 2` is the `Int` 48 — integer
+    // division, not the float fallback below.
+    let (a, b) = match (num_of(&a), num_of(&b)) {
+        (Some(x), Some(y)) if as_char(&a).is_some() || as_char(&b).is_some() => {
+            (Value::int(x), Value::int(y))
+        }
+        _ => (a, b),
+    };
     match (&a, &b) {
         (Value::Int(x), Value::Int(y)) => {
             if *y == 0 {
@@ -5497,6 +5969,35 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     // displacing the real exception (see `Exception unwinding`).
     if unwinding() {
         return Ok(Value::Undef);
+    }
+    // A `Char` operand. `Char` is a heap handle, so every operation on one
+    // reaches this hook; it is numeric in all of them (`'a' + 1 == 98`) except
+    // `+` against a `String`. Answered before the arms below, which would
+    // otherwise treat the handle as a collection or reject it.
+    if as_char(a).is_some() || as_char(b).is_some() {
+        if op == NumOp::Neg {
+            // Unary minus on a `Char` is `-(code point)` as an `Int`.
+            return Ok(Value::int(-char_code(a).unwrap_or(0)));
+        }
+        let name = match op {
+            NumOp::Add => "+",
+            NumOp::Sub => "-",
+            NumOp::Mul => "*",
+            NumOp::Div => "/",
+            NumOp::Mod => "%",
+            NumOp::Lt => "<",
+            NumOp::Gt => ">",
+            NumOp::Le => "<=",
+            NumOp::Ge => ">=",
+            NumOp::Eq => "==",
+            NumOp::Ne => "!=",
+            // `Char` has no `pow`; fall through to the general arms. `Neg`
+            // already returned above.
+            NumOp::Pow | NumOp::Neg => "",
+        };
+        if !name.is_empty() {
+            return char_binop(name, a, b);
+        }
     }
     match op {
         // Scala 3 `+` on a mixed operand. Unlike Scala 2, there is NO universal
