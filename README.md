@@ -254,7 +254,8 @@ Implemented and checked against the reference `scala`:
   hierarchy.
 - **First-class functions** — lambdas (`x => e`, `(a, b) => e`, block bodies
   `x => { … }`, `Int => Int` function-type annotations) and the `_`-placeholder
-  form (`_ + 1`, `_ * 2`, `_ + _`). A lambda captures its enclosing frame, so it
+  form (`_ + 1`, `_ * 2`, `_ + _`, the applied `_(1)`, and the bare `_` argument
+  that eta-expands its enclosing call, `xs.map(f(_))`). A lambda captures its enclosing frame, so it
   can be stored in a `val`, passed as an argument, returned, and invoked (`f(x)` /
   `f.apply(x)`) — curried closures (`def adder(n: Int): Int => Int = x => x + n`)
   see their upvalues after the defining frame returns. A lambda that ASSIGNS an
@@ -434,7 +435,7 @@ probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
 `nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, `breaks`,
-`params`, `fmt`, …). It needs a real `scala` on
+`params`, `fmt`, `apply`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -460,7 +461,20 @@ negative `Int` rendering 64 bits instead of 32. The `breaks` mode is a reminder
 that a clean score can be an artifact of the generator: it scored zero on its
 first run only because the emitted program omitted `import
 scala.util.control.Breaks._`, so the reference rejected `breakable` too and the
-two agreed on the failure.
+two agreed on the failure. Every mode above then applied its receivers the same
+way — a name in the scope being compiled, applied from that same scope — so none
+of them ever wrote `xs(i)` from inside a lambda, indexed a `String` held in a
+binding, applied a field, or wrote `_(i)`/`f(_)`. The `apply` mode does, and each
+of those was broken: a top-level binding applied from a nested body was rejected
+as an undefined function, `s(i)` on any non-literal string was "cannot be applied
+to arguments", a selector after an apply on a literal was a parse error, and a
+bare `_` argument became the identity function instead of eta-expanding the
+enclosing call — which for `xs.map(m(_))` looked the *function* up as a map key.
+The same run added a **no-signal** count to the report: a program the oracle
+rejects prints nothing and exits non-zero, a frontend that rejects it too then
+"agrees", and the run scores clean having compared nothing. A run where no
+program carried signal — including `--count 0` and `--probes 0`, which both used
+to report a clean score — now exits 2 instead of green.
 
 Next waves, in priority order:
 

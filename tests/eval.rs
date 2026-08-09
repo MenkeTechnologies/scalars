@@ -2609,3 +2609,105 @@ fn padto_segmentlength_and_lastindexwhere_on_a_sequence() {
     assert!(ok);
     assert_eq!(out, "List(1, 2, 3, 9, 9)\nList(1, 2, 3)\n2\n3\n");
 }
+
+// ── apply: `receiver(args)` in every position (byte-verified vs scala 3.8.4) ──
+
+#[test]
+fn a_binding_is_applied_from_inside_a_lambda_and_a_def() {
+    // The receiver is named where it is neither a frame slot nor a capture — the
+    // shape that told a top-level binding apart from an undefined function.
+    let (out, ok) = run(&wrap(
+        r#"val xs = List(10, 20, 30)
+           val ar = Array(4, 5, 6)
+           val m = Map("a" -> 1, "b" -> 2)
+           println(List(0, 2).map(i => xs(i)))
+           println(List(0, 2).map(i => ar(i)).sum)
+           println(List("a", "b").map(k => m(k)))
+           def at(i: Int) = xs(i)
+           println(at(1))
+           val inc = (x: Int) => x + 1
+           println(List(1, 2).map(i => inc(i)))"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(10, 30)\n10\nList(1, 2)\n20\nList(2, 3)\n");
+}
+
+#[test]
+fn a_string_binding_indexes_like_a_string_literal() {
+    let (out, ok) = run(&wrap(
+        r#"val s = "pear"
+           println(s(0))
+           println(s(3).toUpper)
+           println((0 until s.length).map(i => s(i)).mkString("-"))
+           def initial(w: String) = w(0)
+           println(initial("kiwi"))"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "p\nR\np-e-a-r\nk\n");
+}
+
+#[test]
+fn a_bare_placeholder_argument_eta_expands_the_enclosing_call() {
+    // `f(_)` is `x => f(x)`. Expanding it at the argument instead would pass `f`
+    // the identity function, which for a receiver that accepts any value is a
+    // wrong answer rather than an error (`m(_)` looked the function up as a key).
+    let (out, ok) = run(&wrap(
+        r#"def dbl(x: Int) = x * 2
+           def add(x: Int, y: Int) = x + y
+           val m = Map("a" -> 1, "b" -> 2)
+           val s = "abcd"
+           println(List(1, 2).map(dbl(_)))
+           println(List("a", "b").map(m(_)))
+           println(List(1, 2).map(add(_, 10)))
+           println(List(0, 2).map(s(_)))
+           println(List(1, 2, 3).map(_ * 2))"#,
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(2, 4)\nList(1, 2)\nList(11, 12)\nList(a, c)\nList(2, 4, 6)\n"
+    );
+}
+
+#[test]
+fn a_placeholder_can_itself_be_applied() {
+    let (out, ok) = run(&wrap(
+        r#"println(List(List(1, 2), List(3, 4)).map(_(1)))
+           println(List("kiwi", "pear").map(_(1)))"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(2, 4)\nList(i, e)\n");
+}
+
+#[test]
+fn a_selector_chain_continues_after_an_apply_on_a_literal() {
+    let (out, ok) = run(&wrap(
+        r#"println("pear"(1).toUpper)
+           println("pear"(1).toInt)
+           println("pear"(0).toString.length)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "E\n101\n1\n");
+}
+
+#[test]
+fn applying_a_field_reads_the_field_and_applies_that() {
+    // `r.name(0)` is `r.name.apply(0)` — a field of the record, not a method of
+    // its class. An unknown name stays an error.
+    let (out, ok) = run(
+        r#"case class Row(name: String, cells: List[Int], f: Int => Int)
+           object T extends App {
+             val r = Row("melon", List(7, 8, 9), (x: Int) => x * 3)
+             println(r.name(0))
+             println(r.cells(2))
+             println(r.f(5))
+             println(r.name.length)
+           }"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "m\n9\n15\n5\n");
+
+    let (_, bad) = run(r#"case class Row(name: String)
+           object T extends App { println(Row("x").nope(1)) }"#);
+    assert!(!bad, "an unknown member must still be rejected");
+}

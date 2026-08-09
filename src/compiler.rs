@@ -70,6 +70,14 @@ struct Compiler {
     /// the top-level (`main`) scope, where every binding is a global addressed
     /// by `GetVar`/`SetVar`.
     scope: Option<Scope>,
+    /// Every name bound at TOP LEVEL, i.e. every binding [`Compiler::declare_place`]
+    /// gave a `Place::Global`. A nested body (a lambda, a `def`) sees a global by
+    /// name — it is not a capture, so it has no frame slot, and `vals` was swapped
+    /// out on entry. Without this set a call site inside such a body cannot tell
+    /// `xs(i)` on a top-level `val` from a call to an undefined function, and
+    /// rejects it. Reads never needed it: [`Compiler::resolve_place`] already
+    /// falls back to `Place::Global`.
+    global_binds: HashSet<String>,
     /// Class metadata (`name → (ordered field names, is_case)`), for
     /// construction, `copy`, method dispatch, and constructor-pattern binding.
     classes: HashMap<String, ClassMeta>,
@@ -441,6 +449,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         by_name: HashSet::new(),
         vals: HashMap::new(),
         scope: None,
+        global_binds: HashSet::new(),
         classes: class_meta,
         objects: obj_meta,
         method_index,
@@ -2940,11 +2949,16 @@ impl Compiler {
         // A call on a bound name that is not a `def` is an `apply`: the value is a
         // function (`f(x)`), a `List`/`Tuple` (`xs(i)` indexing), or a `Map`
         // (`m(k)` lookup). Load the value, push the args, and dispatch via APPLY.
+        // `vals` covers the body being compiled and `scope.slots` its frame
+        // (parameters, locals, and the captures a closure was given a slot for);
+        // `global_binds` covers a TOP-LEVEL binding read from inside a nested
+        // body, which is neither.
         let is_bound = self.vals.contains_key(name)
             || self
                 .scope
                 .as_ref()
-                .is_some_and(|s| s.slots.contains_key(name));
+                .is_some_and(|s| s.slots.contains_key(name))
+            || self.global_binds.contains(name);
         if is_bound {
             let place = self.resolve_place(name);
             self.emit_load(place);
@@ -2998,6 +3012,7 @@ impl Compiler {
             scope.slots.insert(name.to_string(), slot);
             return Place::Slot(slot);
         }
+        self.global_binds.insert(name.to_string());
         Place::Global(self.b.add_name(name))
     }
 

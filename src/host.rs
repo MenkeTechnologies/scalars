@@ -1696,6 +1696,13 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
     if is_function(recv) {
         return invoke_closure(vm, recv, args);
     }
+    // `s(i)` is `StringOps.apply`, i.e. `charAt` — the same method the named
+    // spelling `s.apply(i)` already reaches through `string_method`. It has to be
+    // here too: a string receiver that is a *binding* rather than a literal
+    // arrives as a value at this universal dispatch, not as a method call.
+    if let Value::Str(s) = recv {
+        return string_method(s, "charAt", args);
+    }
     if let Value::Obj(id) = recv {
         let kind = HEAP.with(|h| {
             h.borrow().get(*id as usize).map(|o| match o {
@@ -3004,6 +3011,25 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
             Ok(v) => v,
             Err(e) => fault(vm, e),
         };
+    }
+    // `o.f(x)` where `f` names a FIELD rather than a method is `o.f.apply(x)` —
+    // indexing a `String`/`List` field, keying a `Map` field, calling a function
+    // field. The compiler routes a known method to its own subroutine, so a
+    // record reaching here with a matching field name has no such method.
+    if !args.is_empty() {
+        let field = with_obj(&recv, |o| {
+            o.fields
+                .iter()
+                .find(|(fname, _)| **fname == *name)
+                .map(|(_, v)| v.clone())
+        })
+        .flatten();
+        if let Some(f) = field {
+            return match apply_value(vm, &f, &args) {
+                Ok(v) => v,
+                Err(e) => fault(vm, e),
+            };
+        }
     }
     match dispatch_method(&recv, &name, &args) {
         Ok(v) => v,

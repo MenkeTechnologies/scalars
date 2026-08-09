@@ -5,6 +5,18 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Supported
 
+- **`apply` — `receiver(args)` — wherever Scala writes it.** The receiver may be
+  a `List`/`Array`/`Vector` (indexing), a `Map` (lookup), a `String` (`s(i)`, i.e.
+  `charAt`), or a function value; it may be a literal (`"pear"(1)`), a top-level
+  or block `val`, a `def` parameter, a lambda parameter, a captured binding read
+  from inside a lambda or a `def` body, or a FIELD of a record (`r.name(0)` is
+  `r.name.apply(0)`, not a method named `name`). A selector chains onto the
+  result (`"pear"(1).toUpper`), and applications compose (`getFn()(arg)`). The
+  placeholder participates on both sides: `_(i)` applies the placeholder
+  (`xs.map(_(1))`), and a bare `_` as an argument eta-expands the ENCLOSING call
+  (`xs.map(f(_))` is `xs.map(x => f(x))`, per Scala's "smallest expression
+  properly containing the underscore" rule) instead of passing the identity
+  function. Covered by the parity fuzzer's `apply` mode.
 - **User-defined methods (`def`), lexically scoped.** Helper `def`s alongside
   `main` (or inside an `extends App` body) are compiled to fusevm's native
   `Op::Call` frame ABI: parameters bind to per-call frame slots, recursion and
@@ -328,9 +340,6 @@ reported as parse/compile errors, never silently mis-run.
   `String` companion, so `String.valueOf(x)` answers "not a member"; use
   `"" + x` or `x.toString` (which differ on `null` only in that `toString` on a
   `null` would NPE in Scala too).
-- **A method chained onto `apply` on a literal receiver.** `"abc"(1)` parses, but
-  `"abc"(1).toInt` does not — the parser does not continue a selector chain after
-  an apply directly on a literal. Bind the receiver first (`val s = "abc"; s(1).toInt`).
 - **By-name params, `given`/`using`, `@main` (Scala 3 annotation entry).**
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.

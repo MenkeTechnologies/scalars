@@ -1406,7 +1406,26 @@ impl Parser {
     /// receiver (a negated numeric literal comes in this way).
     fn postfix_from(&mut self, e: Expr) -> Result<Expr, String> {
         let mut e = e;
-        while self.is(&Tok::Dot) {
+        // `.member` and a trailing application are ONE chain, alternating freely:
+        // `"abc"(1).toUpper` applies then selects, `getFn()(arg)` applies twice.
+        // Two sequential loops would stop at the first switch of kind.
+        loop {
+            if !self.is(&Tok::Dot) {
+                // A trailing application on a value expression (`f(x)`, `xs(i)`,
+                // `getFn()(arg)`, `"abc"(1)`) — Scala's `apply`.
+                if self.is(&Tok::LParen) {
+                    let line = self.line();
+                    let args = self.arg_list()?;
+                    e = Expr::Method {
+                        recv: Box::new(e),
+                        name: "apply".to_string(),
+                        args,
+                        line,
+                    };
+                    continue;
+                }
+                break;
+            }
             self.advance(); // `.`
             let line = self.line();
             // A method name is normally an identifier, but Scala's symbolic
@@ -1468,18 +1487,6 @@ impl Parser {
             e = Expr::Method {
                 recv: Box::new(e),
                 name,
-                args,
-                line,
-            };
-        }
-        // A trailing application on a value expression (`f(x)`, `xs(i)`) when the
-        // receiver is not a `.method` chain — e.g. `getFn()(arg)`. `apply`.
-        while self.is(&Tok::LParen) {
-            let line = self.line();
-            let args = self.arg_list()?;
-            e = Expr::Method {
-                recv: Box::new(e),
-                name: "apply".to_string(),
                 args,
                 line,
             };
@@ -1665,8 +1672,11 @@ impl Parser {
             Tok::Ident(name) => {
                 let next = self.toks.get(self.pos + 1).map(|t| &t.kind);
                 // A bare `_` is an argument placeholder (rewritten to a lambda by
-                // `wrap_placeholders` at the enclosing argument boundary).
-                if name == "_" && !matches!(next, Some(Tok::LParen)) {
+                // `wrap_placeholders` at the enclosing argument boundary). A `(`
+                // after it is an APPLICATION of the placeholder — `xs.map(_(0))`
+                // is `xs.map(x => x(0))` — which `postfix` builds as an `apply`
+                // on this node; it is never a call to a function named `_`.
+                if name == "_" {
                     self.advance();
                     return Ok(Expr::Placeholder);
                 }
@@ -1885,10 +1895,10 @@ impl Parser {
                         self.skip_seps();
                         Expr::NamedArg {
                             name: pname,
-                            value: Box::new(wrap_placeholders(self.expression()?)),
+                            value: Box::new(wrap_arg_placeholders(self.expression()?)),
                         }
                     }
-                    None => wrap_placeholders(self.expression()?),
+                    None => wrap_arg_placeholders(self.expression()?),
                 };
                 args.push(a);
                 if self.is(&Tok::Comma) {
@@ -2366,6 +2376,19 @@ fn parse_fragment(src: &str) -> Result<Expr, String> {
 /// left-to-right — Scala's `_ + 1` ⇒ `x => x + 1`, `_ + _` ⇒ `(a, b) => a + b`.
 /// A placeholder inside an already-wrapped nested lambda is left untouched (the
 /// walk does not descend into a `Lambda`).
+/// [`wrap_placeholders`] for one ARGUMENT of a call. Scala expands a placeholder
+/// at the smallest expression that *properly contains* it, so an argument that is
+/// nothing but `_` is not itself that expression — the enclosing call is. Wrapping
+/// it here instead would make `xs.map(f(_))` pass `f` the identity function rather
+/// than eta-expanding to `x => f(x)`; when `f` accepts any value that is a wrong
+/// answer, not an error (`xs.map(m(_))` looked up the *function* as a map key).
+fn wrap_arg_placeholders(e: Expr) -> Expr {
+    if matches!(e, Expr::Placeholder) {
+        return e;
+    }
+    wrap_placeholders(e)
+}
+
 fn wrap_placeholders(e: Expr) -> Expr {
     let mut n = 0usize;
     let mut body = e;
