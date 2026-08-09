@@ -659,3 +659,37 @@ Two consequences worth stating plainly:
 
 `case NonFatal(e)`, exception chaining (`getCause`, `initCause`,
 `addSuppressed`), stack traces, and `Try`/`Success`/`Failure` are not modeled.
+
+## What a clean parity-fuzz run does not prove
+
+The `parity-fuzz` binary diffs generated programs against a real `scala`. It is
+the main evidence that this frontend is faithful, so it is worth being precise
+about the three ways a green run has been wrong.
+
+**A debug-only fault can wrap into agreement under `--release`.** The host used
+to fold an integral `sum`/`product` with `Iterator::sum`, whose `+` is the
+checked one. `List(Long.MaxValue, 1L).sum` therefore *raised* in a debug build,
+where Scala answers `-9223372036854775808`. The same expression under
+`--release` wraps silently and agrees — so the bug was visible only in the
+profile nobody ships, and a release-mode fuzz run would have scored it clean
+forever. Any arithmetic the host performs in Rust must say which overflow
+behaviour it means (`wrapping_add`, `checked_*`) rather than inherit it from the
+profile; where it does not, a green run is evidence about the profile, not about
+the frontend.
+
+**A mode only covers the shapes it generates.** The `overflow` mode exercises
+widths, not name resolution, so it cannot see a regression in
+`could_be_user_instance` — that needs a program declaring a member whose name
+collides with a stdlib one (`class Thing { def abs: Int }`) *and* a receiver
+that is neither a literal nor a plain variable. `(-2147483648 + 0).abs`
+answers `-2147483648` in Scala; a build that drops the proven-width exemption
+answers `2147483648` and still scores a clean `overflow` run across thousands of
+programs. Do not read a clean run in one mode as coverage of another.
+
+**A run the machine broke is not a run.** `run_prog` reports `exit == -1` for
+its own failures — it could not write the temp file, or could not spawn the
+binary — which a full disk causes in bulk. Those are counted and reported
+separately (`harness-err`), excused from the divergence count, and once they
+exceed a tenth of the run the harness exits 2 rather than green, because those
+programs were never compared. An *oracle* exiting non-zero is deliberately NOT
+excused: "scala rejects a program we accept" is a real divergence.
