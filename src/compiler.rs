@@ -2196,6 +2196,17 @@ impl Compiler {
             };
             return self.lambda(&params, &call, false);
         }
+        // `Ordering[T]` used as a VALUE — `xs.sorted(Ordering[Money])`. The
+        // parser erases the type application, so what reaches here is the bare
+        // name; it denotes the natural ordering for `T`, and the element type it
+        // differs by is a typing concern the runtime does not have. Placed after
+        // every user binding above so a program with its own `Ordering` still
+        // wins.
+        if name == "Ordering" {
+            self.b
+                .emit(Op::CallBuiltin(crate::host::MAKE_ORDERING, 0), 0);
+            return Ok(());
+        }
         let place = self.resolve_place(name);
         self.emit_load(place);
         Ok(())
@@ -2772,7 +2783,14 @@ impl Compiler {
         // ordering value; any other member is a method on the natural ordering
         // `Ordering[T]` denotes, so it is emitted as a call on that.
         if is_ordering_module(recv) {
-            let factory = matches!(name, "by" | "on" | "fromLessThan") || args.is_empty();
+            // A FACTORY is the two function-taking builders plus the type
+            // members, which merely name the element type. Anything else is a
+            // METHOD on the natural ordering `Ordering[T]` denotes — including
+            // the zero-argument `reverse`, which must not be mistaken for a type
+            // member: `Ordering[T].reverse` would then build an unreversed
+            // natural ordering and `xs.sorted(…)` would silently sort ASCENDING.
+            let factory =
+                matches!(name, "by" | "on" | "fromLessThan") || ORDERING_MEMBERS.contains(&name);
             let member = if factory { name } else { "Int" };
             if factory {
                 for a in args {
@@ -2953,6 +2971,79 @@ impl Compiler {
             self.b.patch_jump(je, end);
         }
         Ok(())
+    }
+
+    /// `a < b` where `a` may be an instance of a class extending `Ordered`.
+    ///
+    /// Scala's `Ordered` derives `<`/`>`/`<=`/`>=` from the class's own
+    /// `compare`, but the infix spelling never becomes a method call in this
+    /// frontend: it lowers to `Op::NumLt`, whose non-numeric fallback is
+    /// `host::numeric_hook`. That hook cannot run a user `compare` — fusevm
+    /// hands it `&self`, with no VM to re-enter — so the choice has to be made
+    /// here, at compile time.
+    ///
+    /// Emits the same runtime class-tag chain as [`Self::dispatch_instance_method`]:
+    /// for each class defining `compare`, test the receiver's tag and, on a
+    /// match, compare `this.compare(that)` against 0. Any other receiver — an
+    /// `Int`, a `String`, a class with no `compare` — falls through to the plain
+    /// numeric op, so ordinary comparisons are untouched.
+    ///
+    /// Answers `false` (emitted nothing) when the program defines no `compare`
+    /// at all, which is the overwhelmingly common case: a program without one
+    /// gets exactly the bytecode it did before this existed.
+    fn ordered_relational(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<bool, String> {
+        let Some(classes) = self.method_index.get("compare").cloned() else {
+            return Ok(false);
+        };
+        let vop = match op {
+            BinOp::Lt => Op::NumLt,
+            BinOp::Gt => Op::NumGt,
+            BinOp::Le => Op::NumLe,
+            BinOp::Ge => Op::NumGe,
+            _ => unreachable!("only the four relational operators route here"),
+        };
+        // Both operands are evaluated ONCE, into temporaries: the chain reads the
+        // receiver twice (for its class tag and for the call) and Scala evaluates
+        // each operand exactly once.
+        self.obj_counter += 1;
+        let n = self.obj_counter;
+        self.expr(lhs)?;
+        let t = self.declare_place(&format!(" ord_l{n}"));
+        self.emit_store(t);
+        self.expr(rhs)?;
+        let u = self.declare_place(&format!(" ord_r{n}"));
+        self.emit_store(u);
+        self.emit_load(t);
+        self.b.emit(Op::CallBuiltin(crate::host::OBJ_CLASS, 1), 0);
+        let cls = self.declare_place(&format!(" ord_c{n}"));
+        self.emit_store(cls);
+
+        let mut end_jumps = Vec::new();
+        for (tag, owner) in &classes {
+            self.emit_load(cls);
+            let cc = self.b.add_constant(Value::str(tag.clone()));
+            self.b.emit(Op::LoadConst(cc), 0);
+            self.b.emit(Op::NumEq, 0);
+            let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+            self.emit_load(t);
+            self.emit_load(u);
+            let nidx = self.b.add_name(&method_sub_name(owner, "compare"));
+            self.b.emit(Op::Call(nidx, 2), 0);
+            let zero = self.b.add_constant(Value::int(0));
+            self.b.emit(Op::LoadConst(zero), 0);
+            self.b.emit(vop.clone(), 0);
+            end_jumps.push(self.b.emit(Op::Jump(0), 0));
+            let next = self.b.current_pos();
+            self.b.patch_jump(jf, next);
+        }
+        self.emit_load(t);
+        self.emit_load(u);
+        self.b.emit(vop, 0);
+        let end = self.b.current_pos();
+        for je in end_jumps {
+            self.b.patch_jump(je, end);
+        }
+        Ok(true)
     }
 
     // ── class / object subroutine emission ──────────────────────────────────
@@ -3793,6 +3884,14 @@ impl Compiler {
                 return Ok(());
             }
             _ => {}
+        }
+        // `a < b` on a class that extends `Ordered` is that class's `compare`,
+        // not a numeric comparison. Emitted before the operand code below
+        // because the chain needs the receiver in a temporary.
+        if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
+            && self.ordered_relational(op, lhs, rhs)?
+        {
+            return Ok(());
         }
         // The result's width, decided before anything is emitted. `Int` operands
         // make an `Int` result, which wraps at 32 bits; a `Long` anywhere in the

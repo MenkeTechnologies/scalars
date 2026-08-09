@@ -290,7 +290,11 @@ Implemented and checked against the reference `scala`:
   a CHAMP `HashSet(…)`/`HashMap(…)` in trie order (the JVM hash codes, the
   `MurmurHash3` product/seq/set/map hashes, the trie's `improve` scramble and its
   iteration order are all ported, so a set or map keyed by another *collection*
-  orders correctly too). Mutable `Array` too — `Array(a, b)`,
+  orders correctly too). Equality follows the collection's own contract: a `Set`
+  is UNORDERED, so `Set(1, 2) == Set(2, 1)` and a `mutable.HashSet` equals the
+  immutable `Set` with the same members, while a `Seq` stays positional
+  (`List(1, 2) != List(2, 1)`) and a set is never equal to a non-set. Mutable
+  `Array` too — `Array(a, b)`,
   `new Array[T](n)` (zero-filled per `T`), `a(i)` reads and `a(i) = v` writes.
 - **The bitwise and shift operators** — `&`, `|`, `^`, `~`, `<<`, `>>`, `>>>`,
   each evaluated at its receiver's width, so `1 << 33` is `2` while `1L << 33` is
@@ -328,6 +332,14 @@ Implemented and checked against the reference `scala`:
   `Ordering.by(f)`, `Ordering.fromLessThan(lt)`, `Ordering[T]` and `ord.on(f)`,
   driving `sorted`, `sortBy`, `max`, `min`, `maxBy` and `minBy`, plus the
   value's own `compare`/`lt`/`gt`/`lteq`/`gteq`/`equiv`/`max`/`min`.
+- **`Ordered`/`Comparable` on a user class** — a class that defines its own
+  `compare` (or `compareTo`) drives the IMPLICIT ordering too, so `sorted`,
+  `min`, `max`, `sortBy`, `maxBy` and `minBy` all run it, including through
+  tuples and nested sequences. `Ordered` also derives `<`, `>`, `<=`, `>=` and
+  `compareTo` from it — `compareTo` answering the user's value verbatim, the
+  operators its sign. It does NOT derive `min`/`max` on the instance, matching
+  Scala 3, where those need
+  `import scala.math.Ordering.Implicits.infixOrderingOps`.
 - **The boxed-primitive and `String` statics** — `scala.Int`'s
   `MaxValue`/`MinValue` family and `java.lang.Integer`/`Long`/`Double`/
   `Boolean`/`Character`'s `parseInt`, `toHexString`, `bitCount`, `isDigit`,
@@ -520,8 +532,9 @@ Next waves, in priority order:
 3. **`mutable.PriorityQueue`** — the last absent mutable collection. Its
    `toString` is the raw binary-heap array order, so it needs a faithful port of
    the library's `addAll`/`heapify`/`fixUp`/`fixDown` rather than any max-heap.
-4. **`Ordered`/`Comparable` on a user class** — an explicit `Ordering` works, but
-   a class's own `compare` is not yet consulted by the implicit one.
+4. **A user class's `toString` override** — honoured for an explicit
+   `p.toString`, but not for `println(p)`, `s"$p"` or `List(p)`, which render
+   through a pure path with no VM to re-enter.
 5. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.

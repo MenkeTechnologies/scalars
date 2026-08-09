@@ -3340,6 +3340,63 @@ fn a_collection_factory_takes_a_spread_too() {
 }
 
 #[test]
+fn ordered_on_a_user_class_drives_every_ordering_op() {
+    // `compare` is REVERSED and scaled by 7 on purpose. A natural `n - that.n`
+    // would agree with the structural fallback for a one-field `case class`, so
+    // a frontend that ignored the user's method entirely would still print the
+    // right answer; reversing it means only a real call can pass. The scale
+    // proves `compareTo` forwards the user's value verbatim (14, not 1) while
+    // the relational operators reduce it to a sign.
+    let (out, ok) = run(
+        "case class V(n: Int) extends Ordered[V] {\n  def compare(that: V): Int = (that.n - n) * 7\n}\nobject T extends App {\n  val xs = List(V(3), V(1), V(2))\n  println(xs.sorted)\n  println(xs.max)\n  println(xs.min)\n  println(xs.sortBy(v => v))\n  println(xs.maxBy(v => v))\n  println(xs.minBy(v => v))\n  println(V(1) < V(2))\n  println(V(1) > V(2))\n  println(V(2) <= V(2))\n  println(V(2) >= V(3))\n  println(V(1).compareTo(V(3)))\n  println(List((0, V(1)), (0, V(2))).sorted)\n  println(xs.sorted(Ordering[V].reverse))\n  println(1 < 2)\n  println(\"a\" < \"b\")\n  println(List(3, 1, 2).sorted)\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        // The last three lines are the control: a program that defines `compare`
+        // still compares `Int`s and `String`s numerically/lexicographically, and
+        // still sorts a plain `List[Int]` naturally.
+        "List(V(3), V(2), V(1))\nV(1)\nV(3)\nList(V(3), V(2), V(1))\nV(1)\nV(3)\nfalse\ntrue\ntrue\ntrue\n14\nList((0,V(2)), (0,V(1)))\nList(V(1), V(2), V(3))\ntrue\ntrue\nList(1, 2, 3)\n"
+    );
+}
+
+#[test]
+fn a_user_ordered_sort_is_stable_on_every_path() {
+    // Scala's sorts are stable, so elements whose `compare` answers 0 come out
+    // in INPUT order. Every one of these runs through `host::merge_sort_idx`:
+    // the implicit ordering (`sorted`), a key function (`sortBy`), and an
+    // explicit `Ordering` — a merge that took from the right run on a tie would
+    // scramble the tags while leaving the keys looking correctly sorted.
+    // `reverse` flips the key order but must still keep ties in input order.
+    let (out, ok) = run(
+        "case class K(k: Int, tag: String) extends Ordered[K] {\n  def compare(that: K): Int = k - that.k\n}\nobject T extends App {\n  val ties = List(K(1,\"a\"), K(1,\"b\"), K(1,\"c\"), K(1,\"d\"), K(1,\"e\"), K(1,\"f\"), K(1,\"g\"))\n  println(ties.sorted)\n  println(ties.sortBy(x => x))\n  println(ties.sorted(Ordering[K]))\n  val mixed = List(K(2,\"a\"), K(1,\"b\"), K(2,\"c\"), K(1,\"d\"), K(3,\"e\"), K(2,\"f\"))\n  println(mixed.sorted)\n  println(mixed.sortBy(x => x))\n  println(mixed.sortBy(_.k))\n  println(mixed.sorted(Ordering[K].reverse))\n  println((1 to 40).toList.map(i => K(41 - i, \"t\")).sorted.map(_.k).take(8))\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(K(1,a), K(1,b), K(1,c), K(1,d), K(1,e), K(1,f), K(1,g))\nList(K(1,a), K(1,b), K(1,c), K(1,d), K(1,e), K(1,f), K(1,g))\nList(K(1,a), K(1,b), K(1,c), K(1,d), K(1,e), K(1,f), K(1,g))\nList(K(1,b), K(1,d), K(2,a), K(2,c), K(2,f), K(3,e))\nList(K(1,b), K(1,d), K(2,a), K(2,c), K(2,f), K(3,e))\nList(K(1,b), K(1,d), K(2,a), K(2,c), K(2,f), K(3,e))\nList(K(3,e), K(2,a), K(2,c), K(2,f), K(1,b), K(1,d))\nList(1, 2, 3, 4, 5, 6, 7, 8)\n"
+    );
+}
+
+#[test]
+fn set_equality_ignores_iteration_order() {
+    // A `Set` is unordered, so `equals` is "same size, same members". The stored
+    // `Vec` is only an iteration order — and for a `mutable.HashSet` or a
+    // `LinkedHashSet` it is not even the order an equal set would arrive at — so
+    // comparing positionally answered `false` for sets Scala calls equal.
+    // A set is equal only to another set: `Set(1, 2).equals(List(1, 2))` is
+    // `false`, and `List` equality stays positional.
+    let (out, ok) = run(
+        "import scala.collection.mutable\nobject T extends App {\n  println(Set(1, 2) == Set(2, 1))\n  println(Set(1, 2) == Set(1, 2, 3))\n  println(List(3, 1, 2).toSet == Set(1, 2, 3))\n  println(Set(1, 2, 3, 4, 5, 6) == Set(6, 5, 4, 3, 2, 1))\n  println(mutable.Set(1, 2) == Set(2, 1))\n  println(mutable.LinkedHashSet(2, 1) == Set(1, 2))\n  println(Set(Set(1, 2)) == Set(Set(2, 1)))\n  println(Map(1 -> Set(1, 2)) == Map(1 -> Set(2, 1)))\n  println(Set(1, 2).equals(List(1, 2)))\n  println(List(1, 2) == List(2, 1))\n  println(Set(\"a\", \"b\") == Set(\"b\", \"a\"))\n}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true\nfalse\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\ntrue\n"
+    );
+}
+
+#[test]
 fn every_builtin_id_is_distinct() {
     // Builtin ids are hand-assigned `pub const`s, and two slices adding one at
     // the same time pick the same number without any conflict marker: the file

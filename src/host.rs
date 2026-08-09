@@ -439,7 +439,6 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(CELL_SET, b_cell_set);
     vm.register_builtin(CHAR_NEW, b_char_new);
     vm.register_builtin(UNAPPLY_SEQ, b_unapply_seq);
-    vm.register_builtin(MAKE_ORDERING, b_make_ordering);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -1120,6 +1119,9 @@ pub fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     // The intern table holds arena indices, which the clear above invalidates.
     CHARS.with(|t| t.borrow_mut().clear());
+    // Method entries are offsets into the OUTGOING chunk; the next program
+    // compiles its own, so a stale hit would jump into unrelated bytecode.
+    METHOD_ENTRIES.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -1338,7 +1340,7 @@ fn ordering_cmp(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Orderi
         ),
     };
     let base = match lt {
-        Value::Undef => value_cmp(&a, &b),
+        Value::Undef => cmp_vm(vm, &a, &b)?,
         // `Ordering.fromLessThan(lt)` is defined by its `lt` alone: equal when
         // neither side is less than the other.
         f => {
@@ -2358,19 +2360,14 @@ fn best_by_ordering(
     Ok(best)
 }
 
-/// Sort `items` under `ord`, stably. Written as an insertion merge rather than
-/// `sort_by` because the comparison runs a user closure, which may raise and
-/// which `slice::sort_by` would panic on if it were inconsistent.
+/// Sort `items` under `ord`, stably. Goes through [`merge_sort_idx`] rather than
+/// `slice::sort_by` because the comparison runs a user closure, which may raise
+/// and which `sort_by` would panic on if it were inconsistent.
 fn sort_by_ordering(vm: &mut VM, ord: &Value, items: &[Value]) -> Result<Vec<Value>, String> {
-    let mut out: Vec<Value> = Vec::with_capacity(items.len());
-    for it in items {
-        let mut at = out.len();
-        while at > 0 && ordering_cmp(vm, ord, it, &out[at - 1])? == Ordering::Less {
-            at -= 1;
-        }
-        out.insert(at, it.clone());
-    }
-    Ok(out)
+    let idx = merge_sort_idx(vm, items.len(), &mut |vm, i, j| {
+        ordering_cmp(vm, ord, &items[i], &items[j])
+    })?;
+    Ok(idx.into_iter().map(|i| items[i].clone()).collect())
 }
 
 /// `x.getClass` — a `java.lang.Class` record carrying the two names a program
@@ -2984,9 +2981,27 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
                             .zip(&ob.fields[..n])
                             .all(|((_, x), (_, y))| value_eq(x, y))
                 }
-                // Two sequences/tuples are equal element-by-element (a `List`
-                // equals a `Set` only if both order and elements match — good
-                // enough for the collections this frontend builds).
+                // A `Set` is UNORDERED, so `Set.equals` is "same size and every
+                // element of mine is in yours" — `Set(1, 2) == Set(2, 1)`. The
+                // stored `Vec` is only an iteration order, and for a
+                // `mutable.HashSet` or a `LinkedHashSet` it is not even the same
+                // order two equal sets would arrive at, so comparing positionally
+                // answers `false` for sets Scala calls equal.
+                //
+                // A set is also equal only to another set: `Set` and `Seq` are
+                // different branches of `Iterable`, and `scala.collection.Set`'s
+                // `equals` requires a `Set` on the other side (Scala 3 rejects
+                // `Set(1, 2) == List(1, 2)` at compile time; at run time
+                // `.equals` answers `false`).
+                (HeapVal::Seq(ka, xa), HeapVal::Seq(kb, xb))
+                    if matches!(ka, SeqKind::Set(_)) || matches!(kb, SeqKind::Set(_)) =>
+                {
+                    matches!(ka, SeqKind::Set(_))
+                        && matches!(kb, SeqKind::Set(_))
+                        && xa.len() == xb.len()
+                        && xa.iter().all(|x| xb.iter().any(|y| value_eq(x, y)))
+                }
+                // Two sequences/tuples are equal element-by-element.
                 (HeapVal::Seq(_, xa), HeapVal::Seq(_, xb))
                 | (HeapVal::Tuple(xa), HeapVal::Tuple(xb)) => {
                     xa.len() == xb.len() && xa.iter().zip(&xb).all(|(x, y)| value_eq(x, y))
@@ -3544,6 +3559,19 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
             Err(e) => fault(vm, e),
         };
     }
+    // The members `Ordered` DERIVES from the user's `compare`. The class only
+    // writes `compare`, so the compiler's method index has no entry for these
+    // and they would otherwise be rejected as "not a member". Answered here
+    // rather than in the pure `obj_method` because running the user's `compare`
+    // needs the VM. (The infix spelling `a < b` never reaches a method call at
+    // all — it lowers to a numeric op, and is handled in the compiler.)
+    if let Some(r) = ordered_derived_method(vm, &recv, &name, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(e) => fault(vm, e),
+        };
+    }
+
     // `o.f(x)` where `f` names a FIELD rather than a method is `o.f.apply(x)` —
     // indexing a `String`/`List` field, keying a `Map` field, calling a function
     // field. The compiler routes a known method to its own subroutine, so a
@@ -4201,21 +4229,18 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             } else {
                 Ordering::Less
             };
-            items
-                .iter()
-                .skip(1)
-                .fold(items.first().cloned(), |best, it| {
-                    best.map(|b| {
-                        if value_cmp(it, &b) == want {
-                            it.clone()
-                        } else {
-                            b
-                        }
-                    })
-                })
-                .ok_or_else(|| {
-                    format!("scalars: java.lang.UnsupportedOperationException: empty.{name}")
-                })
+            let Some(first) = items.first() else {
+                return Err(format!(
+                    "scalars: java.lang.UnsupportedOperationException: empty.{name}"
+                ));
+            };
+            let mut best = first.clone();
+            for it in items.iter().skip(1) {
+                if cmp_vm(vm, it, &best)? == want {
+                    best = it.clone();
+                }
+            }
+            Ok(best)
         }
         ("toArray", 0) => Ok(new_seq(SeqKind::Array, items)),
         ("toVector", 0) => Ok(new_seq(SeqKind::Vector, items)),
@@ -4547,11 +4572,16 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             ))
         }
         ("sortBy", 1) => {
+            // Sorted by INDEX so `f` runs exactly once per element, as Scala's
+            // `sortBy` (a `map`-then-sort over the keys) does.
             let ks = keys_of(vm, &args[0], &items)?;
-            let mut idx: Vec<usize> = (0..items.len()).collect();
-            idx.sort_by(|&a, &b| value_cmp(&ks[a], &ks[b]));
+            let idx = merge_sort_idx(vm, items.len(), &mut |vm, i, j| cmp_vm(vm, &ks[i], &ks[j]))?;
             Ok(same(idx.into_iter().map(|i| items[i].clone()).collect()))
         }
+        // The implicit ordering. A user class that extends `Ordered` supplies it
+        // through its own `compare`, which needs the VM — so this cannot be
+        // answered by the pure `seq_slice_method` path above.
+        ("sorted", 0) => Ok(same(sort_values(vm, &items)?)),
         // An EXPLICIT `Ordering`. Scala passes it as a second (implicit)
         // parameter list, which this frontend flattens into the same call, so
         // `xs.sorted(ord)` arrives with one argument and `xs.sortBy(f)(ord)`
@@ -4603,7 +4633,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             };
             let mut best = 0usize;
             for i in 1..items.len() {
-                if value_cmp(&ks[i], &ks[best]) == want {
+                if cmp_vm(vm, &ks[i], &ks[best])? == want {
                     best = i;
                 }
             }
@@ -5086,6 +5116,201 @@ fn java_str_cmp(a: &str, b: &str) -> Ordering {
     a.encode_utf16().cmp(b.encode_utf16())
 }
 
+thread_local! {
+    /// `(class, method) → subroutine entry`, memoized because resolving one is a
+    /// LINEAR scan of the chunk's name table and a `sorted` over a user-`Ordered`
+    /// class asks the same question once per comparison. A MISS is cached too:
+    /// sorting ordinary `case class`es asks about a `compare` that is not there,
+    /// once per comparison, and that scan is the one worth skipping. Cleared by
+    /// [`reset_heap`], which is also when a new program's chunk arrives.
+    static METHOD_ENTRIES: RefCell<HashMap<(Arc<str>, &'static str), Option<usize>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The entry point of the user-defined method `Class$name`, when the program
+/// compiled one. `compiler::method_sub_name` registers every class method under
+/// that name, so the host can re-enter one exactly as [`invoke_body`] re-enters
+/// a closure body — no fusevm change, the name table is already public.
+fn user_method_entry(vm: &VM, class: &Arc<str>, name: &'static str) -> Option<usize> {
+    let key = (Arc::clone(class), name);
+    if let Some(hit) = METHOD_ENTRIES.with(|t| t.borrow().get(&key).copied()) {
+        return hit;
+    }
+    let want = format!("{class}${name}");
+    let found = vm
+        .chunk
+        .names
+        .iter()
+        .position(|n| n == &want)
+        .and_then(|idx| vm.chunk.find_sub(idx as u16));
+    METHOD_ENTRIES.with(|t| t.borrow_mut().insert(key, found));
+    found
+}
+
+/// Call the user-defined method `recv.name(args)` when `recv` is an instance of
+/// a class that defines it. `None` means "no such method on that class", which
+/// lets a caller fall back to the built-in behaviour.
+///
+/// A method subroutine takes `this` first, then its declared parameters — the
+/// same shape [`compiler::dispatch_instance_method`] pushes.
+fn call_user_method(
+    vm: &mut VM,
+    recv: &Value,
+    // `'static` so the memo in `user_method_entry` can key on it without
+    // allocating; every caller passes a literal method name.
+    name: &'static str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    // `with_obj` is what restricts this to a class instance: a `Char`, tuple or
+    // collection handle is also a `Value::Obj` but is not a record.
+    let class = with_obj(recv, |o| Arc::clone(&o.class))?;
+    let entry = user_method_entry(vm, &class, name)?;
+    let stack_base = vm.stack.len();
+    vm.stack.push(recv.clone());
+    for a in args {
+        vm.stack.push(a.clone());
+    }
+    Some(run_sub(vm, entry, stack_base))
+}
+
+/// `a compare b` when `a`'s class defines it — `class V extends Ordered[V]` or
+/// `implements Comparable[V]`. Scala's `Ordered`/`Comparable` are ordinary
+/// traits whose single abstract member is the user's, and the implicit
+/// `Ordering.ordered` makes every ordering-taking collection method use it, so
+/// this is what `sorted`/`min`/`max`/`sortBy` must consult before falling back
+/// to the structural order in [`value_cmp`].
+///
+/// `Comparable` spells the method `compareTo`; both names are tried, `compare`
+/// first, since a class extending `Ordered` inherits a `compareTo` that merely
+/// forwards to `compare`.
+fn user_cmp(vm: &mut VM, a: &Value, b: &Value) -> Option<Result<Ordering, String>> {
+    let r = call_user_method(vm, a, "compare", std::slice::from_ref(b))
+        .or_else(|| call_user_method(vm, a, "compareTo", std::slice::from_ref(b)))?;
+    // `compare` answers a negative/zero/positive `Int`, not `-1`/`0`/`1`.
+    Some(r.map(|v| v.to_int().cmp(&0)))
+}
+
+/// [`value_cmp`], plus the `compare` a user class defines. Takes the VM because
+/// running that `compare` re-enters the interpreter.
+///
+/// The element-wise arm is repeated from `value_cmp` rather than delegating to
+/// it, because a tuple or nested sequence of user-ordered values has to keep
+/// consulting the user's `compare` all the way down: `List((1, V(2)))` sorts by
+/// `V`'s order in its second position.
+fn cmp_vm(vm: &mut VM, a: &Value, b: &Value) -> Result<Ordering, String> {
+    if let Some(r) = user_cmp(vm, a, b) {
+        return r;
+    }
+    if matches!((a, b), (Value::Obj(_), Value::Obj(_))) && as_char(a).is_none() {
+        if let (Some(xs), Some(ys)) = (as_seq_or_tuple(a), as_seq_or_tuple(b)) {
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                let o = cmp_vm(vm, x, y)?;
+                if o != Ordering::Equal {
+                    return Ok(o);
+                }
+            }
+            return Ok(xs.len().cmp(&ys.len()));
+        }
+    }
+    Ok(value_cmp(a, b))
+}
+
+/// The members `scala.math.Ordered` derives from the single `compare` the user
+/// writes: the four relational operators and `compareTo`, the `Comparable`
+/// name. `None` when the receiver's class defines no `compare`, or the name is
+/// not one of them, so the caller goes on to its usual dispatch.
+///
+/// `Ordered` in Scala 3 does NOT give a class `min`/`max` — those are extension
+/// methods that need `import scala.math.Ordering.Implicits.infixOrderingOps`,
+/// and the reference rejects `V(1).min(V(2))` without it. They are deliberately
+/// absent here so the same program is rejected rather than silently answered.
+fn ordered_derived_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    if args.len() != 1 || !matches!(name, "<" | ">" | "<=" | ">=" | "compareTo") {
+        return None;
+    }
+    let that = std::slice::from_ref(&args[0]);
+    let raw = match call_user_method(vm, recv, "compare", that)
+        .or_else(|| call_user_method(vm, recv, "compareTo", that))?
+    {
+        Ok(v) => v.to_int(),
+        Err(e) => return Some(Err(e)),
+    };
+    // `Ordered.compareTo` is `def compareTo(that: A) = compare(that)` — it
+    // answers the user's result VERBATIM. A `compare` of `(n - that.n) * 100`
+    // makes `V(1).compareTo(V(3))` answer -200, not -1 (checked against the
+    // reference). Only the relational operators reduce it to a sign.
+    if name == "compareTo" {
+        return Some(Ok(Value::int(raw)));
+    }
+    let o = raw.cmp(&0);
+    Some(Ok(Value::bool(match name {
+        "<" => o == Ordering::Less,
+        ">" => o == Ordering::Greater,
+        "<=" => o != Ordering::Greater,
+        _ => o != Ordering::Less,
+    })))
+}
+
+/// A STABLE sort of `0..len` under a comparator that may re-enter the VM and
+/// fail, returning the sorted index permutation.
+///
+/// `slice::sort_by` cannot be used: its comparator answers a bare `Ordering`,
+/// with nowhere to report a user `compare` that raised. The obvious alternative
+/// — inserting each element into a growing sorted run — is O(n²), which a
+/// reverse-ordered 4000-element `sorted` feels immediately (measured at 57s
+/// before this became a merge). This is a bottom-up merge instead: O(n log n)
+/// comparisons, and stable because a tie never takes from the right run.
+fn merge_sort_idx(
+    vm: &mut VM,
+    len: usize,
+    cmp: &mut dyn FnMut(&mut VM, usize, usize) -> Result<Ordering, String>,
+) -> Result<Vec<usize>, String> {
+    let mut cur: Vec<usize> = (0..len).collect();
+    let mut buf: Vec<usize> = vec![0; len];
+    let mut width = 1;
+    while width < len {
+        let mut lo = 0;
+        while lo < len {
+            let mid = (lo + width).min(len);
+            let hi = (lo + 2 * width).min(len);
+            let (mut i, mut j, mut k) = (lo, mid, lo);
+            while i < mid && j < hi {
+                // Strictly-less is what makes this stable: on a tie the left run
+                // goes first, so equal elements keep their input order.
+                if cmp(vm, cur[j], cur[i])? == Ordering::Less {
+                    buf[k] = cur[j];
+                    j += 1;
+                } else {
+                    buf[k] = cur[i];
+                    i += 1;
+                }
+                k += 1;
+            }
+            buf[k..k + (mid - i)].copy_from_slice(&cur[i..mid]);
+            k += mid - i;
+            buf[k..k + (hi - j)].copy_from_slice(&cur[j..hi]);
+            lo = hi;
+        }
+        std::mem::swap(&mut cur, &mut buf);
+        width *= 2;
+    }
+    Ok(cur)
+}
+
+/// Sort `items` stably under [`cmp_vm`] — the implicit ordering, including a
+/// user class's own `compare`.
+fn sort_values(vm: &mut VM, items: &[Value]) -> Result<Vec<Value>, String> {
+    let idx = merge_sort_idx(vm, items.len(), &mut |vm, i, j| {
+        cmp_vm(vm, &items[i], &items[j])
+    })?;
+    Ok(idx.into_iter().map(|i| items[i].clone()).collect())
+}
+
 /// The `Some(v)`/`None` a `find`/`headOption`-style method returns.
 fn opt(v: Option<Value>) -> Value {
     match v {
@@ -5159,11 +5384,6 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
                     out.push(it.clone());
                 }
             }
-            out
-        }
-        ("sorted", 0) => {
-            let mut out = items.to_vec();
-            out.sort_by(value_cmp);
             out
         }
         ("flatten", 0) => {

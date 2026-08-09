@@ -412,11 +412,16 @@ reported as parse/compile errors, never silently mis-run.
   still escapes both checks is a *counted `for` loop* whose endpoints are BOTH
   `Char` variables (`val a = 'a'; val z = 'z'; for (c <- a to z)`), which lowers
   to inline loop bytecode rather than through either builtin.
-- **`Ordered`/`Comparable` on a user class.** An explicit `Ordering` IS supported
-  (see below), but a class that defines its own `compare`/`compareTo` is not
-  consulted by the implicit ordering: the built-in one covers numbers, `String`,
-  `Boolean` and tuples of those, and anything else compares equal, which a stable
-  sort leaves in input order. Pass `sortBy`/`sortWith`/an explicit `Ordering`.
+- **A user class's `toString` override is ignored everywhere but an explicit
+  call.** `class P(val n: Int) { override def toString = s"P($n)" }` answers
+  `P(1)` for `p.toString` — that spelling is a method call, so it reaches the
+  class's own subroutine — but `println(p)`, `s"$p"`, `"" + p` and `List(p)` all
+  print `P@0`, and a `case class` override loses to the derived `Class(f0,…)`
+  form. Rendering runs through the pure `host::scala_str`, which has no VM to
+  re-enter, and `obj_to_string` renders a collection's elements while holding the
+  heap borrow, so consulting the override needs `scala_str` to become VM-aware
+  (50 call sites) and `obj_to_string` to clone its elements out before
+  recursing. Until then the override is only honoured where it is written out.
 - **Symbolic operators beyond the wired set.** `/:`, `:\` and user-defined
   symbolic method names.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
@@ -438,9 +443,20 @@ reported as parse/compile errors, never silently mis-run.
   `@specialized` naming. They stay an error; `getClass` on a `String`, a
   primitive, a user `class`/`case class`/`object` or a throwable works (see
   above).
-- **`Float`'s single-precision rendering.** There is one `Double` numeric type,
-  so `Float.MaxValue` (which Scala prints `3.4028235E38`, at `Float` precision)
-  is not answered. Every other value-class companion bound is.
+- **`Float` is not a distinct type.** There is one `Double` numeric type, so
+  `Float.MaxValue`/`MinValue`/`MinPositiveValue` are not answered. The constant
+  is the visible half of it; single precision is the rest. `0.1f + 0.2f` answers
+  `0.30000000000000004` where Scala answers `0.3`, `1.0f / 3.0f` answers
+  `0.3333333333333333` where Scala answers `0.33333334`, and `(1.1f).getClass`
+  is `double`, not `float`.
+
+  This is why the constants stay an ERROR rather than becoming `f32::MAX as
+  f64`: that renders `3.4028234663852886E38`, not Scala's `3.4028235E38`.
+  Storing the shortest `Float` decimal as a `Double` instead would fix the
+  printing and leave `Float.MaxValue.toDouble` wrong — a plausible-looking wrong
+  answer in place of an honest rejection. The constants land when `Float` becomes
+  a real value type with its own `f32` arithmetic and `Float.toString`
+  rendering. Every other value-class companion bound is answered.
 - **By-name params, `given`/`using`, `@main` (Scala 3 annotation entry).**
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
@@ -533,14 +549,28 @@ reported as parse/compile errors, never silently mis-run.
 - **`grouped`/`sliding` answer a `List` of windows**, not an `Iterator`. Every
   consumption Scala programs use (`.toList`, `.foreach`, `.map`) matches;
   printing the un-consumed result does not (Scala prints `<iterator>`).
-- **A SUBNORMAL `Double` renders one digit shorter than the JVM's.**
-  `host::format_double` takes its digits from Rust's shortest round-tripping
-  representation, which agrees with `java.lang.Double.toString` over the whole
-  normal range. The JVM's legacy `FloatingDecimal` is not shortest-round-trip in
-  the subnormal range, though: it prints `Double.MinPositiveValue` as
-  `4.9E-324` where the shortest form is `5.0E-324`. Matching it there needs a
-  port of `FloatingDecimal.dtoa`'s digit count, which no ordinary magnitude
-  reaches — every `|x| >= 2.2250738585072014E-308` already agrees byte for byte.
+- **A few of the smallest SUBNORMAL `Double`s render one digit shorter than the
+  JVM's.** `host::format_double` takes its digits from Rust's shortest
+  round-tripping representation. The JVM's legacy `FloatingDecimal` (JDK 17, the
+  reference here) is not shortest-round-trip down there, so it prints
+  `Double.MinPositiveValue` as `4.9E-324` where the shortest form is
+  `5.0E-324`, and `128 * MinPositiveValue` as `6.32E-322` where it is
+  `6.3E-322`. In every case the JVM emits exactly one significant digit MORE,
+  correctly rounded.
+
+  Measured, not estimated. Over the first 60000 subnormals (`MinPositiveValue *
+  k`, `k = 1..60000`) exactly **10** disagree, at `k ∈ {1, 10, 12, 14, 16, 18,
+  32, 128, 2048, 16384}` — several of them exact powers of two, which
+  `FloatingDecimal.dtoa` singles out with its own "HACK!! For exact powers of
+  two" branch. A 3000-value sample drawn across the whole subnormal significand
+  range (`k` up to 2^52) found none above `6.32E-322`, and a 2400-value
+  full-range fuzz found **0** disagreements anywhere in the normal range.
+
+  Closing it means porting `FloatingDecimal.dtoa`'s digit-count decision, which
+  needs `FDBigInteger` too: down there `decExp ≈ -324`, so the `B`/`S`/`M`
+  comparison the digit loop stops on runs at ~750 bits and does not fit `u128`.
+  A heuristic — "subnormals get one more digit" — is NOT the fix: it would break
+  the 59990 subnormals that already agree.
 - **Integer arithmetic narrows to 32 bits only where the width is PROVEN.**
   `Int` overflow now wraps — `2147483647 + 1` is `-2147483648` — and a `Long`
   anywhere in an expression promotes it so it does not
