@@ -3617,7 +3617,11 @@ impl Compiler {
         // claimed. A receiver already known to be a primitive or a collection is
         // exempt — otherwise one `class Thing { def abs: Int }` anywhere in the
         // program would stop `(-2147483648).abs` from wrapping.
-        if self.could_be_user_instance(recv) && self.user_declares_member(name) {
+        // The name test comes first on purpose: it is a hash lookup per class and
+        // does not depend on the receiver, while the receiver test walks an
+        // expression. Most programs declare no member named like a stdlib one, so
+        // this short-circuits before anything is walked.
+        if self.user_declares_member(name) && self.could_be_user_instance(recv) {
             return NumTy::Unknown;
         }
         // `xs.sum` / `xs.product` — the ELEMENT type, which is the width Scala
