@@ -194,3 +194,5 @@ object T extends App { for (x <- List(0.0, -0.0, 1234.5, 6.022e23, 1.0 / 0.0, -1
 object T extends App { println("%s-%d".format("a", 7)); println(String.format("%05d|%.2f", 42, 3.14159)); println(3.14159.formatted("%.3f")); println("%.1f%%".format(50.0)) }	a-7\n00042|3.14\n3.142\n50.0%\n
 object T extends App { println("%x".format(-1)); println("%X".format(-42)); println("%o".format(-7)); println("%x".format(255)); println("%08x".format(-2)) }	ffffffff\nFFFFFFD6\n37777777771\nff\nfffffffe\n
 object T extends App { println(List(1, 2, 3).padTo(5, 9)); println(List(1, 2, 3).padTo(2, 9)); println(List(1, 2, 5, 3).segmentLength(_ < 5)); println(List(1, 4, 2, 4).lastIndexWhere(_ == 4)) }	List(1, 2, 3, 9, 9)\nList(1, 2, 3)\n2\n3\n
+object T extends App { val x: Long = 16677181699666569L; println(x == x.toDouble); println(x + 2.5); println(x % 2.5); println(x < 1.667718169966657E16) }	true\n1.667718169966657E16\n0.5\ntrue\n
+object T extends App { val x: Long = 9007199254740993L; val y: Double = 9.007199254740992E15; println(x == y); println(y >= x); println(x - y); println(x * 2.0) }	true\ntrue\n0.0\n1.8014398509481984E16\n

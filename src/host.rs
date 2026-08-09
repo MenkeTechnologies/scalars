@@ -16,7 +16,10 @@
 //!    operand is a `String` (via `Predef.any2stringadd` / `String.+`). fusevm
 //!    runs *strict* once a numeric hook is installed, delegating any operation
 //!    with a non-numeric operand to [`numeric_hook`], where `+` concatenates via
-//!    the same [`scala_str`].
+//!    the same [`scala_str`]. Strict mode also delegates the two numeric cases
+//!    an `f64` cannot answer exactly — integer overflow, and a mixed
+//!    `Int`/`Float` pair whose integer is past `2^53` — which [`numeric_hook`]
+//!    answers with Scala's own rules (`Long` wraps; a mixed pair promotes).
 
 use fusevm::{Frame, NumOp, VMResult, Value, VM};
 use std::cell::RefCell;
@@ -7443,10 +7446,18 @@ fn format_double(f: f64) -> String {
     }
 }
 
-/// Strict numeric hook: fusevm calls this only for an operation with a
-/// non-numeric operand. That is Scala's `String` `+` overload plus
-/// value comparisons against strings; all-numeric arithmetic never reaches here
-/// (it stays on the native fast path and the JIT).
+/// Strict numeric hook. fusevm calls this for
+///
+/// * an operation with a non-numeric operand — Scala's `String` `+` overload
+///   plus value comparisons against strings, and the `Char` handle, which is a
+///   heap object here so every operation on one arrives;
+/// * integer `+`/`-`/`*` whose exact result left `i64` (answered wrapped, since
+///   Scala's `Long` wraps);
+/// * a mixed `Int`/`Float` pair whose integer is outside the range an `f64`
+///   holds exactly (`|x| > 2^53`), where converting it would round.
+///
+/// All-`Float` arithmetic, and mixed arithmetic with a small integer, stay on
+/// the native fast path and the JIT and never reach here.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     // Suppressed while unwinding: an operand is the `Undef` a raise left behind,
     // and Scala 3's strict `+`/comparison rules would reject it as a type error,
@@ -7497,6 +7508,54 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         };
         if let Some(v) = wrapped {
             return Ok(Value::int(v));
+        }
+    }
+    // A mixed `Int`/`Float` pair. fusevm hands one over when the integer is past
+    // `2^53`, where converting it to `f64` rounds (`16677181699666569` collapses
+    // onto its neighbour `16677181699666568`), so a host with an exact integer
+    // type can answer exactly instead of about the neighbour.
+    //
+    // Scala has no such answer to give. Binary numeric promotion widens the
+    // `Long` to `Double` FIRST and the operation is then a `Double` one, its
+    // rounding included: reference `scala` 3.8.4 answers
+    // `16677181699666569L == 1.6677181699666568E16` with `true`, and
+    // `9007199254740993L == 9.007199254740992E15` (that is, `2^53+1 == 2^53`)
+    // with `true` as well. So the promoted result IS the correct Scala answer —
+    // return it deliberately rather than falling into the arms below, which
+    // rejected the arithmetic outright and answered the comparisons by
+    // LEXICOGRAPHIC order of the two rendered operands
+    // (`"16677181699666569" < "1.6677181699666568E16"`).
+    //
+    // `Div` is included for completeness; Scala's `/` is type-dispatching and
+    // lowers to the [`SDIV`] builtin (`compiler.rs`), so `Op::Div` never reaches
+    // the hook from Scala source. `Pow` is not: Scala has no `**` operator, so
+    // there is no reference behaviour to match and it stays with the rejections.
+    if matches!(
+        (a, b),
+        (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_))
+    ) {
+        let (x, y) = (a.to_float(), b.to_float());
+        let promoted = match op {
+            NumOp::Add => Some(Value::float(x + y)),
+            NumOp::Sub => Some(Value::float(x - y)),
+            NumOp::Mul => Some(Value::float(x * y)),
+            // Scala's `%` on `Double` is the truncated remainder (`-7 % 2.5` is
+            // `-2.0`, `7 % 0.0` is `NaN`), which is Rust's `f64` `%`.
+            NumOp::Mod => Some(Value::float(x % y)),
+            NumOp::Div => Some(Value::float(x / y)),
+            // IEEE comparison on the promoted values: every one of the six is
+            // false against a `NaN` operand except `!=`, which `partial_cmp`
+            // gives for free.
+            NumOp::Lt => Some(Value::bool(x < y)),
+            NumOp::Gt => Some(Value::bool(x > y)),
+            NumOp::Le => Some(Value::bool(x <= y)),
+            NumOp::Ge => Some(Value::bool(x >= y)),
+            NumOp::Eq => Some(Value::bool(x == y)),
+            NumOp::Ne => Some(Value::bool(x != y)),
+            NumOp::Pow | NumOp::Neg => None,
+        };
+        if let Some(v) = promoted {
+            return Ok(v);
         }
     }
     match op {
