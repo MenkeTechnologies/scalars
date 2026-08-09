@@ -64,8 +64,15 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Scala 3 `+` rules** — a strict numeric hook supplies `String` concatenation
   (`"x=" + x`, `1 + "a"`) for the mixed operands the VM's native arithmetic does
   not compute, while rejecting `Boolean`/`null` `+ String` exactly as Scala 3
-  does (the universal `any2stringadd` was removed); all-numeric arithmetic stays
-  on the JIT fast path.
+  does (the universal `any2stringadd` was removed); most numeric arithmetic
+  stays on the JIT fast path.
+- **Widening past 2^53** — a mixed `Int`/`Double` pair whose integer an `f64`
+  cannot hold exactly (`16677181699666569L`) is handed to the same hook rather
+  than computed on the rounded value. Scala's answer is the *promoted* one — its
+  binary numeric promotion widens to `Double` first, so
+  `16677181699666569L == 1.6677181699666568E16` is `true` — and the hook returns
+  it for `+`, `-`, `*`, `%`, `/` and all six comparisons in either operand
+  order.
 - **`Double.toString` fidelity** — whole/decimal values in `[1e-3, 1e7)` print
   plain (`3.0`, `9999999.0`), everything else in Java's computerized scientific
   notation (`1.0E7`, `1.23456789E8`, `1.0E-4`), and exponent literals (`6.022e23`,
@@ -431,7 +438,7 @@ Scala source → lexer → parser (AST) → lower to fusevm bytecode → fusevm 
 | --- | --- |
 | **fusevm-hosted** | No local `vm.rs` / `jit.rs`, no JVM. Scala lowers to fusevm bytecode and runs on the shared three-tier Cranelift JIT; `jit-disk-cache` persists native code across runs. |
 | **Newline inference** | The lexer emits a statement separator for a source line break only where one token can end a statement and the next can begin one (Scala's rule), so idiomatic semicolon-free source parses. |
-| **Native arithmetic** | Operators lower to native fusevm ops; the JIT traces hot integer loops. A strict numeric hook supplies Scala's `+` string concatenation for non-numeric operands; a division builtin restores `Int` truncation. |
+| **Native arithmetic** | Operators lower to native fusevm ops; the JIT traces hot integer loops. A strict numeric hook supplies Scala's `+` string concatenation for non-numeric operands, `Long` wrapping on integer overflow, and `Double` promotion for a mixed pair past 2^53; a division builtin restores `Int` truncation. |
 | **Scala print semantics** | `println`/`print` lower to a registered builtin that formats values Scala-style (`true`/`false`, `3.0`, `null`), rather than the VM's shell-flavoured `PrintLn`. |
 
 ---

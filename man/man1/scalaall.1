@@ -272,9 +272,11 @@ Execution runs on fusevm's three\-tier Cranelift JIT; hot loops
 trace\-compile to native code, and the
 .B jit-disk-cache
 feature persists compiled native code across runs keyed by chunk hash.
-All\-numeric arithmetic stays on the native fast path; only operations
-with a non\-numeric operand delegate to the strict numeric hook in the
-host.
+Most arithmetic stays on the native fast path. Operations with a
+non\-numeric operand delegate to the strict numeric hook in the host, as
+do the two numeric cases an f64 cannot answer exactly: integer overflow
+(Scala's Long wraps) and a mixed Int/Double pair whose integer is past
+2^53, where the hook applies Scala's widening to Double.
 .SH "7.  LSP SERVER"
 .B scala --lsp
 speaks the Language Server Protocol over stdio.  It is self\-contained and
