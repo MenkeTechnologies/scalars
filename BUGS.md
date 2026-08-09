@@ -429,6 +429,32 @@ reported as parse/compile errors, never silently mis-run.
   evaluated at `Int` width, because that is observable at ordinary magnitudes
   (`1 << 33` is `2`, not `8589934592`) rather than only on overflow. A genuinely
   `Long` receiver therefore shifts as an `Int` would.
+- **The `%x`/`%X`/`%o` format conversions pick their width from the VALUE, not
+  the static type.** Java writes the two's-complement bit pattern at the width of
+  the operand's type — `Int` is 32 bits (`"%x".format(-1)` is `ffffffff`), `Long`
+  is 64 (`ffffffffffffffff`). With no static types, this frontend uses the
+  narrowest width that holds the value, which is right for every `Int` and for
+  any `Long` outside `Int` range. A `Long` variable holding a small negative
+  number is the residual gap: it renders 32-bit where Scala renders 64.
+- **`break`/`breakable` are recognized without their import.** Scala requires
+  `import scala.util.control.Breaks._` (or the qualified spelling) before either
+  name resolves; this frontend recognizes them in the parser, so a program that
+  omits the import still runs here and is rejected by `scalac`. That is a
+  superset, not a wrong answer — but it means the parity fuzzer's generated
+  programs must emit the import, or the reference rejects the probe and the two
+  sides agree on a failure that tests nothing.
+- **A parameter list's second (curried) group is flattened into the first.**
+  `def f(a: Int)(b: Int)` is callable as `f(1)(2)` only in the sense that the
+  parameters exist; the two groups are one flat list, so a partially applied
+  `f(1)` is not a function. Default values in a later group also cannot see the
+  earlier group's parameters (Scala allows that; Scala 3 forbids it *within* one
+  group, which is why call-site splicing of a default is otherwise exact).
+- **`xs: _*` argument spread is not parsed.** `f(List(1, 2, 3): _*)` is a parse
+  error; the varargs must be written out (`f(1, 2, 3)`).
+- **`getClass` is not modeled.** `e.getClass.getName` / `.getSimpleName` — the
+  usual way a program prints an exception's class — is an unknown-method error.
+  `toString` on a throwable already carries the fully-qualified name, so
+  `println(e)` is the working spelling.
 - **`/` is dispatched at runtime, not by static type.** Scala picks integer vs.
   floating division from the *static* operand types; there are no static types
   here, so the [`host::b_div`] builtin decides at runtime — both operands `Int`

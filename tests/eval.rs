@@ -2381,3 +2381,231 @@ fn a_triple_quoted_literal_is_taken_verbatim() {
     assert!(ok);
     assert_eq!(out, "(\\w+)@(\\w+)\n5\na\"b\n12\n");
 }
+
+// ── parameter lists: defaults, named arguments, varargs, by-name ───────────
+//
+// All four are decided at the CALL site from the callee's signature. The
+// by-name tests count evaluations with a mutable counter on purpose: a by-name
+// parameter that is quietly passed by value still returns a plausible number,
+// just one built from the wrong number of evaluations.
+
+#[test]
+fn default_parameter_values_fill_omitted_trailing_arguments() {
+    let (out, ok) = run(&wrap(
+        r#"def f(x: Int, y: Int = 10, z: Int = 3): String = x + ":" + y + ":" + z
+           println(f(1)); println(f(1, 2)); println(f(1, 2, 5))"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "1:10:3\n1:2:3\n1:2:5\n");
+}
+
+#[test]
+fn a_default_runs_at_the_call_site_only_when_the_argument_is_omitted() {
+    // Scala evaluates a default where the call is written, and not at all when
+    // the caller supplies the argument — so the counter moves exactly once.
+    let (out, ok) = run(&wrap(
+        r#"var c = 0
+           def d(): Int = { c += 1; 7 }
+           def f(x: Int, y: Int = d()): Int = x + y
+           println(f(1)); println(c); println(f(1, 2)); println(c)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "8\n1\n3\n1\n");
+}
+
+#[test]
+fn named_arguments_move_to_their_parameters_position() {
+    let (out, ok) = run(&wrap(
+        r#"def f(x: Int, y: Int, z: Int = 3): String = x + "/" + y + "/" + z
+           println(f(y = 1, x = 2)); println(f(2, y = 1)); println(f(z = 9, x = 2, y = 1))"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "2/1/3\n2/1/3\n2/1/9\n");
+}
+
+#[test]
+fn a_repeated_parameter_arrives_as_an_arrayseq() {
+    // The runtime class is observable through `toString`, and Scala hands a
+    // varargs method an `ArraySeq` — not a `List`.
+    let (out, ok) = run(&wrap(
+        r#"def f(xs: Int*): String = xs.toString + "|" + xs.length + "|" + xs.sum
+           println(f()); println(f(4)); println(f(1, 2, 3))"#,
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "ArraySeq()|0|0\nArraySeq(4)|1|4\nArraySeq(1, 2, 3)|3|6\n"
+    );
+}
+
+#[test]
+fn a_by_name_parameter_is_re_evaluated_at_every_use() {
+    // `x + x` reads the thunk twice, so the counter ends at 2 and the sum is
+    // 1 + 2. Passing by value would answer 2 with the counter at 1.
+    let (out, ok) = run(&wrap(
+        r#"var c = 0
+           def f(x: => Int): Int = x + x
+           println(f({ c += 1; c })); println(c)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "3\n2\n");
+}
+
+#[test]
+fn an_unused_by_name_argument_never_runs() {
+    let (out, ok) = run(&wrap(
+        r#"var c = 0
+           def f(x: => Int, on: Boolean): Int = if (on) x else -1
+           println(f({ c += 1; c }, false)); println(c)
+           println(f({ c += 1; c }, true)); println(c)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "-1\n0\n1\n1\n");
+}
+
+#[test]
+fn a_by_name_parameter_read_inside_a_lambda_still_forces() {
+    // The thunk is captured by the closure, so the force has to happen inside
+    // the closure body rather than at the enclosing frame's parameter bind.
+    let (out, ok) = run(&wrap(
+        r#"var c = 0
+           def f(x: => Int): Int = List(1, 2).map(k => k * x).sum
+           println(f({ c += 1; c })); println(c)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "5\n2\n");
+}
+
+// ── scala.util.control.Breaks ──────────────────────────────────────────────
+
+#[test]
+fn breakable_stops_a_loop_and_execution_continues_after_it() {
+    let (out, ok) = run("import scala.util.control.Breaks._\n\
+         object T extends App { var a = 0\n\
+         breakable { for (i <- 1 to 5) { if (i == 3) break(); a += i } }\n\
+         println(a); println(\"after\") }");
+    assert!(ok);
+    assert_eq!(out, "3\nafter\n");
+}
+
+#[test]
+fn a_finally_between_break_and_breakable_still_runs() {
+    let (out, ok) = run("import scala.util.control.Breaks._\n\
+         object T extends App { var a = 0\n\
+         breakable { for (i <- 1 to 5) { try { if (i == 3) break() } finally { a += 1 } } }\n\
+         println(a) }");
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn a_catch_on_exception_does_not_swallow_a_break() {
+    // Scala's `BreakControl` is a `ControlThrowable`, which hangs off
+    // `Throwable` rather than `Exception` precisely so a catch-all handler
+    // cannot eat a control-flow signal.
+    let (out, ok) = run("import scala.util.control.Breaks._\n\
+         object T extends App { var a = 0\n\
+         breakable { for (i <- 1 to 4) { try { if (i == 3) break(); a += 1 } \
+         catch { case e: Exception => println(\"swallowed\") } } }\n\
+         println(a) }");
+    assert!(ok);
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn a_break_raised_inside_a_def_unwinds_to_the_enclosing_breakable() {
+    let (out, ok) = run("import scala.util.control.Breaks._\n\
+         object T extends App { def step(i: Int): Int = { if (i == 3) break(); i }\n\
+         var a = 0\n\
+         breakable { for (i <- 1 to 5) a += step(i) }\n\
+         println(a) }");
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn nested_breakables_bind_a_break_to_the_innermost_one() {
+    let (out, ok) = run("import scala.util.control.Breaks._\n\
+         object T extends App { var a = 0\n\
+         breakable { for (i <- 1 to 3) { breakable { for (j <- 1 to 4) \
+         { if (j == 3) break(); a += 1 } }; a += 100 } }\n\
+         println(a) }");
+    assert!(ok);
+    assert_eq!(out, "306\n");
+}
+
+// ── java.util.Formatter conversions ────────────────────────────────────────
+
+#[test]
+fn float_conversions_round_half_up_like_java_not_half_to_even() {
+    // Rust's `{:.*}` rounds half-to-even and would answer 0.12 / 2 / 0.1 here.
+    let (out, ok) = run(&wrap(
+        r#"println(f"${0.125}%.2f"); println(f"${2.5}%.0f"); println(f"${0.375}%.2f")"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "0.13\n3\n0.38\n");
+}
+
+#[test]
+fn float_conversions_round_the_shortest_decimal_not_the_exact_binary_value() {
+    // The stored double for 1.005 is 1.00499999999999989…, so rounding the
+    // exact expansion answers 1.00. Java rounds the digits `Double.toString`
+    // would print, which are "1.005", and so answers 1.01.
+    let (out, ok) = run(&wrap(
+        r#"println(f"${1.005}%.2f"); println(f"${0.15}%.1f")"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "1.01\n0.2\n");
+}
+
+#[test]
+fn scientific_notation_signs_the_exponent_and_pads_it_to_two_digits() {
+    let (out, ok) = run(&wrap(
+        r#"println(f"${1.0}%e"); println(f"${1234.5}%.3e"); println(f"${0.0001}%.2E")"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "1.000000e+00\n1.235e+03\n1.00E-04\n");
+}
+
+#[test]
+fn negative_zero_and_the_non_finite_doubles_use_javas_spellings() {
+    let (out, ok) = run(&wrap(
+        r#"println(f"${-0.0}%.2f"); println(f"${1.0 / 0.0}%.2f")
+           println(f"${-1.0 / 0.0}%.1E"); println(f"${0.0 / 0.0}%.1E")
+           println(f"${1.0 / 0.0}%+.2f")"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "-0.00\nInfinity\n-INFINITY\nNAN\n+Infinity\n");
+}
+
+#[test]
+fn format_is_available_on_a_string_statically_and_as_formatted() {
+    let (out, ok) = run(&wrap(
+        r#"println("%s-%d".format("a", 7)); println(String.format("%05d|%.2f", 42, 3.14159))
+           println(3.14159.formatted("%.3f")); println("%.1f%%".format(50.0))"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "a-7\n00042|3.14\n3.142\n50.0%\n");
+}
+
+#[test]
+fn radix_conversions_use_int_width_for_a_negative_value() {
+    // Java prints the two's-complement pattern at the operand's type width;
+    // every value here fits in `Int`, so that width is 32 bits.
+    let (out, ok) = run(&wrap(
+        r#"println("%x".format(-1)); println("%X".format(-42)); println("%o".format(-7))
+           println("%x".format(255)); println("%08x".format(-2))"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "ffffffff\nFFFFFFD6\n37777777771\nff\nfffffffe\n");
+}
+
+#[test]
+fn padto_segmentlength_and_lastindexwhere_on_a_sequence() {
+    let (out, ok) = run(&wrap(
+        r#"println(List(1, 2, 3).padTo(5, 9)); println(List(1, 2, 3).padTo(2, 9))
+           println(List(1, 2, 5, 3).segmentLength(_ < 5)); println(List(1, 4, 2, 4).lastIndexWhere(_ == 4))"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(1, 2, 3, 9, 9)\nList(1, 2, 3)\n2\n3\n");
+}

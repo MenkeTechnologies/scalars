@@ -188,13 +188,28 @@ Implemented and checked against the reference `scala`:
   two blocks may each declare `def f`, an inner one shadows an outer one, and
   the enclosing-frame locals a local `def` reads are lambda-lifted into extra
   parameters every call site passes (`src/resolve.rs`).
+- **Parameter lists** — default values (`def f(x: Int, y: Int = 10)`, evaluated
+  at the call site and only when the argument is omitted), named arguments in
+  any order (`f(y = 1, x = 2)`), repeated parameters (`def f(xs: Int*)`, which
+  arrive as the `ArraySeq` Scala hands a varargs method), and by-name parameters
+  (`def f(x: => Int)`, passed as a thunk and re-evaluated at every use — so an
+  argument that is never read never runs).
+- **`break` / `breakable`** — `scala.util.control.Breaks`, lowered the way the
+  library implements it: `break()` raises a `BreakControl` that `breakable`
+  catches. A `finally` between the two still runs, a `catch { case e: Exception }`
+  between them does not swallow it, and a `break` inside a nested `def` unwinds
+  out of that frame.
 - **Expressions** — integer / floating / string (including the triple-quoted
   `"""…"""` form, taken verbatim) / char / boolean / `null`
   literals and the unit literal `()`; the binary operators `+ - * / %`,
   `== != < > <= >=`, `&& ||` (short-circuiting); unary `-` and `!`;
   parenthesised grouping and type ascription (`(e: T)`, with the numeric
   widening `(3: Double)` actually widening); Scala's `+` string concatenation
-  and `*` string repetition; `Int`-vs-`Double` division dispatch (integer `/ 0`
+  and `*` string repetition; the `java.util.Formatter` conversions behind the
+  `f"…"` interpolator, `"…".format(…)`, `String.format(…)` and `x.formatted(…)`
+  (`%s %d %f %e %E %x %X %o %b %c`, with the flags, width and precision, rounded
+  HALF_UP off the shortest round-tripping decimal exactly as Java rounds);
+  `Int`-vs-`Double` division dispatch (integer `/ 0`
   throws `ArithmeticException`, floating `/ 0.0` is `Infinity`); `if`/`else` in
   value position (`val r = if (c) a else b`, including block branches). Every
   operator is a method, so the dotted spelling works too (`n.+(1)`, `"a".*(3)`).
@@ -418,7 +433,8 @@ dispatch, `Range` values, `Array`, and the `scala.math` overload split) and diff
 probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
-`nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, …). It needs a real `scala` on
+`nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, `breaks`,
+`params`, `fmt`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -434,6 +450,17 @@ mode found `String.split` iterating matches by the Rust rule instead of
 `Vector` instead of `""` — a comparator's result type says nothing about the
 elements — and `"abc".toList` still handing out one-character `String`s, which
 silently made `"abc".toList.map(_.toInt)` a parse instead of the code points.
+The `params` mode exists because by-name parameters parsed but compiled
+call-by-value, which is the quietest possible failure: `f(x)` with `x + x` still
+answered a plausible number, just one evaluation short. The `fmt` mode found
+`%f` rounding half-to-even where `java.util.Formatter` rounds HALF_UP off the
+shortest round-tripping decimal (`f"${0.125}%.2f"` was `0.12` and
+`f"${1.005}%.2f"` was `1.00`), `-0.0` losing its sign, and `%x`/`%o` on a
+negative `Int` rendering 64 bits instead of 32. The `breaks` mode is a reminder
+that a clean score can be an artifact of the generator: it scored zero on its
+first run only because the emitted program omitted `import
+scala.util.control.Breaks._`, so the reference rejected `breakable` too and the
+two agreed on the failure.
 
 Next waves, in priority order:
 

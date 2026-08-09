@@ -288,7 +288,10 @@ pub enum Expr {
     /// `name = value` in an argument list — a named argument. Legal ONLY in
     /// argument position: the compiler's call lowering matches it to the
     /// callee's parameter of that name and never sees it anywhere else.
-    NamedArg { name: String, value: Box<Expr> },
+    NamedArg {
+        name: String,
+        value: Box<Expr>,
+    },
     /// `recv.copy(field = e, …)` on a `case class` — a new instance with the
     /// named (or positional) fields overwritten and the rest copied from `recv`.
     /// `updates` pairs an optional field name (`None` = positional) with its

@@ -2705,17 +2705,25 @@ fn format_one(spec: &str, v: &Value) -> Result<String, String> {
                 width,
             ))
         }
-        // Radix conversions. Rust's `{:x}`/`{:X}`/`{:o}` on a signed integer
-        // format the two's-complement bit pattern with no sign — identical to
-        // Java for non-negative values; a negative value renders as 64-bit
-        // (Scala `Long`) two's complement (this frontend models every integer as
-        // `i64`, so it cannot pick Java's 32-bit `Int` width).
+        // Radix conversions. Java formats the two's-complement bit pattern with
+        // no sign, at the WIDTH OF THE STATIC TYPE: `Int` is 32 bits
+        // (`-1` is `ffffffff`) and `Long` is 64 (`ffffffffffffffff`).
+        //
+        // This frontend models every integer as `i64` and so has no static type
+        // to consult. It picks the narrowest width that holds the value, which
+        // is right for every `Int` — the overwhelmingly common case, and the one
+        // a literal like `-1` has. A `Long` variable holding a small negative
+        // number is the residual gap (see `BUGS.md`); it renders 32-bit.
         'x' | 'X' | 'o' => {
             let n = v.to_int();
+            let bits = match i32::try_from(n) {
+                Ok(narrow) => narrow as u32 as u64,
+                Err(_) => n as u64,
+            };
             let body = match conv {
-                'x' => format!("{n:x}"),
-                'X' => format!("{n:X}"),
-                _ => format!("{n:o}"),
+                'x' => format!("{bits:x}"),
+                'X' => format!("{bits:X}"),
+                _ => format!("{bits:o}"),
             };
             Ok(pad_num(body, false, left, zero, false, false, width))
         }
@@ -2834,7 +2842,11 @@ fn round_half_up(a: f64, p: usize) -> String {
 /// to be exact.
 fn round_half_up_str(s: &str, p: usize) -> String {
     let (int_part, frac) = s.split_once('.').unwrap_or((s, ""));
-    let mut digits: Vec<u8> = int_part.bytes().chain(frac.bytes()).take(int_part.len() + p).collect();
+    let mut digits: Vec<u8> = int_part
+        .bytes()
+        .chain(frac.bytes())
+        .take(int_part.len() + p)
+        .collect();
     while digits.len() < int_part.len() + p {
         digits.push(b'0');
     }

@@ -1799,6 +1799,9 @@ enum Mode {
     Capture,
     Char,
     PatRegex,
+    Breaks,
+    Params,
+    Fmt,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1839,6 +1842,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Capture => "capture",
         Mode::Char => "char",
         Mode::PatRegex => "patregex",
+        Mode::Breaks => "breaks",
+        Mode::Params => "params",
+        Mode::Fmt => "fmt",
     }
 }
 
@@ -1880,6 +1886,9 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "capture" => Mode::Capture,
         "char" => Mode::Char,
         "patregex" => Mode::PatRegex,
+        "breaks" => Mode::Breaks,
+        "params" => Mode::Params,
+        "fmt" => Mode::Fmt,
         _ => return None,
     })
 }
@@ -1920,7 +1929,211 @@ const CONCRETE: &[Mode] = &[
     Mode::Capture,
     Mode::Char,
     Mode::PatRegex,
+    Mode::Breaks,
+    Mode::Params,
+    Mode::Fmt,
 ];
+
+/// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
+/// control-flow signal that must travel THROUGH the constructs between the
+/// `break` and its `breakable`: a `finally` in between still runs, a
+/// `catch { case e: Exception }` in between does NOT swallow it (Scala's
+/// `BreakControl` is a `ControlThrowable`, not an `Exception`), and a `break`
+/// raised inside a `def` unwinds out of that frame.
+fn g_breaks(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let hi = 2 + r.below(5);
+    let stop = 1 + r.below(hi + 2);
+    match r.below(10) {
+        // Plain `for` exit — the surviving prefix is what proves where it left.
+        0 => format!(
+            "{{ var a{u} = 0; breakable {{ for (i <- 1 to {hi}) {{ if (i == {stop}) break(); a{u} += i }} }}; println(a{u}) }}"
+        ),
+        // `while` exit.
+        1 => format!(
+            "{{ var a{u} = 0; var i{u} = 0; breakable {{ while (i{u} < {hi}) {{ if (i{u} == {stop}) break(); a{u} += i{u}; i{u} += 1 }} }}; println(a{u} + \":\" + i{u}) }}"
+        ),
+        // Paren-less `break`, the other spelling of the same method.
+        2 => format!(
+            "{{ var a{u} = 0; breakable {{ for (i <- 1 to {hi}) {{ if (i == {stop}) break; a{u} += 1 }} }}; println(a{u}) }}"
+        ),
+        // A `breakable` INSIDE a loop breaks only the inner one, so the outer
+        // loop still runs every iteration.
+        3 => format!(
+            "{{ var a{u} = 0; for (i <- 1 to 3) {{ breakable {{ for (j <- 1 to {hi}) {{ if (j == {stop}) break(); a{u} += 1 }} }} }}; println(a{u}) }}"
+        ),
+        // The statement after `breakable` runs whether or not it broke.
+        4 => format!(
+            "{{ breakable {{ for (i <- 1 to {hi}) {{ println(\"i\" + i); if (i == {stop}) break() }} }}; println(\"after\") }}"
+        ),
+        // A `finally` between the `break` and its `breakable` still runs.
+        5 => format!(
+            "{{ var a{u} = 0; breakable {{ for (i <- 1 to {hi}) {{ try {{ if (i == {stop}) break() }} finally {{ a{u} += 1 }} }} }}; println(a{u}) }}"
+        ),
+        // A `catch { case e: Exception }` between them does NOT catch it.
+        6 => format!(
+            "{{ var a{u} = 0; breakable {{ for (i <- 1 to {hi}) {{ try {{ if (i == {stop}) break(); a{u} += 1 }} catch {{ case e: Exception => println(\"swallowed\") }} }} }}; println(a{u}) }}"
+        ),
+        // `break` raised one frame deeper unwinds out of the `def`.
+        7 => format!(
+            "{{ def s{u}(i: Int): Int = {{ if (i == {stop}) break(); i }}; var a{u} = 0; \
+             breakable {{ for (i <- 1 to {hi}) a{u} += s{u}(i) }}; println(a{u}) }}"
+        ),
+        // Two `breakable`s nested: the inner `break` binds to the INNER one.
+        8 => format!(
+            "{{ var a{u} = 0; breakable {{ for (i <- 1 to 3) {{ breakable {{ for (j <- 1 to {hi}) {{ if (j == {stop}) break(); a{u} += 1 }} }}; a{u} += 100 }} }}; println(a{u}) }}"
+        ),
+        // A `break` that never fires leaves the loop to finish normally.
+        _ => format!(
+            "{{ var a{u} = 0; breakable {{ for (i <- 1 to {hi}) {{ if (i == 999) break(); a{u} += i }} }}; println(a{u}) }}"
+        ),
+    }
+}
+
+/// Parameter-list features that are all decided at the CALL site: default
+/// values, named arguments, repeated (`T*`) parameters, and by-name parameters.
+///
+/// The by-name probes are the load-bearing ones: they count evaluations with a
+/// mutable counter, because a by-name argument that is silently passed by value
+/// still produces a plausible number — it just produces the WRONG one (one
+/// evaluation instead of two, or one instead of zero).
+fn g_params(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let d = pick(r, INTS);
+    let n = 1 + r.below(3) as usize;
+    match r.below(12) {
+        // A default used, then overridden.
+        0 => format!(
+            "{{ def f{u}(x: Int, y: Int = {d}): Int = x * 10 + y; println(f{u}({a})); println(f{u}({a}, {b})) }}"
+        ),
+        // Two defaults, filled from the right.
+        1 => format!(
+            "{{ def f{u}(x: Int, y: Int = {d}, z: Int = 7): String = x + \",\" + y + \",\" + z; \
+             println(f{u}({a})); println(f{u}({a}, {b})); println(f{u}({a}, {b}, 0)) }}"
+        ),
+        // A default is evaluated at the call site and ONLY when omitted, so the
+        // side effect appears exactly once.
+        2 => format!(
+            "{{ var c{u} = 0; def d{u}(): Int = {{ c{u} += 1; {d} }}; \
+             def f{u}(x: Int, y: Int = d{u}()): Int = x + y; \
+             println(f{u}({a})); println(c{u}); println(f{u}({a}, {b})); println(c{u}) }}"
+        ),
+        // Named arguments, including out of order.
+        3 => format!(
+            "{{ def f{u}(x: Int, y: Int): String = x + \"/\" + y; \
+             println(f{u}(y = {a}, x = {b})); println(f{u}(x = {a}, y = {b})); println(f{u}({a}, y = {b})) }}"
+        ),
+        // A named argument skipping over a defaulted parameter.
+        4 => format!(
+            "{{ def f{u}(x: Int, y: Int = {d}, z: Int = 3): String = x + \":\" + y + \":\" + z; \
+             println(f{u}({a}, z = {b})); println(f{u}(z = {b}, x = {a})) }}"
+        ),
+        // A repeated parameter: its runtime class is observable through
+        // `toString`, so this pins `ArraySeq` and not `List`.
+        5 => format!(
+            "{{ def f{u}(xs: Int*): String = xs.toString + \"|\" + xs.length + \"|\" + xs.sum; \
+             println(f{u}()); println(f{u}({a})); println(f{u}({a}, {b}, {d})) }}"
+        ),
+        // A repeated parameter after a fixed one.
+        6 => format!(
+            "{{ def f{u}(k: String, xs: Int*): String = k + xs.sum + \"/\" + xs.size; \
+             println(f{u}(\"k\")); println(f{u}(\"k\", {a}, {b})) }}"
+        ),
+        // By-name: the argument runs once per USE.
+        7 => format!(
+            "{{ var c{u} = 0; def f{u}(x: => Int): Int = x + x; \
+             println(f{u}({{ c{u} += 1; c{u} }})); println(c{u}) }}"
+        ),
+        // By-name: an unused argument never runs at all.
+        8 => format!(
+            "{{ var c{u} = 0; def f{u}(x: => Int, on: Boolean): Int = if (on) x else -1; \
+             println(f{u}({{ c{u} += 1; c{u} }}, false)); println(c{u}); \
+             println(f{u}({{ c{u} += 1; c{u} }}, true)); println(c{u}) }}"
+        ),
+        // By-name used inside a loop — one evaluation per iteration.
+        9 => format!(
+            "{{ var c{u} = 0; def f{u}(x: => Int): Int = {{ var s = 0; for (i <- 1 to {n}) s += x; s }}; \
+             println(f{u}({{ c{u} += 1; c{u} }})); println(c{u}) }}"
+        ),
+        // By-name read from inside a nested lambda: the thunk must still force.
+        10 => format!(
+            "{{ var c{u} = 0; def f{u}(x: => Int): Int = List(1, 2).map(k => k * x).sum; \
+             println(f{u}({{ c{u} += 1; c{u} }})); println(c{u}) }}"
+        ),
+        // By-name plus a default, both on one signature.
+        _ => format!(
+            "{{ var c{u} = 0; def f{u}(x: => Int, k: Int = {d}): Int = x * k; \
+             println(f{u}({{ c{u} += 1; 2 }})); println(f{u}({{ c{u} += 1; 2 }}, {b})); println(c{u}) }}"
+        ),
+    }
+}
+
+/// `java.util.Formatter` conversions, reached through the `f"…"` interpolator,
+/// `"…".format(…)`, `String.format(…)` and `x.formatted(…)`.
+///
+/// The pool is weighted toward the values that fall on a ROUNDING TIE, because
+/// that is where Java's rule (HALF_UP, applied to the shortest round-tripping
+/// decimal) parts company with the obvious implementations: half-to-even
+/// answers `0.12` for `0.125` at `%.2f`, and rounding the exact binary
+/// expansion answers `1.00` for `1.005`.
+fn g_fmt(r: &mut Rng) -> String {
+    const TIES: &[&str] = &[
+        "0.125",
+        "0.375",
+        "2.5",
+        "3.5",
+        "-0.125",
+        "1.005",
+        "0.5",
+        "1.5",
+        "12.345",
+        "0.15",
+        "0.0",
+        "-0.0",
+        "1234.5",
+        "9.99",
+        "99.995",
+        "0.0001",
+        "1e21",
+        "6.022e23",
+        "1e-300",
+        "-7.25",
+        "0.045",
+        "1.0 / 0.0",
+        "-1.0 / 0.0",
+        "0.0 / 0.0",
+    ];
+    const FCONV: &[&str] = &[
+        "%f", "%.0f", "%.1f", "%.2f", "%.3f", "%10.2f", "%-10.2f", "%+.2f", "%012.3f", "% .2f",
+        "%e", "%.0e", "%.1e", "%.3e", "%E", "%.2E", "%14.3e", "%-14.3e", "%+.3e",
+    ];
+    const ICONV: &[&str] = &[
+        "%d", "%5d", "%-5d", "%05d", "%+d", "% d", "%x", "%X", "%o", "%,d",
+    ];
+    let x = pick(r, TIES);
+    let n = pick(r, INTS);
+    let s = pick(r, STRS);
+    match r.below(8) {
+        0 => format!("println(f\"${{{x}}}{}\")", pick(r, FCONV)),
+        1 => format!("println(\"{}\".format({x}))", pick(r, FCONV)),
+        2 => format!("println(\"{}\".format({n}))", pick(r, ICONV)),
+        3 => format!("println(String.format(\"{}\", {x}))", pick(r, FCONV)),
+        4 => format!("println(({x}).formatted(\"{}\"))", pick(r, FCONV)),
+        5 => format!(
+            "println(\"[{}] [{}] %%\".format({x}, {n}))",
+            pick(r, FCONV),
+            pick(r, ICONV)
+        ),
+        6 => format!("println(\"%s={}\".format({s}, {x}))", pick(r, FCONV)),
+        _ => format!(
+            "println(f\"a${{{n}}}{}b${{{x}}}{}c\")",
+            pick(r, ICONV),
+            pick(r, FCONV)
+        ),
+    }
+}
 
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
     let m = if mode == Mode::All {
@@ -1964,6 +2177,9 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Capture => g_capture(r),
         Mode::Char => g_char(r),
         Mode::PatRegex => g_patregex(r),
+        Mode::Breaks => g_breaks(r),
+        Mode::Params => g_params(r),
+        Mode::Fmt => g_fmt(r),
         Mode::All => unreachable!(),
     }
 }
@@ -1995,12 +2211,20 @@ fn build_program(probes: &[String]) -> String {
         body.push_str(stmt);
         body.push('\n');
     }
-    // The `mutable` prefix and the `Regex` type are in scope for every program:
-    // they cost an unused import in the modes that never mention them, and let
-    // the `mutable`/`patregex` modes write the idiomatic `mutable.ListBuffer(…)`
-    // and `new Regex(…)` rather than the fully qualified spellings.
+    // The `mutable` prefix, the `Regex` type and `Breaks._` are in scope for
+    // every program: they cost an unused import in the modes that never mention
+    // them, and let the `mutable`/`patregex`/`breaks` modes write the idiomatic
+    // `mutable.ListBuffer(…)`, `new Regex(…)` and `breakable { … }` rather than
+    // the fully qualified spellings.
+    //
+    // The `Breaks._` import is LOAD-BEARING, not cosmetic. Without it the
+    // reference rejects `breakable` as an unknown name, and a frontend that
+    // also rejects it agrees on the failure — so the whole `breaks` mode scores
+    // a clean zero while testing nothing. That is exactly what it did before
+    // this import was added.
     format!(
         "import scala.collection.mutable\nimport scala.util.matching.Regex\n\
+         import scala.util.control.Breaks._\n\
          {top}object T extends App {{\n{body}}}\n"
     )
 }

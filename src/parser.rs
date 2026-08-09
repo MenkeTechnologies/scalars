@@ -493,7 +493,10 @@ impl Parser {
             while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
                 // `implicit`/`using` lead a parameter list, not a parameter.
                 if matches!(self.peek(), Tok::Ident(w) if w == "implicit" || w == "using")
-                    && !matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(Tok::Colon))
+                    && !matches!(
+                        self.toks.get(self.pos + 1).map(|t| &t.kind),
+                        Some(Tok::Colon)
+                    )
                 {
                     self.advance();
                     self.skip_seps();
