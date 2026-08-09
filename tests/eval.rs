@@ -3431,6 +3431,199 @@ fn every_builtin_id_is_distinct() {
     );
 }
 
+// ── The same hazard, one key type over: registries keyed by NAME ────────────
+//
+// `every_builtin_id_is_distinct` guards the integer-keyed builtin table. The
+// tables below are keyed by a STRING, and they fail the same way and just as
+// silently: two entries under one key, the build clean, and one of the two
+// handlers simply never reached. Which one loses depends on the lookup —
+// `throwable_fqn` and `Chunk::find_sub` take the FIRST match, while
+// `VM::register_builtin` and a `HashMap::insert` keep the LAST — so a duplicate
+// is never a compile error and never a panic, only a wrong answer somewhere
+// else in the program.
+//
+// These read source text rather than the consts, for the same reason the id
+// guard does: a table can be private to its module, and a duplicate should be
+// caught where it is WRITTEN rather than only where it happens to be reachable.
+
+/// Every `("key", "value"),` pair inside `const NAME: &[(&str, &str)] = &[…];`
+/// in `src`, in source order. Returns `None` when the table is not found, so a
+/// renamed table fails the guard instead of silently scanning nothing.
+fn str_pair_table_keys<'a>(src: &'a str, table: &str) -> Option<Vec<&'a str>> {
+    let start = src.find(&format!("const {table}: &[(&str, &str)] = &["))?;
+    let body = &src[start..];
+    let end = body.find("\n];")?;
+    Some(
+        quoted_strings(&body[..end])
+            .into_iter()
+            .step_by(2)
+            .collect(),
+    )
+}
+
+/// Every string literal in `s`, in source order. The tables scanned here hold
+/// only plain literals — no escapes, no raw strings — so a scan to the next
+/// unescaped quote is exact for them.
+fn quoted_strings(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let from = i + 1;
+        let mut j = from;
+        while j < b.len() && b[j] != b'"' {
+            j += if b[j] == b'\\' { 2 } else { 1 };
+        }
+        if j >= b.len() {
+            break;
+        }
+        out.push(&s[from..j]);
+        i = j + 1;
+    }
+    out
+}
+
+/// Report the first key that appears twice in `keys`.
+fn first_repeat<'a>(keys: &[&'a str]) -> Option<&'a str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for k in keys {
+        if seen.contains(k) {
+            return Some(k);
+        }
+        seen.push(k);
+    }
+    None
+}
+
+#[test]
+fn every_throwable_table_key_is_distinct() {
+    // `throwable_fqn` is a `.iter().find()`, so a second row under a simple name
+    // is dead — and a second row is exactly what an "add the JDK's package"
+    // edit produces. Adding `("NoSuchElementException", "java.lang.…")` above
+    // the real `java.util.…` row builds clean, and the only symptom is that a
+    // caught `NoSuchElementException` prints the wrong package. Same for
+    // `THROWABLE_PARENTS`, whose walk takes the first parent it finds: a second
+    // row re-parenting a class silently loses, so `case e: Exception` either
+    // stops catching something or starts catching a `ControlThrowable`.
+    let src = include_str!("../src/host.rs");
+    for table in ["BUILTIN_THROWABLES", "THROWABLE_PARENTS"] {
+        let keys = str_pair_table_keys(src, table)
+            .unwrap_or_else(|| panic!("`{table}` not found in src/host.rs — was it renamed?"));
+        assert!(
+            keys.len() > 10,
+            "expected to scan `{table}`, found {} rows",
+            keys.len()
+        );
+        if let Some(dup) = first_repeat(&keys) {
+            panic!("`{table}` has two rows keyed `{dup}`; only the first is ever reached");
+        }
+    }
+}
+
+#[test]
+fn every_builtin_is_registered_once() {
+    // The id guard checks the `pub const` DECLARATIONS. This checks the CALL
+    // SITES: `register_builtin` overwrites its slot, so registering one id twice
+    // — the shape a copy-pasted line takes — silently drops the first handler.
+    // Two consts with distinct ids and a mistyped second line pass the id guard
+    // and fail here.
+    let src = include_str!("../src/host.rs");
+    let ids: Vec<&str> = src
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("vm.register_builtin("))
+        .filter_map(|l| l.split_once(',').map(|(id, _)| id))
+        .collect();
+    assert!(
+        ids.len() > 50,
+        "expected to scan the register_builtin calls, found {}",
+        ids.len()
+    );
+    if let Some(dup) = first_repeat(&ids) {
+        panic!("builtin `{dup}` is registered twice; the first handler is unreachable");
+    }
+}
+
+#[test]
+fn every_method_name_list_is_distinct() {
+    // The compiler's static-width tables are `&[&str]` membership sets. A
+    // repeated name is not a wrong answer today, but it is the tell that a name
+    // was added to a list that already had it — usually because the same method
+    // was classified twice, in two different lists, with two different widths.
+    // Cheap to hold to zero, and it keeps the lists auditable by eye.
+    let src = include_str!("../src/compiler.rs");
+    let mut scanned = 0;
+    for (i, line) in src.lines().enumerate() {
+        let Some(rest) = line.strip_prefix("const ") else {
+            continue;
+        };
+        let Some((name, tail)) = rest.split_once(": &[&str] = ") else {
+            continue;
+        };
+        // Multi-line lists run to the closing `];` on its own line.
+        let body: String = if tail.trim_end().ends_with("];") {
+            tail.to_string()
+        } else {
+            src.lines()
+                .skip(i + 1)
+                .take_while(|l| l.trim() != "];")
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let names = quoted_strings(&body);
+        scanned += 1;
+        if let Some(dup) = first_repeat(&names) {
+            panic!("`{name}` lists `{dup}` twice");
+        }
+    }
+    assert!(
+        scanned >= 8,
+        "expected to scan the compiler's method-name lists, found {scanned}"
+    );
+}
+
+#[test]
+fn every_reference_corpus_entry_is_distinct() {
+    // `lsp::hover` renders EVERY corpus row matching the word under the cursor,
+    // and `lsp::completions` emits one item per row, so a duplicated row is a
+    // doubled completion entry and a hover that says the same thing twice — and
+    // it ships, because `gen-docs` renders the same table into
+    // `docs/reference.html`. A name legitimately recurs across chapters (`map`
+    // is both a sequence and a map method), so the key is `(name, chapter)`.
+    let src = include_str!("../src/corpus.rs");
+    let Some(start) = src.find("pub const CORPUS: &[Entry] = &[") else {
+        panic!("`CORPUS` not found in src/corpus.rs — was it renamed?");
+    };
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    // rustfmt puts each field of a wrapped tuple on its own line, and every
+    // corpus row wraps: the row opens with `    (` and its first two fields are
+    // the name and the chapter.
+    let lines: Vec<&str> = src[start..].lines().collect();
+    for w in lines.windows(3) {
+        if w[0] != "    (" {
+            continue;
+        }
+        let (Some(name), Some(chapter)) = (
+            quoted_strings(w[1]).first().copied(),
+            quoted_strings(w[2]).first().copied(),
+        ) else {
+            continue;
+        };
+        if seen.contains(&(name, chapter)) {
+            panic!("the reference corpus documents `{name}` twice under `{chapter}`");
+        }
+        seen.push((name, chapter));
+    }
+    assert!(
+        seen.len() > 300,
+        "expected to scan the reference corpus, found {} entries",
+        seen.len()
+    );
+}
+
 // ── Compound assignment to a target that is not a plain name ────────────────
 //
 // Scala resolves `l op= r` by preferring an `op=` MEMBER on `l` and falling
@@ -3460,7 +3653,10 @@ fn an_indexed_map_and_buffer_target_updates_in_place() {
          val neg = scala.collection.mutable.Map(1 -> 5); neg(1) -= 8; println(neg)",
     ));
     assert!(ok);
-    assert_eq!(out, "ArrayBuffer(11, 2)\nHashMap(k -> 11)\nHashMap(1 -> -3)\n");
+    assert_eq!(
+        out,
+        "ArrayBuffer(11, 2)\nHashMap(k -> 11)\nHashMap(1 -> -3)\n"
+    );
 }
 
 #[test]
