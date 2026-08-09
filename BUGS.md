@@ -667,8 +667,12 @@ reported as parse/compile errors, never silently mis-run.
   kind. A program with no mutable collection in it emits exactly the arithmetic
   it did before, so a counted `while` loop stays JIT-trace-eligible.
 - **`object … extends App` runs the object body directly.** Statements run in
-  order and any `def` members are hoisted and callable; other member kinds
-  (fields, nested types) are skipped.
+  order and any `def` members are hoisted and callable. A **nested type** is not
+  skipped, it is REFUSED: `object T extends App { class C(var n: Int); … }`
+  is a parse error (`unexpected token Var in expression`), where Scala compiles
+  it. Declare the class at the top level instead — which is where the parser
+  accepts `class`/`case class`/`trait`, and where a `class` a program means to
+  reuse belongs anyway. A refusal rather than a wrong answer, but a real gap.
 - **Singleton `object` `val`s initialize eagerly**, before `main`, rather than
   lazily on first access. Observably identical for pure initializers.
 
