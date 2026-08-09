@@ -157,6 +157,77 @@ fn g_arith(r: &mut Rng) -> String {
     }
 }
 
+/// Operands at and around the 32-bit boundary. The `arith` mode deliberately
+/// keeps "products &lt; 2^31" (see its comment), which means NO probe it has ever
+/// generated could observe an `Int` overflow — a clean score over that surface
+/// says nothing at all about whether `Int` is 32 bits. These are the values that
+/// make the difference visible.
+const EDGE_INTS: &[&str] = &[
+    "2147483647",
+    "-2147483648",
+    "2147483646",
+    "-2147483647",
+    "1073741824",
+    "-1073741824",
+    "65536",
+    "46341",
+    "-46341",
+    "2",
+    "-1",
+    "3",
+];
+
+/// The same boundary values as `Long`s. A `Long` anywhere in an expression
+/// promotes the whole thing, so these probes pin the OTHER side of the rule:
+/// narrowing must NOT happen here.
+const EDGE_LONGS: &[&str] = &[
+    "2147483647L",
+    "-2147483648L",
+    "4294967296L",
+    "9223372036854775807L",
+    "-9223372036854775808L",
+    "1L",
+];
+
+/// 32-bit `Int` overflow, and the `Long` promotion that suppresses it.
+///
+/// Every arm mixes boundary operands, because the wrap is only observable there.
+/// The `Long` arms matter as much as the `Int` ones: a frontend that narrowed
+/// everything unconditionally would pass all the `Int` probes and fail these.
+fn g_overflow(r: &mut Rng) -> String {
+    let a = pick(r, EDGE_INTS);
+    let b = pick(r, EDGE_INTS);
+    let c = pick(r, EDGE_INTS);
+    let l = pick(r, EDGE_LONGS);
+    let op = pick(r, AOPS);
+    let op2 = pick(r, AOPS);
+    match r.below(14) {
+        // Plain binary and nested arithmetic at the boundary.
+        0 => format!("println({a} {op} {b})"),
+        1 => format!("println(({a} {op} {b}) {op2} {c})"),
+        2 => format!("println({a} {op} ({b} {op2} {c}))"),
+        // Unary negation — `-Int.MinValue` is `Int.MinValue`.
+        3 => format!("println(-({a} {op} {b}))"),
+        // The companion-object bounds.
+        4 => format!("println(Int.MaxValue {op} {b})"),
+        5 => format!("println(Int.MinValue {op} {b})"),
+        // Mixed `Int`/`Long`: the result must NOT wrap.
+        6 => format!("println({a} {op} {l})"),
+        7 => format!("println({l} {op} {a})"),
+        // A `var` and a compound assignment.
+        8 => format!("{{ var v = {a}; v {op}= {b}; println(v) }}"),
+        // A `def` whose parameter types give the width.
+        9 => format!("{{ def f(x: Int, y: Int): Int = x {op} y; println(f({a}, {b})) }}"),
+        10 => format!("{{ def g(x: Long, y: Long): Long = x {op} y; println(g({l}, {l})) }}"),
+        // Division and remainder — `Int.MinValue / -1` overflows to itself.
+        11 => format!("println({a} / {b}); println({a} % {b})"),
+        // The conversions and `abs`, both of which narrow.
+        12 => format!("println({l}.toInt); println(({a}).abs)"),
+        // A `val` whose width is inferred from its initializer.
+        _ => format!("{{ val v = {a}; println(v {op} {b}) }}"),
+    }
+}
+
 fn g_intdiv(r: &mut Rng) -> String {
     let a = pick(r, INTS);
     let b = pick(r, DIVS);
@@ -1803,6 +1874,7 @@ enum Mode {
     Params,
     Fmt,
     Apply,
+    Overflow,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1847,6 +1919,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Params => "params",
         Mode::Fmt => "fmt",
         Mode::Apply => "apply",
+        Mode::Overflow => "overflow",
     }
 }
 
@@ -1892,6 +1965,7 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "params" => Mode::Params,
         "fmt" => Mode::Fmt,
         "apply" => Mode::Apply,
+        "overflow" => Mode::Overflow,
         _ => return None,
     })
 }
@@ -1936,6 +2010,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Params,
     Mode::Fmt,
     Mode::Apply,
+    Mode::Overflow,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -2258,6 +2333,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Params => g_params(r),
         Mode::Fmt => g_fmt(r),
         Mode::Apply => g_apply(r),
+        Mode::Overflow => g_overflow(r),
         Mode::All => unreachable!(),
     }
 }
