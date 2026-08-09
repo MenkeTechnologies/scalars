@@ -1802,6 +1802,7 @@ enum Mode {
     Breaks,
     Params,
     Fmt,
+    Apply,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1845,6 +1846,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Breaks => "breaks",
         Mode::Params => "params",
         Mode::Fmt => "fmt",
+        Mode::Apply => "apply",
     }
 }
 
@@ -1889,6 +1891,7 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "breaks" => Mode::Breaks,
         "params" => Mode::Params,
         "fmt" => Mode::Fmt,
+        "apply" => Mode::Apply,
         _ => return None,
     })
 }
@@ -1932,6 +1935,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Breaks,
     Mode::Params,
     Mode::Fmt,
+    Mode::Apply,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -2070,6 +2074,79 @@ fn g_params(r: &mut Rng) -> String {
     }
 }
 
+/// `apply` — Scala's universal `receiver(args)`, in every position the earlier
+/// modes never put it. They only ever applied a receiver named directly in the
+/// scope being compiled: a `val` of the entry object's own body, applied from
+/// that same body. Nothing indexed a binding from INSIDE a lambda or a `def`
+/// (where it is neither a frame slot nor a capture), nothing applied a `String`
+/// held in a binding rather than written as a literal, nothing wrote `_(i)` or
+/// `f(_)`, and nothing applied a FIELD. Each is an ordinary Scala spelling, and
+/// each was a hard rejection or a wrong answer while the modes above stayed
+/// green — the reason this mode exists.
+fn g_apply(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let k = pick(r, DIVS);
+    let s = pick(r, STRS);
+    let word = *pick(r, &["pear", "kiwi", "apple", "melon"]);
+    let i = r.below(3);
+    match r.below(11) {
+        // Index a top-level `val` from inside a lambda.
+        0 => format!(
+            "{{ val xs{u} = List({}); println(List(0, 1, 2).map(j => xs{u}(j))) }}",
+            int_elems(r, 3)
+        ),
+        // Index a `String` binding — the receiver arrives as a value, not a literal.
+        1 => format!(
+            "{{ val s{u} = \"{word}\"; println((0 until s{u}.length).map(j => s{u}(j)).mkString(\"-\")) }}"
+        ),
+        // `m(_)` — the placeholder as the whole argument of an inner call, which
+        // eta-expands to `x => m(x)` rather than passing the identity function.
+        2 => format!(
+            "{{ val m{u} = Map(\"a\" -> {a}, \"b\" -> {b}); println(List(\"a\", \"b\").map(m{u}(_))) }}"
+        ),
+        // `_(i)` — an application OF the placeholder.
+        3 => format!(
+            "{{ val g{u} = List(List({a}, {b}), List({b}, {a})); println(g{u}.map(_(1))) }}"
+        ),
+        4 => format!("println(List(\"{word}\", \"melon\").map(_({i})))"),
+        // `f(_)` on a user `def`, and the same `def` called normally.
+        5 => format!(
+            "{{ def f{u}(x: Int) = x * {k}; println(List({a}, {b}).map(f{u}(_))); println(f{u}({a})) }}"
+        ),
+        // A lambda-valued binding called BY NAME from inside another lambda.
+        6 => format!(
+            "{{ val fn{u} = (x: Int) => x + {k}; println(List({a}, {b}).map(j => fn{u}(j))) }}"
+        ),
+        // An `apply` directly on a literal, then a selector chained onto it.
+        7 => format!("println(\"{word}\"({i}).toUpper + \"|\" + \"{word}\"({i}).toInt)"),
+        // Apply a FIELD: `o.f(i)` is `o.f.apply(i)`, not a method named `f`.
+        8 => format!(
+            "case class A{u}(name: String, xs: List[Int])\n{sep}\
+             {{ val v{u} = A{u}(\"{word}\", List({}));\
+             println(v{u}.name({i})); println(v{u}.xs(1)); println(v{u}.name.length) }}",
+            int_elems(r, 3)
+        ),
+        // Index a top-level `val` from inside a `def` body.
+        9 => format!(
+            "{{ val xs{u} = List({}); def at{u}(j: Int) = xs{u}(j); \
+             println(at{u}(0) + \"/\" + at{u}(1)) }}",
+            str_elems(r, 3)
+        ),
+        // An `Array` binding indexed from inside a lambda, and `f(_, k)` — a
+        // placeholder argument alongside an ordinary one.
+        _ => format!(
+            "{{ val ar{u} = Array({}); def add{u}(x: Int, y: Int) = x + y; \
+             println(List(0, 1).map(j => ar{u}(j)).sum); \
+             println(List({a}, {b}).map(add{u}(_, {k})).mkString(\",\")); \
+             println({s}.length) }}",
+            int_elems(r, 3)
+        ),
+    }
+}
+
 /// `java.util.Formatter` conversions, reached through the `f"…"` interpolator,
 /// `"…".format(…)`, `String.format(…)` and `x.formatted(…)`.
 ///
@@ -2180,6 +2257,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Breaks => g_breaks(r),
         Mode::Params => g_params(r),
         Mode::Fmt => g_fmt(r),
+        Mode::Apply => g_apply(r),
         Mode::All => unreachable!(),
     }
 }
@@ -2495,6 +2573,13 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
+    // `--probes 0` builds an EMPTY program, which both sides run happily and
+    // identically; `--count 0` runs none at all. Both used to report a clean
+    // score and exit 0 while comparing nothing, so both are configuration errors.
+    if args.probes == 0 || (args.count == 0 && !args.once) {
+        eprintln!("parity-fuzz: --count and --probes must be > 0 (nothing would be compared)");
+        std::process::exit(2);
+    }
     let ours = ours_bin();
     if !ours.exists() {
         eprintln!(
@@ -2539,6 +2624,14 @@ fn main() {
     let next = AtomicU64::new(0);
     let checked = AtomicU64::new(0);
     let timeouts = AtomicU64::new(0);
+    // Programs that carried SIGNAL: the oracle either ran to completion (so its
+    // stdout is an answer to compare against) or printed something before it
+    // failed. A program the oracle rejects outright prints nothing and exits
+    // non-zero, and a frontend that rejects it too then "agrees" — a clean score
+    // from a comparison that never happened. That is how a missing import scored
+    // the whole `breaks` mode zero (see `build_program`). Counting it is what
+    // makes a barren run visible instead of green.
+    let signal = AtomicU64::new(0);
     let stop = AtomicBool::new(false);
     let divergences: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     let start = Instant::now();
@@ -2580,6 +2673,9 @@ fn main() {
                 if o.timed_out || r.timed_out {
                     timeouts.fetch_add(1, Ordering::Relaxed);
                 }
+                if !o.timed_out && (o.exit == 0 || !o.stdout.is_empty()) {
+                    signal.fetch_add(1, Ordering::Relaxed);
+                }
                 if !o.timed_out && differs(&o, &r) {
                     let minimal = minimize(&probes, &ours, &oracle, args.timeout);
                     // re-verify the shrunk case actually reproduces
@@ -2620,6 +2716,7 @@ fn main() {
 
     let checked = checked.load(Ordering::Relaxed);
     let timeouts = timeouts.load(Ordering::Relaxed);
+    let signal = signal.load(Ordering::Relaxed);
     let mut divergences: Vec<(u64, String)> = divergences.into_inner().unwrap();
     divergences.sort_by_key(|(seed, _)| *seed);
     let divergences: Vec<String> = divergences.into_iter().map(|(_, r)| r).collect();
@@ -2628,11 +2725,13 @@ fn main() {
     println!(
         "\nfuzzed {checked} programs ({} probes) in {:.1}s\n\
          divergences : {}\n\
-         timeouts    : {}",
+         timeouts    : {}\n\
+         no-signal   : {}/{checked}",
         checked as usize * args.probes,
         elapsed.as_secs_f64(),
         divergences.len(),
         timeouts,
+        checked - signal,
     );
 
     if !divergences.is_empty() {
@@ -2654,5 +2753,19 @@ fn main() {
         }
         std::process::exit(1);
     }
-    println!("no divergences — scalars matches reference scala across all probes ✓");
+    // A run that compared NOTHING is not a pass. `--count 0`, `--probes 0`, and
+    // an oracle that rejected every program all reach the line below with zero
+    // divergences; none of them is evidence of anything, so they exit 2 (the
+    // harness's own configuration-error status) rather than green.
+    if signal == 0 {
+        eprintln!(
+            "parity-fuzz: NO SIGNAL — {checked} programs checked, none of them comparable \
+             (the oracle answered nothing). A clean score here would be vacuous."
+        );
+        std::process::exit(2);
+    }
+    println!(
+        "no divergences — scalars matches reference scala across all probes ✓ \
+         ({signal}/{checked} programs carried signal)"
+    );
 }
