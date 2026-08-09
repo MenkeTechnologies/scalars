@@ -442,12 +442,24 @@ reported as parse/compile errors, never silently mis-run.
 - **`grouped`/`sliding` answer a `List` of windows**, not an `Iterator`. Every
   consumption Scala programs use (`.toList`, `.foreach`, `.map`) matches;
   printing the un-consumed result does not (Scala prints `<iterator>`).
-- **Integer arithmetic uses fusevm's 64-bit semantics.** Scala `Int` 32-bit
-  overflow wrapping is not modeled for `+`/`-`/`*` (values behave like `Long`).
-  The **bitwise** operators are the exception: `~`, `<<`, `>>` and `>>>` are
-  evaluated at `Int` width, because that is observable at ordinary magnitudes
-  (`1 << 33` is `2`, not `8589934592`) rather than only on overflow. A genuinely
-  `Long` receiver therefore shifts as an `Int` would.
+- **Integer arithmetic narrows to 32 bits only where the width is PROVEN.**
+  `Int` overflow now wraps — `2147483647 + 1` is `-2147483648` — and a `Long`
+  anywhere in an expression promotes it so it does not
+  (`2147483647 + 1L` is `2147483648`). The runtime is still dynamically typed, so
+  the decision is made statically by `compiler::NumTy`, which proves a width from
+  a literal (`1` vs `1L`), a declared type (`val n: Long`, and a `def`
+  parameter's mandatory annotation), an inferred `val` initializer, and the
+  methods whose result type is fixed (`toInt`, `toLong`, `length`, `indexOf`, …).
+  What it CANNOT prove stays 64-bit, because the wrap is emitted as a shift pair
+  that would destroy a `Double` or a `String`. An enclosing scope's widths travel
+  into a lambda body, so a captured accumulator still wraps
+  (`var t = 0; xs.foreach(t += _)`); the residual gaps are the positions Scala
+  types from context this frontend does not model. A **lambda parameter** is the
+  main one — in `xs.map(x => x * 2147483647)` the element type comes from `xs`,
+  which is not inferred, so the multiply stays 64-bit. The same applies to a
+  **class field**, a `def`'s **return type** feeding a caller's arithmetic, and
+  `.sum`/`.product` over a collection whose element type is unknown. Each keeps
+  the pre-existing 64-bit answer rather than a wrongly narrowed one.
 - **The `%x`/`%X`/`%o` format conversions pick their width from the VALUE, not
   the static type.** Java writes the two's-complement bit pattern at the width of
   the operand's type — `Int` is 32 bits (`"%x".format(-1)` is `ffffffff`), `Long`

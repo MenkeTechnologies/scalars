@@ -64,6 +64,13 @@ struct Compiler {
     /// Swapped out for a fresh map while a function body compiles so a `val`
     /// inside `main` cannot mask a `var` of the same name inside a `def`.
     vals: HashMap<String, bool>,
+    /// The statically known numeric WIDTH of each binding in scope:
+    /// `name → NumTy`. Populated from a declared type (`val n: Long`, and a
+    /// `def` parameter's mandatory annotation) or inferred from the initializer,
+    /// and consulted by [`Compiler::num_ty`] to decide whether an arithmetic
+    /// result wraps at 32 bits. Swapped out with [`Compiler::vals`] on entry to a
+    /// function body, so one frame's widths never leak into another's.
+    widths: HashMap<String, NumTy>,
     /// `Some` while compiling a function body: maps that function's local names
     /// (parameters, then `val`/`var`/`for` locals) to frame slot indices, so
     /// each call frame gets its own copies and recursion is correct. `None` in
@@ -175,6 +182,13 @@ struct PendingClosure {
     /// with the queued body instead of being read from the compiler's cursor
     /// (which has long since moved on by the time the body is emitted).
     by_name: HashSet<String>,
+    /// The enclosing scope's numeric widths, captured when the body was queued.
+    /// A lambda body compiles with a fresh scope, so without this an enclosing
+    /// `var n = 0` would lose its `Int` width the moment a closure touched it and
+    /// `xs.foreach(_ => n += 1)` would stop wrapping. The lambda's own parameters
+    /// stay unknown — their type comes from the collection, which this frontend
+    /// does not infer.
+    widths: HashMap<String, NumTy>,
 }
 
 /// Compile-time class shape.
@@ -448,6 +462,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         func_sig,
         by_name: HashSet::new(),
         vals: HashMap::new(),
+        widths: HashMap::new(),
         scope: None,
         global_binds: HashSet::new(),
         classes: class_meta,
@@ -695,10 +710,21 @@ impl Compiler {
         }
         match &s.kind {
             StmtKind::Local {
-                name, init, is_val, ..
+                name,
+                init,
+                is_val,
+                ty,
             } => {
                 let place = self.declare_place(name);
                 self.vals.insert(name.clone(), *is_val);
+                // The binding's numeric width: the declared type when there is
+                // one (`val n: Long = 1`), otherwise inferred from the
+                // initializer, which is how Scala itself types a bare `val`.
+                let w = match ty {
+                    Some(t) => declared_width(t),
+                    None => init.as_ref().map_or(NumTy::Unknown, |e| self.num_ty(e)),
+                };
+                self.widths.insert(name.clone(), w);
                 // A `var` a closure assigns lives in a heap cell, allocated here
                 // even without an initializer so the closure has something to
                 // write through (see [`boxed_vars`]).
@@ -804,7 +830,8 @@ impl Compiler {
                     if boxed {
                         self.b.emit(Op::CallBuiltin(crate::host::CELL_GET, 1), 0);
                     }
-                    self.compound_tail(*op, value)?;
+                    let target = self.widths.get(name).copied().unwrap_or(NumTy::Unknown);
+                    self.compound_tail(*op, value, target)?;
                 }
                 self.unwind_check_dropping(1);
                 // A boxed `var` is written through its cell, so the write is
@@ -1114,7 +1141,10 @@ impl Compiler {
 
     fn expr(&mut self, e: &Expr) -> Result<(), String> {
         match e {
-            Expr::Int(n) => {
+            // A `Long` literal loads exactly as an `Int` one does — the value
+            // model is the same `i64`. Only the STATIC width differs, and that is
+            // read off the AST node by `num_ty`, never off the emitted constant.
+            Expr::Int(n) | Expr::Long(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
             }
             Expr::Float(f) => {
@@ -1148,10 +1178,14 @@ impl Compiler {
                 ))
             }
             Expr::Unary { op, rhs } => {
+                let w = self.num_ty(rhs);
                 self.expr(rhs)?;
                 match op {
                     UnOp::Neg => {
                         self.b.emit(Op::Negate, 0);
+                        // `-Int.MinValue` is `Int.MinValue` — negation is the
+                        // one unary operator that can overflow.
+                        self.narrow(w, 0);
                     }
                     UnOp::Not => {
                         self.b.emit(Op::LogNot, 0);
@@ -1342,6 +1376,7 @@ impl Compiler {
                     current_class: self.current_class.clone(),
                     current_object: self.current_object.clone(),
                     by_name: self.by_name.clone(),
+                    widths: self.widths.clone(),
                 });
                 Some(idx)
             }
@@ -1377,6 +1412,7 @@ impl Compiler {
             current_class: self.current_class.clone(),
             current_object: self.current_object.clone(),
             by_name: self.by_name.clone(),
+            widths: self.widths.clone(),
         });
         Ok(())
     }
@@ -1407,8 +1443,15 @@ impl Compiler {
             boxed,
         });
         let saved_vals = std::mem::take(&mut self.vals);
+        // The enclosing scope's widths travel into the body, so a captured
+        // `var n = 0` is still known to be an `Int` here.
+        let saved_widths = std::mem::replace(&mut self.widths, pc.widths);
         for p in &pc.params {
             self.vals.insert(p.clone(), true);
+            // A parameter SHADOWS any enclosing binding of the same name, and its
+            // own type comes from the collection being traversed, which is not
+            // inferred — so it is unknown rather than inherited.
+            self.widths.remove(p);
         }
         let saved_class = std::mem::replace(&mut self.current_class, pc.current_class);
         let saved_object = std::mem::replace(&mut self.current_object, pc.current_object);
@@ -1437,6 +1480,7 @@ impl Compiler {
 
         self.scope = saved_scope;
         self.vals = saved_vals;
+        self.widths = saved_widths;
         self.current_class = saved_class;
         self.current_object = saved_object;
         self.by_name = saved_by_name;
@@ -2142,13 +2186,23 @@ impl Compiler {
     /// [`crate::host::IS_GROWABLE`] asks the receiver, and only the taken branch
     /// runs. A program with no mutable collection in it still emits exactly the
     /// arithmetic it did before, because the test is only emitted for `+=`/`-=`.
-    fn compound_tail(&mut self, op: AssignOp, value: &Expr) -> Result<(), String> {
+    /// `target` is the width of the binding being updated; the result's width is
+    /// that combined with the operand's, exactly as for the `x = x op e` form
+    /// Scala expands this to.
+    fn compound_tail(
+        &mut self,
+        op: AssignOp,
+        value: &Expr,
+        target: NumTy,
+    ) -> Result<(), String> {
+        let w = target.combine(self.num_ty(value));
         if !matches!(op, AssignOp::Add | AssignOp::Sub) {
             self.expr(value)?;
             match op {
                 AssignOp::Div => self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0),
                 _ => self.b.emit(compound_op(op), 0),
             };
+            self.narrow(w, 0);
             return Ok(());
         }
         // No mutable collection in the program: `+=` can only be arithmetic,
@@ -2156,6 +2210,7 @@ impl Compiler {
         if !self.has_mutable {
             self.expr(value)?;
             self.b.emit(compound_op(op), 0);
+            self.narrow(w, 0);
             return Ok(());
         }
         let method = if op == AssignOp::Add { "+=" } else { "-=" };
@@ -2172,6 +2227,9 @@ impl Compiler {
         self.b.patch_jump(to_arith, arith);
         self.expr(value)?;
         self.b.emit(compound_op(op), 0);
+        // Only this branch is arithmetic — the growable one answers a collection,
+        // which must not be narrowed.
+        self.narrow(w, 0);
         let end = self.b.current_pos();
         self.b.patch_jump(to_end, end);
         Ok(())
@@ -2195,7 +2253,7 @@ impl Compiler {
             self.expr(value)?;
         } else {
             self.emit_field_get_this(field);
-            self.compound_tail(op, value)?;
+            self.compound_tail(op, value, NumTy::Unknown)?;
         }
         self.b.emit(Op::CallBuiltin(crate::host::OBJ_SET, 3), line);
         self.b.emit(Op::Pop, 0); // discard the `Unit` result
@@ -2216,7 +2274,7 @@ impl Compiler {
             self.expr(value)?;
         } else {
             self.b.emit(Op::GetVar(g), 0);
-            self.compound_tail(op, value)?;
+            self.compound_tail(op, value, NumTy::Unknown)?;
         }
         self.unwind_check_dropping(1);
         self.b.emit(Op::SetVar(g), 0);
@@ -2454,6 +2512,19 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower a method call, then wrap the result back to 32 bits when it is an
+    /// `Int` that could have left the range. Split from [`Self::method_inner`] so
+    /// the narrowing covers EVERY lowering path — the math builtin, the operator
+    /// spellings, and the generic `SMETHOD` fallback all funnel through here.
+    fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        let w = self.method_width(recv, name, args);
+        self.method_inner(recv, name, args, line)?;
+        if NARROW_AFTER_METHODS.contains(&name) {
+            self.narrow(w, line);
+        }
+        Ok(())
+    }
+
     /// Lower postfix `recv.name(args)`. Dispatch order:
     ///
     /// 1. **Static object member** — `Obj.method(...)` calls `Obj$method`;
@@ -2462,7 +2533,38 @@ impl Compiler {
     ///    runtime class-tag dispatch chain (with a [`SMETHOD`] fallback).
     /// 3. **Fallback** — the universal `SMETHOD` builtin (String/Int/Double
     ///    stdlib and host-heap field/`toString`/`hashCode`/`equals` access).
-    fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+    fn method_inner(
+        &mut self,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<(), String> {
+        // A shift is evaluated at the RECEIVER's width: `1 << 40` masks the
+        // distance to five bits and answers 256, while `1L << 40` masks to six
+        // and answers 1099511627776. The host cannot tell the two apart from the
+        // value alone, so a `Long` receiver is dispatched under a distinct name.
+        if args.len() == 1
+            && matches!(name, "<<" | ">>" | ">>>")
+            && self.num_ty(recv) == NumTy::Long
+        {
+            self.expr(recv)?;
+            self.expr(&args[0])?;
+            let nc = self.b.add_constant(Value::str(format!("{name}#long")));
+            self.b.emit(Op::LoadConst(nc), line);
+            self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 3), line);
+            return Ok(());
+        }
+        // `Int.MaxValue` and friends — the numeric companion objects' bounds.
+        // These are constants, not receiver dispatch, so they fold to a literal.
+        if args.is_empty() {
+            if let Expr::Var(owner) = recv {
+                if let Some(v) = companion_bound(owner, name) {
+                    self.b.emit(Op::LoadInt(v), line);
+                    return Ok(());
+                }
+            }
+        }
         // `super.m(args)` — skip this class in the linearization and call the
         // nearest supertype that defines `m` (a static call, as the JVM's
         // `invokespecial` is).
@@ -2699,6 +2801,7 @@ impl Compiler {
 
         let mut slots = HashMap::new();
         let saved_vals = std::mem::take(&mut self.vals);
+        let saved_widths = std::mem::take(&mut self.widths);
         for (i, p) in cd.params.iter().enumerate() {
             slots.insert(p.clone(), i as u16);
             self.vals.insert(p.clone(), true);
@@ -2767,6 +2870,7 @@ impl Compiler {
 
         self.scope = None;
         self.vals = saved_vals;
+        self.widths = saved_widths;
         Ok(())
     }
 
@@ -2781,6 +2885,7 @@ impl Compiler {
         let mut slots = HashMap::new();
         slots.insert("this".to_string(), 0u16);
         let saved_vals = std::mem::take(&mut self.vals);
+        let saved_widths = std::mem::take(&mut self.widths);
         self.vals.insert("this".to_string(), true);
         for (i, p) in m.params.iter().enumerate() {
             slots.insert(p.clone(), (i + 1) as u16);
@@ -2812,6 +2917,7 @@ impl Compiler {
 
         self.scope = None;
         self.vals = saved_vals;
+        self.widths = saved_widths;
         Ok(())
     }
 
@@ -2824,6 +2930,7 @@ impl Compiler {
 
         let mut slots = HashMap::new();
         let saved_vals = std::mem::take(&mut self.vals);
+        let saved_widths = std::mem::take(&mut self.widths);
         for (i, p) in m.params.iter().enumerate() {
             slots.insert(p.clone(), i as u16);
             self.vals.insert(p.clone(), true);
@@ -2846,6 +2953,7 @@ impl Compiler {
 
         self.scope = None;
         self.vals = saved_vals;
+        self.widths = saved_widths;
         Ok(())
     }
 
@@ -3068,10 +3176,16 @@ impl Compiler {
         // clear `vals` so val-immutability is tracked per function body.
         let mut slots = HashMap::new();
         let saved_vals = std::mem::take(&mut self.vals);
+        let saved_widths = std::mem::take(&mut self.widths);
         for (i, p) in f.params.iter().enumerate() {
             slots.insert(p.clone(), i as u16);
             // Scala method parameters are `val`s — reassigning one is an error.
             self.vals.insert(p.clone(), true);
+            // Scala requires a type on every `def` parameter, so this is the one
+            // place inside a function body where numeric widths are always known.
+            if let Some(t) = f.sig.get(i).and_then(|s| s.ty.as_deref()) {
+                self.widths.insert(p.clone(), declared_width(t));
+            }
         }
         self.scope = Some(Scope {
             slots,
@@ -3104,6 +3218,7 @@ impl Compiler {
 
         self.scope = None;
         self.vals = saved_vals;
+        self.widths = saved_widths;
         self.by_name = saved_by_name;
         Ok(())
     }
@@ -3162,6 +3277,95 @@ impl Compiler {
         }
     }
 
+    /// The statically known numeric width of `e` — see [`NumTy`]. Everything
+    /// this cannot prove answers [`NumTy::Unknown`], which suppresses narrowing.
+    fn num_ty(&self, e: &Expr) -> NumTy {
+        match e {
+            Expr::Int(_) => NumTy::Int,
+            Expr::Long(_) => NumTy::Long,
+            // A `Char` widens to `Int` the moment it enters arithmetic: `'a' + 1`
+            // is the `Int` 98, and `Char` itself has no arithmetic of its own.
+            Expr::Char(_) => NumTy::Int,
+            Expr::Var(n) => self.widths.get(n).copied().unwrap_or(NumTy::Unknown),
+            // `-x` and `~x` keep their operand's width.
+            Expr::Unary {
+                op: UnOp::Neg | UnOp::Complement,
+                rhs,
+            } => self.num_ty(rhs),
+            Expr::Binary {
+                op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+                lhs,
+                rhs,
+            } => self.num_ty(lhs).combine(self.num_ty(rhs)),
+            Expr::Method {
+                recv, name, args, ..
+            } => self.method_width(recv, name, args),
+            _ => NumTy::Unknown,
+        }
+    }
+
+    /// The width of a method call's result. Split three ways: names that are
+    /// always `Int` (lengths, indices, comparisons), names that keep the
+    /// receiver's width (`abs`, the shifts), and the operator spellings, which
+    /// promote to the wider of the two operands.
+    fn method_width(&self, recv: &Expr, name: &str, args: &[Expr]) -> NumTy {
+        if args.is_empty() {
+            if let Expr::Var(owner) = recv {
+                if companion_bound(owner, name).is_some() {
+                    return declared_width(owner);
+                }
+            }
+        }
+        // `math.abs(n)` / `math.max(a, b)` — the module is a namespace, not a
+        // value, so the width comes from the ARGUMENTS. Scala keeps these at the
+        // argument's own width (`math.abs(Int.MinValue)` is `Int.MinValue`).
+        if math_module(recv).is_some() {
+            return match (name, args.len()) {
+                ("abs" | "signum", 1) => self.num_ty(&args[0]),
+                ("max" | "min", 2) => self.num_ty(&args[0]).combine(self.num_ty(&args[1])),
+                _ => NumTy::Unknown,
+            };
+        }
+        if name == "toLong" {
+            return NumTy::Long;
+        }
+        if INT_RESULT_METHODS.contains(&name) {
+            return NumTy::Int;
+        }
+        if WIDTH_PRESERVING_METHODS.contains(&name) {
+            return self.num_ty(recv);
+        }
+        if args.len() == 1 && WIDTH_COMBINING_METHODS.contains(&name) {
+            return self.num_ty(recv).combine(self.num_ty(&args[0]));
+        }
+        NumTy::Unknown
+    }
+
+    /// Wrap the integer on top of the stack back to 32 bits — Scala's `Int`
+    /// overflow. `(n << 32) >> 32` sign-extends the low half, so 2147483648
+    /// becomes -2147483648, which is what `2147483647 + 1` answers.
+    ///
+    /// Emitted as a shift pair rather than a host builtin on purpose: fusevm's
+    /// JIT and AOT tiers compile `Shl`/`Shr` (to `ishl`/`sshr`) but REFUSE to
+    /// trace through `CallBuiltin`, so a builtin here would silently stop every
+    /// arithmetic loop in the program from ever being compiled. This is the same
+    /// recipe the Java frontend uses for the identical rule.
+    fn emit_wrap32(&mut self, line: u32) {
+        self.b.emit(Op::LoadInt(32), line);
+        self.b.emit(Op::Shl, line);
+        self.b.emit(Op::LoadInt(32), line);
+        self.b.emit(Op::Shr, line);
+    }
+
+    /// Wrap only when the result is provably a 32-bit `Int`. A `Long` result
+    /// must keep its full width, and an unproven one might be a `Double` or a
+    /// `String`, which the shift pair would destroy — so both are left alone.
+    fn narrow(&mut self, w: NumTy, line: u32) {
+        if w == NumTy::Int {
+            self.emit_wrap32(line);
+        }
+    }
+
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
         // `&&` / `||` short-circuit: keep the deciding operand as the result.
         match op {
@@ -3185,12 +3389,27 @@ impl Compiler {
             }
             _ => {}
         }
+        // The result's width, decided before anything is emitted. `Int` operands
+        // make an `Int` result, which wraps at 32 bits; a `Long` anywhere in the
+        // expression promotes it and suppresses the wrap.
+        // A comparison answers `Boolean` and `::` a `List`; neither narrows.
+        let w = if matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+        ) {
+            self.num_ty(lhs).combine(self.num_ty(rhs))
+        } else {
+            NumTy::Unknown
+        };
         self.expr(lhs)?;
         self.expr(rhs)?;
         // Scala `/` truncates for two `Int`s; fusevm's native `Op::Div` always
         // floats, so route division through the type-dispatching host builtin.
         if let BinOp::Div = op {
             self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0);
+            // `Int.MinValue / -1` overflows to itself — the one division that
+            // does not fit back into 32 bits.
+            self.narrow(w, 0);
             return Ok(());
         }
         // `::` (cons) prepends the left operand to the right `List` via the host
@@ -3215,6 +3434,7 @@ impl Compiler {
             BinOp::And | BinOp::Or => unreachable!("handled above"),
         };
         self.b.emit(vop, 0);
+        self.narrow(w, 0);
         Ok(())
     }
 }
@@ -3293,6 +3513,7 @@ fn expr_any(e: &Expr, pred: &impl Fn(&Expr) -> bool) -> bool {
             elems.iter().any(|el| expr_any(el, pred))
         }
         Expr::Int(_)
+        | Expr::Long(_)
         | Expr::Float(_)
         | Expr::Str(_)
         | Expr::Char(_)
@@ -3484,6 +3705,120 @@ fn range_test(inclusive: bool, descending: bool) -> Op {
 }
 
 // ── for-comprehension desugaring (collection generators) ────────────────────
+
+/// The bound named by a numeric companion object — `Int.MaxValue`,
+/// `Long.MinValue`, and the sub-`Int` widths Scala also exposes. Returns `None`
+/// for anything else, which leaves the access on the ordinary dispatch path.
+fn companion_bound(owner: &str, member: &str) -> Option<i64> {
+    let max = match owner {
+        "Int" => i64::from(i32::MAX),
+        "Long" => i64::MAX,
+        "Short" => i64::from(i16::MAX),
+        "Byte" => i64::from(i8::MAX),
+        _ => return None,
+    };
+    let min = match owner {
+        "Int" => i64::from(i32::MIN),
+        "Long" => i64::MIN,
+        "Short" => i64::from(i16::MIN),
+        "Byte" => i64::from(i8::MIN),
+        _ => return None,
+    };
+    match member {
+        "MaxValue" => Some(max),
+        "MinValue" => Some(min),
+        _ => None,
+    }
+}
+
+/// The static WIDTH of a numeric expression.
+///
+/// Scala's `Int` is 32 bits and its `Long` is 64, and the two are the same
+/// runtime representation here (an `i64`), so the only way to tell them apart is
+/// statically. That is what this answers, and it is what decides whether an
+/// arithmetic result gets wrapped back to 32 bits.
+///
+/// The default is deliberately [`NumTy::Unknown`], not [`NumTy::Int`]: wrapping
+/// is emitted as a shift pair, and a shift applied to a `Double` or a `String`
+/// would destroy it. So a width is claimed only where it is PROVEN, and an
+/// unproven expression keeps the 64-bit behaviour this frontend had before.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NumTy {
+    /// Provably a 32-bit `Int`: arithmetic on it wraps.
+    Int,
+    /// Provably a 64-bit `Long`: arithmetic on it does not wrap.
+    Long,
+    /// A `Double`, a `String`, a collection, or a value whose type this frontend
+    /// cannot recover. Never narrowed.
+    Unknown,
+}
+
+impl NumTy {
+    /// The width of a binary numeric result, under Scala's promotion rule: two
+    /// `Int`s stay `Int`, and a `Long` on either side promotes the whole
+    /// expression to `Long` (so `2147483647 + 1L` is 2147483648, not a wrap).
+    /// Anything unproven poisons the result, because a `Double` or `String`
+    /// operand means this was never integer arithmetic at all.
+    fn combine(self, other: NumTy) -> NumTy {
+        match (self, other) {
+            (NumTy::Int, NumTy::Int) => NumTy::Int,
+            (NumTy::Long, NumTy::Int | NumTy::Long) | (NumTy::Int, NumTy::Long) => NumTy::Long,
+            _ => NumTy::Unknown,
+        }
+    }
+}
+
+/// The width a declared type name denotes, for `val x: Long = …` and a `def`
+/// parameter's mandatory annotation.
+fn declared_width(ty: &str) -> NumTy {
+    // A by-name parameter is spelled `=> Int`; the arrow is part of the string.
+    match ty.trim_start_matches("=>").trim() {
+        "Int" | "Short" | "Byte" | "Integer" => NumTy::Int,
+        "Long" => NumTy::Long,
+        _ => NumTy::Unknown,
+    }
+}
+
+/// Method names whose result is an `Int` REGARDLESS of the receiver's width —
+/// lengths, indices, counts and comparisons. Scala types every one of these as
+/// `Int`, so an arithmetic expression built from them wraps at 32 bits.
+const INT_RESULT_METHODS: &[&str] = &[
+    "length",
+    "size",
+    "knownSize",
+    "toInt",
+    "indexOf",
+    "lastIndexOf",
+    "indexWhere",
+    "lastIndexWhere",
+    "segmentLength",
+    "count",
+    "hashCode",
+    "compareTo",
+    "compare",
+    "compareToIgnoreCase",
+    "asDigit",
+    "productArity",
+    "groupCount",
+];
+
+/// Method names that PRESERVE the receiver's width — `Int.abs` is an `Int`,
+/// `Long.abs` is a `Long`. The bitwise and shift operators belong here too: they
+/// are already evaluated at the receiver's width by the host.
+const WIDTH_PRESERVING_METHODS: &[&str] = &["abs", "unary_~", "<<", ">>", ">>>"];
+
+/// Method names whose result takes the WIDER of the receiver and the argument —
+/// the numeric operators in their method spelling (`n.+(1)`, `a max b`).
+const WIDTH_COMBINING_METHODS: &[&str] =
+    &["+", "-", "*", "/", "%", "max", "min", "&", "|", "^"];
+
+/// Method names whose result must be wrapped back to 32 bits when it is an
+/// `Int`. Deliberately NOT every `Int`-typed method: a `length` or an `indexOf`
+/// cannot leave the range, and wrapping it would cost four ops on every call for
+/// no change in answer. These are the ones that genuinely overflow — the
+/// arithmetic operators in method spelling, `abs` (at `Int.MinValue`), and
+/// `toInt`, which is Scala's explicit narrowing conversion.
+const NARROW_AFTER_METHODS: &[&str] = &["toInt", "abs", "+", "-", "*", "/", "%"];
 
 /// Whether `e` names a math module — `math`/`scala.math` or `Math`/
 /// `java.lang.Math` — and which of the two. These are namespaces, not values, so
@@ -4112,6 +4447,7 @@ impl BoxScan {
                 }
             }
             Expr::Int(_)
+            | Expr::Long(_)
             | Expr::Float(_)
             | Expr::Str(_)
             | Expr::Char(_)
@@ -4320,6 +4656,7 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
             }
         }
         Expr::Int(_)
+        | Expr::Long(_)
         | Expr::Float(_)
         | Expr::Str(_)
         | Expr::Char(_)

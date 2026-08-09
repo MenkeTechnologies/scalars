@@ -620,6 +620,7 @@ impl Resolver {
                 Ok(())
             }
             Expr::Int(_)
+            | Expr::Long(_)
             | Expr::Float(_)
             | Expr::Str(_)
             | Expr::Char(_)
@@ -889,6 +890,7 @@ fn cs_expr(e: &mut Expr, sigs: &HashMap<String, Sig>) {
             }
         }
         Expr::Int(_)
+        | Expr::Long(_)
         | Expr::Float(_)
         | Expr::Str(_)
         | Expr::Char(_)

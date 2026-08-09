@@ -2732,3 +2732,161 @@ fn a_char_range_is_refused_rather_than_read_as_integers() {
     assert!(ok);
     assert_eq!(out, "List(1, 2, 3, 4)\n3\n");
 }
+
+// ── Int is 32 bits ──────────────────────────────────────────────────────────
+// Scala's `Int` wraps at 32 bits while this frontend computes in `i64`, so every
+// expected value below was diffed against `scala-cli` (Scala 3.8.4) rather than
+// reasoned about. The `Long` cases are as load-bearing as the `Int` ones: they
+// are what fails if narrowing is applied unconditionally instead of by width.
+
+#[test]
+fn int_addition_wraps_at_thirty_two_bits() {
+    let (out, _) = run(&wrap(
+        "println(2147483647 + 1); println(-2147483648 - 1); println(2147483647 * 2)",
+    ));
+    assert_eq!(out, "-2147483648\n2147483647\n-2\n");
+}
+
+#[test]
+fn int_multiplication_wraps_to_zero_at_two_to_the_thirty_two() {
+    let (out, _) = run(&wrap("println(65536 * 65536)"));
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn negating_int_min_value_answers_itself() {
+    // The one unary operator that overflows: `Int.MinValue` has no positive.
+    let (out, _) = run(&wrap("println(-(-2147483648)); println((-2147483648).abs)"));
+    assert_eq!(out, "-2147483648\n-2147483648\n");
+}
+
+#[test]
+fn int_companion_bounds_are_available_and_wrap() {
+    let (out, _) = run(&wrap(
+        "println(Int.MaxValue); println(Int.MinValue); println(Int.MaxValue + 1)",
+    ));
+    assert_eq!(out, "2147483647\n-2147483648\n-2147483648\n");
+}
+
+#[test]
+fn long_arithmetic_does_not_wrap_at_thirty_two_bits() {
+    // A `Long` anywhere in the expression promotes the whole thing, so none of
+    // these narrow — including the two mixed forms.
+    let (out, _) = run(&wrap(
+        "println(2147483647L + 1L); println(2147483647L + 1); println(2147483647 + 1L)",
+    ));
+    assert_eq!(out, "2147483648\n2147483648\n2147483648\n");
+}
+
+#[test]
+fn declared_long_binding_keeps_full_width() {
+    let (out, _) = run(&wrap(
+        "val big: Long = 2147483647L; println(big + 1); val small = 2147483647; println(small + 1)",
+    ));
+    assert_eq!(out, "2147483648\n-2147483648\n");
+}
+
+#[test]
+fn def_parameter_types_decide_the_width() {
+    // Scala requires a type on every `def` parameter, which is what makes the
+    // width knowable inside a function body.
+    let src = "object T { def bump(n: Int): Int = n + 1\n\
+               def bumpL(n: Long): Long = n + 1\n\
+               def main(a: Array[String]): Unit = { println(bump(2147483647)); println(bumpL(2147483647L)) } }";
+    let (out, _) = run(src);
+    assert_eq!(out, "-2147483648\n2147483648\n");
+}
+
+#[test]
+fn compound_assignment_wraps() {
+    let (out, _) = run(&wrap(
+        "var x = 2147483647; x += 1; println(x); var m = 2147483647; m *= 2; println(m)",
+    ));
+    assert_eq!(out, "-2147483648\n-2\n");
+}
+
+#[test]
+fn int_min_value_divided_by_negative_one_overflows_to_itself() {
+    let (out, _) = run(&wrap(
+        "println(-2147483648 / -1); println(-2147483648 % -1); println(2147483647 / -1)",
+    ));
+    assert_eq!(out, "-2147483648\n0\n-2147483647\n");
+}
+
+#[test]
+fn to_int_truncates_and_double_to_int_saturates() {
+    // `Long.toInt` keeps the low 32 bits; `Double.toInt` is the JVM's `d2i`,
+    // which CLAMPS instead of truncating.
+    let (out, _) = run(&wrap(
+        "println(5000000000L.toInt); println(3000000000.0.toInt); println((-3000000000.0).toInt)",
+    ));
+    assert_eq!(out, "705032704\n2147483647\n-2147483648\n");
+}
+
+#[test]
+fn shifts_use_the_receivers_width() {
+    // `1 << 40` masks the distance to five bits, `1L << 40` to six.
+    let (out, _) = run(&wrap(
+        "println(1 << 40); println(1L << 40); println(1 << 31); println(-1 >>> 1)",
+    ));
+    assert_eq!(out, "256\n1099511627776\n-2147483648\n2147483647\n");
+}
+
+#[test]
+fn long_arithmetic_wraps_at_sixty_four_bits() {
+    // Scala has no bignum in the primitive tower — `Long` overflow wraps rather
+    // than widening or failing.
+    let (out, _) = run(&wrap(
+        "println(4294967296L * 4294967296L); println(9223372036854775807L + 1L)",
+    ));
+    assert_eq!(out, "0\n-9223372036854775808\n");
+}
+
+#[test]
+fn long_min_value_literal_parses() {
+    let (out, _) = run(&wrap(
+        "println(-9223372036854775808L); println(Long.MinValue); println(Long.MaxValue)",
+    ));
+    assert_eq!(
+        out,
+        "-9223372036854775808\n-9223372036854775808\n9223372036854775807\n"
+    );
+}
+
+#[test]
+fn narrowing_leaves_doubles_and_strings_alone() {
+    // The wrap is a shift pair, which would destroy a `Double` or a `String`, so
+    // it must fire only where the result is provably an `Int`.
+    let (out, _) = run(&wrap(
+        r#"println(1.5 + 2.0); println("a" + 1); println(2147483647 + 1.0); println('a' + 1)"#,
+    ));
+    assert_eq!(out, "3.5\na1\n2.147483648E9\n98\n");
+}
+
+#[test]
+fn a_hot_loop_wraps_the_same_way_the_interpreter_does() {
+    // Two hundred thousand iterations is well past the tracing JIT's threshold,
+    // so this pins the compiled tier to the interpreter's answer.
+    let (out, _) = run(&wrap(
+        "var s = 0; for (k <- 1 to 200000) { s = s + 100000 }; println(s)",
+    ));
+    assert_eq!(out, "-1474836480\n");
+}
+
+#[test]
+fn a_captured_accumulator_still_wraps_inside_a_lambda() {
+    // A lambda body compiles in a fresh scope; the enclosing widths have to
+    // travel with it or `t` loses its `Int` width the moment a closure writes it.
+    let (out, _) = run(&wrap(
+        "var t = 0; List(1,2,3).foreach(x => t += 2147483647); println(t)",
+    ));
+    assert_eq!(out, "2147483645\n");
+}
+
+#[test]
+fn math_abs_of_int_min_value_stays_negative() {
+    let (out, _) = run(&wrap(
+        "println(math.abs(-2147483648)); println(java.lang.Math.abs(-2147483648))",
+    ));
+    assert_eq!(out, "-2147483648\n-2147483648\n");
+}

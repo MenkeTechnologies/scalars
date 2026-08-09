@@ -6026,6 +6026,14 @@ fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         (">>>", 1) => Ok(Value::int(i64::from(
             (n as u32).wrapping_shr(args[0].to_int() as u32 & 31) as i32,
         ))),
+        // The same three at `Long` width, which the compiler selects by name
+        // when it can prove the receiver is a `Long`: the distance masks to six
+        // bits instead of five, and the result is not truncated to 32.
+        ("<<#long", 1) => Ok(Value::int(n.wrapping_shl(args[0].to_int() as u32 & 63))),
+        (">>#long", 1) => Ok(Value::int(n.wrapping_shr(args[0].to_int() as u32 & 63))),
+        (">>>#long", 1) => Ok(Value::int(
+            (n as u64).wrapping_shr(args[0].to_int() as u32 & 63) as i64,
+        )),
         ("formatted", 1) => Ok(Value::str(format_all(
             &args[0].as_str_cow(),
             std::slice::from_ref(&Value::int(n)),
@@ -6051,7 +6059,13 @@ fn bool_method(b: bool, name: &str, args: &[Value]) -> Result<Value, String> {
 fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
     match (name, args.len()) {
         ("abs", 0) => Ok(Value::float(f.abs())),
-        ("toInt" | "toLong", 0) => Ok(Value::int(f as i64)),
+        // `Double.toInt` is the JVM's `d2i`, which SATURATES rather than wraps:
+        // NaN answers 0 and anything past the range clamps to `Int.MaxValue` /
+        // `Int.MinValue`, so `3000000000.0.toInt` is 2147483647, not a truncated
+        // bit pattern. Rust's `as` cast has had exactly these semantics since
+        // 1.45, at both widths, so `d2l` is the same cast one size up.
+        ("toInt", 0) => Ok(Value::int(i64::from(f as i32))),
+        ("toLong", 0) => Ok(Value::int(f as i64)),
         ("toChar", 0) => Ok(make_char(char_of_code(f as i64))),
         ("toDouble" | "toFloat", 0) => Ok(Value::float(f)),
         ("isNaN", 0) => Ok(Value::bool(f.is_nan())),
@@ -6310,6 +6324,22 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         };
         if !name.is_empty() {
             return char_binop(name, a, b);
+        }
+    }
+    // Two integers reaching this hook means the exact result left `i64` — the VM
+    // delegates an overflow here so a host with bignums can widen. Scala has no
+    // bignum in its primitive tower: `Long` arithmetic WRAPS, so
+    // `4294967296L * 4294967296L` is 0. Answer the wrapped result rather than
+    // rejecting the operation.
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        let wrapped = match op {
+            NumOp::Add => Some(x.wrapping_add(*y)),
+            NumOp::Sub => Some(x.wrapping_sub(*y)),
+            NumOp::Mul => Some(x.wrapping_mul(*y)),
+            _ => None,
+        };
+        if let Some(v) = wrapped {
+            return Ok(Value::int(v));
         }
     }
     match op {

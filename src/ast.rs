@@ -95,6 +95,12 @@ pub struct ParamSig {
     /// thunk and forced at EVERY use inside the body, so a by-name argument with
     /// a side effect runs once per use (and not at all if never used).
     pub by_name: bool,
+    /// The parameter's declared type, verbatim (`"Int"`, `"Long"`, `"Double"`).
+    /// Scala REQUIRES a type on every `def` parameter, which makes this the one
+    /// place a nested body's numeric widths are always knowable — and so the
+    /// main source of `Int`-vs-`Long` information inside a `def`. Consulted only
+    /// by the compiler's width analysis; the runtime stays dynamically typed.
+    pub ty: Option<String>,
 }
 
 /// A user-defined method: `def name(p0: T0, p1: T1, …): R = body`. Parameter and
@@ -232,6 +238,13 @@ pub enum AssignOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(i64),
+    /// An `L`-suffixed integer literal (`1L`, `5000000000L`). Its *value* is an
+    /// integer exactly like [`Expr::Int`], and it compiles to the same constant;
+    /// the variant exists so the compiler can tell a `Long` from an `Int`
+    /// STATICALLY. That distinction is what keeps 32-bit overflow wrapping off
+    /// `Long` arithmetic — `2147483647L + 1` is `2147483648`, while the same
+    /// expression written without the suffix wraps to `-2147483648`.
+    Long(i64),
     Float(f64),
     Str(String),
     /// A `Char` literal. Distinct from [`Expr::Str`]: a `Char` is its own type,

@@ -514,7 +514,7 @@ impl Parser {
                     // arrow into the type string, so the leading `=>` is the
                     // marker.
                     ps.by_name = self.is(&Tok::FatArrow);
-                    self.type_ref()?;
+                    ps.ty = Some(self.type_ref()?);
                     // `xs: Int*` — a repeated parameter.
                     if self.is(&Tok::Star) {
                         self.advance();
@@ -1193,6 +1193,7 @@ impl Parser {
             self.toks.get(self.pos + 1).map(|t| &t.kind),
             Some(
                 Tok::Int(_)
+                    | Tok::Long(_)
                     | Tok::Float(_)
                     | Tok::Str(_)
                     | Tok::Char(_)
@@ -1359,7 +1360,11 @@ impl Parser {
                 let negated = match self.peek().clone() {
                     Tok::Int(n) => {
                         self.advance();
-                        Some(Expr::Int(-n))
+                        Some(Expr::Int(n.wrapping_neg()))
+                    }
+                    Tok::Long(n) => {
+                        self.advance();
+                        Some(Expr::Long(n.wrapping_neg()))
                     }
                     Tok::Float(f) => {
                         self.advance();
@@ -1563,6 +1568,10 @@ impl Parser {
             Tok::Int(n) => {
                 self.advance();
                 Ok(Expr::Int(n))
+            }
+            Tok::Long(n) => {
+                self.advance();
+                Ok(Expr::Long(n))
             }
             Tok::Float(f) => {
                 self.advance();
@@ -2169,6 +2178,13 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::Literal(Expr::Int(n)))
             }
+            // A literal in PATTERN position is only ever compared for equality,
+            // never used in arithmetic, so its width cannot be observed — a
+            // `Long` pattern keeps the `Int` node and needs no separate lowering.
+            Tok::Long(n) => {
+                self.advance();
+                Ok(Pattern::Literal(Expr::Int(n)))
+            }
             Tok::Float(f) => {
                 self.advance();
                 Ok(Pattern::Literal(Expr::Float(f)))
@@ -2197,7 +2213,7 @@ impl Parser {
             Tok::Minus => {
                 self.advance();
                 match self.advance() {
-                    Tok::Int(n) => Ok(Pattern::Literal(Expr::Int(-n))),
+                    Tok::Int(n) | Tok::Long(n) => Ok(Pattern::Literal(Expr::Int(n.wrapping_neg()))),
                     Tok::Float(f) => Ok(Pattern::Literal(Expr::Float(-f))),
                     other => Err(format!(
                         "scalars: expected a numeric literal after `-` in a pattern, found {other} (line {})",

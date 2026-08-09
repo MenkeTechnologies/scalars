@@ -26,6 +26,11 @@ pub struct Token {
 pub enum Tok {
     // literals & names
     Int(i64),
+    /// An `L`-suffixed integer literal. Carries the same value as [`Tok::Int`];
+    /// the suffix is kept (rather than dropped, as the float suffixes are)
+    /// because `Long` and `Int` differ in WIDTH, and the compiler needs the
+    /// static distinction to decide whether an expression wraps at 32 bits.
+    Long(i64),
     Float(f64),
     Str(String),
     /// A `Char` literal (`'a'`, `'\n'`). Separate from [`Tok::Str`] because
@@ -130,6 +135,7 @@ impl Tok {
         matches!(
             self,
             Tok::Int(_)
+                | Tok::Long(_)
                 | Tok::Float(_)
                 | Tok::Str(_)
                 | Tok::Char(_)
@@ -153,6 +159,7 @@ impl Tok {
         matches!(
             self,
             Tok::Int(_)
+                | Tok::Long(_)
                 | Tok::Float(_)
                 | Tok::Str(_)
                 | Tok::Char(_)
@@ -316,17 +323,23 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     i += 1;
                 }
                 let text = &src[start..i];
+                let mut is_long = false;
                 if i < bytes.len() && matches!(bytes[i], b'L' | b'l') {
+                    is_long = true;
                     i += 1;
                 }
                 let v = u64::from_str_radix(text, 16)
                     .map_err(|_| format!("scalars: bad hex literal `{text}` on line {line}"))?;
-                let v = if text.len() <= 8 {
+                // An `Int`-width hex literal denotes a BIT PATTERN, so `0xFFFFFFFF`
+                // is `-1`. The `L` suffix makes it `Long`-width instead, where the
+                // same digits are the positive 4294967295 — so the sign extension
+                // is exactly what the suffix suppresses.
+                let v = if text.len() <= 8 && !is_long {
                     i64::from(v as u32 as i32)
                 } else {
                     v as i64
                 };
-                push!(Tok::Int(v), line);
+                push!(if is_long { Tok::Long(v) } else { Tok::Int(v) }, line);
                 continue;
             }
             let start = i;
@@ -361,10 +374,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
             }
-            // long/float/double suffixes are accepted and dropped
+            // The float/double suffixes are accepted and dropped — they name a
+            // type the value model already has. `L` is KEPT, because `Long` and
+            // `Int` are the same runtime representation but different WIDTHS,
+            // and only the suffix says which one a literal is.
+            let mut is_long = false;
             if i < bytes.len() && matches!(bytes[i], b'L' | b'l' | b'f' | b'F' | b'd' | b'D') {
                 if matches!(bytes[i], b'f' | b'F' | b'd' | b'D') {
                     is_float = true;
+                } else {
+                    is_long = true;
                 }
                 i += 1;
             }
@@ -375,10 +394,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     .map_err(|_| format!("scalars: bad float literal `{text}` on line {line}"))?;
                 push!(Tok::Float(v), line);
             } else {
-                let v: i64 = text
-                    .parse()
-                    .map_err(|_| format!("scalars: bad integer literal `{text}` on line {line}"))?;
-                push!(Tok::Int(v), line);
+                // `Long.MinValue` is written `-9223372036854775808L`, and the
+                // sign is a separate token — so the MAGNITUDE the lexer sees is
+                // one past `i64::MAX`. Parse as `u64` and wrap, which lands on
+                // `i64::MIN`; the parser's literal-negation fold then negates it
+                // back to itself. Anything genuinely too large still errors.
+                let v: i64 = match text.parse::<i64>() {
+                    Ok(v) => v,
+                    Err(_) => text.parse::<u64>().map(|u| u as i64).map_err(|_| {
+                        format!("scalars: bad integer literal `{text}` on line {line}")
+                    })?,
+                };
+                push!(if is_long { Tok::Long(v) } else { Tok::Int(v) }, line);
             }
             continue;
         }

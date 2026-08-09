@@ -285,10 +285,18 @@ Implemented and checked against the reference `scala`:
   iteration order are all ported, so a set or map keyed by another *collection*
   orders correctly too). Mutable `Array` too — `Array(a, b)`,
   `new Array[T](n)` (zero-filled per `T`), `a(i)` reads and `a(i) = v` writes.
-- **The bitwise and shift operators** — `&`, `|`, `^`, `~`, `<<`, `>>`, `>>>` on
-  `Int` (evaluated at 32-bit `Int` width, so `1 << 33` is `2`), `&`/`|`/`^` on
-  `Boolean`, `&`/`|`/`&~` on `Set`, and hexadecimal literals. Precedence follows
-  the SLS's first-character table, which is where `&&`/`||` get theirs too.
+- **The bitwise and shift operators** — `&`, `|`, `^`, `~`, `<<`, `>>`, `>>>`,
+  each evaluated at its receiver's width, so `1 << 33` is `2` while `1L << 33` is
+  `8589934592`; plus `&`/`|`/`^` on `Boolean`, `&`/`|`/`&~` on `Set`, and
+  hexadecimal literals. Precedence follows the SLS's first-character table,
+  which is where `&&`/`||` get theirs too.
+- **32-bit `Int` overflow** — `2147483647 + 1` is `-2147483648`, as are
+  `-Int.MinValue` and `math.abs(Int.MinValue)`, while a `Long` operand promotes
+  the expression so it does not wrap (`2147483647 + 1L` is `2147483648`) and
+  `Long` itself wraps at 64. The runtime is dynamically typed, so the `Int`/`Long`
+  split is decided statically from literals, declared types and the methods whose
+  result type is fixed; see `BUGS.md` for the positions where no width can be
+  proven and the 64-bit answer is kept instead of a guessed one.
 - **Partial functions** — a `{ case … }` literal answers `isDefinedAt` as well
   as `apply`, which is what `collect`/`collectFirst` need to skip a
   non-matching element; `applyOrElse`, `lift`, `orElse`, `andThen` and
