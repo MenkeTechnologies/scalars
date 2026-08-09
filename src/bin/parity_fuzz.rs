@@ -2532,6 +2532,25 @@ fn render(bytes: &[u8]) -> String {
     text.to_string()
 }
 
+/// Whether OUR side failed before the program ever ran.
+///
+/// `run_prog` answers `exit == -1` only for its own failures — it could not
+/// write the temp file, or could not spawn the binary. A program that actually
+/// ran always reports the status it exited with, so `-1` is never a program
+/// result. It is the machine's state (a full disk, a process limit), and
+/// counting it as a divergence measures the machine rather than the frontend.
+/// A full disk did exactly that to one run of the `overflow` mode: the oracle
+/// exited 1 with no output, our side could not write its temp file, and
+/// `differs` read "the oracle failed and we did not" as a parity gap.
+///
+/// Deliberately narrow. An ORACLE exiting non-zero is NOT excused here: "scala
+/// rejects a program we accept" is a real and important divergence, and
+/// discarding it would hide the class of bug this fuzzer exists to find. Only
+/// a timeout (above) and our own `-1` are treated as pathology.
+fn harness_failed(ours: &RunOut) -> bool {
+    ours.exit == -1
+}
+
 fn diverges(probes: &[String], ours: &Path, oracle: &Path, timeout: Duration) -> bool {
     let src = build_program(probes);
     let o = run_prog(oracle, &src, timeout);
@@ -2539,6 +2558,9 @@ fn diverges(probes: &[String], ours: &Path, oracle: &Path, timeout: Duration) ->
         return false; // oracle-side pathology, not a parity gap
     }
     let r = run_prog(ours, &src, timeout);
+    if harness_failed(&r) {
+        return false; // our side never ran; nothing was compared
+    }
     differs(&o, &r)
 }
 
@@ -2711,7 +2733,7 @@ fn main() {
         let full = build_program(&probes);
         let o = run_prog(&oracle, &full, args.timeout);
         let r = run_prog(&ours, &full, args.timeout);
-        let diverged = !o.timed_out && differs(&o, &r);
+        let diverged = !o.timed_out && !harness_failed(&r) && differs(&o, &r);
         let show = if diverged {
             minimize(&probes, &ours, &oracle, args.timeout)
         } else {
@@ -2733,6 +2755,12 @@ fn main() {
             mr.exit, mr.timed_out
         );
         println!("{}", render(&mr.stdout));
+        // Our side failing to start is not a match — nothing was compared — so
+        // it gets its own status rather than passing as green.
+        if harness_failed(&mr) {
+            println!("--- HARNESS ERROR (our side never ran; nothing compared) ---");
+            std::process::exit(2);
+        }
         println!("--- {} ---", if diverged { "DIVERGE" } else { "match" });
         std::process::exit(if diverged { 1 } else { 0 });
     }
@@ -2748,6 +2776,10 @@ fn main() {
     // the whole `breaks` mode zero (see `build_program`). Counting it is what
     // makes a barren run visible instead of green.
     let signal = AtomicU64::new(0);
+    // Programs our side never ran at all (see `harness_failed`). Reported as
+    // its own bucket rather than folded into either the clean or the diverging
+    // count, because it is neither: nothing was compared.
+    let harness_errs = AtomicU64::new(0);
     let stop = AtomicBool::new(false);
     let divergences: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     let start = Instant::now();
@@ -2789,10 +2821,16 @@ fn main() {
                 if o.timed_out || r.timed_out {
                     timeouts.fetch_add(1, Ordering::Relaxed);
                 }
-                if !o.timed_out && (o.exit == 0 || !o.stdout.is_empty()) {
+                let harness_err = harness_failed(&r);
+                if harness_err {
+                    harness_errs.fetch_add(1, Ordering::Relaxed);
+                }
+                // A program our side never ran is not comparable either, so it
+                // does not count as signal any more than the oracle's silence does.
+                if !o.timed_out && !harness_err && (o.exit == 0 || !o.stdout.is_empty()) {
                     signal.fetch_add(1, Ordering::Relaxed);
                 }
-                if !o.timed_out && differs(&o, &r) {
+                if !o.timed_out && !harness_err && differs(&o, &r) {
                     let minimal = minimize(&probes, &ours, &oracle, args.timeout);
                     // re-verify the shrunk case actually reproduces
                     if !diverges(&minimal, &ours, &oracle, args.timeout) {
@@ -2820,9 +2858,13 @@ fn main() {
                 }
                 if done % 20 == 0 {
                     let n = divergences.lock().unwrap().len();
+                    // The harness-error count rides along so a run that has
+                    // stopped comparing anything is visible while it happens,
+                    // not only in the summary.
                     eprintln!(
-                        "  {done}/{} programs, {n} divergences, {:.1} prog/s",
+                        "  {done}/{} programs, {n} divergences, {} harness-err, {:.1} prog/s",
                         args.count,
+                        harness_errs.load(Ordering::Relaxed),
                         done as f64 / start.elapsed().as_secs_f64().max(0.001)
                     );
                 }
@@ -2833,6 +2875,7 @@ fn main() {
     let checked = checked.load(Ordering::Relaxed);
     let timeouts = timeouts.load(Ordering::Relaxed);
     let signal = signal.load(Ordering::Relaxed);
+    let harness_errs = harness_errs.load(Ordering::Relaxed);
     let mut divergences: Vec<(u64, String)> = divergences.into_inner().unwrap();
     divergences.sort_by_key(|(seed, _)| *seed);
     let divergences: Vec<String> = divergences.into_iter().map(|(_, r)| r).collect();
@@ -2841,6 +2884,7 @@ fn main() {
     println!(
         "\nfuzzed {checked} programs ({} probes) in {:.1}s\n\
          divergences : {}\n\
+         harness-err : {harness_errs}/{checked}\n\
          timeouts    : {}\n\
          no-signal   : {}/{checked}",
         checked as usize * args.probes,
@@ -2868,6 +2912,19 @@ fn main() {
             println!("\n{d}");
         }
         std::process::exit(1);
+    }
+    // Excusing a harness error is only half the job. A bucket nothing consumes
+    // is worthless: a run where our side never started on a tenth of the
+    // programs compared far less than it claims, and printing that as green is
+    // precisely the false clean this whole change exists to prevent. So the
+    // count reaches the exit status once it stops being incidental.
+    if harness_errs * 10 > checked {
+        eprintln!(
+            "parity-fuzz: HARNESS ERRORS DOMINATE — our side never ran on {harness_errs}/{checked} \
+             programs (temp-file write or spawn failed; a full disk does this). Those programs \
+             were not compared, so this is not a clean run."
+        );
+        std::process::exit(2);
     }
     // A run that compared NOTHING is not a pass. `--count 0`, `--probes 0`, and
     // an oracle that rejected every program all reach the line below with zero
