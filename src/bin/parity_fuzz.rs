@@ -194,14 +194,25 @@ const EDGE_LONGS: &[&str] = &[
 /// Every arm mixes boundary operands, because the wrap is only observable there.
 /// The `Long` arms matter as much as the `Int` ones: a frontend that narrowed
 /// everything unconditionally would pass all the `Int` probes and fail these.
+///
+/// Arms 0-13 put the arithmetic where the WIDTH IS WRITTEN ON IT — a literal, a
+/// `val` initializer, a `def` parameter's annotation. Scala also supplies a
+/// width from CONTEXT, and an expression's syntactic position was what decided
+/// whether this frontend wrapped: arms 14 and up put the same boundary operands
+/// inside a lambda over a typed collection, a class field, a `def` with a
+/// declared return type, and an accumulating fold. Without them the mode scores
+/// clean over half the rule.
 fn g_overflow(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
     let a = pick(r, EDGE_INTS);
     let b = pick(r, EDGE_INTS);
     let c = pick(r, EDGE_INTS);
     let l = pick(r, EDGE_LONGS);
     let op = pick(r, AOPS);
     let op2 = pick(r, AOPS);
-    match r.below(14) {
+    match r.below(24) {
+        // ── the width is written on the expression ──
         // Plain binary and nested arithmetic at the boundary.
         0 => format!("println({a} {op} {b})"),
         1 => format!("println(({a} {op} {b}) {op2} {c})"),
@@ -224,9 +235,38 @@ fn g_overflow(r: &mut Rng) -> String {
         // The conversions and `abs`, both of which narrow.
         12 => format!("println({l}.toInt); println(({a}).abs)"),
         // A `val` whose width is inferred from its initializer.
-        _ => format!("{{ val v = {a}; println(v {op} {b}) }}"),
+        13 => format!("{{ val v = {a}; println(v {op} {b}) }}"),
+        // ── the width comes from context ──
+        // A lambda parameter over an `Int` collection, and the same traversal
+        // over a `Long` one, which must NOT wrap.
+        14 => format!("println(List({a}, {b}).map(x => x {op} {c}).mkString(\",\"))"),
+        15 => format!("println(List({a}, {b}).map(_ {op} {c}).mkString(\",\"))"),
+        16 => format!("println(List({l}, 1L).map(x => x {op} {c}).mkString(\",\"))"),
+        // The element width has to survive a combinator, and reach a lambda
+        // written against a DECLARED collection type.
+        17 => format!("println(List({a}, {b}).filter(x => x != 0).map(x => x {op} {c}).mkString(\",\"))"),
+        18 => format!(
+            "{{ val xs: List[Int] = List({a}, {b}); println(xs.map(x => x {op} {c}).mkString(\",\")) }}"
+        ),
+        // `reduce` binds two parameters at the element width; `sum`/`product`
+        // accumulate, so they overflow even where no element is near the edge.
+        19 => format!("println(List({a}, {b}).reduce((p, q) => p {op} q))"),
+        20 => format!("println(List({a}, {b}, {c}).sum); println(List({a}, {b}).product)"),
+        21 => format!("println((1 to 100000).sum); println(List({l}, 1L).sum)"),
+        // A class field, read from outside and from a method that names it bare.
+        22 => format!(
+            "class F{u}(val n: Int, val m: Long) {{ def own: Int = n {op} {b} }}\n\
+             {sep}{{ val f = new F{u}({a}, {l}); println(f.n {op} {b}); println(f.m {op} {b}); \
+               println(f.own) }}"
+        ),
+        // A `def` whose declared RETURN type is the only statement of its width.
+        _ => format!(
+            "{{ def r{u}(): Int = {a}; def rl{u}(): Long = {l}; \
+               println(r{u}() {op} {b}); println(rl{u}() {op} {b}) }}"
+        ),
     }
 }
+
 
 fn g_intdiv(r: &mut Rng) -> String {
     let a = pick(r, INTS);
