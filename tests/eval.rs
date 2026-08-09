@@ -2711,3 +2711,24 @@ fn applying_a_field_reads_the_field_and_applies_that() {
            object T extends App { println(Row("x").nope(1)) }"#);
     assert!(!bad, "an unknown member must still be rejected");
 }
+
+#[test]
+fn a_char_range_is_refused_rather_than_read_as_integers() {
+    // `'a' to 'e'` is a `NumericRange[Char]`. Reading the endpoints as integers
+    // answered `List(0)` — a silent wrong answer, which this frontend does not
+    // ship. Every spelling is refused, including endpoints held in bindings.
+    for src in [
+        "println(('a' to 'e').toList)",
+        "println(('a' until 'e').size)",
+        "for (c <- 'a' to 'd') print(c)",
+        "val a = 'a'; val z = 'e'; println((a to z).toList)",
+    ] {
+        let (out, ok) = run(&wrap(src));
+        assert!(!ok, "a Char range must be refused: {src}");
+        assert_eq!(out, "", "a refused Char range must print nothing: {src}");
+    }
+    // The integer range it would be confused with is untouched.
+    let (out, ok) = run(&wrap("println((1 to 4).toList); println((1 until 4).size)"));
+    assert!(ok);
+    assert_eq!(out, "List(1, 2, 3, 4)\n3\n");
+}

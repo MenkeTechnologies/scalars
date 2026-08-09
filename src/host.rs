@@ -1621,8 +1621,13 @@ fn b_list_cons(vm: &mut VM, _argc: u8) -> Value {
 fn b_range_list(vm: &mut VM, _argc: u8) -> Value {
     let step = vm.pop().to_int();
     let inclusive = matches!(vm.pop(), Value::Bool(true));
-    let end = vm.pop().to_int();
-    let start = vm.pop().to_int();
+    let end_v = vm.pop();
+    let start_v = vm.pop();
+    if let Err(e) = reject_char_endpoint(&start_v, &end_v) {
+        return fault(vm, e);
+    }
+    let end = end_v.to_int();
+    let start = start_v.to_int();
     if step == 0 {
         return fault(vm, "java.lang.IllegalArgumentException: step cannot be 0.");
     }
@@ -1646,6 +1651,19 @@ fn b_range_list(vm: &mut VM, _argc: u8) -> Value {
     // materialized range as a `Vector` so a range-led comprehension renders as
     // Scala's `Vector(...)`, not `List(...)`.
     heap_push(HeapVal::Seq(SeqKind::Vector, items))
+}
+
+/// `'a' to 'e'` is a `NumericRange[Char]`, which this frontend does not build.
+/// A `Char` endpoint would read as an integer here and the range would come out
+/// silently wrong, so it is refused instead. The compiler already refuses the
+/// literal spelling; this catches the endpoints that arrive as values.
+fn reject_char_endpoint(start: &Value, end: &Value) -> Result<(), String> {
+    if as_char(start).is_some() || as_char(end).is_some() {
+        return Err("scalars: a Char range (`'a' to 'z'`) is not modeled — its \
+                    NumericRange[Char] has no representation here"
+            .to_string());
+    }
+    Ok(())
 }
 
 /// Read a tuple/seq's elements (a `Tuple2` is a 2-element sequence).
@@ -4511,8 +4529,13 @@ fn b_array_fill(vm: &mut VM, _argc: u8) -> Value {
 fn b_make_range(vm: &mut VM, _argc: u8) -> Value {
     let step = vm.pop().to_int();
     let inclusive = matches!(vm.pop(), Value::Bool(true));
-    let end = vm.pop().to_int();
-    let start = vm.pop().to_int();
+    let end_v = vm.pop();
+    let start_v = vm.pop();
+    if let Err(e) = reject_char_endpoint(&start_v, &end_v) {
+        return fault(vm, e);
+    }
+    let end = end_v.to_int();
+    let start = start_v.to_int();
     match range_items(start, end, inclusive, step) {
         Ok(items) => new_seq(
             SeqKind::Range {

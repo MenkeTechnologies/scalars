@@ -978,6 +978,7 @@ impl Compiler {
                 inclusive,
                 step,
             } => {
+                Self::reject_char_range(start, end)?;
                 self.expr(start)?;
                 let vplace = self.declare_place(name);
                 self.emit_store(vplace);
@@ -2547,6 +2548,7 @@ impl Compiler {
         // rebuilds it through the host (see `crate::host`), so `(1 to 9 by 2)`
         // is one range value rather than a chain of collections.
         if (name == "to" || name == "until") && args.len() == 1 {
+            Self::reject_char_range(recv, &args[0])?;
             self.expr(recv)?;
             self.expr(&args[0])?;
             self.b.emit(
@@ -2989,6 +2991,22 @@ impl Compiler {
 
     /// Resolve a name that already exists (a read, or an assignment target). A
     /// function-local slot wins; otherwise it is a global.
+    /// A `Char`-endpoint range (`'a' to 'e'`) is Scala's `NumericRange[Char]`,
+    /// which this frontend does not build: the endpoints would be read as
+    /// integers and the range would come out silently wrong (`List(0)`, size 1)
+    /// rather than as the characters. Reject it, per the rule that an
+    /// unsupported construct is an error and never a mis-run.
+    fn reject_char_range(start: &Expr, end: &Expr) -> Result<(), String> {
+        if matches!(start, Expr::Char(_)) || matches!(end, Expr::Char(_)) {
+            return Err(
+                "scalars: a Char range (`'a' to 'z'`) is not modeled — its NumericRange[Char] \
+                 has no representation here"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     fn resolve_place(&mut self, name: &str) -> Place {
         if let Some(scope) = &self.scope {
             if let Some(&slot) = scope.slots.get(name) {

@@ -319,6 +319,16 @@ reported as parse/compile errors, never silently mis-run.
   printing the iterator itself differs, and Scala's own `Iterator.toString` is
   unreproducible anyway. Likewise `grouped`/`sliding` answer the `List` of
   windows rather than an `Iterator`.
+- **A `Char` range — `'a' to 'e'`, `'a' until 'z'`, `for (c <- 'a' to 'd')`.**
+  Scala's is a `NumericRange[Char]`, which this frontend has no representation
+  for: a `Char` is a heap value here, so reading the endpoints as integers built
+  `Range 0 to 0` and answered `List(0)`, `size` 1, `contains('c')` false. That is
+  a silent wrong answer, so it is now REFUSED — at compile time for a `Char`
+  literal endpoint, and in `MAKE_RANGE`/`RANGE_LIST` for endpoints that arrive as
+  values. Write `('a'.toInt to 'e'.toInt).map(_.toChar)`. The one spelling that
+  still escapes both checks is a *counted `for` loop* whose endpoints are BOTH
+  `Char` variables (`val a = 'a'; val z = 'z'; for (c <- a to z)`), which lowers
+  to inline loop bytecode rather than through either builtin.
 - **Sorting by a user `Ordering`.** `sorted(ord)`, `sortBy` with an explicit
   `Ordering`, and `Ordered`/`Comparable` on a user class. The built-in ordering
   covers numbers, `String`, `Boolean` and tuples of those; anything else
