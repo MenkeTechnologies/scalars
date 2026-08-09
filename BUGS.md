@@ -710,10 +710,12 @@ stays poisoned and the result is not narrowed to 32 bits:
     println((if (true) -2147483648 else 0).abs)   // scala: -2147483648
                                                   // scalars: 2147483648
 
-Declining to narrow is not the harmless direction it looks like: at the `Int`
-boundary `abs` is exactly where the two widths disagree. `(-2147483648).abs`
-and `x.abs` for a proven `x` are both correct; only the unproven receiver is
-wrong.
+The instinct here is that skipping a narrow is the conservative choice. It is
+not. **Declining to narrow is not the safe direction, because the `Int`
+boundary is exactly where the widths disagree** — `abs` is the operation whose
+answer differs between 32 and 64 bits, so refusing to commit to a width does
+not abstain, it silently picks the 64-bit one. `(-2147483648).abs` and `x.abs`
+for a proven `x` are both correct; only the unproven receiver is wrong.
 
 **Compile time is exponential in the length of the method chain.** Deciding the
 exemption calls `num_ty` on the receiver, which re-enters `method_width` for a
@@ -734,3 +736,33 @@ memoise the width walk or to prove the common receiver shapes without
 re-entering `num_ty`; simply treating every non-literal receiver as unprovable
 is NOT a fix, because it produces the wrong answer above for `(-2147483648 + 0).abs`
 as well.
+
+## Operational: a fuzz number from a shared checkout is not trustworthy
+
+Several agent sessions work this repo at once, against ONE working copy and one
+`target/`. `parity-fuzz` spawns `target/debug/scala` fresh for every program, so
+it reads that path thousands of times over a run lasting tens of minutes. Any
+`cargo build` in any other session — including one that only asks for a
+different binary, since the library is shared — relinks `target/debug/scala`
+underneath a run already in progress.
+
+The failure is silent, which is what makes it worse than a crash. The peer's
+run does not error; it simply compares its first N programs against one binary
+and its remaining programs against another, then prints a single clean score
+for both halves. Nothing in the output says which binary produced which result,
+and a divergence introduced by the newer code reads as a divergence in the
+older. This session did it: a 4000-program run was measuring a build that was
+replaced mid-run, and its partial number had to be discarded rather than
+reported.
+
+So: **a clean fuzz number is evidence only if no other session built during it.**
+Before quoting one, confirm the binary's mtime predates the run's start. Before
+building, check whether a peer has a run in flight (`pgrep -f parity-fuzz`) —
+and if one does, either wait or accept that you are invalidating their result.
+
+An untaken mitigation, recorded rather than implemented: have the harness copy
+the frontend to a pid-suffixed path once at startup and spawn that copy, the way
+scratch files are already namespaced per pid. The run then holds its own
+immutable binary and a peer's rebuild cannot reach it. It costs one file copy
+per run and would make the number self-contained; it has NOT been done, so today
+the discipline above is the only protection.
