@@ -830,6 +830,7 @@ impl Compiler {
                 self.b.patch_jump(ok, end);
                 Ok(())
             }
+            StmtKind::PlaceAssign { place, op, value } => self.place_assign(place, *op, value),
             StmtKind::Assign { name, op, value } => {
                 // Scala rejects reassignment to a `val` at compile time; so do
                 // we — except for `+=`/`-=`, which on a `val` can only be the
@@ -2336,6 +2337,161 @@ impl Compiler {
         self.narrow(w, 0);
         let end = self.b.current_pos();
         self.b.patch_jump(to_end, end);
+        Ok(())
+    }
+
+    /// Lower a compound assignment whose target is not a plain name —
+    /// `a(i) += 1`, `m(k) *= 2`, `obj.field += 1`.
+    ///
+    /// Scala resolves `l op= r` (SLS 6.12.4) by preferring an `op=` **member**
+    /// on `l` and falling back to `l = l op r`. For an *application* target that
+    /// expansion is `l.update(args, l.apply(args) op r)`, which is what the
+    /// index arm emits; the preference for a `+=` member is the same run-time
+    /// test every other compound assignment takes ([`Compiler::compound_tail`]),
+    /// so an element that is itself growable (`m(k) += 7` over `ListBuffer`
+    /// values) mutates in place and the write-back stores the handle the slot
+    /// already held.
+    ///
+    /// The receiver and every index are evaluated ONCE, into temporaries,
+    /// because Scala evaluates them once and they may have side effects
+    /// (`counts(next()) += 1` must not advance twice).
+    fn place_assign(&mut self, place: &Expr, op: AssignOp, value: &Expr) -> Result<(), String> {
+        let (recv, args, line) = match place {
+            // `a(i)` reaches here as a bare call from `primary`, or as an
+            // `apply` on a computed receiver (`xs.head(i)`) — the same two
+            // shapes the plain `a(i) = v` sugar accepts.
+            Expr::Call { name, args, line } => (Expr::Var(name.clone()), args.clone(), *line),
+            Expr::Method {
+                recv,
+                name,
+                args,
+                line,
+            } if name == "apply" => ((**recv).clone(), args.clone(), *line),
+            // `obj.field op= e` — a selection with no argument list.
+            Expr::Method {
+                recv,
+                name,
+                args,
+                line,
+            } if args.is_empty() => {
+                return self.select_assign(recv, name, op, value, *line);
+            }
+            _ => {
+                return Err("cannot compound-assign to this expression".to_string());
+            }
+        };
+        self.obj_counter += 1;
+        let n = self.obj_counter;
+        // The leading space keeps these names out of the user namespace.
+        self.expr(&recv)?;
+        let r = self.declare_place(&format!(" pa_r{n}"));
+        self.emit_store(r);
+        let mut idx = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            self.expr(a)?;
+            let s = self.declare_place(&format!(" pa_a{n}_{i}"));
+            self.emit_store(s);
+            idx.push(s);
+        }
+        // `recv.update(idx…, recv.apply(idx…) op value)` — the update call's
+        // receiver and indices are pushed first, then the new element value.
+        self.emit_load(r);
+        for s in &idx {
+            self.emit_load(*s);
+        }
+        self.emit_load(r);
+        for s in &idx {
+            self.emit_load(*s);
+        }
+        let ac = self.b.add_constant(Value::str("apply".to_string()));
+        self.b.emit(Op::LoadConst(ac), line);
+        self.b.emit(
+            Op::CallBuiltin(crate::host::SMETHOD, idx.len() as u8 + 2),
+            line,
+        );
+        self.compound_tail(op, value, NumTy::Unknown)?;
+        let uc = self.b.add_constant(Value::str("update".to_string()));
+        self.b.emit(Op::LoadConst(uc), line);
+        self.b.emit(
+            Op::CallBuiltin(crate::host::SMETHOD, idx.len() as u8 + 3),
+            line,
+        );
+        self.b.emit(Op::Pop, 0); // discard the `Unit` result
+        Ok(())
+    }
+
+    /// Lower `obj.field op= e` — a compound assignment through an explicit
+    /// receiver, the counterpart of [`Compiler::field_assign`]'s implicit `this`.
+    ///
+    /// Scala's "prefer the `op=` member" rule decides more here than it does for
+    /// a name: when the current value is growable the member call mutates it in
+    /// place and there is nothing to store back, and the receiver need not be a
+    /// record at all (`buffers.head += 3` selects a method, not a field). So the
+    /// growable test picks not just the operation but whether a write-back is
+    /// emitted; only the arithmetic branch performs one.
+    fn select_assign(
+        &mut self,
+        recv: &Expr,
+        field: &str,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        self.obj_counter += 1;
+        let n = self.obj_counter;
+        self.expr(recv)?;
+        let r = self.declare_place(&format!(" ps_r{n}"));
+        self.emit_store(r);
+        // The current value, read once through the ordinary selection path.
+        self.emit_load(r);
+        let fc = self.b.add_constant(Value::str(field.to_string()));
+        self.b.emit(Op::LoadConst(fc), line);
+        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), line);
+        if matches!(op, AssignOp::Add | AssignOp::Sub) && self.has_mutable {
+            let method = if op == AssignOp::Add { "+=" } else { "-=" };
+            self.b.emit(Op::Dup, 0);
+            self.b.emit(Op::CallBuiltin(crate::host::IS_GROWABLE, 1), 0);
+            let to_arith = self.b.emit(Op::JumpIfFalse(0), 0);
+            // Growable: the member call mutates in place, so no write-back.
+            self.expr(value)?;
+            let mc = self.b.add_constant(Value::str(method.to_string()));
+            self.b.emit(Op::LoadConst(mc), line);
+            self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 3), line);
+            self.b.emit(Op::Pop, 0);
+            let to_end = self.b.emit(Op::Jump(0), 0);
+            let arith = self.b.current_pos();
+            self.b.patch_jump(to_arith, arith);
+            self.emit_place_store(r, field, op, value, line)?;
+            let end = self.b.current_pos();
+            self.b.patch_jump(to_end, end);
+            return Ok(());
+        }
+        self.emit_place_store(r, field, op, value, line)
+    }
+
+    /// The arithmetic half of [`Compiler::select_assign`]: the field's current
+    /// value is on the stack, so finish the operation and store it back with
+    /// [`OBJ_SET`].
+    fn emit_place_store(
+        &mut self,
+        r: Place,
+        field: &str,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        self.compound_tail(op, value, NumTy::Unknown)?;
+        // OBJ_SET pops `[recv, name, value]`, so the computed value is parked in
+        // a temporary while the receiver and name are pushed under it.
+        self.obj_counter += 1;
+        let t = self.declare_place(&format!(" ps_v{}", self.obj_counter));
+        self.emit_store(t);
+        self.emit_load(r);
+        let fc = self.b.add_constant(Value::str(field.to_string()));
+        self.b.emit(Op::LoadConst(fc), line);
+        self.emit_load(t);
+        self.b.emit(Op::CallBuiltin(crate::host::OBJ_SET, 3), line);
+        self.b.emit(Op::Pop, 0); // discard the `Unit` result
         Ok(())
     }
 
@@ -3959,6 +4115,9 @@ fn body_any(body: &[Stmt], pred: &impl Fn(&Expr) -> bool) -> bool {
         StmtKind::Local { init, .. } => init.as_ref().is_some_and(|e| expr_any(e, pred)),
         StmtKind::Destructure { init, .. } => expr_any(init, pred),
         StmtKind::Assign { value, .. } => expr_any(value, pred),
+        StmtKind::PlaceAssign { place, value, .. } => {
+            expr_any(place, pred) || expr_any(value, pred)
+        }
         StmtKind::Expr(e) => expr_any(e, pred),
         StmtKind::If { cond, then, els } => {
             expr_any(cond, pred) || body_any(then, pred) || body_any(els, pred)
@@ -4108,6 +4267,9 @@ fn stmts_have_return(stmts: &[Stmt]) -> bool {
         StmtKind::Local { init, .. } => init.as_ref().is_some_and(expr_has_return),
         StmtKind::Destructure { init, .. } => expr_has_return(init),
         StmtKind::Assign { value, .. } => expr_has_return(value),
+        StmtKind::PlaceAssign { place, value, .. } => {
+            expr_has_return(place) || expr_has_return(value)
+        }
         // Lifted into `Program::functions` before compiling; its own `return`s
         // are local to it, not to the enclosing body.
         StmtKind::DefDecl(_) => false,
@@ -5100,6 +5262,12 @@ impl BoxScan {
                     }
                     self.expr(value, in_lambda);
                 }
+                // A place assignment mutates *through* a handle; it never
+                // rebinds the name holding it, so nothing here needs boxing.
+                StmtKind::PlaceAssign { place, value, .. } => {
+                    self.expr(place, in_lambda);
+                    self.expr(value, in_lambda);
+                }
                 StmtKind::Expr(e) => self.expr(e, in_lambda),
                 StmtKind::If { cond, then, els } => {
                     self.expr(cond, in_lambda);
@@ -5270,6 +5438,12 @@ fn fv_block(
             }
             StmtKind::Assign { name, value, .. } => {
                 fv_note(name, &b, out, seen);
+                fv_expr(value, &b, out, seen);
+            }
+            // The target is an expression, so the handle it reads is a free
+            // READ (`a` in `a(i) += 1`), already reported by scanning `place`.
+            StmtKind::PlaceAssign { place, value, .. } => {
+                fv_expr(place, &b, out, seen);
                 fv_expr(value, &b, out, seen);
             }
             StmtKind::Expr(e) => fv_expr(e, &b, out, seen),

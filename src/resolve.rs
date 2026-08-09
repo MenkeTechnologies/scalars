@@ -452,6 +452,12 @@ impl Resolver {
                 }
                 Ok(())
             }
+            // The target is mutated through a handle, not rebound, so unlike
+            // `Assign` it records no `assigns` entry for the lifted `def`.
+            StmtKind::PlaceAssign { place, value, .. } => {
+                self.walk_expr(place)?;
+                self.walk_expr(value)
+            }
             StmtKind::Expr(e) => self.walk_expr(e),
             StmtKind::If { cond, then, els } => {
                 self.walk_expr(cond)?;
@@ -744,6 +750,10 @@ fn cs_block(stmts: &mut [Stmt], sigs: &HashMap<String, Sig>) {
             }
             StmtKind::Destructure { init, .. } => cs_expr(init, sigs),
             StmtKind::Assign { value, .. } => cs_expr(value, sigs),
+            StmtKind::PlaceAssign { place, value, .. } => {
+                cs_expr(place, sigs);
+                cs_expr(value, sigs);
+            }
             StmtKind::Expr(e) => cs_expr(e, sigs),
             StmtKind::If { cond, then, els } => {
                 cs_expr(cond, sigs);

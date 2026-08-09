@@ -891,6 +891,31 @@ impl Parser {
             }
         }
         let e = self.expression()?;
+        // A compound assignment whose target is not a plain name — `a(i) += 1`,
+        // `m(k) *= 2`, `obj.field += 1`. The simple-name forms are handled
+        // above; these keep the whole target expression so the compiler can
+        // evaluate its receiver and indices exactly once.
+        if let Tok::OpAssign(op) = self.peek().clone() {
+            // `xs(i) ++= ys` has no arithmetic reading: it is the growable
+            // method on the *element*, so it lowers as that call with no
+            // write-back, exactly like the plain-name form above.
+            let line = self.line();
+            self.advance();
+            let value = self.expression()?;
+            return Ok(StmtKind::Expr(Expr::Method {
+                recv: Box::new(e),
+                name: op,
+                args: vec![value],
+                line,
+            }));
+        }
+        if let Some(op) = assign_op(self.peek()) {
+            if op != AssignOp::Assign {
+                self.advance();
+                let value = self.expression()?;
+                return Ok(StmtKind::PlaceAssign { place: e, op, value });
+            }
+        }
         // `a(i) = v` — Scala's element-assignment sugar for `a.update(i, v)`.
         // The indexing form reaches here either as a bare call (`a(i)`, from
         // `primary`) or as an `apply` on a computed receiver (`xs.head(i)`).

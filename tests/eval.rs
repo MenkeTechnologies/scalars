@@ -3430,3 +3430,87 @@ fn every_builtin_id_is_distinct() {
         seen.len()
     );
 }
+
+// ── Compound assignment to a target that is not a plain name ────────────────
+//
+// Scala resolves `l op= r` by preferring an `op=` MEMBER on `l` and falling
+// back to `l = l op r`, which for an application target expands to
+// `l.update(args, l.apply(args) op r)` (SLS 6.12.4). Every expected string
+// below was diffed byte-for-byte against `scala` 3.8.4 (JVM 26) during
+// authoring.
+
+#[test]
+fn an_indexed_target_takes_the_update_expansion() {
+    let (out, ok) = run(&wrap(
+        "val a = Array(1,2,3); a(0) += 10; a(1) -= 5; a(2) *= 4; \
+         println(a(0)); println(a(1)); println(a(2)); \
+         val d = Array(7); d(0) /= 2; println(d(0)); \
+         val md = Array(7); md(0) %= 4; println(md(0)); \
+         val g = Array(Array(1,2), Array(3,4)); g(0)(1) += 9; println(g(0)(1))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "11\n-3\n12\n3\n3\n11\n");
+}
+
+#[test]
+fn an_indexed_map_and_buffer_target_updates_in_place() {
+    let (out, ok) = run(&wrap(
+        "val ab = scala.collection.mutable.ArrayBuffer(1,2); ab(0) += 10; println(ab); \
+         val m = scala.collection.mutable.Map(\"k\" -> 1); m(\"k\") += 10; println(m); \
+         val neg = scala.collection.mutable.Map(1 -> 5); neg(1) -= 8; println(neg)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "ArrayBuffer(11, 2)\nHashMap(k -> 11)\nHashMap(1 -> -3)\n");
+}
+
+#[test]
+fn a_growable_element_takes_the_member_call_not_the_arithmetic() {
+    // `+=` on a `ListBuffer` element is the growable METHOD — it mutates the
+    // buffer the slot already holds. The arithmetic expansion would need a `+`
+    // on `ListBuffer`, which Scala does not have, so picking the wrong branch
+    // here is a hard failure rather than a subtly wrong number.
+    let (out, ok) = run(&wrap(
+        "val m = scala.collection.mutable.Map(\"k\" -> scala.collection.mutable.ListBuffer(1)); \
+         m(\"k\") += 7; println(m); \
+         m(\"k\") ++= List(5,6); println(m); \
+         val nb = scala.collection.mutable.ListBuffer(scala.collection.mutable.ListBuffer(1)); \
+         nb.head += 3; println(nb)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "HashMap(k -> ListBuffer(1, 7))\n\
+         HashMap(k -> ListBuffer(1, 7, 5, 6))\n\
+         ListBuffer(ListBuffer(1, 3))\n"
+    );
+}
+
+#[test]
+fn a_field_compound_assign_reaches_an_explicit_receiver() {
+    let src = "import scala.collection.mutable\n\
+               class C(var n: Int, val items: mutable.ListBuffer[Int])\n\
+               object T extends App {\n\
+                 val c = new C(1, mutable.ListBuffer(9))\n\
+                 c.n += 5; println(c.n)\n\
+                 c.items += 4; println(c.items)\n\
+                 c.n *= 3; println(c.n)\n\
+               }\n";
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "6\nListBuffer(9, 4)\n18\n");
+}
+
+#[test]
+fn a_compound_assign_evaluates_its_target_exactly_once() {
+    // The index expression has a side effect, so a lowering that re-evaluates
+    // the target instead of parking it in a temporary answers `2` for the call
+    // count. Scala evaluates it once.
+    let (out, ok) = run(&wrap(
+        "val log = scala.collection.mutable.ListBuffer[Int](); \
+         val a = Array(1,2); \
+         def k(): Int = { log += 1; 0 }; \
+         a(k()) += 5; println(a(0)); println(log.size)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "6\n1\n");
+}

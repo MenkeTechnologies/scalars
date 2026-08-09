@@ -184,7 +184,12 @@ Implemented and checked against the reference `scala`:
 - **Bindings** — `val` / `var` with optional type ascription
   (`val x: Int = …`, `var s = …`), type inferred as storage; plain and compound
   assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`). Reassigning a `val`
-  (or a method parameter) is a compile error, as in `scalac`.
+  (or a method parameter) is a compile error, as in `scalac`. A compound
+  assignment also reaches a target that is not a plain name — `a(i) += 1`,
+  `counts(w) += 1`, `g(0)(1) += 9`, `obj.field += 5` — which Scala expands to
+  `l.update(args, l.apply(args) op r)` unless the element has an `op=` member of
+  its own, in which case that member mutates it in place. The receiver and the
+  indices are evaluated exactly once.
 - **User-defined methods** — helper `def f(a: T, b: U): R = body` alongside
   `main` (or in an `App` body) compile to fusevm's native `Op::Call` frames:
   parameters bind to per-call frame slots, so recursion and mutual recursion are

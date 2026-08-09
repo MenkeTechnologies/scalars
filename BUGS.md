@@ -75,6 +75,22 @@ reported as parse/compile errors, never silently mis-run.
   whether written infix or dotted (`n.+(1)`, `7./(2)`, `"a".*(3)`), including
   `/`'s Int-vs-Double split and its zero-divisor throw. `s * n` is
   `StringOps.*` in both spellings.
+- **Compound assignment to a target that is not a plain name.** `a(i) += 1`,
+  `m(k) *= 2`, `counts(w) += 1`, `g(0)(1) += 9`, `obj.field += 5` and
+  `obj.items += 9`, in all of `+= -= *= /= %=` plus `++=`/`--=`. Scala resolves
+  `l op= r` by preferring an `op=` **member** on `l` and falling back to
+  `l = l op r`, which for an *application* target expands to
+  `l.update(args, l.apply(args) op r)` (SLS 6.12.4). Both halves are taken: an
+  `Int` element takes the arithmetic expansion through `update`, while an
+  element that is itself growable (`m(k) += 7` over `ListBuffer` values, or a
+  selection like `nb.head += 3`) takes the member call and mutates in place, so
+  no write-back is emitted and the receiver need not be a record at all. The
+  receiver and every index are evaluated exactly ONCE, into temporaries, because
+  Scala evaluates them once and they may have side effects
+  (`counts(next()) += 1` advances one step). The choice between the two halves is
+  the same run-time `IS_GROWABLE` test a plain-name `+=` already took, so a
+  program with no mutable collection still emits exactly the arithmetic it did
+  before. Covered by the parity fuzzer's `placeassign` mode.
 - **Postfix method dispatch on core values.** `s.length`/`.size`,
   `.toUpperCase`/`.toLowerCase`, `.trim`, `.reverse`, `.isEmpty`/`.nonEmpty`,
   `.substring`, `.charAt`, `.contains`/`.startsWith`/`.endsWith`,
@@ -391,7 +407,10 @@ reported as parse/compile errors, never silently mis-run.
   a bare `Set(1, 2)` builds the immutable set. Write `mutable.Set(1, 2)`.
 - **`x += e` in expression position.** `println(buf += 1)` — Scala's `+=` is an
   expression whose value is the buffer. Here `+=` is a statement, so it is a
-  parse error rather than a mis-run. `buf += 1` on its own line works.
+  parse error rather than a mis-run. `buf += 1` on its own line works, and so
+  does every non-name target (`a(i) += 1`, `obj.f += 1`; see the supported entry
+  above) — it is the *expression position* that is unimplemented, not the target
+  shape.
 - **`xs: _*` outside an argument position.** The spread is parsed where Scala
   allows it — as an argument — and rejected everywhere else, which is also what
   Scala does. A spread handed to a parameter that is not repeated is a compile
@@ -617,12 +636,6 @@ reported as parse/compile errors, never silently mis-run.
   `f(1)` is not a function. Default values in a later group also cannot see the
   earlier group's parameters (Scala allows that; Scala 3 forbids it *within* one
   group, which is why call-site splicing of a default is otherwise exact).
-- **`xs: _*` argument spread is not parsed.** `f(List(1, 2, 3): _*)` is a parse
-  error; the varargs must be written out (`f(1, 2, 3)`).
-- **`getClass` is not modeled.** `e.getClass.getName` / `.getSimpleName` — the
-  usual way a program prints an exception's class — is an unknown-method error.
-  `toString` on a throwable already carries the fully-qualified name, so
-  `println(e)` is the working spelling.
 - **`/` is dispatched at runtime, not by static type.** Scala picks integer vs.
   floating division from the *static* operand types; there are no static types
   here, so the [`host::b_div`] builtin decides at runtime — both operands `Int`

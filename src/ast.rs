@@ -168,6 +168,19 @@ pub enum StmtKind {
         op: AssignOp,
         value: Expr,
     },
+    /// A compound assignment whose target is not a simple name: `a(i) += 1`,
+    /// `m(k) *= 2`, `obj.field += 1`.
+    ///
+    /// Scala resolves `l op= r` (SLS 6.12.4) by preferring an `op=` **member**
+    /// on `l` and falling back to `l = l op r` — which for an *application*
+    /// target is `l.update(args, l.apply(args) op r)`. A simple-name target is
+    /// [`StmtKind::Assign`]; every other target shape lands here, so the
+    /// receiver and the indices can be evaluated exactly once.
+    PlaceAssign {
+        place: Expr,
+        op: AssignOp,
+        value: Expr,
+    },
     /// An expression evaluated for its side effects: `println(x)`.
     Expr(Expr),
     /// `if (cond) { .. } else { .. }`.
