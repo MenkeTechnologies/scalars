@@ -329,10 +329,16 @@ reported as parse/compile errors, never silently mis-run.
   still escapes both checks is a *counted `for` loop* whose endpoints are BOTH
   `Char` variables (`val a = 'a'; val z = 'z'; for (c <- a to z)`), which lowers
   to inline loop bytecode rather than through either builtin.
-- **Sorting by a user `Ordering`.** `sorted(ord)`, `sortBy` with an explicit
-  `Ordering`, and `Ordered`/`Comparable` on a user class. The built-in ordering
-  covers numbers, `String`, `Boolean` and tuples of those; anything else
-  compares equal, which a stable sort leaves in input order.
+- **`Ordering` beyond the companion instances and `reverse`.** `sorted(ord)`,
+  `max(ord)`/`min(ord)` and the `Ordering` predicates (`compare`, `lt`, `gt`,
+  `lteq`, `gteq`, `equiv`, `max`, `min`) work for `Ordering.Int` and its sibling
+  companion members, in either direction. What is missing is an ordering built
+  from a function — `Ordering.by(f)`, `Ordering.fromLessThan(f)`, `ord.on(f)` —
+  and `Ordered`/`Comparable` on a user class. Note also that every companion
+  member names the SAME natural order here, since the element type it selects in
+  Scala is erased; the underlying comparison covers numbers, `String`, `Boolean`
+  and tuples of those, and anything else compares equal, which a stable sort
+  leaves in input order.
 - **Symbolic operators beyond the wired set.** `/:`, `:\` and user-defined
   symbolic method names.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
@@ -505,10 +511,10 @@ reported as parse/compile errors, never silently mis-run.
   process hanging). Every observable result matches for the sizes real programs
   use; the memory profile does not.
 - **Uninitialized bindings are unbound** rather than rejected; reading one before
-  assignment yields `null` instead of a compile error. The same value stands in
-  for `Unit`, so *printing* a `Unit` result — `println(xs.clear())`,
-  `println(println("x"))` — renders `null` where Scala renders `()`. Every other
-  use of a `Unit` value agrees.
+  assignment yields `null` instead of a compile error. `Unit` no longer shares
+  that value — it is the empty tuple the `()` literal already lowered to, so
+  `println(println("x"))` and `println(xs.foreach(f))` render `()` while `null`
+  keeps rendering `null`.
 - **`x += e` chooses the growable method at run time, not from a static type.**
   Scala calls `x.+=(e)` when the receiver's type has that method and falls back
   to `x = x + e` otherwise. There are no static types here, so a program that

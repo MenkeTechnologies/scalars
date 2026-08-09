@@ -186,6 +186,14 @@ pub const MAKE_VECTOR: u16 = 737;
 /// This is the class a Scala varargs method sees for its repeated parameter, so
 /// `def f(xs: Int*)` printing `xs` prints `ArraySeq(1, 2, 3)`.
 pub const MAKE_ARRAYSEQ: u16 = 753;
+/// Build a `scala.math.Ordering` — the value `sorted(ord)` / `max(ord)` /
+/// `min(ord)` take. Every `Ordering.Int` / `Ordering.String` / … names the same
+/// NATURAL order here, because [`value_cmp`] already compares each of those
+/// types the way Scala's instance does; what the companion member selects in
+/// Scala is the element TYPE, which a dynamically typed runtime does not need.
+/// The only state an ordering carries is therefore its direction, which
+/// `.reverse` flips.
+pub const MAKE_ORDERING: u16 = 754;
 /// Builtin id for a `Set(...)` literal: pops `argc` elements and returns the set
 /// handle (duplicates dropped; five or more elements make a `HashSet`).
 pub const MAKE_SET: u16 = 738;
@@ -392,6 +400,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(CELL_SET, b_cell_set);
     vm.register_builtin(CHAR_NEW, b_char_new);
     vm.register_builtin(UNAPPLY_SEQ, b_unapply_seq);
+    vm.register_builtin(MAKE_ORDERING, b_make_ordering);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -770,6 +779,9 @@ enum HeapVal {
     /// A built-in throwable (`new RuntimeException("…")`, or one raised by the
     /// runtime itself) — see [`ExcObj`].
     Exc(ExcObj),
+    /// A `scala.math.Ordering` — see [`MAKE_ORDERING`]. `reversed` is the whole
+    /// of its state: the natural direction, or the one `.reverse` answers.
+    Ordering { reversed: bool },
     /// A `scala.util.matching.Regex` (`"…".r`). The *source* pattern is stored,
     /// which is what `toString`/`regex` answer; the compiled automaton lives in
     /// the [`REGEX_CACHE`] keyed by that source.
@@ -1091,6 +1103,73 @@ fn char_code(v: &Value) -> Option<i64> {
 fn b_char_new(vm: &mut VM, _argc: u8) -> Value {
     let code = vm.pop().to_int();
     make_char(char_of_code(code))
+}
+
+/// The `Unit` value, as an empty tuple — the same thing the `()` literal lowers
+/// to. It is NOT `Value::Undef`: that is `null`, and the two print differently
+/// (`()` against `null`), so a `Unit`-returning method that answered `Undef`
+/// made `println(xs.foreach(f))` render `null`.
+fn unit_value() -> Value {
+    heap_push(HeapVal::Tuple(Vec::new()))
+}
+
+/// [`MAKE_ORDERING`] — build the natural `Ordering`.
+fn b_make_ordering(_vm: &mut VM, _argc: u8) -> Value {
+    heap_push(HeapVal::Ordering { reversed: false })
+}
+
+/// `scala.math.Ordering`'s methods. `reverse` flips the direction and `compare`
+/// answers the three-way result; `lt`/`gt`/`lteq`/`gteq`/`equiv` are the
+/// predicates Scala derives from `compare`, and `max`/`min` pick under it.
+fn ordering_method(reversed: bool, name: &str, args: &[Value]) -> Result<Value, String> {
+    let cmp = |a: &Value, b: &Value| {
+        let o = value_cmp(a, b);
+        if reversed {
+            o.reverse()
+        } else {
+            o
+        }
+    };
+    match (name, args.len()) {
+        ("reverse", 0) => Ok(heap_push(HeapVal::Ordering {
+            reversed: !reversed,
+        })),
+        ("compare", 2) => Ok(Value::int(match cmp(&args[0], &args[1]) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        })),
+        ("lt", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) == Ordering::Less)),
+        ("gt", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) == Ordering::Greater)),
+        ("lteq", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) != Ordering::Greater)),
+        ("gteq", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) != Ordering::Less)),
+        ("equiv", 2) => Ok(Value::bool(cmp(&args[0], &args[1]) == Ordering::Equal)),
+        // Scala's `Ordering.max`/`min` keep the FIRST argument on a tie.
+        ("max", 2) => Ok(if cmp(&args[0], &args[1]) == Ordering::Less {
+            args[1].clone()
+        } else {
+            args[0].clone()
+        }),
+        ("min", 2) => Ok(if cmp(&args[1], &args[0]) == Ordering::Less {
+            args[1].clone()
+        } else {
+            args[0].clone()
+        }),
+        _ => Err(format!("scalars: value {name} is not a member of Ordering")),
+    }
+}
+
+/// The direction of `v` when it is an `Ordering`, for the collection methods
+/// that take one (`sorted`, `max`, `min`, `maxBy`, `minBy`, `sortBy`).
+fn as_ordering(v: &Value) -> Option<bool> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Ordering { reversed }) => Some(*reversed),
+            _ => None,
+        })
+    } else {
+        None
+    }
 }
 
 /// Scala's `toChar`: the value truncated to 16 bits. An unpaired surrogate is
@@ -2034,6 +2113,10 @@ fn obj_to_string(v: &Value) -> String {
             // `Regex.toString` is the source pattern; `Match.toString` is the
             // matched text (both as in Scala/`java.util.regex`).
             Some(HeapVal::Regex(p)) => p.to_string(),
+            // Scala renders an `Ordering` as an anonymous-class identity string
+            // (`scala.math.Ordering$$anon$1@1b6d3586`), which is unreproducible
+            // and never depended on; name the class without the address.
+            Some(HeapVal::Ordering { .. }) => "scala.math.Ordering".to_string(),
             Some(HeapVal::Match { matched, .. }) => matched.to_string(),
             // A `Char` renders as its one character, everywhere text conversion
             // applies: `println`, `toString`, interpolation, and as a collection
@@ -3093,6 +3176,8 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 // A `Char` is answered by `char_method` ahead of the routed
                 // dispatchers, so it needs no kind of its own.
                 HeapVal::Char(_) => 8,
+                // Likewise an `Ordering`, which `ordering_method` answers.
+                HeapVal::Ordering { .. } => 9,
             })
         })
     } else {
@@ -3524,8 +3609,12 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(Value::Undef)
         }
-        ("min", 0) | ("max", 0) => {
-            let want = if name == "max" {
+        // `max`/`min`, with or without an explicit `Ordering`. A reversed one
+        // swaps which end they pick, so `xs.max(Ordering.Int.reverse)` is the
+        // minimum.
+        ("min", 0) | ("max", 0) | ("min", 1) | ("max", 1) => {
+            let flip = args.first().and_then(as_ordering).unwrap_or(false);
+            let want = if (name == "max") != flip {
                 Ordering::Greater
             } else {
                 Ordering::Less
@@ -3623,7 +3712,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             for it in &items {
                 invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
             }
-            Ok(Value::Undef)
+            Ok(unit_value())
         }
         // `collect` / `collectFirst` — `filter` and `map` in one pass, driven by
         // the partial function's `isDefinedAt` so an element no arm matches is
@@ -4209,7 +4298,7 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             for p in &pairs {
                 invoke_closure(vm, &args[0], std::slice::from_ref(p))?;
             }
-            Ok(Value::Undef)
+            Ok(unit_value())
         }
         _ => map_read_method(&entries, recv, name, args),
     }
@@ -4466,6 +4555,19 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
             out
         }
         ("sorted", 0) => {
+            let mut out = items.to_vec();
+            out.sort_by(value_cmp);
+            out
+        }
+        // `sorted(ord)` — the explicit `Ordering`. Scala's sort is stable, and
+        // `sort_by` is too, so a reversed ordering keeps equal elements in
+        // their original order rather than flipping them.
+        ("sorted", 1) if as_ordering(&args[0]) == Some(true) => {
+            let mut out = items.to_vec();
+            out.sort_by(|a, b| value_cmp(a, b).reverse());
+            out
+        }
+        ("sorted", 1) if as_ordering(&args[0]) == Some(false) => {
             let mut out = items.to_vec();
             out.sort_by(value_cmp);
             out
@@ -4859,7 +4961,7 @@ fn option_method(
             if let Some(v) = inner {
                 call!(&args[0], &v);
             }
-            Ok(Value::Undef)
+            Ok(unit_value())
         }
         // `fold(ifEmpty)(f)` — the parser folds the second argument list into
         // one call, so both arrive together.
@@ -4907,6 +5009,11 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     // code point 53, where `"5".toInt` parses to 5).
     if let Some(c) = as_char(recv) {
         return char_method(c, name, args);
+    }
+    // An `Ordering` handle is likewise not a record; `.reverse` on one must not
+    // reach the sequence dispatcher, which would try to reverse a collection.
+    if let Some(reversed) = as_ordering(recv) {
+        return ordering_method(reversed, name, args);
     }
     // Scala's operators ARE methods, so the dotted spelling (`n.+(1)`, `"a".*(3)`)
     // is legal wherever the infix one is. Only the primitive receivers route here:
@@ -6205,9 +6312,10 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool) -> Value {
     if newline {
         let _ = writeln!(lock);
     }
-    // `println`/`print` return `Unit`; the CallBuiltin result is discarded by a
-    // trailing Pop in statement position.
-    Value::Undef
+    // `println`/`print` return `Unit`. In statement position a trailing `Pop`
+    // discards this, but it is observable through a `Unit`-returning `def` whose
+    // body is a `println` — `println(side())` prints `()`.
+    unit_value()
 }
 
 /// Render a value with Scala's `String.valueOf`/`println` rules (as opposed to

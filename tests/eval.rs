@@ -2890,3 +2890,66 @@ fn math_abs_of_int_min_value_stays_negative() {
     ));
     assert_eq!(out, "-2147483648\n-2147483648\n");
 }
+
+// ── Unit is `()`, null is `null` ────────────────────────────────────────────
+
+#[test]
+fn a_unit_returning_def_renders_as_the_unit_literal() {
+    // `Unit` and `null` are different values with different renderings, so they
+    // cannot share one representation.
+    let src = "object T { def u(): Unit = {}\n\
+               def s(): Unit = println(\"s\")\n\
+               def main(a: Array[String]): Unit = { println(u()); println(s()); val v = u(); println(v) } }";
+    let (out, _) = run(src);
+    assert_eq!(out, "()\ns\n()\n()\n");
+}
+
+#[test]
+fn unit_from_statements_and_empty_branches() {
+    let (out, _) = run(&wrap(
+        "println(if (false) 1); println({ }); println(List(1).foreach(x => x)); println(for (i <- 1 to 2) { })",
+    ));
+    assert_eq!(out, "()\n()\n()\n()\n");
+}
+
+#[test]
+fn null_still_renders_as_null_and_compares_as_null() {
+    let (out, _) = run(&wrap(
+        "println(null); val n: String = null; println(n); println(n == null); println(List(null, \"a\"))",
+    ));
+    assert_eq!(out, "null\nnull\ntrue\nList(null, a)\n");
+}
+
+#[test]
+fn unit_values_compare_equal() {
+    let src = "object T { def u(): Unit = {}\n\
+               def main(a: Array[String]): Unit = { println(() == ()); println(u() == ()) } }";
+    let (out, _) = run(src);
+    assert_eq!(out, "true\ntrue\n");
+}
+
+// ── scala.math.Ordering ─────────────────────────────────────────────────────
+
+#[test]
+fn sorted_takes_an_explicit_ordering() {
+    let (out, _) = run(&wrap(
+        "println(List(3,1,2).sorted(Ordering.Int.reverse)); println(List(3,1,2).sorted(Ordering.Int)); println(List(\"b\",\"a\",\"c\").sorted(Ordering.String.reverse))",
+    ));
+    assert_eq!(out, "List(3, 2, 1)\nList(1, 2, 3)\nList(c, b, a)\n");
+}
+
+#[test]
+fn an_ordering_reverses_max_min_and_compare() {
+    let (out, _) = run(&wrap(
+        "println(List(3,1,2).max(Ordering.Int.reverse)); println(List(3,1,2).min(Ordering.Int.reverse)); println(Ordering.Int.compare(1,2)); println(Ordering.Int.reverse.compare(1,2))",
+    ));
+    assert_eq!(out, "1\n3\n-1\n1\n");
+}
+
+#[test]
+fn reversing_an_ordering_twice_restores_it() {
+    let (out, _) = run(&wrap(
+        "println(List(1,2).sorted(Ordering.Int.reverse.reverse)); println(Ordering.Int.lt(1,2)); println(Ordering.Int.max(3,5))",
+    ));
+    assert_eq!(out, "List(1, 2)\ntrue\n5\n");
+}

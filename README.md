@@ -54,8 +54,10 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   awkrs, elisp, and ruby runs Scala too. `jit-disk-cache` persists native code
   across runs.
 - **Scala print semantics** — `println`/`print` lower to a formatting builtin so
-  `Boolean` prints `true`/`false`, `Double` prints `3.0`, and `null` prints
-  `null` — matching `scala`, not the VM's shell-flavoured default.
+  `Boolean` prints `true`/`false`, `Double` prints `3.0`, `null` prints `null`
+  and `Unit` prints `()` — matching `scala`, not the VM's shell-flavoured
+  default. `Unit` is its own value rather than an alias for the absent one, so
+  `println(xs.foreach(f))` and `println(println("x"))` render `()`.
 - **Scala `/` semantics** — a type-dispatching division builtin truncates when
   both operands are `Int` (`7 / 2 == 3`) and floats when either is a `Double`
   (`7 / 2.0 == 3.5`), because fusevm's native divide is always floating.
@@ -71,9 +73,10 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
-  against a live `scala` across twenty-nine generators — every probe in this
-  wave's `patmatch`, `option`, `caseclass`, `strops` and `nlr` modes ran clean,
-  on top of the 61,000+ that ran clean before it.
+  against a live `scala` across forty generators — this wave added the
+  `overflow` mode, whose operands sit at the 32-bit boundary because no earlier
+  generator could reach it, and its 3,600 probes ran clean alongside every other
+  mode.
 
 The language surface today: programs with an entry point (`def main`, or an
 `extends App` body) plus sibling `class`/`object` declarations, using `val`/`var`
@@ -272,7 +275,8 @@ Implemented and checked against the reference `scala`:
   (`foldLeft`/`foldRight`/`fold`/`reduce*`), aggregates
   (`sum`/`product`/`min`/`max`/`minBy`/`maxBy`/`count`), predicates
   (`exists`/`forall`/`find`/`indexOf`/`indexWhere`/`contains`), ordering
-  (`sorted`/`sortBy`/`sortWith`/`reverse`/`distinct`), slicing
+  (`sorted` — with or without an explicit `Ordering` — `sortBy`/`sortWith`/
+  `reverse`/`distinct`), slicing
   (`take`/`drop`/`slice`/`splitAt`/`span`/`partition`/`takeWhile`/`dropWhile`/
   `init`/`tail`/`headOption`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
   `grouped`/`sliding`), `groupBy`, `mkString`, the `to*` conversions, the set
@@ -488,7 +492,8 @@ Next waves, in priority order:
 
 1. **Lazy views** — `.view` and `LazyList` (`.iterator` is wired, but strictly).
 2. **The broader standard library** — `scala.io`, `scala.collection.*` as a
-   namespace, and user `Ordering`s.
+   namespace, and an `Ordering` built from a function (`Ordering.by`).
+
 3. **The rest of `scala.collection.mutable`** — the insertion-ordered
    `LinkedHashSet`/`LinkedHashMap`, `Queue`, `Stack` and `ArrayDeque`.
 4. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement.

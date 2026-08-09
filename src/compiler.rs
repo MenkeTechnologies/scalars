@@ -670,7 +670,7 @@ impl Compiler {
             }
             // A lambda body: pass everything through, non-local return included.
             Some(UnwindKind::Lambda) => {
-                self.b.emit(Op::LoadUndef, 0);
+                self.emit_unit(0);
                 self.b.emit(Op::ReturnValue, 0);
             }
             // Top level: nothing left to unwind into, so the exception is
@@ -856,7 +856,7 @@ impl Compiler {
                     match val {
                         Some(e) => self.expr(e)?,
                         None => {
-                            self.b.emit(Op::LoadUndef, s.line);
+                            self.emit_unit(s.line);
                         }
                     };
                     self.b
@@ -873,7 +873,7 @@ impl Compiler {
                         self.b.emit(Op::ReturnValue, s.line);
                     }
                     None => {
-                        self.b.emit(Op::Return, s.line);
+                        self.emit_return_unit(s.line);
                     }
                 }
                 Ok(())
@@ -1265,7 +1265,7 @@ impl Compiler {
                 } else {
                     self.lower_for(enums, 0, body, None)?;
                     // `foreach` yields `Unit`.
-                    self.b.emit(Op::LoadUndef, 0);
+                    self.emit_unit(0);
                 }
             }
             Expr::Lambda {
@@ -1499,7 +1499,7 @@ impl Compiler {
         match els {
             Some(e) => self.expr(e)?,
             None => {
-                self.b.emit(Op::LoadUndef, 0);
+                self.emit_unit(0);
             }
         }
         let end = self.b.current_pos();
@@ -1512,7 +1512,7 @@ impl Compiler {
     /// value, or `Unit` for a non-expression last statement or an empty block).
     fn block_expr(&mut self, stmts: &[Stmt]) -> Result<(), String> {
         let Some((last, init)) = stmts.split_last() else {
-            self.b.emit(Op::LoadUndef, 0);
+            self.emit_unit(0);
             return Ok(());
         };
         for s in init {
@@ -1525,7 +1525,7 @@ impl Compiler {
             // A non-expression last statement runs for effect; the block is `Unit`.
             _ => {
                 self.stmt(last)?;
-                self.b.emit(Op::LoadUndef, 0);
+                self.emit_unit(0);
             }
         }
         Ok(())
@@ -2555,6 +2555,18 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 3), line);
             return Ok(());
         }
+        // `Ordering.Int` / `Ordering.String` / … — the companion's members are
+        // namespace, not receiver dispatch. Every one names the natural order;
+        // the element type they differ by is a typing concern the runtime does
+        // not have (see `host::MAKE_ORDERING`). `.reverse` is then an ordinary
+        // method on the value this builds.
+        if args.is_empty()
+            && matches!(recv, Expr::Var(o) if o == "Ordering")
+            && ORDERING_MEMBERS.contains(&name)
+        {
+            self.b.emit(Op::CallBuiltin(crate::host::MAKE_ORDERING, 0), line);
+            return Ok(());
+        }
         // `Int.MaxValue` and friends — the numeric companion objects' bounds.
         // These are constants, not receiver dispatch, so they fold to a literal.
         if args.is_empty() {
@@ -2912,7 +2924,7 @@ impl Compiler {
         self.push_unwind(UnwindKind::Def);
         self.tail(&m.body)?;
         self.pop_unwind_to(self.b.current_pos());
-        self.b.emit(Op::Return, 0);
+        self.emit_return_unit(0);
         self.current_class = saved_class;
 
         self.scope = None;
@@ -2948,7 +2960,7 @@ impl Compiler {
         self.push_unwind(UnwindKind::Def);
         self.tail(&m.body)?;
         self.pop_unwind_to(self.b.current_pos());
-        self.b.emit(Op::Return, 0);
+        self.emit_return_unit(0);
         self.current_object = saved_obj;
 
         self.scope = None;
@@ -3214,7 +3226,7 @@ impl Compiler {
         self.pop_unwind_to(self.b.current_pos());
         // A body that returned on every path never reaches here; one that fell
         // through (e.g. ends in a loop) returns `Unit`.
-        self.b.emit(Op::Return, 0);
+        self.emit_return_unit(0);
 
         self.scope = None;
         self.vals = saved_vals;
@@ -3229,7 +3241,7 @@ impl Compiler {
     /// a else b` works, including the canonical recursive `fact`).
     fn tail(&mut self, stmts: &[Stmt]) -> Result<(), String> {
         let Some((last, init)) = stmts.split_last() else {
-            self.b.emit(Op::Return, 0);
+            self.emit_return_unit(0);
             return Ok(());
         };
         for s in init {
@@ -3261,7 +3273,7 @@ impl Compiler {
                 self.b.patch_jump(jf, else_start);
                 if els.is_empty() {
                     // No `else` → the false path yields `Unit`.
-                    self.b.emit(Op::Return, 0);
+                    self.emit_return_unit(0);
                 } else {
                     self.tail(els)?;
                 }
@@ -3271,7 +3283,7 @@ impl Compiler {
             // its effect, then return `Unit`.
             _ => {
                 self.stmt(s)?;
-                self.b.emit(Op::Return, 0);
+                self.emit_return_unit(0);
                 Ok(())
             }
         }
@@ -3339,6 +3351,27 @@ impl Compiler {
             return self.num_ty(recv).combine(self.num_ty(&args[0]));
         }
         NumTy::Unknown
+    }
+
+    /// Return `Unit` from the current frame.
+    ///
+    /// `Unit` and `null` are different values that print differently — `()` and
+    /// `null` — so they cannot share fusevm's `Undef`, which is what a bare
+    /// `Op::Return` leaves behind. That is why `println(f())` on a `Unit`-valued
+    /// `f` used to render `null`. The unit LITERAL already lowers to an empty
+    /// tuple, and it is structural (`() == ()` holds, `toString` is `()`), so
+    /// returning the same value makes every `Unit` in the language one thing
+    /// rather than adding a second representation.
+    fn emit_return_unit(&mut self, line: u32) {
+        self.emit_unit(line);
+        self.b.emit(Op::ReturnValue, line);
+    }
+
+    /// Push the `Unit` value. Kept distinct from `Op::LoadUndef`, which stays
+    /// the representation of `null` and of a genuinely absent value.
+    fn emit_unit(&mut self, line: u32) {
+        self.b
+            .emit(Op::CallBuiltin(crate::host::MAKE_TUPLE, 0), line);
     }
 
     /// Wrap the integer on top of the stack back to 32 bits — Scala's `Int`
@@ -3705,6 +3738,15 @@ fn range_test(inclusive: bool, descending: bool) -> Op {
 }
 
 // ── for-comprehension desugaring (collection generators) ────────────────────
+
+/// The `scala.math.Ordering` companion members this frontend answers — the
+/// per-type instances. All of them build the same natural ordering, because
+/// `host::value_cmp` already orders each of these types the way Scala's instance
+/// does; the member only picks the element TYPE, which is erased here.
+const ORDERING_MEMBERS: &[&str] = &[
+    "Int", "Long", "Short", "Byte", "Double", "Float", "String", "Char", "Boolean", "Unit",
+    "BigInt", "BigDecimal",
+];
 
 /// The bound named by a numeric companion object — `Int.MaxValue`,
 /// `Long.MinValue`, and the sub-`Int` widths Scala also exposes. Returns `None`
