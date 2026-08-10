@@ -4693,3 +4693,32 @@ fn a_named_group_in_a_replacement_is_refused() {
     assert!(ok);
     assert_eq!(out, "a<1>b<2>\n");
 }
+
+#[test]
+fn a_forward_reference_reads_the_jvm_field_default() {
+    // An `extends App` body's `val`s are FIELDS, and a JVM field holds its
+    // type's default from the moment the object exists. Every one of these read
+    // `null` before, whatever the declared type. The `Char` line is the NUL
+    // character, which is what Scala prints for the `Char` default.
+    let (out, ok) = run("object T extends App {\n  \
+         println(i); println(l); println(d); println(b); println(s); println(c); println(xs)\n  \
+         println(ii); println(dd); println(bb)\n  \
+         val i: Int = 7\n  val l: Long = 8L\n  val d: Double = 1.5\n  \
+         val b: Boolean = true\n  val s: String = \"s\"\n  val c: Char = 'x'\n  \
+         val xs: List[Int] = List(1)\n  \
+         val ii = 7\n  val dd = 1.5\n  val bb = true\n}");
+    assert!(ok);
+    assert_eq!(out, "0\n0\n0.0\nfalse\nnull\n\u{0}\nnull\n0\n0.0\nfalse\n");
+}
+
+#[test]
+fn a_declared_binding_still_holds_its_initializer_afterwards() {
+    // The default is a PRE-store; the declaration must overwrite it, or every
+    // annotated top-level `val` in the program would read zero.
+    let (out, ok) = run(
+        "object T extends App { val i: Int = 7; val d: Double = 1.5; val b: Boolean = true\n  \
+         println(i); println(d); println(b); println(i + 1) }",
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n1.5\ntrue\n8\n");
+}

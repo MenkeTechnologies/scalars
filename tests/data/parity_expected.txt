@@ -208,3 +208,4 @@ var seen = 0; def bump(): Int = { seen += 1; seen }; @main def go(): Unit = { pr
 object T { def main(args: Array[String]): Unit = { println(args.length); println(args.mkString("|")); println(args.isEmpty) } }	0\n\ntrue\n
 val order = { println("init"); 1 }; @main def go(n: Int): Unit = println(n + order)	init\nIllegal command line: more arguments expected\n
 @main def go(): Unit = { println(List("b", "A", "é", "a", "Z").sorted); println("café — ☕".length); println("naïve".toUpperCase) }	List(A, Z, a, b, é)\n8\nNAÏVE\n
+object T extends App { println(i); println(l); println(d); println(b); println(s); println(xs); println(ii); println(dd); val i: Int = 7; val l: Long = 8L; val d: Double = 1.5; val b: Boolean = true; val s: String = "s"; val xs: List[Int] = List(1); val ii = 7; val dd = 1.5; println(i + ii) }	0\n0\n0.0\nfalse\nnull\nnull\n0\n0.0\n14\n

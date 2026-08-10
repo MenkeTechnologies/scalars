@@ -673,6 +673,15 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         c.object_inits(od)?;
     }
 
+    // An `extends App` body's `val`s are FIELDS of the entry object, and a JVM
+    // field holds its type's default from the moment the object exists. A
+    // forward reference therefore reads that default, not an absent value:
+    // `println(later); val later: Int = 7` prints `0` in Scala, `0.0` for a
+    // `Double`, `false` for a `Boolean` and `null` for a reference type.
+    // Pre-storing the defaults reproduces it; the declaration that follows
+    // overwrites, exactly as the object's constructor does.
+    c.emit_field_defaults(&prog.main);
+
     // Main body runs first after the object inits (the VM starts at ip 0), so the
     // tracing JIT's early anchor still fires on real work.
     for stmt in &prog.main {
@@ -3921,6 +3930,61 @@ impl Compiler {
             Place::Slot(s) => self.b.emit(Op::GetSlot(s), 0),
             Place::Global(i) => self.b.emit(Op::GetVar(i), 0),
         };
+    }
+
+    /// Store each top-level binding's JVM field default before the entry body
+    /// runs — see the call site.
+    ///
+    /// The width analysis cannot answer this: [`NumTy`] distinguishes `Int` from
+    /// `Long` and nothing else, so it has no way to say `0.0` or `false`. The
+    /// DECLARED TYPE does, and it is already on the statement (`Local::ty`,
+    /// retained "for diagnostics"); an unannotated binding falls back to the
+    /// shape of its initializer, which is what Scala's own inference would have
+    /// read. A binding neither annotated nor obviously typed keeps `null`, which
+    /// is both the previous behaviour and the right answer for every reference
+    /// type.
+    ///
+    /// Only the ENTRY body gets this. A `val` inside a `def` is a local, and
+    /// Scala rejects a forward reference to one outright ("forward reference to
+    /// later extends over the definition of later"), so there is no default to
+    /// reproduce.
+    fn emit_field_defaults(&mut self, body: &[Stmt]) {
+        for s in body {
+            let StmtKind::Local { name, ty, init, .. } = &s.kind else {
+                continue;
+            };
+            let declared = ty
+                .as_deref()
+                .map(str::to_string)
+                .or_else(|| match init.as_ref()? {
+                    Expr::Int(_) => Some("Int".to_string()),
+                    Expr::Long(_) => Some("Long".to_string()),
+                    Expr::Float(_) => Some("Double".to_string()),
+                    Expr::Bool(_) => Some("Boolean".to_string()),
+                    Expr::Char(_) => Some("Char".to_string()),
+                    _ => None,
+                });
+            let op = match declared.as_deref() {
+                Some("Int" | "Long" | "Short" | "Byte") => Op::LoadInt(0),
+                Some("Double" | "Float") => Op::LoadFloat(0.0),
+                Some("Boolean") => Op::LoadFalse,
+                // `' '`, which Scala prints as the NUL character itself.
+                Some("Char") => Op::LoadInt(0),
+                // Every reference type — and anything unrecognised — is `null`,
+                // which a global already reads as. Emitting nothing keeps the
+                // bytecode of a program with no annotated forward reference
+                // byte-identical.
+                _ => continue,
+            };
+            let is_char = declared.as_deref() == Some("Char");
+            let place = self.declare_place(name);
+            self.b.emit(op, s.line);
+            if is_char {
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::CHAR_NEW, 1), s.line);
+            }
+            self.emit_store(place);
+        }
     }
 
     fn emit_store(&mut self, p: Place) {

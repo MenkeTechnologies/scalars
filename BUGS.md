@@ -12,6 +12,15 @@ reported as parse/compile errors, never silently mis-run.
   function namespace an entry object's helpers use, and a top-level `val`'s
   initializer runs BEFORE the entry body and before the command line is read.
 
+  An `extends App` body's `val`s are FIELDS of the entry object, so a forward
+  reference to one reads the JVM field default rather than an absent value:
+  `println(later); val later: Int = 7` prints `0`, and `0.0`/`false`/`null` for
+  a `Double`/`Boolean`/reference type. The declared type answers that (the width
+  analysis could not — `NumTy` separates `Int` from `Long` and nothing else); an
+  unannotated binding falls back to the shape of its initializer. A `val` inside
+  a `def` is a local, and Scala rejects a forward reference to one outright, so
+  no default applies there.
+
   A `@main` method's parameters come from the command line through the reader
   Scala generates, `CommandLineParser.parseArgument[T]`, for the types that have
   one and are representable here: `Int`, `Long`, `Byte`, `Short`, `Double`,
