@@ -154,6 +154,7 @@ impl Parser {
                 break;
             }
             // `case` prefix → `case class` / `case object`.
+            let line = self.line();
             let is_case = if self.is(&Tok::Case) {
                 self.advance();
                 true
@@ -171,12 +172,12 @@ impl Parser {
                         }
                         entry = Some((name, body));
                     }
-                    TopObject::Singleton(obj) => self.objects.push(obj),
+                    TopObject::Singleton(obj) => self.declare_object(obj, line)?,
                 }
             } else if matches!(self.peek(), Tok::Ident(w) if w == "class" || w == "trait") {
                 let is_trait = matches!(self.peek(), Tok::Ident(w) if w == "trait");
                 let c = self.class_decl(is_case, is_trait)?;
-                self.classes.push(c);
+                self.declare_class(c, line)?;
             } else if !self.is(&Tok::Eof) {
                 return Err(format!(
                     "scalars: expected a top-level `object`/`class` declaration, found {} on line {}",
@@ -648,15 +649,119 @@ impl Parser {
     /// [`crate::resolve`] pass can see which block declared it; that pass hoists
     /// it (uniquely renamed, with its captures lambda-lifted into parameters)
     /// into the flat function namespace the compiler consumes.
+    ///
+    /// A nested TYPE is not a statement and does not stay in place: Scala lets a
+    /// `class`/`trait`/`object` be declared wherever a statement can appear, and
+    /// the entry object's body — the whole program, under `extends App` — is the
+    /// commonest such place. It is filed straight into the declaration lists
+    /// [`Parser::program`] fills, so `object T extends App { class C(…); … }`
+    /// declares exactly what `class C(…)` beside the object would.
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
         let mut out = Vec::new();
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-            out.push(self.statement()?);
+            if self.at_nested_declaration() {
+                self.nested_declaration()?;
+            } else {
+                out.push(self.statement()?);
+            }
             self.skip_seps();
         }
         self.eat(&Tok::RBrace)?;
         Ok(out)
+    }
+
+    /// Whether the cursor is on a type declaration in STATEMENT position.
+    ///
+    /// Stricter than [`Parser::at_declaration_start`], which also fires on a
+    /// bare `case`: inside a block a bare `case` is a `match` arm, so `case` is
+    /// only a declaration when `class`/`object` follows it. Neither of those two
+    /// words can be an identifier — both are reserved — so no expression
+    /// statement can be mistaken for a declaration here.
+    fn at_nested_declaration(&self) -> bool {
+        if self.is(&Tok::Object) {
+            return true;
+        }
+        if matches!(self.peek(), Tok::Ident(w) if w == "class" || w == "trait") {
+            return true;
+        }
+        if !self.is(&Tok::Case) {
+            return false;
+        }
+        match self.toks.get(self.pos + 1).map(|t| &t.kind) {
+            Some(Tok::Object) => true,
+            Some(Tok::Ident(w)) => w == "class",
+            _ => false,
+        }
+    }
+
+    /// Consume a type declaration met in statement position and file it in the
+    /// flat namespace the compiler consumes.
+    ///
+    /// A nested `object` that would itself be an entry point (it `extends App`
+    /// or declares `def main`) is REFUSED rather than silently demoted: its body
+    /// would otherwise be dropped, which is a wrong answer where this is a
+    /// diagnosable one.
+    fn nested_declaration(&mut self) -> Result<(), String> {
+        let line = self.line();
+        let is_case = if self.is(&Tok::Case) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        if self.is(&Tok::Object) {
+            match self.object_decl(is_case)? {
+                TopObject::Singleton(o) => self.declare_object(o, line)?,
+                TopObject::Entry(name, _) => {
+                    return Err(format!(
+                        "scalars: nested entry object `{name}` (`extends App` / `def main`) on line {line}"
+                    ))
+                }
+            }
+        } else {
+            let is_trait = matches!(self.peek(), Tok::Ident(w) if w == "trait");
+            let c = self.class_decl(is_case, is_trait)?;
+            self.declare_class(c, line)?;
+        }
+        Ok(())
+    }
+
+    /// File a `class`/`trait` declaration, refusing a name already declared.
+    ///
+    /// Scala distinguishes same-named types by SCOPE: `def a() = { case class
+    /// Q(v: Int); … }` and `def b() = { case class Q(v: Int, w: Int); … }`
+    /// declare two different `Q`s, and a member `class Q` shadows a top-level
+    /// one. Every declaration here lands in ONE flat namespace, so a second `Q`
+    /// would silently replace the first and every mention of `Q` in the program
+    /// would resolve to whichever won — a wrong answer, and a quiet one. Refuse
+    /// instead: a program that cannot be modelled must not be run.
+    ///
+    /// A `class Q` beside an `object Q` is the COMPANION idiom, which Scala
+    /// allows and this frontend supports, so the two kinds are counted apart.
+    fn declare_class(&mut self, c: ClassDecl, line: u32) -> Result<(), String> {
+        if self.classes.iter().any(|d| d.name == c.name) {
+            return Err(format!(
+                "scalars: type `{}` is already declared; shadowing type declarations are not modelled (line {line})",
+                c.name
+            ));
+        }
+        self.classes.push(c);
+        Ok(())
+    }
+
+    /// File a singleton `object` declaration. The companion-aware counterpart of
+    /// [`Parser::declare_class`], and refusing a redeclaration for the same
+    /// reason: one flat namespace cannot hold two.
+    fn declare_object(&mut self, o: ObjectDecl, line: u32) -> Result<(), String> {
+        if self.objects.iter().any(|d| d.name == o.name) {
+            return Err(format!(
+                "scalars: object `{}` is already declared; shadowing object declarations are not modelled (line {line})",
+                o.name
+            ));
+        }
+        self.objects.push(o);
+        Ok(())
     }
 
     /// Parse a `{ ... }` or a single statement into a statement list. Leading

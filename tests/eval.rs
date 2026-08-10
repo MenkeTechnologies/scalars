@@ -4067,3 +4067,118 @@ fn a_compound_assign_evaluates_its_target_exactly_once() {
     assert!(ok);
     assert_eq!(out, "6\n1\n");
 }
+
+#[test]
+fn a_class_declared_in_the_app_body_is_a_member() {
+    // Scala compiles a type declared inside `object T extends App { … }` as a
+    // member of the object. Declaring it beside the object is a PLACEMENT, not
+    // a requirement, and this form used to be a parse error.
+    let (out, ok) = run(&wrap(
+        "class C(var n: Int); val c = new C(1); c.n += 4; println(c.n)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn a_member_case_class_gets_its_generated_members() {
+    let (out, ok) = run(&wrap(
+        "case class P(x: Int, y: Int); val p = P(1, 2); \
+         println(p); println(p.copy(y = 9)); println(p == P(1, 2))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "P(1,2)\nP(1,9)\ntrue\n");
+}
+
+#[test]
+fn a_member_trait_dispatches_polymorphically() {
+    let (out, ok) = run(&wrap(
+        "trait S { def area: Int }; class Sq(s: Int) extends S { def area = s * s }; \
+         class Rc(w: Int, h: Int) extends S { def area = w * h }; \
+         val xs: List[S] = List(new Sq(3), new Rc(2, 5)); \
+         println(xs.map(_.area)); println(xs.map(_.area).sum)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(9, 10)\n19\n");
+}
+
+#[test]
+fn a_member_object_is_a_singleton() {
+    let (out, ok) = run(&wrap(
+        "object U { val k = 3; def f(n: Int) = n * k }; println(U.f(4)); println(U.k)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "12\n3\n");
+}
+
+#[test]
+fn a_member_class_reads_an_app_body_val() {
+    // The `App` body's `val`s are program globals, so a member class's method
+    // sees `k` the way Scala's would. A member class inside a `def` frame
+    // cannot — see `BUGS.md`.
+    let (out, ok) = run(&wrap(
+        "val k = 10; class C(val n: Int) { def g = n + k }; println(new C(1).g)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "11\n");
+}
+
+#[test]
+fn a_class_declared_inside_a_def_body_is_hoisted() {
+    let (out, ok) = run(&wrap(
+        "def f(): Int = { class C(val n: Int); new C(7).n }; println(f())",
+    ));
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn a_member_class_declared_after_its_use_still_resolves() {
+    // Members are not ordered the way statements are: Scala resolves `C` in the
+    // first statement against a declaration that comes later in the body.
+    let (out, ok) = run(&wrap(
+        "val c = new C(4); println(c.twice); class C(val n: Int) { def twice = n + n }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn member_case_objects_form_an_adt() {
+    let (out, ok) = run(&wrap(
+        "sealed trait E; case object A extends E; case object B extends E; \
+         val es: List[E] = List(A, B, A); println(es.map { case A => 1; case B => 2 })",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(1, 2, 1)\n");
+}
+
+#[test]
+fn a_redeclared_type_is_refused_rather_than_silently_shadowed() {
+    // Scala scopes same-named types (`class Q` in the body shadows the one
+    // beside the object, and answers 200 here). Every declaration lands in ONE
+    // flat namespace here, so the second would silently replace the first and
+    // the program would print 20 — a wrong answer, not a refusal. The
+    // diagnostic is asserted, because "it exited non-zero" would pass on any
+    // failure at all.
+    let (_out, err, ok) = run_full(
+        "class Q(val v: Int) { def g = v * 10 }\n\
+         object T extends App { class Q(val v: Int) { def g = v * 100 }; println(new Q(2).g) }\n",
+    );
+    assert!(!ok, "a redeclared type must not run");
+    assert!(
+        err.contains("type `Q` is already declared"),
+        "expected the redeclaration diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn a_companion_object_is_not_a_redeclaration() {
+    // `class P` beside `object P` is the companion idiom, which Scala allows —
+    // so the redeclaration check counts the two kinds apart.
+    let (out, ok) = run("case class P(x: Int)\n\
+         object P { def zero = P(0) }\n\
+         object T extends App { println(P.zero); println(P(5)) }\n");
+    assert!(ok);
+    assert_eq!(out, "P(0)\nP(5)\n");
+}

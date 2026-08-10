@@ -86,7 +86,8 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   mode.
 
 The language surface today: programs with an entry point (`def main`, or an
-`extends App` body) plus sibling `class`/`object` declarations, using `val`/`var`
+`extends App` body) plus `class`/`object` declarations beside it or inside it,
+using `val`/`var`
 bindings (with `val` immutability enforced), arithmetic, `if`/`while`, the Scala
 range `for` (with a `by` step), `try`/`catch`/`finally`/`throw`, and
 `println`/`print`. User-defined `def`s — parameters, recursion,
@@ -189,6 +190,13 @@ Implemented and checked against the reference `scala`:
 - **Entry point** — `object Name { def main(args: Array[String]): Unit = { … } }`
   or `object Name extends App { … }` (the body runs directly). An object that
   also declares other members still finds and runs its `main`.
+- **Type declarations, wherever Scala accepts them** — `class`, `trait`,
+  `case class`, `case object` and `object` beside the entry object, inside its
+  `extends App` body (where they are members, as in Scala), or inside any block
+  such as a `def` body. Members are not ordered the way statements are, so a
+  member `class` may be declared after the statement that constructs it. A
+  `class Q` beside an `object Q` is the companion idiom and compiles; a genuine
+  redeclaration is refused rather than silently resolved to one of the two.
 - **Bindings** — `val` / `var` with optional type ascription
   (`val x: Int = …`, `var s = …`), type inferred as storage; plain and compound
   assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`). Reassigning a `val`

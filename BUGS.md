@@ -698,12 +698,36 @@ reported as parse/compile errors, never silently mis-run.
   kind. A program with no mutable collection in it emits exactly the arithmetic
   it did before, so a counted `while` loop stays JIT-trace-eligible.
 - **`object … extends App` runs the object body directly.** Statements run in
-  order and any `def` members are hoisted and callable. A **nested type** is not
-  skipped, it is REFUSED: `object T extends App { class C(var n: Int); … }`
-  is a parse error (`unexpected token Var in expression`), where Scala compiles
-  it. Declare the class at the top level instead — which is where the parser
-  accepts `class`/`case class`/`trait`, and where a `class` a program means to
-  reuse belongs anyway. A refusal rather than a wrong answer, but a real gap.
+  order, any `def` members are hoisted and callable, and a **nested type** —
+  `class`, `trait`, `case class`, `case object`, `object` — is a member, exactly
+  as it is in Scala: `object T extends App { class C(var n: Int); … }` compiles.
+  Declaring the type beside the object is a placement, not a requirement, and
+  the same declarations are accepted in any block (a `def` body, a brace group).
+  Members are not ordered the way statements are, so a member `class` may be
+  declared after the statement that constructs it.
+- **A type declaration lands in ONE flat namespace, so it cannot be shadowed.**
+  Scala scopes same-named types — a member `class Q` shadows a top-level `Q`,
+  and `def a() = { case class Q(v: Int); … }` / `def b() = { case class Q(v:
+  Int, w: Int); … }` declare two different `Q`s. There is one table here, so the
+  second declaration would silently replace the first and every `Q` in the
+  program would mean whichever won. That is refused
+  (``type `Q` is already declared``) rather than run. A `class Q` beside an
+  `object Q` is the companion idiom, not a redeclaration, and still compiles.
+- **A type declared inside a `def` body cannot capture that frame's locals.**
+  `def f(k: Int) = { class C(val n: Int) { def g = n + k }; new C(1).g }` is
+  legal Scala and aborts here: the class is modelled as a top-level one, so `k`
+  is simply an unresolved name and fails the way any unresolved name in a class
+  body fails (``+` is not defined between `1` and `null``). The `App` body's own
+  `val`s are program globals, so a member class DOES read those
+  (`val k = 10; class C(val n: Int) { def g = n + k }` answers 11) — it is the
+  `def`/lambda frames that a class body cannot reach into. Closing it means
+  lambda-lifting captures into constructor fields, the way [`crate::resolve`]
+  already lifts them for a nested `def`.
+- **A nested `object` that is itself an entry point is refused.**
+  `object T extends App { object U extends App { … } }` and the `def main`
+  spelling of the same both exit with ``nested entry object `U```, where Scala
+  compiles them (and never runs `U`'s body unless something touches `U`). A
+  refusal, not a wrong answer.
 - **Singleton `object` `val`s initialize eagerly**, before `main`, rather than
   lazily on first access. Observably identical for pure initializers.
 
