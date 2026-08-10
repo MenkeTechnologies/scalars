@@ -625,6 +625,30 @@ reported as parse/compile errors, never silently mis-run.
 - **`grouped`/`sliding` answer a `List` of windows**, not an `Iterator`. Every
   consumption Scala programs use (`.toList`, `.foreach`, `.map`) matches;
   printing the un-consumed result does not (Scala prints `<iterator>`).
+- **A `Long` shift inside a `def` body truncates to 32 bits.** `<<`, `>>` and
+  `>>>` are evaluated at the RECEIVER's width, and the host cannot tell an `Int`
+  from a `Long` by value, so `compiler::method_inner` selects the 64-bit
+  spelling only when `num_ty(recv)` PROVES `NumTy::Long` and otherwise emits the
+  32-bit one. Everywhere else an unproven width suppresses narrowing; here it
+  causes it. A `def` body starts from an empty width map
+  (`std::mem::take(&mut self.widths)`), so a top-level `val` reachable by name
+  from that body arrives unproven and its shift truncates:
+
+  ```scala
+  val big = 6679246017915255L
+  def g(): Long = big >>> 11        // scala 3261350594685, scalars 313469
+  def h(): Long = big << 2          // scala 26716984071661020,
+                                    // scalars -1727027748
+  ```
+
+  The same expressions at the top level are correct, and so is a shift on a
+  `def` PARAMETER (`def g(x: Long): Long = x >>> 11`), whose annotation Scala
+  requires and which is therefore always proven. A silent wrong answer, and the
+  only known place an unproven width narrows rather than declining to.
+
+  Closing it means carrying the widths of program globals into a `def` frame
+  rather than clearing the whole map, which widens what narrowing applies to
+  across every `def` body — worth doing as its own change, not as a rider.
 - **Integer arithmetic narrows to 32 bits only where the width is PROVEN.**
   `Int` overflow now wraps — `2147483647 + 1` is `-2147483648` — and a `Long`
   anywhere in an expression promotes it so it does not
