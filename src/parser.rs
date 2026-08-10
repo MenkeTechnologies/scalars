@@ -2109,6 +2109,67 @@ impl Parser {
                         finalizer: None,
                     });
                 }
+                // Predef `require` / `assert` / `assume`, desugared to the `if`
+                // + `throw` they are defined as.
+                //
+                // Desugared rather than lowered to a builtin because the message
+                // parameter is BY-NAME (`message: => Any`): Scala does not
+                // evaluate it when the condition holds, so
+                // `require(true, {println("x"); "m"})` prints nothing. A builtin
+                // taking two evaluated arguments could not express that. The `if`
+                // form gets it for free.
+                //
+                // Prefixes and exception classes verified against Scala 3.8.4 on
+                // JDK 26.0.2: `require` raises `IllegalArgumentException` with
+                // `requirement failed`, `assert` an `AssertionError` with
+                // `assertion failed`, `assume` an `AssertionError` with
+                // `assumption failed`; a message is appended after `": "`.
+                if matches!(name.as_str(), "require" | "assert" | "assume")
+                    && matches!(next, Some(Tok::LParen))
+                {
+                    let line = self.line();
+                    self.advance(); // require/assert/assume
+                    let args = self.arg_list()?;
+                    if args.len() == 1 || args.len() == 2 {
+                        let (exc, prefix) = match name.as_str() {
+                            "require" => ("IllegalArgumentException", "requirement failed"),
+                            "assert" => ("AssertionError", "assertion failed"),
+                            _ => ("AssertionError", "assumption failed"),
+                        };
+                        let mut args = args;
+                        let cond = args.remove(0);
+                        let msg = match args.pop() {
+                            // `prefix + ": " + message`, so a non-`String`
+                            // message stringifies the way Scala's does.
+                            Some(m) => Expr::Binary {
+                                op: BinOp::Add,
+                                lhs: Box::new(Expr::Str(format!("{prefix}: "))),
+                                rhs: Box::new(m),
+                            },
+                            None => Expr::Str(prefix.to_string()),
+                        };
+                        return Ok(Expr::If {
+                            cond: Box::new(Expr::Unary {
+                                op: UnOp::Not,
+                                rhs: Box::new(cond),
+                            }),
+                            then: Box::new(Expr::Throw {
+                                value: Box::new(Expr::New {
+                                    name: exc.to_string(),
+                                    args: vec![msg],
+                                    line,
+                                }),
+                                line,
+                            }),
+                            els: None,
+                        });
+                    }
+                    return Err(format!(
+                        "scalars: `{name}` takes a condition and an optional message, \
+                         found {} arguments (line {line})",
+                        args.len()
+                    ));
+                }
                 // `break` and `break()` are the same expression; Scala types it
                 // `Nothing`, so it is legal in operand position.
                 if name == "break" && !matches!(next, Some(Tok::Dot)) {

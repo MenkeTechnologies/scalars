@@ -5129,3 +5129,59 @@ fn strip_margin_drops_the_margin_and_leaves_lines_without_one() {
     assert!(ok);
     assert_eq!(out, "x\ny\nx\ny\na\nb\n  c\n");
 }
+
+#[test]
+fn require_and_assert_raise_the_predef_exceptions_with_their_prefixes() {
+    // Three functions, two exception classes, three prefixes. `assume` is the
+    // one most likely to be assumed identical to `assert` — it is not, it says
+    // "assumption failed".
+    assert_eq!(
+        faults(&[
+            "{ require(false); 1 }",
+            "{ require(false, \"boom\"); 1 }",
+            "{ require(1 > 2, 40 + 2); 1 }",
+            "{ assert(false); 1 }",
+            "{ assert(false, \"m\"); 1 }",
+            "{ assume(false); 1 }",
+            "{ require(true); 7 }",
+        ]),
+        "java.lang.IllegalArgumentException|requirement failed\n\
+         java.lang.IllegalArgumentException|requirement failed: boom\n\
+         java.lang.IllegalArgumentException|requirement failed: 42\n\
+         java.lang.AssertionError|assertion failed\n\
+         java.lang.AssertionError|assertion failed: m\n\
+         java.lang.AssertionError|assumption failed\n\
+         OK|7\n"
+    );
+}
+
+#[test]
+fn the_require_message_is_by_name_and_an_assertion_error_is_not_an_exception() {
+    // `message: => Any` is not evaluated when the condition holds — which is why
+    // this desugars to an `if`/`throw` rather than to a two-argument builtin, and
+    // it is the half a builtin could not have got right. And `AssertionError`
+    // extends `Error`, so `catch { case e: Exception }` must NOT see one.
+    let (out, ok) = run(&wrap(
+        "var n = 0\n  require(true, { n = 1; \"m\" })\n  assert(true, { n = n + 10; \"m\" })\n  \
+         println(n)\n  \
+         println(try { assert(false); \"ran\" } catch { case e: Error => \"Error\" })\n  \
+         println(try { \
+           try { assert(false); \"ran\" } catch { case e: Exception => \"Exception\" } \
+         } catch { case e: Throwable => \"passed through to \" + e.getClass.getName })",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "0\nError\npassed through to java.lang.AssertionError\n"
+    );
+}
+
+#[test]
+fn string_to_long_parses_and_fails_the_way_to_int_does() {
+    let (out, ok) = run(&wrap(
+        "println(\"12\".toLong); println(\"9999999999\".toLong)\n  \
+         println(try { \"x\".toLong } catch { case e: Throwable => e.getMessage })",
+    ));
+    assert!(ok);
+    assert_eq!(out, "12\n9999999999\nFor input string: \"x\"\n");
+}

@@ -175,12 +175,25 @@ reported as parse/compile errors, never silently mis-run.
   Layout is then Java's — plain for `1e-3 <= |x| < 1e7`, computerized
   scientific otherwise, always with one fractional digit.
 - **Postfix method dispatch on core values.** `s.length`/`.size`,
-  `.toUpperCase`/`.toLowerCase`, `.trim`, `.reverse`, `.isEmpty`/`.nonEmpty`,
+  `.toUpperCase`/`.toLowerCase`, `.trim`, `.strip`/`.stripLeading`/
+  `.stripTrailing`, `.stripMargin`, `.reverse`, `.isEmpty`/`.nonEmpty`,
   `.substring`, `.charAt`, `.contains`/`.startsWith`/`.endsWith`,
-  `.toInt`/`.toDouble` on `String`; `.abs`/`.min`/`.max`/`.toDouble` on `Int`;
-  `.abs`/`.round`/`.isNaN`/`.toInt` on `Double`; and `.toString` on any value.
+  `.toInt`/`.toLong`/`.toDouble` on `String`; `.abs`/`.min`/`.max`/`.signum`/
+  `.compareTo`/`.toDouble` on `Int`; `.abs`/`.round`/`.min`/`.max`/`.signum`/
+  `.compareTo`/`.isNaN`/`.toInt` on `Double`; and `.toString` on any value.
   Method chaining works (`s.trim.length`). Out-of-range/parse failures throw
   faithfully (`StringIndexOutOfBoundsException`, `NumberFormatException`).
+  `trim` and `strip` are not the same cut and neither is Rust's: `trim` removes
+  every code point at or below U+0020, `strip` removes what
+  `Character.isWhitespace` accepts — which excludes U+00A0.
+- **Predef `require`, `assert` and `assume`.** Desugared in the parser to the
+  `if`/`throw` they are defined as, so the message parameter keeps its by-name
+  semantics and is not evaluated when the condition holds. `require` raises
+  `IllegalArgumentException: requirement failed`, `assert` an
+  `AssertionError: assertion failed`, `assume` an
+  `AssertionError: assumption failed`; a supplied message is appended after
+  `": "`. `AssertionError` extends `Error`, so `catch { case e: Exception }`
+  does not catch one.
 - **Classes, objects, `case class` (host-side object model).** `class C(x: Int)
   { def m = … }` with `new C(…)`, constructor params + body `val`/`var` fields,
   `this`, in-place `var`-field mutation, and instance-method dispatch (runtime

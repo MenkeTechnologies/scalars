@@ -710,6 +710,9 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     ),
     ("NoSuchElementException", "java.util.NoSuchElementException"),
     ("MatchError", "scala.MatchError"),
+    // Predef `assert`/`assume` raise this, and it is an `Error` rather than an
+    // `Exception` — so `catch { case e: Exception }` does NOT catch one.
+    ("AssertionError", "java.lang.AssertionError"),
     // `scala.util.control.Breaks`. `break()` raises a `BreakControl` and
     // `breakable { … }` catches it (see the desugar in [`crate::parser`]).
     // `ControlThrowable` is its supertype and NOT a subtype of `Exception`,
@@ -747,6 +750,7 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("UnsupportedOperationException", "RuntimeException"),
     ("NoSuchElementException", "RuntimeException"),
     ("MatchError", "RuntimeException"),
+    ("AssertionError", "Error"),
     // Deliberately hangs off `Throwable`, not `Exception`: Scala's
     // `ControlThrowable` is a direct `Throwable` so control-flow signals are not
     // caught by ordinary `case e: Exception` handlers.
@@ -7150,7 +7154,9 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // exactly that view here.
         ("toSeq", 0) => Ok(Value::str(s)),
         ("reverse", 0) => Ok(Value::str(s.chars().rev().collect::<String>())),
-        ("toInt", 0) => s.trim().parse::<i64>().map(Value::int).map_err(|_| {
+        // `toLong` shares the parse: the value model is one `i64`, so the two
+        // differ only in the STATIC width, which is read off the AST.
+        ("toInt" | "toLong", 0) => s.trim().parse::<i64>().map(Value::int).map_err(|_| {
             format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
         }),
         ("toDouble", 0) => s.trim().parse::<f64>().map(Value::float).map_err(|_| {
@@ -7341,8 +7347,8 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // unrecognized name is "no such method".
         (
             "length" | "size" | "isEmpty" | "nonEmpty" | "toUpperCase" | "toLowerCase" | "trim"
-            | "reverse" | "toInt" | "toDouble" | "charAt" | "contains" | "startsWith" | "endsWith"
-            | "substring",
+            | "reverse" | "toInt" | "toLong" | "toDouble" | "charAt" | "contains" | "startsWith"
+            | "endsWith" | "substring",
             _,
         ) => Err(arity_err()),
         _ => Err(no_such_method(&Value::str(s), name)),

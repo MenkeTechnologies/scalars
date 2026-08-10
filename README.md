@@ -411,10 +411,17 @@ Implemented and checked against the reference `scala`:
   namespaces are kept apart where the JDK lacks an overload (`Math.signum(5)` is
   `1.0`, `math.signum(5)` is `1`).
 - **Method dispatch** — postfix `.` on core values: `String` (`length`,
-  `toUpperCase`/`toLowerCase`, `trim`, `reverse`, `substring`, `charAt`,
-  `contains`/`startsWith`/`endsWith`, `toInt`/`toDouble`, …), `Int`/`Double`
-  (`abs`, `min`/`max`, `round`, `toDouble`/`toInt`, …), and `toString` on any
-  value; chains left-to-right (`s.trim.length`).
+  `toUpperCase`/`toLowerCase`, `trim`, `strip`, `stripMargin`, `reverse`,
+  `substring`, `charAt`, `contains`/`startsWith`/`endsWith`,
+  `toInt`/`toLong`/`toDouble`, …), `Int`/`Double` (`abs`, `min`/`max`, `round`,
+  `signum`, `compareTo`, `toDouble`/`toInt`, …), and `toString` on any value;
+  chains left-to-right (`s.trim.length`). `Math.round` is the JDK algorithm, so
+  `(-2.5).round` is `-2`; `min`/`max` propagate a NaN operand; and the implicit
+  `Ordering[Double]` is `TotalOrdering`, so `sorted` puts NaN last and `-0.0`
+  before `0.0`.
+- **Predef `require`/`assert`/`assume`** — with their by-name messages and their
+  exact prefixes (`requirement failed`, `assertion failed`, `assumption
+  failed`).
 - **Regular expressions** — `java.util.regex` through its three Scala doorways:
   `String.matches`/`replaceAll`/`replaceFirst` (with `$N` group splices in the
   replacement) and the regex-based `String.split`; `"…".r` building a
