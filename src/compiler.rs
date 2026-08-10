@@ -4467,6 +4467,14 @@ impl Compiler {
             self.narrow(w, 0);
             return Ok(());
         }
+        // Scala `%` traps on an integer zero divisor the same way `/` does;
+        // fusevm's native `Op::Mod` answers `0` instead, so route it through the
+        // host builtin as well.
+        if let BinOp::Mod = op {
+            self.b.emit(Op::CallBuiltin(crate::host::SMOD, 2), 0);
+            self.narrow(w, 0);
+            return Ok(());
+        }
         // `::` (cons) prepends the left operand to the right `List` via the host
         // constructor builtin.
         if let BinOp::Cons = op {
@@ -4479,7 +4487,7 @@ impl Compiler {
             BinOp::Mul => Op::Mul,
             BinOp::Div => unreachable!("division routed through the SDIV builtin above"),
             BinOp::Cons => unreachable!("cons routed through the LIST_CONS builtin above"),
-            BinOp::Mod => Op::Mod,
+            BinOp::Mod => unreachable!("remainder routed through the SMOD builtin above"),
             BinOp::Eq => Op::NumEq,
             BinOp::Ne => Op::NumNe,
             BinOp::Lt => Op::NumLt,

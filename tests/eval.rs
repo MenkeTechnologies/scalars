@@ -4722,3 +4722,237 @@ fn a_declared_binding_still_holds_its_initializer_afterwards() {
     assert!(ok);
     assert_eq!(out, "7\n1.5\ntrue\n8\n");
 }
+
+/// Print `<class>|<message>` for each expression, the way the oracle probe that
+/// captured these expectations did. `null` is what a JVM exception built with no
+/// message answers from `getMessage`, and several of these have exactly that.
+fn faults(exprs: &[&str]) -> String {
+    let body: String = exprs
+        .iter()
+        .map(|e| {
+            format!(
+                "try {{ println(\"OK|\" + ({e})) }} \
+                 catch {{ case ex: Throwable => println(ex.getClass.getName + \"|\" + ex.getMessage) }}\n"
+            )
+        })
+        .collect();
+    let (out, ok) = run(&format!("object T extends App {{\n{body}}}"));
+    assert!(ok, "program was rejected outright:\n{body}\n{out}");
+    out
+}
+
+#[test]
+fn an_out_of_range_index_reports_the_receivers_own_exception() {
+    // Scala does not have ONE out-of-bounds message. A linear sequence passes
+    // the bare index, an indexed one formats the legal span, an `Array` hits the
+    // JVM's own array check, and a `StringBuilder` hits `String`'s. Answering
+    // `List`'s message for all four was wrong three times over — and note the
+    // exception CLASS differs too, so a `catch` selecting on the class behaved
+    // differently from Scala.
+    assert_eq!(
+        faults(&[
+            "List(1,2)(5)",
+            "Seq(1,2)(5)",
+            "Vector(1,2)(5)",
+            "IndexedSeq(1,2)(5)",
+            "Array(1,2)(5)",
+            "scala.collection.mutable.ListBuffer(1,2)(5)",
+            "scala.collection.mutable.ArrayBuffer(1,2)(5)",
+            "scala.collection.mutable.Queue(1,2)(5)",
+            "(1 to 2)(5)",
+            "new StringBuilder(\"ab\")(5)",
+        ]),
+        "java.lang.IndexOutOfBoundsException|5\n\
+         java.lang.IndexOutOfBoundsException|5\n\
+         java.lang.IndexOutOfBoundsException|5 is out of bounds (min 0, max 1)\n\
+         java.lang.IndexOutOfBoundsException|5 is out of bounds (min 0, max 1)\n\
+         java.lang.ArrayIndexOutOfBoundsException|Index 5 out of bounds for length 2\n\
+         java.lang.IndexOutOfBoundsException|5\n\
+         java.lang.IndexOutOfBoundsException|5 is out of bounds (min 0, max 1)\n\
+         java.lang.IndexOutOfBoundsException|5 is out of bounds (min 0, max 1)\n\
+         java.lang.IndexOutOfBoundsException|5 is out of bounds (min 0, max 1)\n\
+         java.lang.StringIndexOutOfBoundsException|Index 5 out of bounds for length 2\n"
+    );
+}
+
+#[test]
+fn an_indexed_write_fails_the_way_the_matching_read_does() {
+    // `a(i) = v` used to answer the JVM's ARRAY message for every receiver, the
+    // mirror image of the read bug: an `ArrayBuffer` write is a library check,
+    // not an array store.
+    assert_eq!(
+        faults(&[
+            "{ val a = Array(1,2); a(5) = 7; a.length }",
+            "{ val b = scala.collection.mutable.ArrayBuffer(1,2); b(5) = 7; b.length }",
+        ]),
+        "java.lang.ArrayIndexOutOfBoundsException|Index 5 out of bounds for length 2\n\
+         java.lang.IndexOutOfBoundsException|5 is out of bounds (min 0, max 1)\n"
+    );
+}
+
+#[test]
+fn head_and_last_on_an_empty_receiver_name_that_receiver() {
+    // Every one of these was `head of empty list` before, including for a `Map`
+    // and a `Set` — which have no head at all and report the ITERATOR they could
+    // not advance. `Vector.last` reporting `empty.tail` is not a typo: it is
+    // implemented as one, and the JVM prints what ran.
+    assert_eq!(
+        faults(&[
+            "List[Int]().head",
+            "Vector[Int]().head",
+            "Vector[Int]().last",
+            "Array[Int]().head",
+            "scala.collection.mutable.ListBuffer[Int]().head",
+            "scala.collection.mutable.ArrayBuffer[Int]().last",
+            "scala.collection.mutable.Stack[Int]().head",
+            "Set[Int]().head",
+            "Map[Int,Int]().head",
+            "Map[Int,Int]().last",
+            "(1 until 1).head",
+            "\"\".last",
+        ]),
+        "java.util.NoSuchElementException|head of empty list\n\
+         java.util.NoSuchElementException|empty.head\n\
+         java.util.NoSuchElementException|empty.tail\n\
+         java.util.NoSuchElementException|head of empty array\n\
+         java.util.NoSuchElementException|next on empty iterator\n\
+         java.util.NoSuchElementException|last of empty ArrayBuffer\n\
+         java.util.NoSuchElementException|head of empty Stack\n\
+         java.util.NoSuchElementException|next on empty iterator\n\
+         java.util.NoSuchElementException|next on empty iterator\n\
+         java.util.NoSuchElementException|next on empty iterator\n\
+         java.util.NoSuchElementException|head on empty Range\n\
+         java.util.NoSuchElementException|last of empty String\n"
+    );
+}
+
+#[test]
+fn tail_and_init_on_an_empty_receiver_raise_rather_than_answer_empty() {
+    // `init` answered an empty collection for EVERY kind, and `"".tail`
+    // answered `""` — neither is a Scala behaviour. The mutable buffers raise
+    // with no message at all, which `getMessage` reads as `null`; that is a real
+    // observable, not a gap in the capture.
+    assert_eq!(
+        faults(&[
+            "List[Int]().tail",
+            "List[Int]().init",
+            "Vector[Int]().init",
+            "Array[Int]().init",
+            "scala.collection.mutable.ArrayBuffer[Int]().init",
+            "Set[Int]().init",
+            "(1 until 1).init",
+            "\"\".tail",
+            "\"\".init",
+        ]),
+        "java.lang.UnsupportedOperationException|tail of empty list\n\
+         java.lang.UnsupportedOperationException|init of empty list\n\
+         java.lang.UnsupportedOperationException|empty.init\n\
+         java.lang.UnsupportedOperationException|init of empty array\n\
+         java.lang.UnsupportedOperationException|null\n\
+         java.lang.UnsupportedOperationException|null\n\
+         java.util.NoSuchElementException|init on empty Range\n\
+         java.lang.UnsupportedOperationException|tail of empty String\n\
+         java.lang.UnsupportedOperationException|init of empty String\n"
+    );
+}
+
+#[test]
+fn a_priority_queue_reports_its_root_read_and_its_iterator_separately() {
+    assert_eq!(
+        faults(&[
+            "scala.collection.mutable.PriorityQueue[Int]().head",
+            "scala.collection.mutable.PriorityQueue[Int]().max",
+            "scala.collection.mutable.PriorityQueue[Int]().dequeue()",
+            "(1 until 1).max",
+            "(1 until 1).min",
+        ]),
+        "java.util.NoSuchElementException|queue is empty\n\
+         java.lang.UnsupportedOperationException|empty.max\n\
+         java.util.NoSuchElementException|no element to remove from heap\n\
+         java.util.NoSuchElementException|last on empty Range\n\
+         java.util.NoSuchElementException|head on empty Range\n"
+    );
+}
+
+#[test]
+fn integer_remainder_traps_on_a_zero_divisor_like_the_jvms_irem() {
+    // fusevm's native `Op::Mod` answers `0`, so `%` has to route through the
+    // host the way `/` does. The JVM's message names `/` for BOTH operators.
+    assert_eq!(
+        faults(&[
+            "1 % 0",
+            "1L % 0L",
+            "{ val z = 0; 5 % z }",
+            "1 / 0",
+            "Int.MinValue % -1",
+            "-7 % 2",
+            "7 % -2",
+            "5.5 % 2.0",
+            "5.0 % 0.0",
+        ]),
+        "java.lang.ArithmeticException|/ by zero\n\
+         java.lang.ArithmeticException|/ by zero\n\
+         java.lang.ArithmeticException|/ by zero\n\
+         java.lang.ArithmeticException|/ by zero\n\
+         OK|0\nOK|-1\nOK|1\nOK|1.5\nOK|NaN\n"
+    );
+}
+
+#[test]
+fn grouped_and_sliding_report_the_step_their_argument_implies() {
+    // Both go through one `require(size > 0 && step > 0)`, which prints BOTH
+    // numbers — and `grouped(n)` passes `n` as the step where `sliding(n)`
+    // leaves it at 1, so the same argument produces different text.
+    assert_eq!(
+        faults(&[
+            "List(1,2,3).grouped(0).toList",
+            "List(1,2,3).sliding(0).toList",
+            "List(1,2,3).grouped(-1).toList",
+            "List(1,2,3).sliding(-1).toList",
+        ]),
+        "java.lang.IllegalArgumentException|requirement failed: size=0 and step=0, but both must be positive\n\
+         java.lang.IllegalArgumentException|requirement failed: size=0 and step=1, but both must be positive\n\
+         java.lang.IllegalArgumentException|requirement failed: size=-1 and step=-1, but both must be positive\n\
+         java.lang.IllegalArgumentException|requirement failed: size=-1 and step=1, but both must be positive\n"
+    );
+}
+
+#[test]
+fn a_regex_group_index_and_a_replacement_group_reference_fail_differently() {
+    // `Match.group(i)` indexes the match's own arrays; `replaceAll`'s `$n` goes
+    // through `Matcher`. Two different exceptions from two different APIs — the
+    // frontend used to answer `Matcher`'s wording for both. The array holds
+    // group 0, so its length is one more than the capture count.
+    assert_eq!(
+        faults(&[
+            "\"(a)(b)\".r.findFirstMatchIn(\"ab\").get.group(7)",
+            "\"ab\".r.findFirstMatchIn(\"ab\").get.group(1)",
+            "\"(a)(b)\".r.findFirstMatchIn(\"ab\").get.group(0)",
+            "\"a1\".replaceAll(\"[0-9]\", \"$1\")",
+        ]),
+        "java.lang.ArrayIndexOutOfBoundsException|Index 7 out of bounds for length 3\n\
+         java.lang.ArrayIndexOutOfBoundsException|Index 1 out of bounds for length 1\n\
+         OK|ab\n\
+         java.lang.IndexOutOfBoundsException|No group 1\n"
+    );
+}
+
+#[test]
+fn a_missing_key_and_a_bad_conversion_are_catchable_jvm_exceptions() {
+    // Both used to abort the program with wording of the frontend's own, so no
+    // `catch` could see them and no JDK ever printed them.
+    assert_eq!(
+        faults(&[
+            "Map(1 -> 2)(5)",
+            "Map(\"a\" -> 2)(\"z\")",
+            "\"%q\".format(\"x\")",
+            "String.format(\"%s %s\", \"x\")",
+            "new Array[Int](-1)",
+        ]),
+        "java.util.NoSuchElementException|key not found: 5\n\
+         java.util.NoSuchElementException|key not found: z\n\
+         java.util.UnknownFormatConversionException|Conversion = 'q'\n\
+         java.util.MissingFormatArgumentException|Format specifier '%s'\n\
+         java.lang.NegativeArraySizeException|-1\n"
+    );
+}

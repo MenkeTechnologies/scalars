@@ -35,6 +35,8 @@ pub const SPRINTLN: u16 = 700;
 pub const SPRINT: u16 = 701;
 /// Builtin id for Scala `/` (type-dispatching division — see `b_div`).
 pub const SDIV: u16 = 702;
+/// Builtin id for Scala `%` (type-dispatching remainder — see `b_mod`).
+pub const SMOD: u16 = 771;
 /// Builtin id for the `scala --dap` per-statement debug marker. Emitted only by
 /// `compiler::compile_debug`; registered only on the debug run path
 /// (`crate::run_chunk_debug`). It carries no args and returns `Unit`.
@@ -503,6 +505,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SPRINTLN, b_println);
     vm.register_builtin(SPRINT, b_print);
     vm.register_builtin(SDIV, b_div);
+    vm.register_builtin(SMOD, b_mod);
     vm.register_builtin(FFI_COMPILE, b_ffi_compile);
     vm.register_builtin(FFI_CALL, b_ffi_call);
     vm.register_builtin(SMETHOD, b_method);
@@ -1061,6 +1064,28 @@ enum SeqKind {
     },
 }
 
+/// Which empty-receiver access [`SeqKind::empty_fault`] is reporting. The four
+/// share one message shape per kind but not one wording, so the op is a
+/// parameter rather than four near-duplicate tables.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmptyOp {
+    Head,
+    Last,
+    Tail,
+    Init,
+}
+
+impl EmptyOp {
+    fn word(self) -> &'static str {
+        match self {
+            EmptyOp::Head => "head",
+            EmptyOp::Last => "last",
+            EmptyOp::Tail => "tail",
+            EmptyOp::Init => "init",
+        }
+    }
+}
+
 impl SeqKind {
     fn label(self) -> &'static str {
         match self {
@@ -1080,6 +1105,110 @@ impl SeqKind {
             SeqKind::PriorityQueue => "PriorityQueue",
             SeqKind::StrBuf => "StringBuilder",
             SeqKind::Range { .. } => "Range",
+        }
+    }
+
+    /// The out-of-range text `apply(i)` answers, which is NOT one message: each
+    /// Scala class reaches a different JDK/library check, so the exception CLASS
+    /// differs too.
+    ///
+    /// Captured from Scala 3.8.4 on JDK 26.0.2 — `List(1,2)(5)` is
+    /// `IndexOutOfBoundsException: 5` (`LinearSeqOps.apply` passes the bare
+    /// index), `Vector(1,2)(5)` is `IndexOutOfBoundsException: 5 is out of
+    /// bounds (min 0, max 1)` (`IndexedSeqOps` formats a span),
+    /// `Array(1,2)(5)` is the JVM's own `ArrayIndexOutOfBoundsException: Index 5
+    /// out of bounds for length 2`, and `new StringBuilder("ab")(5)` is
+    /// `StringIndexOutOfBoundsException` with the array wording. Answering one
+    /// of these for all of them was the bug this table replaces.
+    fn index_fault(self, i: i64, len: usize) -> String {
+        match self {
+            // The JVM's array bytecode check, and `ArraySeq` which delegates to it.
+            SeqKind::Array | SeqKind::ArraySeq => format!(
+                "scalars: java.lang.ArrayIndexOutOfBoundsException: Index {i} out of bounds for length {len}"
+            ),
+            // `StringBuilder` forwards to `String.charAt`'s check.
+            SeqKind::StrBuf => format!(
+                "scalars: java.lang.StringIndexOutOfBoundsException: Index {i} out of bounds for length {len}"
+            ),
+            // Linear sequences pass the raw index through.
+            SeqKind::List | SeqKind::Iterable | SeqKind::ListBuffer => {
+                format!("scalars: java.lang.IndexOutOfBoundsException: {i}")
+            }
+            // Every indexed sequence formats the legal span.
+            _ => index_out_of_bounds(i, len),
+        }
+    }
+
+    /// The empty-receiver text for `head`, `last`, `tail` and `init`.
+    ///
+    /// Same story as [`SeqKind::index_fault`]: `List` names itself
+    /// (`head of empty list`), `Vector` answers `IndexedSeqOps`' `empty.head`,
+    /// `Range` uses `on` where everything else uses `of`, a `Set`/`Map` reports
+    /// the ITERATOR it failed to advance (`next on empty iterator`), and the
+    /// mutable buffers throw with NO message at all. `None` is that last case —
+    /// `getMessage` reads `null`, which the caller renders by omitting the
+    /// `: <text>` suffix entirely.
+    ///
+    /// Captured from Scala 3.8.4 on JDK 26.0.2.
+    fn empty_fault(self, op: EmptyOp) -> String {
+        let exc = match (self, op) {
+            // `Range` raises `NoSuchElementException` even for `tail`/`init`,
+            // where every other kind raises `UnsupportedOperationException`.
+            (SeqKind::Range { .. }, _) | (_, EmptyOp::Head | EmptyOp::Last) => {
+                "java.util.NoSuchElementException"
+            }
+            _ => "java.lang.UnsupportedOperationException",
+        };
+        let text: Option<String> = match self {
+            SeqKind::Range { .. } => Some(format!("{} on empty Range", op.word())),
+            SeqKind::List | SeqKind::Iterable => Some(format!("{} of empty list", op.word())),
+            // `Vector`/`IndexedSeq` name the operation on an `empty` receiver —
+            // and `last` reports `empty.tail`, because it is implemented as one.
+            SeqKind::Vector => Some(match op {
+                EmptyOp::Last => "empty.tail".into(),
+                _ => format!("empty.{}", op.word()),
+            }),
+            SeqKind::Array => Some(format!("{} of empty array", op.word())),
+            SeqKind::ArraySeq => match op {
+                EmptyOp::Head | EmptyOp::Last => Some(format!("{} of empty ArraySeq", op.word())),
+                EmptyOp::Tail => Some("tail of empty array".into()),
+                EmptyOp::Init => None,
+            },
+            // A `ListBuffer` iterates for `head` but indexes for `last`.
+            SeqKind::ListBuffer => match op {
+                EmptyOp::Head => Some("next on empty iterator".into()),
+                EmptyOp::Last => Some("last of empty ListBuffer".into()),
+                _ => None,
+            },
+            SeqKind::ArrayBuffer | SeqKind::Queue | SeqKind::Stack | SeqKind::ArrayDeque => {
+                match op {
+                    EmptyOp::Head | EmptyOp::Last => {
+                        Some(format!("{} of empty {}", op.word(), self.label()))
+                    }
+                    _ => None,
+                }
+            }
+            // A `StringBuilder` is a `Seq[Char]` whose ops report `IndexedSeq`.
+            SeqKind::StrBuf => match op {
+                EmptyOp::Head | EmptyOp::Last => Some(format!("{} of empty IndexedSeq", op.word())),
+                _ => None,
+            },
+            // A `Set` has no order, so every access goes through its iterator.
+            SeqKind::Set(_) => match op {
+                EmptyOp::Head | EmptyOp::Last => Some("next on empty iterator".into()),
+                _ => None,
+            },
+            // A `PriorityQueue` reads its root directly for `head` but iterates
+            // for `last`, and says so.
+            SeqKind::PriorityQueue => match op {
+                EmptyOp::Head => Some("queue is empty".into()),
+                EmptyOp::Last => Some("next on empty iterator".into()),
+                _ => None,
+            },
+        };
+        match text {
+            Some(t) => format!("scalars: {exc}: {t}"),
+            None => format!("scalars: {exc}"),
         }
     }
 
@@ -1308,11 +1437,6 @@ fn str_chars(v: &Value) -> Vec<Value> {
 /// / `ArrayDeque` removal raises with nothing to remove.
 fn empty_collection() -> String {
     "scalars: java.util.NoSuchElementException: empty collection".into()
-}
-
-/// The peek (`Stack.top`, `Queue.front`) counterpart, which names the receiver.
-fn empty_head_of(label: &str) -> String {
-    format!("scalars: java.util.NoSuchElementException: head of empty {label}")
 }
 
 /// `java.lang.StringBuilder`'s out-of-range message, which reports the length
@@ -2118,9 +2242,12 @@ fn priority_queue_method(
             set(v);
             Ok(new_seq(SeqKind::ArraySeq, out))
         }
+        // Both read the heap root, but they fail differently: `head` reports the
+        // queue, `max` reports the generic empty-reduction.
         ("head" | "max", 0) => match items.first() {
             Some(v) => Ok(v.clone()),
-            None => Err("scalars: java.util.NoSuchElementException: empty collection".into()),
+            None if name == "head" => Err(SeqKind::PriorityQueue.empty_fault(EmptyOp::Head)),
+            None => Err("scalars: java.lang.UnsupportedOperationException: empty.max".into()),
         },
         ("headOption", 0) => Ok(opt(items.first().cloned())),
         ("clone", 0) => Ok(new_seq(SeqKind::PriorityQueue, items.to_vec())),
@@ -2485,13 +2612,28 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
             Some(0) | Some(1) => {
                 let items = as_seq_or_tuple(recv).unwrap_or_default();
                 let i = args.first().map(|a| a.to_int()).unwrap_or(0);
-                return list_index(&items, i);
+                // Applying a BOUND sequence (`val b = …; b(5)`) must fail the
+                // same way `Seq(…)(5)` does, so it reads the receiver's kind
+                // rather than defaulting to `List`'s bare-index message. A
+                // `Tuple` has no kind and keeps that bare index, which is what
+                // `Tuple.productElement` raises.
+                return match usize::try_from(i).ok().and_then(|u| items.get(u)) {
+                    Some(v) => Ok(v.clone()),
+                    None => Err(match seq_kind_items(recv) {
+                        Some((k, _)) => k.index_fault(i, items.len()),
+                        None => format!("scalars: java.lang.IndexOutOfBoundsException: {i}"),
+                    }),
+                };
             }
             Some(2) => {
                 let m = as_map(recv).unwrap_or_default();
                 let key = args.first().cloned().unwrap_or(Value::Undef);
-                return map_get(&m, &key)
-                    .ok_or_else(|| format!("scalars: key not found: {}", scala_str(&key)));
+                return map_get(&m, &key).ok_or_else(|| {
+                    format!(
+                        "scalars: java.util.NoSuchElementException: key not found: {}",
+                        scala_str(&key)
+                    )
+                });
             }
             _ => {}
         }
@@ -3716,7 +3858,13 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             };
             Ok(pad_str(ch.to_string(), left, width))
         }
-        other => Err(format!("scalars: unsupported format conversion `%{other}`")),
+        // `java.util.Formatter` rejects an unknown conversion character with a
+        // catchable exception naming just that character — the same one the
+        // truncated-specifier path above raises. This used to answer wording of
+        // its own, which no `catch` could match on and no JDK ever printed.
+        other => Err(format!(
+            "scalars: java.util.UnknownFormatConversionException: Conversion = '{other}'"
+        )),
     }
 }
 
@@ -4247,7 +4395,7 @@ fn mut_seq_method(
         // `Stack.top` / `Queue.front` peek without removing.
         ("top" | "front", 0) if buffer => match items.first() {
             Some(v) => Some(Ok(v.clone())),
-            None => Some(Err(empty_head_of(kind.label()))),
+            None => Some(Err(kind.empty_fault(EmptyOp::Head))),
         },
         // `StringBuilder`'s own character-level mutators.
         ("deleteCharAt", 1) | ("setCharAt", 2) if strbuf => {
@@ -4639,12 +4787,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             if !(kind == SeqKind::Array || kind.is_buffer()) {
                 return Err(no_such_method(recv, name));
             }
+            // `a(i) = v` fails exactly the way `a(i)` does: an `Array` hits the
+            // JVM's array check, a buffer hits `IndexedSeqOps`' span message.
             let i = args[0].to_int();
             if i < 0 || i as usize >= items.len() {
-                return Err(format!(
-                    "scalars: java.lang.ArrayIndexOutOfBoundsException: Index {i} out of bounds for length {}",
-                    items.len()
-                ));
+                return Err(kind.index_fault(i, items.len()));
             }
             if let Value::Obj(id) = recv {
                 HEAP.with(|h| {
@@ -4665,6 +4812,16 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 Ordering::Less
             };
             let Some(first) = items.first() else {
+                // A `Range` knows its extremes without scanning, so it answers
+                // `last`/`head` on an empty receiver rather than `empty.max`.
+                if matches!(kind, SeqKind::Range { .. }) {
+                    let op = if name == "max" {
+                        EmptyOp::Last
+                    } else {
+                        EmptyOp::Head
+                    };
+                    return Err(kind.empty_fault(op));
+                }
                 return Err(format!(
                     "scalars: java.lang.UnsupportedOperationException: empty.{name}"
                 ));
@@ -4692,19 +4849,29 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         ("length" | "size", 0) => Ok(Value::int(items.len() as i64)),
         ("isEmpty", 0) => Ok(Value::bool(items.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!items.is_empty())),
+        // The four empty-receiver accesses. Each kind words its own failure —
+        // see [`SeqKind::empty_fault`] — so they route through that table
+        // rather than answering `List`'s message for every collection.
         ("head", 0) => items
             .first()
             .cloned()
-            .ok_or_else(|| "scalars: java.util.NoSuchElementException: head of empty list".into()),
+            .ok_or_else(|| kind.empty_fault(EmptyOp::Head)),
         ("last", 0) => items
             .last()
             .cloned()
-            .ok_or_else(|| "scalars: java.util.NoSuchElementException: last of empty list".into()),
+            .ok_or_else(|| kind.empty_fault(EmptyOp::Last)),
         ("tail", 0) => {
             if items.is_empty() {
-                Err("scalars: java.lang.UnsupportedOperationException: tail of empty list".into())
+                Err(kind.empty_fault(EmptyOp::Tail))
             } else {
                 Ok(same(items[1..].to_vec()))
+            }
+        }
+        ("init", 0) => {
+            if items.is_empty() {
+                Err(kind.empty_fault(EmptyOp::Init))
+            } else {
+                Ok(same(items[..items.len() - 1].to_vec()))
             }
         }
         ("reverse", 0) => Ok(same(items.iter().rev().cloned().collect())),
@@ -4715,7 +4882,13 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             Ok(Value::str(join_vm(vm, &items, &sep)))
         }
         ("contains", 1) => Ok(Value::bool(items.iter().any(|x| value_eq(x, &args[0])))),
-        ("apply", 1) => list_index(&items, args[0].to_int()),
+        ("apply", 1) => {
+            let i = args[0].to_int();
+            match usize::try_from(i).ok().and_then(|u| items.get(u)) {
+                Some(v) => Ok(v.clone()),
+                None => Err(kind.index_fault(i, items.len())),
+            }
+        }
         ("toList", 0) => Ok(new_list(items)),
         ("map", 1) => {
             let mut out = Vec::with_capacity(items.len());
@@ -4948,8 +5121,14 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         ("grouped" | "sliding", 1) => {
             let n = args[0].to_int();
             if n < 1 {
+                // Both are `iterateUntilEmpty(size, step)` underneath, and its
+                // `require` reports BOTH numbers. `grouped(n)` passes `n` as the
+                // step; `sliding(n)` leaves the step at 1 — which is why the two
+                // print different text for the same argument.
+                let step = if name == "grouped" { n } else { 1 };
                 return Err(format!(
-                    "scalars: java.lang.IllegalArgumentException: requirement failed: size={n}"
+                    "scalars: java.lang.IllegalArgumentException: requirement failed: \
+                     size={n} and step={step}, but both must be positive"
                 ));
             }
             let n = n as usize;
@@ -5342,8 +5521,11 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             if name.ends_with("Option") {
                 return Ok(opt(pick.cloned()));
             }
+            // A `Map` is unordered, so `head`/`last` both advance its iterator
+            // and both report that iterator when there is nothing to advance —
+            // NOT a `head of empty map`, which no Scala version prints.
             pick.cloned().ok_or_else(|| {
-                "scalars: java.util.NoSuchElementException: head of empty map".into()
+                "scalars: java.util.NoSuchElementException: next on empty iterator".into()
             })
         }
         // Everything else that only reads the entries as a pair sequence is the
@@ -5381,8 +5563,12 @@ fn map_read_method(
         ("isEmpty", 0) => Ok(Value::bool(entries.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!entries.is_empty())),
         ("contains", 1) => Ok(Value::bool(map_get(entries, &args[0]).is_some())),
-        ("apply", 1) => map_get(entries, &args[0])
-            .ok_or_else(|| format!("scalars: key not found: {}", scala_str(&args[0]))),
+        ("apply", 1) => map_get(entries, &args[0]).ok_or_else(|| {
+            format!(
+                "scalars: java.util.NoSuchElementException: key not found: {}",
+                scala_str(&args[0])
+            )
+        }),
         ("get", 1) => Ok(match map_get(entries, &args[0]) {
             Some(v) => make_some(v),
             None => make_none(),
@@ -5827,7 +6013,8 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
             let until = clamp(args[1].to_int(), len).max(from);
             items[from..until].to_vec()
         }
-        ("init", 0) => items[..len.saturating_sub(1)].to_vec(),
+        // `init` is NOT here: on an empty receiver it raises, and the wording is
+        // per-kind, so `seq_method` answers it from `SeqKind::empty_fault`.
         ("distinct", 0) => {
             let mut out: Vec<Value> = Vec::with_capacity(len);
             for it in items {
@@ -5892,7 +6079,10 @@ fn b_array_fill(vm: &mut VM, _argc: u8) -> Value {
     let ty = vm.pop().as_str_cow().into_owned();
     let n = vm.pop().to_int();
     if n < 0 {
-        return fault(vm, "scalars: java.lang.NegativeArraySizeException");
+        return fault(
+            vm,
+            &format!("scalars: java.lang.NegativeArraySizeException: {n}"),
+        );
     }
     let zero = match ty.as_str() {
         "Int" | "Long" | "Short" | "Byte" | "Char" => Value::int(0),
@@ -6897,7 +7087,10 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             "scalars: java.util.NoSuchElementException: head of empty String".to_string()
         }),
         ("last", 0) => s.chars().next_back().map(make_char).ok_or_else(|| {
-            "scalars: java.lang.UnsupportedOperationException: last of empty String".to_string()
+            // `StringOps.last` reads through the iterator, so it is a
+            // `NoSuchElementException` — NOT the `UnsupportedOperationException`
+            // its `tail`/`init` siblings raise.
+            "scalars: java.util.NoSuchElementException: last of empty String".to_string()
         }),
         ("headOption", 0) => Ok(match s.chars().next() {
             Some(c) => make_some(make_char(c)),
@@ -6918,6 +7111,14 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 format!("scalars: java.lang.UnsupportedOperationException: empty.{name}")
             })
         }
+        // Both raise on an empty receiver — `StringOps` inherits `SeqOps`'
+        // checks, so `"".tail` is NOT `""`.
+        ("init", 0) if s.is_empty() => Err(
+            "scalars: java.lang.UnsupportedOperationException: init of empty String".to_string(),
+        ),
+        ("tail", 0) if s.is_empty() => Err(
+            "scalars: java.lang.UnsupportedOperationException: tail of empty String".to_string(),
+        ),
         ("init", 0) => Ok(Value::str(char_slice(s, 0, s.chars().count() as i64 - 1))),
         ("tail", 0) => Ok(Value::str(char_slice(s, 1, s.chars().count() as i64))),
         ("apply", 1) => string_method(s, "charAt", args),
@@ -7210,8 +7411,17 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
                         match usize::try_from(i).ok().and_then(|i| groups.get(i - 1)) {
                             Some(Some(g)) => Ok(Value::str(g.to_string())),
                             Some(None) => Ok(Value::Undef),
+                            // `Regex.Match.group(i)` indexes its own start/end
+                            // ARRAYS rather than calling `Matcher.group`, so an
+                            // out-of-range group is the JVM's array fault — not
+                            // the `IndexOutOfBoundsException: No group i` that
+                            // `Matcher` (and hence `replaceAll`'s `$n`) raises.
+                            // The array holds group 0 too, so its length is one
+                            // more than the capture count.
                             None => Err(format!(
-                                "scalars: java.lang.IndexOutOfBoundsException: No group {i}"
+                                "scalars: java.lang.ArrayIndexOutOfBoundsException: \
+                                 Index {i} out of bounds for length {}",
+                                groups.len() + 1
                             )),
                         }
                     }
@@ -7809,6 +8019,42 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
             }
         }
         _ => Value::float(a.to_float() / b.to_float()),
+    }
+}
+
+/// Scala `%`, which shares `/`'s zero-divisor trap.
+///
+/// The JVM's `irem` raises the SAME `java.lang.ArithmeticException: / by zero`
+/// as `idiv` — the message names `/` even though the operator was `%`. Verified
+/// against Scala 3.8.4 on JDK 26.0.2: `1 % 0` answers
+/// `java.lang.ArithmeticException: / by zero`. fusevm's native `Op::Mod` has no
+/// such trap and quietly answers `0`, so `%` routes here exactly as `/` routes
+/// through [`b_div`]. Float `%` is IEEE remainder-toward-zero and never throws,
+/// so it stays on the float path.
+fn b_mod(vm: &mut VM, _argc: u8) -> Value {
+    let b = vm.stack.pop().unwrap_or(Value::Undef);
+    let a = vm.stack.pop().unwrap_or(Value::Undef);
+    if unwinding() {
+        return Value::Undef;
+    }
+    // A `Char` takes its remainder as a code point, matching `b_div`.
+    let (a, b) = match (num_of(&a), num_of(&b)) {
+        (Some(x), Some(y)) if as_char(&a).is_some() || as_char(&b).is_some() => {
+            (Value::int(x), Value::int(y))
+        }
+        _ => (a, b),
+    };
+    match (&a, &b) {
+        (Value::Int(x), Value::Int(y)) => {
+            if *y == 0 {
+                fault(vm, "java.lang.ArithmeticException: / by zero")
+            } else {
+                // `Int.MinValue % -1` is 0 on the JVM; `wrapping_rem` agrees
+                // where the plain operator would panic on overflow.
+                Value::int(x.wrapping_rem(*y))
+            }
+        }
+        _ => Value::float(a.to_float() % b.to_float()),
     }
 }
 
