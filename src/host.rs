@@ -3719,7 +3719,7 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
     // `Vector`); promote it to a heap `Vector` seq so the collection methods
     // (`map`, `toList`, …) apply uniformly.
     let recv = match &recv {
-        Value::Array(items) => heap_push(HeapVal::Seq(SeqKind::Vector, items.clone())),
+        Value::Array(items) => heap_push(HeapVal::Seq(SeqKind::Vector, items.to_vec())),
         _ => recv,
     };
 
