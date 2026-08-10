@@ -2628,7 +2628,46 @@ fn g_appmember(r: &mut Rng) -> String {
 /// probing the type, not where it was written.
 const TOP_SEP: &str = "//@TOP@";
 
-fn build_program(probes: &[String]) -> String {
+/// Which entry point the generated program is written with.
+///
+/// Every probe in this file is a STATEMENT, and until now every statement was
+/// placed in one shape — `object T extends App { … }`. That made the entry point
+/// a constant of the harness rather than an axis of it, so any behaviour that
+/// differs by entry shape was invisible however many probes ran. It does differ:
+/// under `extends App` a forward reference to a later `val` reads the JVM field
+/// default while under `@main` there is no such field at all, `getClass.getName`
+/// answers `T$` against `scala.Predef$`, and `args` is null in the first and the
+/// real command line in the second.
+///
+/// `--entry` selects the shape, so any mode can be run under any of them.
+#[derive(Clone, Copy, PartialEq)]
+enum Entry {
+    /// `object T extends App { … }` — the historical (and default) shape.
+    App,
+    /// `@main def zzMain(): Unit = { … }` — the Scala 3 entry annotation.
+    Main,
+    /// `object T { def main(args: Array[String]): Unit = { … } }`.
+    MainSig,
+}
+
+fn parse_entry(s: &str) -> Option<Entry> {
+    Some(match s {
+        "app" => Entry::App,
+        "main" => Entry::Main,
+        "mainsig" => Entry::MainSig,
+        _ => return None,
+    })
+}
+
+fn entry_name(e: Entry) -> &'static str {
+    match e {
+        Entry::App => "app",
+        Entry::Main => "main",
+        Entry::MainSig => "mainsig",
+    }
+}
+
+fn build_program(probes: &[String], entry: Entry) -> String {
     let mut top = String::new();
     let mut body = String::new();
     for p in probes {
@@ -2655,10 +2694,20 @@ fn build_program(probes: &[String]) -> String {
     // also rejects it agrees on the failure — so the whole `breaks` mode scores
     // a clean zero while testing nothing. That is exactly what it did before
     // this import was added.
+    // The `@main` method's name is deliberately not `main`: Scala 3 rejects
+    // `@main def main` ("method main is already defined"), because the generated
+    // launcher class would collide with it.
+    let shell = match entry {
+        Entry::App => format!("object T extends App {{\n{body}}}\n"),
+        Entry::Main => format!("@main def zzMain(): Unit = {{\n{body}}}\n"),
+        Entry::MainSig => {
+            format!("object T {{ def main(args: Array[String]): Unit = {{\n{body}}} }}\n")
+        }
+    };
     format!(
         "import scala.collection.mutable\nimport scala.util.matching.Regex\n\
          import scala.util.control.Breaks._\n\
-         {top}object T extends App {{\n{body}}}\n"
+         {top}{shell}"
     )
 }
 
@@ -2794,8 +2843,14 @@ fn harness_failed(r: &RunOut) -> bool {
     r.exit == -1
 }
 
-fn diverges(probes: &[String], ours: &Path, oracle: &Path, timeout: Duration) -> bool {
-    let src = build_program(probes);
+fn diverges(
+    probes: &[String],
+    ours: &Path,
+    oracle: &Path,
+    timeout: Duration,
+    entry: Entry,
+) -> bool {
+    let src = build_program(probes, entry);
     let o = run_prog(oracle, &src, timeout);
     if o.timed_out || harness_failed(&o) {
         return false; // oracle-side pathology, not a parity gap
@@ -2810,11 +2865,17 @@ fn diverges(probes: &[String], ours: &Path, oracle: &Path, timeout: Duration) ->
 /// Shrink a diverging program to the smallest still-diverging probe subset.
 /// Probes are independent, so a single offending probe almost always reproduces;
 /// fall back to a linear "remove one at a time" pass otherwise.
-fn minimize(probes: &[String], ours: &Path, oracle: &Path, timeout: Duration) -> Vec<String> {
+fn minimize(
+    probes: &[String],
+    ours: &Path,
+    oracle: &Path,
+    timeout: Duration,
+    entry: Entry,
+) -> Vec<String> {
     // 1. Try each probe alone.
     for p in probes {
         let one = vec![p.clone()];
-        if diverges(&one, ours, oracle, timeout) {
+        if diverges(&one, ours, oracle, timeout, entry) {
             return one;
         }
     }
@@ -2824,7 +2885,7 @@ fn minimize(probes: &[String], ours: &Path, oracle: &Path, timeout: Duration) ->
     while i < cur.len() && cur.len() > 1 {
         let mut trial = cur.clone();
         trial.remove(i);
-        if diverges(&trial, ours, oracle, timeout) {
+        if diverges(&trial, ours, oracle, timeout, entry) {
             cur = trial;
         } else {
             i += 1;
@@ -2880,6 +2941,7 @@ fn resolve_oracle(ours: &Path) -> PathBuf {
         }
         if scala_version(&cp).is_some() {
             check_oracle_jvm(&cp);
+            check_oracle_locale(&cp);
             return cp;
         }
     }
@@ -2894,6 +2956,60 @@ fn resolve_oracle(ours: &Path) -> PathBuf {
 /// round-trips, JDK-4511638): an older JVM answers `1.0e23` with
 /// `9.999999999999999E22`, a newer one with `1.0E23`. Verified on this machine —
 /// Corretto 17.0.4.1 prints the former, OpenJDK 21.0.12 and 26.0.2 the latter.
+/// The oracle's `Locale.getDefault` decides the decimal separator and the
+/// grouping separator every `%f`/`%e`/`%,d` conversion lays out, and the
+/// case-mapping rules `toUpperCase`/`toLowerCase` apply. It is a SECOND axis on
+/// top of the JVM version: two oracles on the same JDK 26 disagree about
+/// `f"$x%.2f"` if one runs under `de_DE` (`0,13`) and the other under `en_US`
+/// (`0.13`), and about `"hi".toUpperCase` if one runs under `tr` (`Hİ`).
+///
+/// Both are pinned in the frozen corpus — `tests/data/parity_expected.txt`
+/// records 192-194 are `%.2f`/`%.3e`/`%05d|%.2f` captures, and records 47 and 93
+/// pin `toUpperCase` results — so a capture taken under another locale would
+/// freeze a different string with nothing to mark it as locale-derived. The
+/// grouping flag is included because it is the one the fuzzer's `fmt` mode
+/// generates (`%,d`).
+const LOCALE_PROBE: &str = "object T extends App { \
+                            println(String.format(\"%,.2f\", java.lang.Double.valueOf(1234.5))); \
+                            println(\"hi\".toUpperCase + \"I\".toLowerCase); \
+                            println(java.util.Locale.getDefault.toString) }\n";
+
+/// What [`LOCALE_PROBE`]'s first two lines read under the locale the frozen
+/// corpus was captured with. Verified on this machine: Scala 3.8.4 on JDK 26.0.2
+/// with `Locale.getDefault` `en_US` prints `1,234.50` then `HIi`.
+const LOCALE_EXPECTED: [&str; 2] = ["1,234.50", "HIi"];
+
+/// Reject an oracle whose default locale is not the one the frozen expectations
+/// were captured under.
+///
+/// The version gate below answers WHICH JVM the launcher picked. This answers a
+/// different question the version cannot: two runs of the same JVM disagree
+/// about a `%f` conversion when `LANG`/`LC_ALL`/`-Duser.language` differ, and a
+/// re-capture taken under the wrong one would freeze a comma for a period
+/// without any of it looking wrong.
+fn check_oracle_locale(oracle: &Path) {
+    let out = run_prog(oracle, LOCALE_PROBE, Duration::from_secs(120));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let got: Vec<&str> = lines.iter().take(2).copied().collect();
+    if got != LOCALE_EXPECTED {
+        eprintln!(
+            "parity-fuzz: the oracle at {} runs under locale {} (LANG={:?}, LC_ALL={:?}), which \
+             formats and case-maps differently from the one the frozen corpus was captured under \
+             — it answers {:?} where {:?} is expected. Every `%f`/`%,d`/`toUpperCase` comparison \
+             against it would be spurious. Run it under en_US (or re-capture the corpus and say \
+             so) and re-run.",
+            oracle.display(),
+            lines.get(2).unwrap_or(&"unknown"),
+            std::env::var("LANG").ok(),
+            std::env::var("LC_ALL").ok(),
+            got,
+            LOCALE_EXPECTED,
+        );
+        std::process::exit(2);
+    }
+}
+
 const JVM_PROBE: &str =
     "object T extends App { println(1.0e23); println(System.getProperty(\"java.version\")) }\n";
 
@@ -2963,6 +3079,7 @@ struct Args {
     timeout: Duration,
     max_report: usize,
     out_path: PathBuf,
+    entry: Entry,
 }
 
 fn parse_args() -> Args {
@@ -2980,6 +3097,7 @@ fn parse_args() -> Args {
         timeout: Duration::from_secs(40),
         max_report: 40,
         out_path: PathBuf::from("target/parity-divergences.txt"),
+        entry: Entry::App,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -2990,6 +3108,7 @@ fn parse_args() -> Args {
             "--seed" => a.base_seed = val().parse().expect("--seed"),
             "--jobs" => a.jobs = val().parse::<usize>().expect("--jobs").max(1),
             "--mode" => a.mode = parse_mode(&val()).expect("unknown --mode"),
+            "--entry" => a.entry = parse_entry(&val()).expect("unknown --entry"),
             "--once" => a.once = true,
             "--timeout" => a.timeout = Duration::from_secs(val().parse().expect("--timeout")),
             "--max-report" => a.max_report = val().parse().expect("--max-report"),
@@ -3024,21 +3143,22 @@ fn main() {
 
     if args.once {
         let probes = gen_probes(args.base_seed, args.mode, args.probes);
-        let full = build_program(&probes);
+        let full = build_program(&probes, args.entry);
         let o = run_prog(&oracle, &full, args.timeout);
         let r = run_prog(&ours, &full, args.timeout);
         let diverged =
             !o.timed_out && !harness_failed(&o) && !harness_failed(&r) && differs(&o, &r);
         let show = if diverged {
-            minimize(&probes, &ours, &oracle, args.timeout)
+            minimize(&probes, &ours, &oracle, args.timeout, args.entry)
         } else {
             probes.clone()
         };
-        let ms = build_program(&show);
+        let ms = build_program(&show, args.entry);
         let mo = run_prog(&oracle, &ms, args.timeout);
         let mr = run_prog(&ours, &ms, args.timeout);
         println!("seed   : {}", args.base_seed);
         println!("mode   : {}", mode_name(args.mode));
+        println!("entry  : {}", entry_name(args.entry));
         println!("program:\n{ms}");
         println!(
             "--- scala(ref) exit={} timeout={} ---",
@@ -3095,10 +3215,11 @@ fn main() {
     );
     eprintln!("ours   : {}", ours.display());
     eprintln!(
-        "fuzzing {} programs x {} probes ({}) across {} workers…",
+        "fuzzing {} programs x {} probes ({}, entry {}) across {} workers…",
         args.count,
         args.probes,
         mode_name(args.mode),
+        entry_name(args.entry),
         args.jobs
     );
 
@@ -3114,7 +3235,7 @@ fn main() {
                 }
                 let seed = args.base_seed.wrapping_add(idx);
                 let probes = gen_probes(seed, args.mode, args.probes);
-                let src = build_program(&probes);
+                let src = build_program(&probes, args.entry);
                 let o = run_prog(&oracle, &src, args.timeout);
                 let r = run_prog(&ours, &src, args.timeout);
                 let done = checked.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3131,12 +3252,12 @@ fn main() {
                     signal.fetch_add(1, Ordering::Relaxed);
                 }
                 if !o.timed_out && !harness_err && differs(&o, &r) {
-                    let minimal = minimize(&probes, &ours, &oracle, args.timeout);
+                    let minimal = minimize(&probes, &ours, &oracle, args.timeout, args.entry);
                     // re-verify the shrunk case actually reproduces
-                    if !diverges(&minimal, &ours, &oracle, args.timeout) {
+                    if !diverges(&minimal, &ours, &oracle, args.timeout, args.entry) {
                         continue;
                     }
-                    let ms = build_program(&minimal);
+                    let ms = build_program(&minimal, args.entry);
                     let mo = run_prog(&oracle, &ms, args.timeout);
                     let mr = run_prog(&ours, &ms, args.timeout);
                     let rec = format!(
