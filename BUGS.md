@@ -486,6 +486,13 @@ reported as parse/compile errors, never silently mis-run.
   `@specialized` naming. They stay an error; `getClass` on a `String`, a
   primitive, a user `class`/`case class`/`object` or a throwable works (see
   above).
+
+  This one is **settled, not pending**: the answer would have to be a table of
+  private class names — which representation a `Vector` of each size picks,
+  which specialization suffix each primitive tuple carries — that says nothing
+  about how a program runs and goes stale with every library release. Refusing
+  it is the intended behaviour, so a program asking for it gets `value getClass
+  is not a member of value` rather than a plausible-looking wrong name.
 - **`Float` is not a distinct type.** There is one `Double` numeric type, so
   `Float.MaxValue`/`MinValue`/`MinPositiveValue` are not answered. The constant
   is the visible half of it; single precision is the rest. `0.1f + 0.2f` answers
