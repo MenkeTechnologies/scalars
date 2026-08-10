@@ -502,6 +502,14 @@ impl Resolver {
                 }
                 Ok(())
             }
+            // Both halves are ordinary expressions: the target is read (and
+            // written) and the operand is evaluated, so a `def` named in either
+            // needs the same resolution it would anywhere else.
+            Expr::CompoundAssign { target, value, .. } => {
+                self.walk_expr(target)?;
+                self.walk_expr(value)?;
+                Ok(())
+            }
             Expr::New { args, .. } => {
                 for a in args.iter_mut() {
                     self.walk_expr(a)?;
@@ -822,6 +830,10 @@ fn cs_expr(e: &mut Expr, sigs: &HashMap<String, Sig>) {
             for a in args.iter_mut() {
                 cs_expr(a, sigs);
             }
+        }
+        Expr::CompoundAssign { target, value, .. } => {
+            cs_expr(target, sigs);
+            cs_expr(value, sigs);
         }
         Expr::New { args, .. } => {
             for a in args.iter_mut() {

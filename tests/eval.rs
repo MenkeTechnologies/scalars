@@ -4182,3 +4182,85 @@ fn a_companion_object_is_not_a_redeclaration() {
     assert!(ok);
     assert_eq!(out, "P(0)\nP(5)\n");
 }
+
+#[test]
+fn a_compound_assign_in_expression_position_answers_the_growable_receiver() {
+    // Scala's `+=` is an expression. On a receiver that HAS the method the
+    // value is that receiver, so `println(b += 3)` prints the buffer.
+    let (out, ok) = run(&wrap(
+        "val b = scala.collection.mutable.ListBuffer(1, 2); println(b += 3); println(b)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "ListBuffer(1, 2, 3)\nListBuffer(1, 2, 3)\n");
+}
+
+#[test]
+fn a_compound_assign_in_expression_position_answers_unit_when_it_is_arithmetic() {
+    // The other half of the same SLS 6.12.4 choice: with no `+=` member the
+    // expansion is `n = n + 1`, an assignment, whose value is `()`. Both halves
+    // are branches of ONE lowering, so the update must still land.
+    let (out, ok) = run(&wrap(
+        "var n = 5; println(n += 1); println(n); val r = (n *= 2); println(r); println(n)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "()\n6\n()\n12\n");
+}
+
+#[test]
+fn an_expression_position_compound_assign_reaches_an_element_and_a_field() {
+    // An `Int` element goes through `update`, so the value is `()`; a growable
+    // element takes the member call, so the value is the ELEMENT.
+    let (out, ok) = run(&wrap(
+        "val a = Array(1, 2, 3); println(a(1) += 10); println(a.mkString(\",\")); \
+         val m = scala.collection.mutable.Map(\"k\" -> scala.collection.mutable.ListBuffer(1)); \
+         println(m(\"k\") += 5); \
+         class C(var f: Int); val c = new C(3); println(c.f *= 4); println(c.f)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "()\n1,12,3\nListBuffer(1, 5)\n()\n12\n");
+}
+
+#[test]
+fn a_chained_compound_assign_feeds_its_own_result() {
+    // `(b += 2) += 3` has no assignable target for the outer `+=`, so only the
+    // member reading exists — and it only works if the inner one answered the
+    // buffer rather than `()`.
+    let (out, ok) = run(&wrap(
+        "val b = scala.collection.mutable.ListBuffer(1); println((b += 2) += 3); println(b)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "ListBuffer(1, 2, 3)\nListBuffer(1, 2, 3)\n");
+}
+
+#[test]
+fn an_expression_position_compound_assign_still_boxes_the_var_it_writes() {
+    // The value is read AND the write escapes the closure: `n` is written from
+    // inside a lambda, so it has to be boxed exactly as the statement form
+    // boxes it, or the closure would update a copy and `n` would stay 0.
+    let (out, ok) = run(&wrap(
+        "var n = 0; val xs = List(1, 2, 3).map(x => n += x); println(xs); println(n)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List((), (), ())\n6\n");
+}
+
+#[test]
+fn an_expression_position_compound_assign_evaluates_its_target_once() {
+    // Reading the value must not cost a second evaluation of the target: the
+    // index has a side effect, so a re-evaluating lowering answers 2 here.
+    let (out, ok) = run(&wrap(
+        "val a = Array(1, 2); var i = 0; def next(): Int = { i += 1; i - 1 }; \
+         println(a(next()) += 9); println(a.mkString(\",\")); println(i)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "()\n10,2\n1\n");
+}
+
+#[test]
+fn a_growable_operator_assign_in_expression_position_answers_its_receiver() {
+    let (out, ok) = run(&wrap(
+        "val sb = new StringBuilder(\"a\"); println(sb += 'b'); println(sb ++= \"cd\")",
+    ));
+    assert!(ok);
+    assert_eq!(out, "ab\nabcd\n");
+}

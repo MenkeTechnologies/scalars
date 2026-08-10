@@ -314,6 +314,23 @@ pub enum Expr {
         args: Vec<Expr>,
         line: u32,
     },
+    /// A compound assignment read for its VALUE — `println(buf += 1)`,
+    /// `val r = (n -= 2)`, `(buf += 1) += 2`.
+    ///
+    /// The statement forms ([`StmtKind::Assign`], [`StmtKind::PlaceAssign`])
+    /// discard that value; this variant keeps it. It is deliberately NOT one of
+    /// them wrapped in a statement, because the two have different results and
+    /// only the run time knows which: Scala prefers the `op=` MEMBER when the
+    /// receiver has one, whose value is the receiver (`buf += 1` is `buf`), and
+    /// falls back to the `x = x op e` expansion, whose value is `()` (SLS
+    /// 6.12.4). `target` is any shape the statement forms accept — a name, an
+    /// application (`a(i)`), or a selection (`p.n`).
+    CompoundAssign {
+        target: Box<Expr>,
+        op: AssignOp,
+        value: Box<Expr>,
+        line: u32,
+    },
     /// `new Class(args)` — construct a host-heap instance. Lowered to the class's
     /// `Class$new` constructor subroutine (see [`crate::compiler`]).
     New {

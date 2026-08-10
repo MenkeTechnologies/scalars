@@ -205,7 +205,10 @@ Implemented and checked against the reference `scala`:
   `counts(w) += 1`, `g(0)(1) += 9`, `obj.field += 5` — which Scala expands to
   `l.update(args, l.apply(args) op r)` unless the element has an `op=` member of
   its own, in which case that member mutates it in place. The receiver and the
-  indices are evaluated exactly once.
+  indices are evaluated exactly once. A compound assignment is also an
+  EXPRESSION, as in Scala — `println(buf += 1)` prints the buffer (the `op=`
+  member answers its receiver), `println(n += 1)` prints `()` (the
+  `n = n + 1` expansion is an assignment), and `(buf += 2) += 3` chains.
 - **User-defined methods** — helper `def f(a: T, b: U): R = body` alongside
   `main` (or in an `App` body) compile to fusevm's native `Op::Call` frames:
   parameters bind to per-call frame slots, so recursion and mutual recursion are

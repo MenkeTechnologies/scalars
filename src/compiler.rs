@@ -134,6 +134,16 @@ struct Compiler {
     current_object: Option<String>,
     /// Distinguishes synthetic method-dispatch / constructor-pattern temporaries.
     obj_counter: u32,
+    /// Where the VALUE of the compound assignment being lowered must be left —
+    /// `Some` only while an [`Expr::CompoundAssign`] is being compiled, `None`
+    /// in the ordinary statement forms, which discard it.
+    ///
+    /// It is a slot rather than the stack top because the value is decided by a
+    /// RUN-TIME branch: the `op=` member half answers the receiver, the
+    /// `x = x op e` half answers `()` (SLS 6.12.4), and the two rejoin only
+    /// after the write-back each half does or does not need. Each half stores
+    /// its own answer here and the reader loads it once, past the merge.
+    assign_result: Option<Place>,
     /// Lambda bodies discovered while lowering, awaiting emission as subroutine
     /// regions (drained after `main` + the class/object/function subs; draining a
     /// closure may enqueue further nested closures).
@@ -591,6 +601,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         current_class: None,
         current_object: None,
         obj_counter: 0,
+        assign_result: None,
         pending_closures: VecDeque::new(),
         closures_seen: 0,
         // Scan once up front: the unwind checks cost two ops per statement, so
@@ -892,78 +903,10 @@ impl Compiler {
                 self.b.patch_jump(ok, end);
                 Ok(())
             }
-            StmtKind::PlaceAssign { place, op, value } => self.place_assign(place, *op, value),
-            StmtKind::Assign { name, op, value } => {
-                // Scala rejects reassignment to a `val` at compile time; so do
-                // we — except for `+=`/`-=`, which on a `val` can only be the
-                // growable-collection method (`val buf = ListBuffer(); buf += x`
-                // is the idiom). It lowers as that call, so a `val Int` still
-                // fails, with the "value += is not a member of Int" message.
-                if self.vals.get(name) == Some(&true) {
-                    if matches!(op, AssignOp::Add | AssignOp::Sub) {
-                        let m = if *op == AssignOp::Add { "+=" } else { "-=" };
-                        self.emit_smethod(
-                            &Expr::Var(name.clone()),
-                            m,
-                            std::slice::from_ref(value),
-                            s.line,
-                        )?;
-                        self.b.emit(Op::Pop, 0);
-                        return Ok(());
-                    }
-                    return Err(format!(
-                        "scalars: reassignment to val `{name}` (line {})",
-                        s.line
-                    ));
-                }
-                let is_local = self
-                    .scope
-                    .as_ref()
-                    .is_some_and(|s| s.slots.contains_key(name));
-                // A `var` field assignment inside a method mutates the heap record.
-                if !is_local {
-                    if let Some((_, fields)) = &self.current_class {
-                        if fields.contains(name) {
-                            return self.field_assign(name, *op, value, s.line);
-                        }
-                    }
-                    // A `var` reassignment inside an object method updates its
-                    // `Name.val` global.
-                    if let Some(obj) = self.current_object.clone() {
-                        if self
-                            .objects
-                            .get(&obj)
-                            .is_some_and(|m| m.vals.contains(name))
-                        {
-                            return self.object_val_assign(&obj, name, *op, value);
-                        }
-                    }
-                }
-                let place = self.resolve_place(name);
-                let boxed = self.is_boxed(name);
-                // `x = e`, or `x <op>= e` → the current value then the operator.
-                if *op == AssignOp::Assign {
-                    self.expr(value)?;
-                } else {
-                    self.emit_load(place);
-                    if boxed {
-                        self.b.emit(Op::CallBuiltin(crate::host::CELL_GET, 1), 0);
-                    }
-                    let target = self.widths.get(name).map_or(NumTy::Unknown, |w| w.num);
-                    self.compound_tail(*op, value, target)?;
-                }
-                self.unwind_check_dropping(1);
-                // A boxed `var` is written through its cell, so the write is
-                // seen by every closure that captured it.
-                if boxed {
-                    self.emit_load(place);
-                    self.b.emit(Op::CallBuiltin(crate::host::CELL_SET, 2), 0);
-                    self.b.emit(Op::Pop, 0);
-                } else {
-                    self.emit_store(place);
-                }
-                Ok(())
+            StmtKind::PlaceAssign { place, op, value } => {
+                self.place_assign(place, *op, value, s.line)
             }
+            StmtKind::Assign { name, op, value } => self.name_assign(name, *op, value, s.line),
             StmtKind::Return(val) => {
                 // A `return` that has to leave a lambda frame, or run an
                 // enclosing `finally` on its way out, is lowered the way Scala
@@ -1331,6 +1274,12 @@ impl Compiler {
                 args,
                 line,
             } => self.method(recv, name, args, *line)?,
+            Expr::CompoundAssign {
+                target,
+                op,
+                value,
+                line,
+            } => self.compound_assign_expr(target, *op, value, *line)?,
             Expr::New { name, args, line } => self.construct(name, args, *line)?,
             Expr::Copy {
                 recv,
@@ -2373,6 +2322,7 @@ impl Compiler {
                 _ => self.b.emit(compound_op(op), 0),
             };
             self.narrow(w, 0);
+            self.assign_result_is_unit();
             return Ok(());
         }
         // No mutable collection in the program: `+=` can only be arithmetic,
@@ -2381,6 +2331,7 @@ impl Compiler {
             self.expr(value)?;
             self.b.emit(compound_op(op), 0);
             self.narrow(w, 0);
+            self.assign_result_is_unit();
             return Ok(());
         }
         let method = if op == AssignOp::Add { "+=" } else { "-=" };
@@ -2392,6 +2343,7 @@ impl Compiler {
         let nc = self.b.add_constant(Value::str(method.to_string()));
         self.b.emit(Op::LoadConst(nc), 0);
         self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 3), 0);
+        self.assign_result_is_stack_top();
         let to_end = self.b.emit(Op::Jump(0), 0);
         let arith = self.b.current_pos();
         self.b.patch_jump(to_arith, arith);
@@ -2400,8 +2352,149 @@ impl Compiler {
         // Only this branch is arithmetic — the growable one answers a collection,
         // which must not be narrowed.
         self.narrow(w, 0);
+        self.assign_result_is_unit();
         let end = self.b.current_pos();
         self.b.patch_jump(to_end, end);
+        Ok(())
+    }
+
+    /// Record that the value of the compound assignment being lowered is the
+    /// one already on the stack — the `op=` member half, whose result is the
+    /// receiver it mutated. Copies it out; the stack is left as it was, so the
+    /// caller's own use of the value (a write-back, a `Pop`) is unaffected.
+    ///
+    /// A no-op in statement position, where nothing reads the value: the ops
+    /// below are emitted only for [`Expr::CompoundAssign`].
+    fn assign_result_is_stack_top(&mut self) {
+        if let Some(p) = self.assign_result {
+            self.b.emit(Op::Dup, 0);
+            self.emit_store(p);
+        }
+    }
+
+    /// Record that the value of the compound assignment being lowered is `()` —
+    /// the `x = x op e` half, which is an assignment, and an assignment's value
+    /// in Scala is `Unit`. The arithmetic result stays on the stack for the
+    /// write-back; only the recorded answer differs.
+    fn assign_result_is_unit(&mut self) {
+        if let Some(p) = self.assign_result {
+            self.emit_unit(0);
+            self.emit_store(p);
+        }
+    }
+
+    /// Lower a compound assignment that is read for its VALUE rather than run
+    /// for its effect — `println(buf += 1)`, `val r = (n -= 2)`.
+    ///
+    /// The effect is lowered by exactly the statement path the effect-only forms
+    /// take, so the two cannot drift: the target is evaluated once, the growable
+    /// test is the same one, the write-back is the same write-back. The only
+    /// addition is the slot each half of that path stores its answer into, which
+    /// is loaded here once both halves have rejoined.
+    fn compound_assign_expr(
+        &mut self,
+        target: &Expr,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        self.obj_counter += 1;
+        // The leading space keeps the name out of the user namespace.
+        let slot = self.declare_place(&format!(" ca{}", self.obj_counter));
+        let saved = self.assign_result.replace(slot);
+        let lowered = match target {
+            Expr::Var(name) => self.name_assign(name, op, value, line),
+            place => self.place_assign(place, op, value, line),
+        };
+        self.assign_result = saved;
+        lowered?;
+        self.emit_load(slot);
+        Ok(())
+    }
+
+    /// Lower an assignment whose target is a plain name — `x = e`, `x += e`.
+    ///
+    /// Four targets hide behind one name, and which one it is depends on where
+    /// the name was bound: a `val` (growable only), a `var` field of the class
+    /// being compiled, a `val`/`var` of the object being compiled, or an
+    /// ordinary local/global binding.
+    fn name_assign(
+        &mut self,
+        name: &str,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        // Scala rejects reassignment to a `val` at compile time; so do
+        // we — except for `+=`/`-=`, which on a `val` can only be the
+        // growable-collection method (`val buf = ListBuffer(); buf += x`
+        // is the idiom). It lowers as that call, so a `val Int` still
+        // fails, with the "value += is not a member of Int" message.
+        if self.vals.get(name) == Some(&true) {
+            if matches!(op, AssignOp::Add | AssignOp::Sub) {
+                let m = if op == AssignOp::Add { "+=" } else { "-=" };
+                self.emit_smethod(
+                    &Expr::Var(name.to_string()),
+                    m,
+                    std::slice::from_ref(value),
+                    line,
+                )?;
+                // Statically the member half, with no arithmetic branch to
+                // merge with: the call's own result is the value.
+                self.assign_result_is_stack_top();
+                self.b.emit(Op::Pop, 0);
+                return Ok(());
+            }
+            return Err(format!(
+                "scalars: reassignment to val `{name}` (line {line})"
+            ));
+        }
+        let is_local = self
+            .scope
+            .as_ref()
+            .is_some_and(|s| s.slots.contains_key(name));
+        // A `var` field assignment inside a method mutates the heap record.
+        if !is_local {
+            if let Some((_, fields)) = &self.current_class {
+                if fields.contains(name) {
+                    return self.field_assign(name, op, value, line);
+                }
+            }
+            // A `var` reassignment inside an object method updates its
+            // `Name.val` global.
+            if let Some(obj) = self.current_object.clone() {
+                if self
+                    .objects
+                    .get(&obj)
+                    .is_some_and(|m| m.vals.contains(name))
+                {
+                    return self.object_val_assign(&obj, name, op, value);
+                }
+            }
+        }
+        let place = self.resolve_place(name);
+        let boxed = self.is_boxed(name);
+        // `x = e`, or `x <op>= e` → the current value then the operator.
+        if op == AssignOp::Assign {
+            self.expr(value)?;
+        } else {
+            self.emit_load(place);
+            if boxed {
+                self.b.emit(Op::CallBuiltin(crate::host::CELL_GET, 1), 0);
+            }
+            let target = self.widths.get(name).map_or(NumTy::Unknown, |w| w.num);
+            self.compound_tail(op, value, target)?;
+        }
+        self.unwind_check_dropping(1);
+        // A boxed `var` is written through its cell, so the write is
+        // seen by every closure that captured it.
+        if boxed {
+            self.emit_load(place);
+            self.b.emit(Op::CallBuiltin(crate::host::CELL_SET, 2), 0);
+            self.b.emit(Op::Pop, 0);
+        } else {
+            self.emit_store(place);
+        }
         Ok(())
     }
 
@@ -2420,7 +2513,13 @@ impl Compiler {
     /// The receiver and every index are evaluated ONCE, into temporaries,
     /// because Scala evaluates them once and they may have side effects
     /// (`counts(next()) += 1` must not advance twice).
-    fn place_assign(&mut self, place: &Expr, op: AssignOp, value: &Expr) -> Result<(), String> {
+    fn place_assign(
+        &mut self,
+        place: &Expr,
+        op: AssignOp,
+        value: &Expr,
+        stmt_line: u32,
+    ) -> Result<(), String> {
         let (recv, args, line) = match place {
             // `a(i)` reaches here as a bare call from `primary`, or as an
             // `apply` on a computed receiver (`xs.head(i)`) — the same two
@@ -2441,9 +2540,13 @@ impl Compiler {
             } if args.is_empty() => {
                 return self.select_assign(recv, name, op, value, *line);
             }
-            _ => {
-                return Err("cannot compound-assign to this expression".to_string());
-            }
+            // A target that cannot be assigned to at all — `(buf += 1) += 2`,
+            // `f() += 1`. SLS 6.12.4 offers two readings and only one of them
+            // applies here: there is nothing to store back into, so the `l = l
+            // op r` expansion does not exist and the `op=` MEMBER is the whole
+            // meaning. Scala rejects a receiver without that member at compile
+            // time; here the method lookup rejects it at run time.
+            other => return self.member_compound(other, op, value, stmt_line),
         };
         self.obj_counter += 1;
         let n = self.obj_counter;
@@ -2485,6 +2588,30 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower `l op= e` where `l` is not a target that can be assigned to —
+    /// `(buf += 1) += 2`, `f() += 1`.
+    ///
+    /// Only the `op=` MEMBER half of SLS 6.12.4 exists for these, so there is no
+    /// growable test to make and no write-back to emit: the call IS the whole
+    /// lowering, and its result is the value.
+    fn member_compound(
+        &mut self,
+        target: &Expr,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        self.emit_smethod(
+            target,
+            assign_op_method(op),
+            std::slice::from_ref(value),
+            line,
+        )?;
+        self.assign_result_is_stack_top();
+        self.b.emit(Op::Pop, 0);
+        Ok(())
+    }
+
     /// Lower `obj.field op= e` — a compound assignment through an explicit
     /// receiver, the counterpart of [`Compiler::field_assign`]'s implicit `this`.
     ///
@@ -2522,6 +2649,7 @@ impl Compiler {
             let mc = self.b.add_constant(Value::str(method.to_string()));
             self.b.emit(Op::LoadConst(mc), line);
             self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 3), line);
+            self.assign_result_is_stack_top();
             self.b.emit(Op::Pop, 0);
             let to_end = self.b.emit(Op::Jump(0), 0);
             let arith = self.b.current_pos();
@@ -4299,6 +4427,9 @@ fn expr_any(e: &Expr, pred: &impl Fn(&Expr) -> bool) -> bool {
         Expr::Method { recv, args, .. } => {
             expr_any(recv, pred) || args.iter().any(|a| expr_any(a, pred))
         }
+        Expr::CompoundAssign { target, value, .. } => {
+            expr_any(target, pred) || expr_any(value, pred)
+        }
         Expr::Copy { recv, updates, .. } => {
             expr_any(recv, pred) || updates.iter().any(|(_, v)| expr_any(v, pred))
         }
@@ -5441,6 +5572,20 @@ impl BoxScan {
     fn expr(&mut self, e: &Expr, in_lambda: bool) {
         match e {
             Expr::NamedArg { value, .. } => self.expr(value, in_lambda),
+            // `xs.map(x => n += x)` writes `n` from inside a closure exactly as
+            // the statement form does, so it boxes `n` exactly as the statement
+            // form does. Reading the value instead of discarding it changes
+            // nothing about the write, and missing it here would leave the
+            // closure updating its own copy.
+            Expr::CompoundAssign { target, value, .. } => {
+                if in_lambda {
+                    if let Expr::Var(name) = &**target {
+                        self.assigned_in_lambda.insert(name.clone());
+                    }
+                }
+                self.expr(target, in_lambda);
+                self.expr(value, in_lambda);
+            }
             Expr::Lambda { body, .. } => self.expr(body, true),
             Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
                 let desugars = enums.iter().any(is_coll_gen);
@@ -5621,6 +5766,12 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
     match e {
         Expr::NamedArg { value, .. } => fv_expr(value, bound, out, seen),
         Expr::Var(name) => fv_note(name, bound, out, seen),
+        // The target is read as well as written, so walking it as an ordinary
+        // expression notes the same name `StmtKind::Assign` notes by hand.
+        Expr::CompoundAssign { target, value, .. } => {
+            fv_expr(target, bound, out, seen);
+            fv_expr(value, bound, out, seen);
+        }
         Expr::Try {
             body,
             catches,
@@ -5782,6 +5933,21 @@ fn pattern_binds(p: &Pattern, bound: &mut HashSet<String>) {
             bound.insert(n.clone());
         }
         _ => {}
+    }
+}
+
+/// The method name Scala looks for when it prefers the `op=` MEMBER over the
+/// `l = l op r` expansion (SLS 6.12.4). Only `+=`/`-=` name real collection
+/// methods (`Growable`/`Shrinkable`); the rest are here so a program that writes
+/// one gets "no such method" naming the operator it wrote.
+fn assign_op_method(op: AssignOp) -> &'static str {
+    match op {
+        AssignOp::Add => "+=",
+        AssignOp::Sub => "-=",
+        AssignOp::Mul => "*=",
+        AssignOp::Div => "/=",
+        AssignOp::Mod => "%=",
+        AssignOp::Assign => unreachable!("plain assign is not a compound assignment"),
     }
 }
 

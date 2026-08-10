@@ -997,33 +997,33 @@ impl Parser {
         }
         let e = self.expression()?;
         // A compound assignment whose target is not a plain name — `a(i) += 1`,
-        // `m(k) *= 2`, `obj.field += 1`. The simple-name forms are handled
-        // above; these keep the whole target expression so the compiler can
-        // evaluate its receiver and indices exactly once.
-        if let Tok::OpAssign(op) = self.peek().clone() {
-            // `xs(i) ++= ys` has no arithmetic reading: it is the growable
-            // method on the *element*, so it lowers as that call with no
-            // write-back, exactly like the plain-name form above.
-            let line = self.line();
-            self.advance();
-            let value = self.expression()?;
-            return Ok(StmtKind::Expr(Expr::Method {
-                recv: Box::new(e),
-                name: op,
-                args: vec![value],
-                line,
-            }));
-        }
-        if let Some(op) = assign_op(self.peek()) {
-            if op != AssignOp::Assign {
-                self.advance();
-                let value = self.expression()?;
-                return Ok(StmtKind::PlaceAssign {
-                    place: e,
+        // `m(k) *= 2`, `obj.field += 1`. `expression` reads those as the
+        // [`Expr::CompoundAssign`] they are in Scala; in STATEMENT position
+        // nothing reads the value, so unwrap back to the statement forms rather
+        // than lowering a result slot that would only be discarded. The target
+        // is kept whole so the compiler still evaluates its receiver and indices
+        // exactly once.
+        if let Expr::CompoundAssign {
+            target,
+            op,
+            value,
+            line: _,
+        } = e
+        {
+            return Ok(match *target {
+                // `(n) += 1` and the like: the bare-name form is normally caught
+                // above, before `expression` ever runs.
+                Expr::Var(name) => StmtKind::Assign {
+                    name,
                     op,
-                    value,
-                });
-            }
+                    value: *value,
+                },
+                place => StmtKind::PlaceAssign {
+                    place,
+                    op,
+                    value: *value,
+                },
+            });
         }
         // `a(i) = v` — Scala's element-assignment sugar for `a.update(i, v)`.
         // The indexing form reaches here either as a bare call (`a(i)`, from
@@ -1293,6 +1293,39 @@ impl Parser {
         }
         while self.is(&Tok::Match) {
             e = self.match_expr(e)?;
+        }
+        // A compound assignment, which in Scala is an EXPRESSION at the lowest
+        // precedence of all — `println(buf += 1)`, `val r = (n -= 2)`. `=`
+        // itself is not read here: a bare `=` after an expression is either the
+        // `a(i) = v` update sugar or a named argument, both of which are decided
+        // by their own callers.
+        //
+        // `++=`/`--=` have no arithmetic reading at all, so they need no
+        // dedicated node — they are the growable method, and a method call is
+        // already an expression with the receiver as its value.
+        if let Tok::OpAssign(name) = self.peek().clone() {
+            let line = self.line();
+            self.advance();
+            let value = self.expression()?;
+            return Ok(Expr::Method {
+                recv: Box::new(e),
+                name,
+                args: vec![value],
+                line,
+            });
+        }
+        if let Some(op) = assign_op(self.peek()) {
+            if op != AssignOp::Assign {
+                let line = self.line();
+                self.advance();
+                let value = self.expression()?;
+                return Ok(Expr::CompoundAssign {
+                    target: Box::new(e),
+                    op,
+                    value: Box::new(value),
+                    line,
+                });
+            }
         }
         Ok(e)
     }

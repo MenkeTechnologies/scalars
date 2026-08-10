@@ -91,6 +91,22 @@ reported as parse/compile errors, never silently mis-run.
   the same run-time `IS_GROWABLE` test a plain-name `+=` already took, so a
   program with no mutable collection still emits exactly the arithmetic it did
   before. Covered by the parity fuzzer's `placeassign` mode.
+- **Compound assignment in expression position.** `println(buf += 1)`,
+  `val r = (n -= 2)`, `xs.map(x => n += x)`, `(buf += 2) += 3`. Scala's
+  `l op= r` is an EXPRESSION, and its value is decided by which half of the SLS
+  6.12.4 choice ran: the `op=` **member** answers the receiver
+  (`println(buf += 1)` prints the buffer), the `l = l op r` expansion is an
+  assignment and answers `()` (`println(n += 1)` prints `()`, and `n` still
+  moved). That choice is the same run-time `IS_GROWABLE` test the statement
+  forms take, so each half stores its own answer into a slot the reader loads
+  once both have rejoined — which also means the effect is lowered by exactly
+  the statement path, target evaluated once and all
+  (`println(a(next()) += 9)` advances one step). Every target shape the
+  statement forms accept works, plus one they do not: a target that cannot be
+  assigned to at all (`(buf += 2) += 3`, `f() += 1`) has only the member
+  reading, since there is nothing to store back into. A `var` written this way
+  from inside a closure is boxed exactly as the statement form boxes it.
+  Covered by the parity fuzzer's `assignexpr` mode.
 - **Postfix method dispatch on core values.** `s.length`/`.size`,
   `.toUpperCase`/`.toLowerCase`, `.trim`, `.reverse`, `.isEmpty`/`.nonEmpty`,
   `.substring`, `.charAt`, `.contains`/`.startsWith`/`.endsWith`,
@@ -432,12 +448,6 @@ reported as parse/compile errors, never silently mis-run.
 - **An unqualified `Set`/`Map` always means the immutable one.** `import` lines
   are skipped, not tracked, so `import scala.collection.mutable.Set` followed by
   a bare `Set(1, 2)` builds the immutable set. Write `mutable.Set(1, 2)`.
-- **`x += e` in expression position.** `println(buf += 1)` — Scala's `+=` is an
-  expression whose value is the buffer. Here `+=` is a statement, so it is a
-  parse error rather than a mis-run. `buf += 1` on its own line works, and so
-  does every non-name target (`a(i) += 1`, `obj.f += 1`; see the supported entry
-  above) — it is the *expression position* that is unimplemented, not the target
-  shape.
 - **`xs: _*` outside an argument position.** The spread is parsed where Scala
   allows it — as an argument — and rejected everywhere else, which is also what
   Scala does. A spread handed to a parameter that is not repeated is a compile
