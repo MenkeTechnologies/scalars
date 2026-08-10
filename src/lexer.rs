@@ -184,6 +184,13 @@ impl Tok {
                 // stay out so a line break before them continues the `try`.
                 | Tok::Try
                 | Tok::Throw
+                // An annotation opens a declaration: `@main def …` on the line
+                // after an `import` is two statements, not one. Without this the
+                // parser's `import` scan runs past the line break and swallows
+                // the `@main`, leaving the file with no entry point. The `@` of
+                // a pattern binder (`case n @ 1`) never sits at the start of a
+                // line, so it is unaffected.
+                | Tok::At
         )
     }
 }
@@ -487,16 +494,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         }
 
         // operators & punctuation (longest match first)
-        let two = if i + 1 < bytes.len() {
-            &src[i..i + 2]
-        } else {
-            ""
-        };
-        let three = if i + 2 < bytes.len() {
-            &src[i..i + 3]
-        } else {
-            ""
-        };
+        //
+        // The lookahead slices by BYTE offset, and `i + 2` can land inside a
+        // multi-byte character — `,"é` in `List("a", "é")` puts the third byte
+        // of the window on the first continuation byte of `é`, and `&src[i..]`
+        // panics rather than returning a short slice. Every operator matched
+        // below is pure ASCII, so a window that is not a char boundary can never
+        // be one of them: answer `""` and fall through to the one-byte arm.
+        let two = peek(src, i, 2);
+        let three = peek(src, i, 3);
         let (kind, adv) = match three {
             // The growable-collection bulk operators. Longest match first: `++=`
             // would otherwise lex as `++` then `=`.
@@ -564,6 +570,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         line,
     });
     Ok(out)
+}
+
+/// The `n`-byte window at `i`, or `""` when it would run past the end of `src`
+/// or split a multi-byte character. Only ASCII operator spellings are matched
+/// against the result, so a split window and an absent one are equivalent.
+fn peek(src: &str, i: usize, n: usize) -> &str {
+    let end = i + n;
+    if end <= src.len() && src.is_char_boundary(end) {
+        &src[i..end]
+    } else {
+        ""
+    }
 }
 
 fn keyword_or_ident(word: &str) -> Tok {

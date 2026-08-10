@@ -112,8 +112,19 @@ impl Parser {
     }
 
     /// A compilation unit: `[package/import] (class | object | case class | case
-    /// object)*`. Exactly one `object` is the entry point (it `extends App` or
-    /// declares `def main`); the rest are sibling `class`/`object` declarations.
+    /// object | top-level `def`/`val`/`var`)*`. Exactly one entry point — an
+    /// `object` that `extends App` or declares `def main`, or a `@main def` —
+    /// and the rest are sibling declarations.
+    ///
+    /// Scala 3 collects the top-level `def`s and `val`s of `Foo.scala` into a
+    /// synthetic `Foo$package` object; here the `def`s join the same flat
+    /// function namespace an entry object's helpers use, and the `val`s become
+    /// the entry point's prologue. That ordering is the observable one: a
+    /// top-level `val` with a side effect runs BEFORE `@main`'s body, and before
+    /// the command line is read at all — `@main def go(i: Int)` above a
+    /// `val v = { println("init"); 1 }`, run with a non-numeric argument, prints
+    /// `init` and only then the `Illegal command line` diagnostic (Scala 3.8.4,
+    /// JDK 26.0.2).
     fn program(&mut self) -> Result<Program, String> {
         self.skip_seps();
         // Skip package/import prologue lines.
@@ -140,18 +151,57 @@ impl Parser {
         }
 
         let mut entry: Option<(String, Vec<Stmt>)> = None;
+        // A `@main def`'s name, and the top-level `val`/`var` statements that
+        // must run before whichever entry point this unit has.
+        let mut main_fn: Option<String> = None;
+        let mut top_stmts: Vec<Stmt> = Vec::new();
         loop {
             self.skip_seps();
             if self.is(&Tok::Eof) {
                 break;
             }
-            // Leading modifiers/annotations (`final`, `sealed`, `abstract`, …)
-            // arrive as bare idents; skip to the declaration keyword.
+            // An annotation. `@main` marks the next `def` as the entry point;
+            // every other annotation is skipped with its optional argument list.
+            let mut annotated_main = false;
+            while self.is(&Tok::At) {
+                self.advance();
+                let name = self.ident()?;
+                if self.is(&Tok::LParen) {
+                    self.skip_paren_group();
+                }
+                if name == "main" {
+                    annotated_main = true;
+                }
+                self.skip_seps();
+            }
+            // Leading modifiers (`final`, `sealed`, `abstract`, …) arrive as
+            // bare idents; skip to the declaration keyword.
             while !self.is(&Tok::Eof) && !self.at_declaration_start() {
                 self.advance();
             }
             if self.is(&Tok::Eof) {
                 break;
+            }
+            // A top-level `def`: a member of the synthetic `Foo$package` object,
+            // which this frontend flattens into the shared function namespace.
+            if self.is(&Tok::Def) {
+                let f = self.parse_def()?;
+                if annotated_main {
+                    if main_fn.is_some() {
+                        return Err("scalars: two `@main` methods in one file (Scala needs \
+                             `--main-class` to choose between them)"
+                            .to_string());
+                    }
+                    main_fn = Some(f.name.clone());
+                }
+                self.funcs.push(f);
+                continue;
+            }
+            // A top-level `val`/`var`: part of the same synthetic object, and its
+            // initializer runs before the entry point.
+            if self.is(&Tok::Val) || self.is(&Tok::Var) {
+                top_stmts.push(self.statement()?);
+                continue;
             }
             // `case` prefix → `case class` / `case object`.
             let line = self.line();
@@ -187,19 +237,86 @@ impl Parser {
             }
         }
 
-        match entry {
-            Some((object_name, main)) => Ok(Program {
-                object_name,
-                main,
-                functions: std::mem::take(&mut self.funcs),
-                classes: std::mem::take(&mut self.classes),
-                objects: std::mem::take(&mut self.objects),
-            }),
-            None => Err(
-                "scalars: no entry object (`extends App` or `def main(args: Array[String])`)"
-                    .to_string(),
-            ),
+        let (object_name, body) = match (entry, main_fn) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "scalars: this file has both an entry object and a `@main` method \
+                            (Scala needs `--main-class` to choose between them)"
+                        .to_string(),
+                )
+            }
+            (Some((name, body)), None) => (name, body),
+            // The `@main` entry: bind each parameter from the command line, in
+            // declaration order, then call the method.
+            (None, Some(name)) => {
+                let call = self.main_call(&name)?;
+                (name, vec![call])
+            }
+            (None, None) => {
+                return Err(
+                    "scalars: no entry point (`extends App`, `def main(args: Array[String])` \
+                     or `@main def`)"
+                        .to_string(),
+                )
+            }
+        };
+        // The synthetic object's `val`s initialize before the entry point runs.
+        top_stmts.extend(body);
+        Ok(Program {
+            object_name,
+            main: top_stmts,
+            functions: std::mem::take(&mut self.funcs),
+            classes: std::mem::take(&mut self.classes),
+            objects: std::mem::take(&mut self.objects),
+        })
+    }
+
+    /// The call a `@main` method's generated entry point makes: one
+    /// [`Expr::MainArg`] per declared parameter, in order.
+    ///
+    /// Scala reads each parameter through a `CommandLineParser.FromString[T]`
+    /// given instance, so a parameter whose type has none is a COMPILE error
+    /// there — `@main def go(c: Char)` is rejected with "No given instance of
+    /// type scala.util.CommandLineParser.FromString[Char]". The types that do
+    /// have one and that this frontend can represent are refused here for the
+    /// same reason rather than being approximated: `Float` is not a distinct
+    /// type here (see `BUGS.md`), so reading one would answer `Double`'s
+    /// rendering for a value that needs more than a `Float`'s digits.
+    fn main_call(&mut self, name: &str) -> Result<Stmt, String> {
+        let line = self.line();
+        let func = self
+            .funcs
+            .iter()
+            .find(|f| f.name == name)
+            .expect("the `@main` def was just pushed");
+        let mut args = Vec::with_capacity(func.params.len());
+        for (i, sig) in func.sig.iter().enumerate() {
+            if sig.vararg {
+                return Err(format!(
+                    "scalars: `@main def {name}`'s repeated parameter is not supported"
+                ));
+            }
+            let ty = sig.ty.clone().ok_or_else(|| {
+                format!("scalars: `@main def {name}` needs a type on every parameter")
+            })?;
+            if !matches!(
+                ty.as_str(),
+                "Int" | "Long" | "Double" | "Boolean" | "String" | "Byte" | "Short"
+            ) {
+                return Err(format!(
+                    "scalars: `@main def {name}` cannot read a `{ty}` from the command line"
+                ));
+            }
+            args.push(Expr::MainArg { index: i, ty });
         }
+        Ok(Stmt {
+            kind: StmtKind::Expr(Expr::Call {
+                name: name.to_string(),
+                args,
+                line,
+            }),
+            line,
+        })
     }
 
     /// Parse an `object`/`case object` declaration (cursor on `object`). Returns
@@ -412,6 +529,25 @@ impl Parser {
         }
     }
 
+    /// Consume a `( … )` group, balancing nested parentheses. The cursor is on
+    /// `(` — an annotation's argument list (`@deprecated("gone", "3.0")`).
+    fn skip_paren_group(&mut self) {
+        let mut depth = 0;
+        loop {
+            match self.advance() {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Eof => break,
+                _ => {}
+            }
+        }
+    }
+
     /// Consume a `[ … ]` group, balancing nested brackets. The cursor is on `[`.
     fn skip_bracket_group(&mut self) {
         let mut depth = 0;
@@ -573,7 +709,12 @@ impl Parser {
             return Ok(None);
         }
         self.eat(&Tok::LParen)?;
-        // skip the parameter list — `args` is parsed and ignored
+        // The parameter list. Only its NAME is kept: whatever `main` calls its
+        // `Array[String]` parameter, the value is the program's arguments.
+        let argv_name = match self.peek() {
+            Tok::Ident(n) => Some(n.clone()),
+            _ => None,
+        };
         let mut depth = 1;
         while depth > 0 && !self.is(&Tok::Eof) {
             match self.advance() {
@@ -592,12 +733,33 @@ impl Parser {
         // `= <body>` — a method body is `= { block }` or `= singleExpr`.
         self.eat(&Tok::Assign)?;
         self.skip_seps();
-        let body = if self.is(&Tok::LBrace) {
+        let line = self.line();
+        let mut body = if self.is(&Tok::LBrace) {
             self.advance();
             self.block()?
         } else {
             vec![self.statement()?]
         };
+        // Bind the parameter, so `args.length` and `args.mkString(",")` read the
+        // command line rather than dereferencing `null`. Scala's `extends App`
+        // form is deliberately NOT given the same treatment: there `args` is a
+        // method on the object that the `DelayedInit` body runs ahead of, so the
+        // reference really is null and the reference throws
+        // `NullPointerException` (verified on Scala 3.8.4 / JDK 26.0.2).
+        if let Some(name) = argv_name {
+            body.insert(
+                0,
+                Stmt {
+                    kind: StmtKind::Local {
+                        name,
+                        ty: Some("Array[String]".to_string()),
+                        init: Some(Expr::MainArgv),
+                        is_val: true,
+                    },
+                    line,
+                },
+            );
+        }
         Ok(Some(body))
     }
 
@@ -1708,11 +1870,15 @@ impl Parser {
     }
 
     /// Whether the cursor is on a token that can only begin a top-level
-    /// declaration: `case` (of `case class`/`case object`), `object`, or the
-    /// `class`/`trait` soft keywords.
+    /// declaration: `case` (of `case class`/`case object`), `object`, the
+    /// `class`/`trait` soft keywords, or the `def`/`val`/`var` of a Scala 3
+    /// top-level definition.
     fn at_declaration_start(&self) -> bool {
         self.is(&Tok::Object)
             || self.is(&Tok::Case)
+            || self.is(&Tok::Def)
+            || self.is(&Tok::Val)
+            || self.is(&Tok::Var)
             || matches!(self.peek(), Tok::Ident(w) if w == "class" || w == "trait")
     }
 

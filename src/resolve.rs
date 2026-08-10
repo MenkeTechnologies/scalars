@@ -391,6 +391,27 @@ impl Resolver {
                 });
                 self.lifted_idx.insert(tag.clone(), li);
                 if let Some(sc) = self.scopes.last_mut() {
+                    // Two `def`s of one name in the SAME block are a Scala
+                    // OVERLOAD, not a shadow — the inner-shadows-outer rule
+                    // applies across nested blocks, and there is no nesting
+                    // here. Overwriting the binding pointed every call at
+                    // whichever was written last, including the calls that
+                    // syntactically preceded the second definition, so
+                    // `def g(x: Int) = "int"; def g(x: String) = "str"`
+                    // answered `str` for BOTH calls and `def h() = "h0";
+                    // def h(x: Int) = "h1"` answered `h1` for both. Neither
+                    // printed a diagnostic. A class/object member overload is
+                    // already refused for the same reason (see
+                    // `Compiler::overload_arities`); this is the flat namespace
+                    // catching up.
+                    if sc.names.contains_key(&f.name) {
+                        return Err(format!(
+                            "scalars: `{}` is declared twice in one block; overloading a \
+                             block-level `def` is not supported (a class member's overload \
+                             resolves by argument count, a local one does not)",
+                            f.name
+                        ));
+                    }
                     sc.names.insert(f.name.clone(), Binding::Fun(tag));
                 }
                 ids.insert(i, li);
@@ -645,6 +666,8 @@ impl Resolver {
             | Expr::Char(_)
             | Expr::Bool(_)
             | Expr::Null
+            | Expr::MainArg { .. }
+            | Expr::MainArgv
             | Expr::Placeholder => Ok(()),
         }
     }
@@ -923,6 +946,8 @@ fn cs_expr(e: &mut Expr, sigs: &HashMap<String, Sig>) {
         | Expr::Char(_)
         | Expr::Bool(_)
         | Expr::Null
+        | Expr::MainArg { .. }
+        | Expr::MainArgv
         | Expr::Placeholder => {}
     }
 }

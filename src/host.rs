@@ -301,6 +301,114 @@ pub const CHAR_NEW: u16 = 751;
 /// `Array` or `Value::Undef` when the pattern does not match (see
 /// `b_unapply_seq`).
 pub const UNAPPLY_SEQ: u16 = 752;
+/// Builtin id for reading one `@main` parameter off the command line. Pops the
+/// declared type name and the argument index, and pushes the converted value.
+///
+/// This is Scala 3's `scala.util.CommandLineParser.parseArgument[T](args, i)`,
+/// including its failure behaviour, which is unlike anything else in the
+/// language: `CommandLineParser.showError` prints the diagnostic to **stdout**
+/// and the process still exits **0**. Verified against Scala 3.8.4 / JDK 26.0.2
+/// — `@main def go(i: Int, l: Long)` run with `zz` for `l` prints
+/// `Illegal command line after first argument: java.lang.NumberFormatException:
+/// For input string: "zz"` on stdout, `echo $?` answers 0.
+pub const MAIN_ARG: u16 = 755;
+/// Builtin id for the `args: Array[String]` parameter of a `def main` entry:
+/// pushes the program arguments as an `Array` of `String`. Takes no operands.
+pub const MAIN_ARGV: u16 = 756;
+
+thread_local! {
+    /// The program arguments after the script path, as
+    /// [`crate::cli::Cli::argv`] captured them. Read by [`MAIN_ARG`] and
+    /// [`MAIN_ARGV`]; empty unless the runner called [`set_argv`].
+    static ARGV: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Hand the program arguments to the run. Called by the `scala` binary before
+/// executing a file; a library `run_str` leaves them empty, which is what a
+/// no-argument invocation sees.
+pub fn set_argv(args: Vec<String>) {
+    ARGV.with(|a| *a.borrow_mut() = args);
+}
+
+/// `MAIN_ARGV` builtin — see [`MAIN_ARGV`].
+fn b_main_argv(_vm: &mut VM, _argc: u8) -> Value {
+    let items: Vec<Value> = ARGV.with(|a| a.borrow().iter().map(Value::str).collect());
+    new_seq(SeqKind::Array, items)
+}
+
+/// Scala's own wording for the position of the argument that could not be read,
+/// as `CommandLineParser.showError` builds it: nothing for the first, the word
+/// `first` for the second, a count for the rest.
+fn arg_position(index: usize) -> String {
+    match index {
+        0 => String::new(),
+        1 => " after first argument".to_string(),
+        n => format!(" after {n} arguments"),
+    }
+}
+
+/// Convert one command-line argument to a `@main` parameter's declared type,
+/// answering the JDK exception text on failure. `Byte`/`Short` go through
+/// `Integer.parseInt`'s range check, which reports differently from an
+/// unparseable string.
+fn parse_main_arg(text: &str, ty: &str) -> Result<Value, String> {
+    let bad_num = || format!("java.lang.NumberFormatException: For input string: \"{text}\"");
+    let out_of_range = || {
+        format!("java.lang.NumberFormatException: Value out of range. Value:\"{text}\" Radix:10")
+    };
+    match ty {
+        "String" => Ok(Value::str(text)),
+        "Boolean" => match text {
+            "true" => Ok(Value::Bool(true)),
+            "false" => Ok(Value::Bool(false)),
+            _ => Err(format!(
+                "java.lang.IllegalArgumentException: For input string: \"{text}\""
+            )),
+        },
+        "Int" => text
+            .parse::<i32>()
+            .map(|v| Value::Int(v as i64))
+            .map_err(|_| bad_num()),
+        "Long" => text.parse::<i64>().map(Value::Int).map_err(|_| bad_num()),
+        "Byte" | "Short" => {
+            let n: i64 = text.parse().map_err(|_| bad_num())?;
+            let (lo, hi) = if ty == "Byte" {
+                (i64::from(i8::MIN), i64::from(i8::MAX))
+            } else {
+                (i64::from(i16::MIN), i64::from(i16::MAX))
+            };
+            if (lo..=hi).contains(&n) {
+                Ok(Value::Int(n))
+            } else {
+                Err(out_of_range())
+            }
+        }
+        "Double" => text.parse::<f64>().map(Value::Float).map_err(|_| bad_num()),
+        other => Err(format!("scalars: no command-line reader for `{other}`")),
+    }
+}
+
+/// `MAIN_ARG` builtin — see [`MAIN_ARG`].
+fn b_main_arg(vm: &mut VM, _argc: u8) -> Value {
+    let ty = vm.pop().as_str_cow().into_owned();
+    let index = vm.pop().to_int().max(0) as usize;
+    let arg = ARGV.with(|a| a.borrow().get(index).cloned());
+    let outcome = match arg {
+        None => Err("more arguments expected".to_string()),
+        Some(text) => parse_main_arg(&text, &ty),
+    };
+    match outcome {
+        Ok(v) => v,
+        Err(cause) => {
+            // `showError` writes to stdout and the exit status stays 0, so this
+            // is a CLEAN halt rather than the `FFI_ERROR` path (which reports on
+            // stderr and exits non-zero).
+            println!("Illegal command line{}: {cause}", arg_position(index));
+            vm.request_halt();
+            Value::Undef
+        }
+    }
+}
 
 thread_local! {
     /// `type name → (linearized supertypes, primary-constructor arity)`,
@@ -456,6 +564,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(CELL_SET, b_cell_set);
     vm.register_builtin(CHAR_NEW, b_char_new);
     vm.register_builtin(UNAPPLY_SEQ, b_unapply_seq);
+    vm.register_builtin(MAIN_ARG, b_main_arg);
+    vm.register_builtin(MAIN_ARGV, b_main_argv);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -6981,6 +7091,18 @@ fn expand_replacement(repl: &str, caps: &fancy_regex::Captures) -> Result<String
                     out.push_str(g.as_str());
                 }
             }
+            // `${name}` — a named-group reference. Not modeled (`BUGS.md`), and
+            // copying it through emitted the six characters `${d}` where Java
+            // splices the group: `"a1b2".replaceAll("(?<d>[0-9])", "<${d}>")`
+            // answered `a<${d}>b<${d}>` against Java's `a<1>b<2>`. A silent
+            // wrong answer becomes the rejection the gap is documented as.
+            '$' if it.peek() == Some(&'{') => {
+                let name: String = it.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                return Err(format!(
+                    "scalars: a named regex group (`${{{name}}}` in a replacement) is not \
+                     modeled — use the group's number"
+                ));
+            }
             _ => out.push(c),
         }
     }
@@ -7069,6 +7191,18 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
                 ("matched" | "toString", 0) => Ok(Value::str(matched.to_string())),
                 ("groupCount", 0) => Ok(Value::int(groups.len() as i64)),
                 ("group", 1) => {
+                    // `m.group("name")`. Named groups are not modeled (`BUGS.md`),
+                    // and `to_int` on a `String` is 0 — which is group 0, the
+                    // whole match. `"(?<y>[0-9]{4})-(?<m>[0-9]{2})".r` on
+                    // `2026-08` therefore answered `2026-08` for BOTH
+                    // `group("y")` and `group("m")` instead of `2026` and `08`.
+                    // An honest rejection is what the documented gap says.
+                    if let Value::Str(g) = &args[0] {
+                        return Some(Err(format!(
+                            "scalars: a named regex group (`group(\"{g}\")`) is not modeled — \
+                             use the group's number"
+                        )));
+                    }
                     let i = args[0].to_int();
                     if i == 0 {
                         Ok(Value::str(matched.to_string()))
@@ -7092,7 +7226,7 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
                         .collect(),
                 )),
                 _ => Err(no_such_obj_member("Regex.Match", name)),
-            })
+            });
         }
     };
     let re = match regex_compile(&pat) {

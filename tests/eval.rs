@@ -4432,3 +4432,264 @@ fn a_tie_needs_both_candidates_to_round_trip() {
         "5.960464477539063E-8\n1.4901161193847656E-8\n4.470348358154297E-8\n"
     );
 }
+
+// ── entry points: `@main`, top-level definitions, and `main`'s `args` ────────
+//
+// Every expectation below was diffed against Scala 3.8.4 on JDK 26.0.2 before
+// being frozen; the `Illegal command line …` wordings are
+// `scala.util.CommandLineParser.showError`'s, which writes to STDOUT and leaves
+// the exit status 0 — unlike every other failure in this frontend.
+
+/// Run a Scala source string with program arguments, as `scala file.scala a b`
+/// would supply them.
+fn run_args(src: &str, argv: &[&str]) -> (String, bool) {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("scalars_argv_{}.scala", fasthash(src)));
+    std::fs::write(&path, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_scala"))
+        .arg(&path)
+        .args(argv)
+        .output()
+        .expect("spawn scala");
+    let _ = std::fs::remove_file(&path);
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+#[test]
+fn a_main_annotated_def_is_an_entry_point() {
+    let (out, ok) = run("@main def go(): Unit = { println(\"hi\"); println(6 * 7) }");
+    assert!(ok);
+    assert_eq!(out, "hi\n42\n");
+}
+
+#[test]
+fn an_annotation_after_an_import_still_starts_a_declaration() {
+    // Newline inference used not to separate before `@`, so the parser's
+    // `import` scan ran past the line break and swallowed the `@main` — leaving
+    // a file whose only entry point had silently become an ordinary top-level
+    // `def`. Every fuzz program carries three imports, so this shape is the
+    // common one, not a corner.
+    let (out, ok) = run("import scala.collection.mutable\n@main def go(): Unit = println(\"ok\")");
+    assert!(ok);
+    assert_eq!(out, "ok\n");
+}
+
+#[test]
+fn top_level_defs_and_vals_are_visible_to_the_entry_point() {
+    let (out, ok) = run("val base = 10\ndef twice(x: Int): Int = x * 2\n\
+         @main def go(): Unit = { println(base); println(twice(base)) }");
+    assert!(ok);
+    assert_eq!(out, "10\n20\n");
+}
+
+#[test]
+fn a_top_level_val_initializes_before_the_entry_body() {
+    // And before the command line is read at all: the initializer's output
+    // precedes the `Illegal command line` diagnostic for the missing argument.
+    let (out, ok) =
+        run("val v = { println(\"init\"); 1 }\n@main def go(n: Int): Unit = println(n)");
+    assert!(ok);
+    assert_eq!(out, "init\nIllegal command line: more arguments expected\n");
+}
+
+#[test]
+fn main_parameters_are_read_from_the_command_line() {
+    let (out, ok) = run_args(
+        "@main def go(n: Int, s: String, d: Double, b: Boolean): Unit = \
+         { println(n + 1); println(s.toUpperCase); println(d * 2); println(!b) }",
+        &["7", "hey", "2.5", "true"],
+    );
+    assert!(ok);
+    assert_eq!(out, "8\nHEY\n5.0\nfalse\n");
+}
+
+#[test]
+fn extra_command_line_arguments_are_ignored() {
+    let (out, ok) = run_args(
+        "@main def go(n: Int): Unit = println(n)",
+        &["7", "spare", "spare"],
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn a_missing_argument_names_the_position_it_stopped_at() {
+    // Scala's wording changes with the index: nothing for the first, the word
+    // `first` for the second, a count from there on.
+    let src = "@main def go(a: Int, b: Int, c: Int): Unit = println(a + b + c)";
+    for (argv, expected) in [
+        (&[][..], "Illegal command line: more arguments expected\n"),
+        (
+            &["1"][..],
+            "Illegal command line after first argument: more arguments expected\n",
+        ),
+        (
+            &["1", "2"][..],
+            "Illegal command line after 2 arguments: more arguments expected\n",
+        ),
+    ] {
+        let (out, ok) = run_args(src, argv);
+        assert!(ok, "a command-line error still exits 0 in Scala");
+        assert_eq!(out, expected, "argv {argv:?}");
+    }
+}
+
+#[test]
+fn an_unreadable_argument_carries_the_jdk_conversion_message() {
+    let src = "@main def go(y: Byte, i: Int, l: Long, d: Double, b: Boolean): Unit = \
+               println(\"\" + y + i + l + d + b)";
+    for (argv, expected) in [
+        (
+            ["300", "1", "1", "1.0", "true"],
+            "Illegal command line: java.lang.NumberFormatException: \
+             Value out of range. Value:\"300\" Radix:10\n",
+        ),
+        (
+            ["1", "zz", "1", "1.0", "true"],
+            "Illegal command line after first argument: \
+             java.lang.NumberFormatException: For input string: \"zz\"\n",
+        ),
+        (
+            ["1", "1", "99999999999999999999", "1.0", "true"],
+            "Illegal command line after 2 arguments: java.lang.NumberFormatException: \
+             For input string: \"99999999999999999999\"\n",
+        ),
+        (
+            ["1", "1", "1", "1.0", "yes"],
+            "Illegal command line after 4 arguments: java.lang.IllegalArgumentException: \
+             For input string: \"yes\"\n",
+        ),
+    ] {
+        let (out, ok) = run_args(src, &argv);
+        assert!(ok);
+        assert_eq!(out, expected, "argv {argv:?}");
+    }
+}
+
+#[test]
+fn a_main_parameter_type_with_no_command_line_reader_is_refused() {
+    // Scala rejects these at COMPILE time for want of a
+    // `CommandLineParser.FromString[T]` given; `Float` is refused here for the
+    // separate reason that it is not a distinct type in this frontend, so
+    // reading one would answer a `Double`'s rendering (`BUGS.md`).
+    for ty in ["Char", "Float"] {
+        let (out, _, ok) = run_full(&format!("@main def go(c: {ty}): Unit = println(c)"));
+        assert!(!ok, "`{ty}` must not be read from the command line");
+        assert!(out.is_empty());
+    }
+}
+
+#[test]
+fn a_second_main_annotation_is_refused_rather_than_guessed() {
+    // Scala does not pick either: it asks for `--main-class`.
+    let (_, err, ok) =
+        run_full("@main def a(): Unit = println(1)\n@main def b(): Unit = println(2)");
+    assert!(!ok);
+    assert!(err.contains("--main-class"), "stderr was {err:?}");
+}
+
+#[test]
+fn mains_args_parameter_is_the_command_line() {
+    // It used to be unbound, so `args.length` dereferenced `null` and the
+    // program died where Scala prints `0`.
+    let src = "object T { def main(args: Array[String]): Unit = \
+               { println(args.length); println(args.mkString(\"|\")); println(args.isEmpty) } }";
+    let (out, ok) = run_args(src, &[]);
+    assert!(ok);
+    assert_eq!(out, "0\n\ntrue\n");
+    let (out, ok) = run_args(src, &["a", "b", "c"]);
+    assert!(ok);
+    assert_eq!(out, "3\na|b|c\nfalse\n");
+}
+
+#[test]
+fn a_non_ascii_character_next_to_an_operator_lexes() {
+    // The operator lookahead sliced `&src[i..i + 3]` by BYTE offset, so the
+    // `,"é` window in a list of strings split a multi-byte character and the
+    // lexer PANICKED on valid Scala. Only a program with a non-ASCII literal
+    // within two bytes of an operator reaches it, and the fuzz corpus is
+    // ASCII-only by construction.
+    let (out, ok) = run(&wrap(
+        "println(List(\"b\", \"A\", \"é\", \"a\", \"Z\").sorted); println(\"naïve\".toUpperCase); \
+         println(Map(\"é\" -> 1).size)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "List(A, Z, a, b, é)\nNAÏVE\n1\n");
+}
+
+// ── three silent wrong answers that are now honest refusals ─────────────────
+//
+// Each was a construct `BUGS.md` already described as unsupported while the
+// runtime answered it anyway — with the wrong value and no diagnostic, which is
+// the one thing the README says never happens.
+
+#[test]
+fn a_block_level_def_overload_is_refused_not_silently_shadowed() {
+    // The same-block pair is an OVERLOAD in Scala; the resolver's
+    // inner-shadows-outer rule turned it into a redefinition, so BOTH calls ran
+    // the second body — `def g(x: Int) = "int"; def g(x: String) = "str"`
+    // answered `str` twice, and even the statically decidable
+    // `def h(); def h(x: Int)` answered `h1` twice.
+    for src in [
+        "def g(x: Int): String = \"int\"\ndef g(x: String): String = \"str\"\nprintln(g(1))",
+        "def h(): String = \"h0\"\ndef h(x: Int): String = \"h1\"\nprintln(h())",
+    ] {
+        let (out, err, ok) = run_full(&wrap(src));
+        assert!(!ok, "a block-level overload must not run: {out:?}");
+        assert!(
+            err.contains("declared twice in one block"),
+            "stderr {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_def_in_a_nested_block_still_shadows_the_outer_one() {
+    // The guard above must not touch the rule it sits next to: two `def`s of one
+    // name at DIFFERENT nesting depths are a shadow, not an overload.
+    let (out, ok) = run(&wrap(
+        "def q(x: Int): Int = x + 1\n{ def q(x: Int): Int = x + 100; println(q(1)) }\nprintln(q(1))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "101\n2\n");
+}
+
+#[test]
+fn a_named_regex_group_is_refused_rather_than_answered_wrongly() {
+    // `m.group("y")` went through `to_int`, which reads a `String` as 0 — group
+    // 0, the whole match. `"(?<y>[0-9]{4})-(?<m>[0-9]{2})"` on `2026-08` gave
+    // `2026-08` for both names instead of `2026` and `08`.
+    let (_, err, ok) = run_full(&wrap(
+        "val r = \"(?<y>[0-9]{4})-(?<m>[0-9]{2})\".r\n\
+         println(r.findFirstMatchIn(\"2026-08\").get.group(\"y\"))",
+    ));
+    assert!(!ok);
+    assert!(err.contains("named regex group"), "stderr {err:?}");
+    // The numbered form is modeled and must keep working.
+    let (out, ok) = run(&wrap(
+        "val r = \"(?<y>[0-9]{4})-(?<m>[0-9]{2})\".r\n\
+         println(r.findFirstMatchIn(\"2026-08\").get.group(1))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "2026\n");
+}
+
+#[test]
+fn a_named_group_in_a_replacement_is_refused() {
+    // `${d}` was copied through verbatim: `"a1b2".replaceAll("(?<d>[0-9])",
+    // "<${d}>")` answered `a<${d}>b<${d}>` where Java splices `a<1>b<2>`.
+    let (_, err, ok) = run_full(&wrap(
+        r##"println("a1b2".replaceAll("(?<d>[0-9])", "<${d}>"))"##,
+    ));
+    assert!(!ok);
+    assert!(err.contains("named regex group"), "stderr {err:?}");
+    let (out, ok) = run(&wrap(
+        r##"println("a1b2".replaceAll("(?<d>[0-9])", "<$1>"))"##,
+    ));
+    assert!(ok);
+    assert_eq!(out, "a<1>b<2>\n");
+}

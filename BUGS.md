@@ -5,6 +5,32 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Supported
 
+- **All three Scala entry points, and top-level definitions.** `object T extends
+  App { … }`, `object T { def main(args: Array[String]) = … }`, and Scala 3's
+  `@main def go(…)`. Top-level `def`s and `val`s — the members Scala 3 collects
+  into a synthetic `Foo$package` object — are hoisted into the same flat
+  function namespace an entry object's helpers use, and a top-level `val`'s
+  initializer runs BEFORE the entry body and before the command line is read.
+
+  A `@main` method's parameters come from the command line through the reader
+  Scala generates, `CommandLineParser.parseArgument[T]`, for the types that have
+  one and are representable here: `Int`, `Long`, `Byte`, `Short`, `Double`,
+  `Boolean`, `String`. That reader's failure behaviour is unlike anything else in
+  the language and is reproduced exactly — the diagnostic goes to **stdout** and
+  the process exits **0**:
+
+  ```
+  Illegal command line: more arguments expected
+  Illegal command line after first argument: java.lang.NumberFormatException: For input string: "zz"
+  Illegal command line after 2 arguments: java.lang.NumberFormatException: Value out of range. Value:"300" Radix:10
+  Illegal command line after 4 arguments: java.lang.IllegalArgumentException: For input string: "yes"
+  ```
+
+  Extra arguments are ignored, as Scala ignores them. `def main`'s `args` is the
+  real argument vector; `extends App`'s `args` is deliberately left null, because
+  that is what the reference does — the `DelayedInit` body runs during the
+  object's `<clinit>`, ahead of the field, so `args.length` there raises
+  `NullPointerException` on both sides.
 - **`apply` — `receiver(args)` — wherever Scala writes it.** The receiver may be
   a `List`/`Array`/`Vector` (indexing), a `Map` (lookup), a `String` (`s(i)`, i.e.
   `charAt`), or a function value; it may be a literal (`"pear"(1)`), a top-level
@@ -527,7 +553,7 @@ reported as parse/compile errors, never silently mis-run.
   symbolic method names.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
   namespace, and the many `String`/numeric methods beyond the wired subset
-  above. The `args` parameter of `main` is parsed and ignored.
+  above.
 - **`case NonFatal(e)` and other extractor patterns in `catch`.** Only
   `case e: Type`, `case _: Type`, `case e` and `case _` arms are modeled.
 - **User exception classes inside the hierarchy.** `class MyErr(m: String)
@@ -535,7 +561,13 @@ reported as parse/compile errors, never silently mis-run.
   throwables are not part of the registered class hierarchy, so `case e:
   Exception` will not catch it.
 - **Named regex groups.** `(?<name>…)` and `${name}` in a replacement are not
-  modeled; numbered groups (`$1`, `Match.group(1)`, `case r(a, b)`) are.
+  modeled; numbered groups (`$1`, `Match.group(1)`, `case r(a, b)`) are. Both
+  spellings now say so instead of answering something. `m.group("y")` went
+  through `to_int`, which reads a `String` as 0 — group 0, the whole match — so
+  `"(?<y>[0-9]{4})-(?<m>[0-9]{2})".r` on `2026-08` answered `2026-08` for BOTH
+  names where Scala answers `2026` and `08`; and `${d}` in a replacement was
+  copied through, so `"a1b2".replaceAll("(?<d>[0-9])", "<${d}>")` answered
+  `a<${d}>b<${d}>` against Java's `a<1>b<2>`.
 - **`getClass` on a collection, a tuple, a function or an `Array`.** Those
   runtime classes are private implementation details — `List(1).getClass.getName`
   is `scala.collection.immutable.$colon$colon`, a one-element `Vector` is
@@ -565,7 +597,26 @@ reported as parse/compile errors, never silently mis-run.
   answer in place of an honest rejection. The constants land when `Float` becomes
   a real value type with its own `f32` arithmetic and `Float.toString`
   rendering. Every other value-class companion bound is answered.
-- **By-name params, `given`/`using`, `@main` (Scala 3 annotation entry).**
+- **`given`/`using`.** A `given` declaration and a `using` parameter list are
+  both parse errors.
+
+  By-name parameters and `@main` used to be listed here and are not gaps: `def
+  f(x: => Int)` passes a thunk forced at every use (the `params` fuzz mode is
+  built on it), and `@main def` is an entry point (see below). The line outlived
+  both.
+- **A repeated `@main` parameter, and two `@main` methods in one file.**
+  `@main def go(first: Int, rest: String*)` is refused rather than collecting
+  the remainder, and a file declaring two `@main` methods is refused rather than
+  picking one — Scala asks for `--main-class` there, which this frontend has no
+  flag for.
+- **Overloading a block-level `def`.** Two `def`s of one name in the SAME block
+  are a Scala overload; the resolver's inner-shadows-outer rule read them as a
+  redefinition and pointed every call at the second body, including the calls
+  written before it. `def g(x: Int) = "int"` beside `def g(x: String) = "str"`
+  answered `str` twice, and even the statically decidable `def h()` beside `def
+  h(x: Int)` answered `h1` twice — no diagnostic either time. They are now
+  refused. A CLASS or OBJECT member's overload still resolves by argument count
+  (`Owner$method$arity`); only the flat `def` namespace lacks that split.
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
 
@@ -613,6 +664,17 @@ reported as parse/compile errors, never silently mis-run.
   `val`s and parameters that make up the common case. A *lambda* has no such
   restriction — it captures a boxed cell and its writes are shared (see the
   closure entry above); only the lifted-`def` path is affected.
+
+  It is also ENTRY-SHAPE dependent, which is why it is easy to miss: under
+  `object T extends App` the enclosing binding is a program global, so the write
+  lands and nothing is rejected. The restriction bites only when the whole thing
+  sits inside a `def` — a `@main` body, or a `def main` body — where the binding
+  is a frame slot.
+- **A constructor pattern naming a LOCAL extractor.** `case p(a)` resolves `p`
+  against the globals, so `val p = "([0-9]+)".r; xs.collect { case p(a) => a }`
+  works at the top level of an `extends App` body and is rejected ("not found:
+  constructor pattern `p`") when the same two lines sit inside a `def` — i.e.
+  inside a `@main` body. Bind the extractor outside the entry point.
 - **`"abc".toSeq` is the string itself.** Scala's is a `WrappedString` view,
   which prints as `abc` and answers every `Seq` operation through `StringOps`;
   the string stands in for it. Observably identical except for an equality
@@ -919,7 +981,28 @@ Two consequences worth stating plainly:
 
 The `parity-fuzz` binary diffs generated programs against a real `scala`. It is
 the main evidence that this frontend is faithful, so it is worth being precise
-about the three ways a green run has been wrong.
+about the ways a green run has been wrong.
+
+### What each harness is structurally unable to report
+
+Below each is what it CANNOT see — not a gap in how many probes have run, but a
+class of divergence the harness has no way to express. The first column of every
+entry is the constant that hides the axis.
+
+| Harness | Blind to |
+| --- | --- |
+| `parity-fuzz` generators | Non-ASCII source. Every literal any generator emits is ASCII, so the lexer's byte-offset operator lookahead splitting a multi-byte character (`List("a", "é")` PANICKED) was unreachable from any seed. |
+| `parity-fuzz` `differs` | The exact exit code (only zero-vs-nonzero), all of stderr, and therefore *which* exception went uncaught: two runs that print the same bytes and both die compare equal whatever killed them. |
+| `parity-fuzz` `diverges` | An oracle that hangs. A timeout on the reference side is excused as pathology, so a construct that makes real Scala loop forever can never be reported. |
+| `parity-fuzz` `build_program` | Anything that differs by ENTRY SHAPE, while the shape was a constant. `--entry` makes it an axis; before it, the by-name-thunk write below could not be seen. |
+| `tests/parity.rs` | Any program that must FAIL — every record asserts success — plus stderr, the exit code, and program arguments. A record is one line, so no program containing a TAB or a real newline is expressible. |
+| `tests/mixed_numeric.rs` | Whether the compiler ever ROUTES to `numeric_hook`; it calls the hook directly. It was also blind to `Div`'s value until this round: `Div` appeared only in the never-rejected test, which asserts the answer is a `Float` and not which one. |
+| `tests/eval.rs` | The same entry-shape constant — `wrap()` is `object T extends App` — and, for the 350-odd tests that use `run` rather than `run_full`, the whole of stderr. |
+| oracle gates | Whether an expectation was ever CAPTURED. Gating the reference's JVM version and locale says which Scala answered; it says nothing about a frozen string no Scala ever printed. Only re-running the program answers that. |
+
+The `Div` gap and the entry-shape gap are closed (twelve `div` records; `--entry
+app|main|mainsig`). The non-ASCII gap is closed in the frontend and pinned by a
+test, though the generators are still ASCII-only. The rest stand as stated.
 
 **A debug-only fault can wrap into agreement under `--release`.** The host used
 to fold an integral `sum`/`product` with `Iterator::sum`, whose `+` is the
@@ -948,6 +1031,26 @@ separately (`harness-err`), excused from the divergence count, and once they
 exceed a tenth of the run the harness exits 2 rather than green, because those
 programs were never compared. An *oracle* exiting non-zero is deliberately NOT
 excused: "scala rejects a program we accept" is a real divergence.
+
+**An oracle that disagrees with itself is not an oracle.** The reference `scala`
+is a launcher script, and two things outside the repository decide what it
+answers. `JAVA_HOME` picks the JVM, and `Double.toString` was reimplemented in
+JDK 19 (JDK-4511638) — Corretto 17.0.4.1 prints `1.0e23` as `9.999999999999999E22`
+where OpenJDK 21.0.12 and 26.0.2 print `1.0E23`, which is one of the axes this
+fuzzer is most biased toward. `LANG`/`LC_ALL` pick the default locale, which
+decides the decimal separator and the grouping separator of every `%f`/`%e`/`%,d`
+conversion and the case-mapping rules of `toUpperCase`. `resolve_oracle` probes
+both and exits 2 rather than comparing against a reference that would make a
+whole class of "divergences" spurious.
+
+Neither gate answers the question one layer above them: **whether a frozen
+expectation was ever captured at all.** A pin that no version and no locale of
+the reference ever printed passes every gate, because the gates check WHICH
+Scala answered rather than WHETHER one did. The only test is re-running the
+program. Every record in `tests/data/mixed_numeric_expected.txt` was
+regenerated from Scala 3.8.4 on JDK 26.0.2 this round and reproduced
+byte-for-byte, and every exception message pinned in `tests/eval.rs` was re-run
+against the same pair.
 
 ## A user member whose name collides with a stdlib one
 

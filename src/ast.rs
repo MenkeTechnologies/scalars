@@ -296,6 +296,20 @@ pub enum Expr {
         newline: bool,
         arg: Option<Box<Expr>>,
     },
+    /// One command-line argument, converted to a `@main` parameter's declared
+    /// type. Scala 3 compiles `@main def go(n: Int)` into a generated `main` that
+    /// calls `scala.util.CommandLineParser.parseArgument[Int](args, 0)` per
+    /// parameter, left to right, so this carries the same two things: the
+    /// argument's position and the type to read it as. A missing or unreadable
+    /// argument ends the program the way that parser does — see
+    /// [`crate::host::MAIN_ARG`].
+    MainArg {
+        index: usize,
+        ty: String,
+    },
+    /// The `args: Array[String]` parameter of a `def main` entry point: the
+    /// program arguments as an `Array` of `String`.
+    MainArgv,
     /// A named call `name(arg, …)`: a user-defined `def` (lowered to `Op::Call`),
     /// the `__rust_compile("<b64>", line)` FFI-block desugar target, or a call to
     /// a function exported by such a block (`add(2, 3)`). Resolved in

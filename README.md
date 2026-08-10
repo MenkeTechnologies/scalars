@@ -85,16 +85,23 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   the first 60000 subnormals, every power of two in the range with its odd
   multiples, and 16000 pseudo-random draws across the whole exponent span —
   agree everywhere.
+- **Scala 3 entry points** — `@main def go(n: Int, s: String)` binds its
+  parameters from the command line through the same reader Scala generates,
+  including the wording and the exit status of a bad one (`Illegal command line
+  after first argument: …` on *stdout*, status 0). Top-level `def`s and `val`s
+  are the members of the synthetic `Foo$package` object, and a top-level `val`'s
+  initializer runs before the entry body and before the command line is read.
+  `def main(args: Array[String])`'s `args` is the real argument vector.
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
   against a live `scala` across forty generators — this wave added the
-  `overflow` mode, whose operands sit at the 32-bit boundary because no earlier
-  generator could reach it, and its 3,600 probes ran clean alongside every other
-  mode.
+  `--entry` axis, which runs any of them under `@main` / `def main` /
+  `extends App` rather than the one shape every probe used to be written in.
 
-The language surface today: programs with an entry point (`def main`, or an
-`extends App` body) plus `class`/`object` declarations beside it or inside it,
+The language surface today: programs with an entry point (`@main def`, `def
+main`, or an `extends App` body) plus top-level `def`/`val` definitions and
+`class`/`object` declarations beside it or inside it,
 using `val`/`var`
 bindings (with `val` immutability enforced), arithmetic, `if`/`while`, the Scala
 range `for` (with a `by` step), `try`/`catch`/`finally`/`throw`, and
@@ -574,18 +581,35 @@ rejects prints nothing and exits non-zero, a frontend that rejects it too then
 program carried signal — including `--count 0` and `--probes 0`, which both used
 to report a clean score — now exits 2 instead of green.
 
+Two things the harness could not report at all, and now can. **The entry point
+was a constant, not an axis:** every probe ever generated was placed in one
+`object T extends App { … }`, so anything that differs by entry shape was
+invisible however many probes ran. `--entry main|mainsig|app` runs the same
+generators under the other two, and its first pass found a by-name argument
+whose thunk wrote an enclosing `var` losing the write — correct at the top level
+where the `var` is a global, wrong inside a `def` where it needed a boxed cell,
+which is why no `app` run had ever seen it. **The oracle's locale was
+unchecked:** `resolve_oracle` gated the reference's JVM version but not its
+default locale, and the frozen corpus pins `%f`/`%e` conversions whose decimal
+separator and `toUpperCase` results come from it. A re-capture under `de_DE`
+would freeze `0,13` for `0.13` with nothing about it looking wrong, so the
+locale is now a hard gate beside the version.
+
 Next waves, in priority order:
 
 1. **Lazy views** — `.view` and `LazyList` (`.iterator` is wired, but strictly).
 2. **The broader standard library** — `scala.io`, `scala.util.Try`/`Random`,
    `BigInt`, and `scala.collection.*` as a namespace.
-3. **`mutable.PriorityQueue`** — the last absent mutable collection. Its
-   `toString` is the raw binary-heap array order, so it needs a faithful port of
-   the library's `addAll`/`heapify`/`fixUp`/`fixDown` rather than any max-heap.
-4. **A user class's `toString` override** — honoured for an explicit
-   `p.toString`, but not for `println(p)`, `s"$p"` or `List(p)`, which render
-   through a pure path with no VM to re-enter.
-5. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement.
+3. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement. Both
+   are refused rather than approximated: reading one by name used to answer the
+   whole match and `${name}` in a replacement used to be copied through
+   verbatim.
+4. **Overloading a block-level `def`** — a class member's overload resolves by
+   argument count, but the flat `def` namespace has no such split, so two
+   same-name `def`s in one block are refused.
+5. **`@main` beyond the plain parameter list** — a repeated parameter
+   (`rest: String*`), and choosing between two `@main` methods the way
+   `--main-class` does.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

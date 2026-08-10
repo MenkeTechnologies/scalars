@@ -85,6 +85,18 @@ struct Compiler {
     /// rejects it. Reads never needed it: [`Compiler::resolve_place`] already
     /// falls back to `Place::Global`.
     global_binds: HashSet<String>,
+    /// Every callable name that declares at least one BY-NAME parameter — user
+    /// `def`s, class methods and object methods alike.
+    ///
+    /// [`Compiler::adapt_args`] wraps a by-name argument in a synthetic
+    /// [`Expr::Lambda`] while LOWERING the call, which is after [`boxed_vars`]
+    /// has walked the AST. To that walk the argument still looks like an
+    /// ordinary block in the caller's own frame, so a thunk that writes an
+    /// enclosing `var` did not mark it for boxing and the write landed in the
+    /// closure's copy of the slot: `def f(x: => Int) = x` called as
+    /// `f({ c += 1; 2 })` inside a `def` left `c` at 0 where Scala answers 1.
+    /// The set lets the walk recognise the position before the lambda exists.
+    by_name_callees: HashSet<String>,
     /// The widths a lambda literal's parameters take if one is lowered right
     /// now, positionally — set by [`Compiler::method`] from the receiver being
     /// traversed (`xs.map(x => …)` types `x` as the element of `xs`) and
@@ -352,6 +364,19 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             )
         })
         .collect();
+    // Method calls dispatch dynamically, so the callee behind `o.m(arg)` is not
+    // known here; the name is matched against every `def` in the unit instead,
+    // which over-approximates. Over-boxing a `var` is correct (the reads and
+    // writes simply go through a cell) — under-boxing is the silent wrong
+    // answer, so the approximation errs that way deliberately.
+    let by_name_callees: HashSet<String> = prog
+        .functions
+        .iter()
+        .chain(prog.classes.iter().flat_map(|c| c.methods.iter()))
+        .chain(prog.objects.iter().flat_map(|o| o.methods.iter()))
+        .filter(|f| f.sig.iter().any(|p| p.by_name))
+        .map(|f| f.name.clone())
+        .collect();
 
     // Classes to emit constructors/methods for: the user's, plus the built-in
     // `Option` support (`Some(value)`), unless the user redefined them.
@@ -575,6 +600,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         has_ffi,
         func_arity,
         func_sig,
+        by_name_callees,
         by_name: HashSet::new(),
         vals: HashMap::new(),
         widths: HashMap::new(),
@@ -1232,6 +1258,18 @@ impl Compiler {
                 self.b.emit(Op::LoadConst(c), 0);
             }
             Expr::Var(name) => self.var_ref(name)?,
+            // The `@main` parameter binding: index and declared type go to the
+            // host reader, which either answers the converted value or ends the
+            // run the way `CommandLineParser.showError` does.
+            Expr::MainArg { index, ty } => {
+                self.b.emit(Op::LoadInt(*index as i64), 0);
+                let c = self.b.add_constant(Value::str(ty.clone()));
+                self.b.emit(Op::LoadConst(c), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::MAIN_ARG, 2), 0);
+            }
+            Expr::MainArgv => {
+                self.b.emit(Op::CallBuiltin(crate::host::MAIN_ARGV, 0), 0);
+            }
             // `adapt_args` strips these off a `def` call; reaching the general
             // lowering means the callee has no named parameter list to match.
             Expr::NamedArg { name, .. } => {
@@ -1538,7 +1576,7 @@ impl Compiler {
         // declares gets boxed for exactly the same reason the enclosing frame's
         // would: a lambda nested one level deeper assigns it.
         let mut boxed = pc.boxed.clone();
-        boxed.extend(boxed_vars_expr(&pc.body));
+        boxed.extend(boxed_vars_expr(&pc.body, &self.by_name_callees));
         let saved_scope = self.scope.replace(Scope {
             slots,
             next_slot: total as u16,
@@ -3491,7 +3529,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: cd.params.len() as u16,
-            boxed: boxed_vars(&cd.body),
+            boxed: boxed_vars(&cd.body, &self.by_name_callees),
         });
         for i in (0..cd.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
@@ -3623,7 +3661,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: (m.params.len() + 1) as u16,
-            boxed: boxed_vars(&m.body),
+            boxed: boxed_vars(&m.body, &self.by_name_callees),
         });
         // Prologue: args arrive as `[this, p0, …]` (deepest = this); pop reverse.
         for i in (0..=m.params.len()).rev() {
@@ -3668,7 +3706,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: m.params.len() as u16,
-            boxed: boxed_vars(&m.body),
+            boxed: boxed_vars(&m.body, &self.by_name_callees),
         });
         for i in (0..m.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
@@ -3922,7 +3960,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: f.params.len() as u16,
-            boxed: boxed_vars(&f.body),
+            boxed: boxed_vars(&f.body, &self.by_name_callees),
         });
         // This body's by-name parameters hold thunks; every read forces one.
         let saved_by_name = std::mem::replace(
@@ -4506,6 +4544,8 @@ fn expr_any(e: &Expr, pred: &impl Fn(&Expr) -> bool) -> bool {
         | Expr::Char(_)
         | Expr::Bool(_)
         | Expr::Null
+        | Expr::MainArg { .. }
+        | Expr::MainArgv
         | Expr::Placeholder
         | Expr::Var(_) => false,
     }
@@ -5530,28 +5570,38 @@ fn method(recv: Expr, name: &str, args: Vec<Expr>) -> Expr {
 
 /// The locals of one frame that a closure inside it ASSIGNS: declared as a `var`
 /// directly in this frame, and written from inside a nested lambda.
-fn boxed_vars(body: &[Stmt]) -> HashSet<String> {
-    let mut scan = BoxScan::default();
+fn boxed_vars(body: &[Stmt], by_name_callees: &HashSet<String>) -> HashSet<String> {
+    let mut scan = BoxScan::new(by_name_callees);
     scan.block(body, false);
     scan.finish()
 }
 
 /// [`boxed_vars`] for a frame whose body is a single expression (a lambda body).
-fn boxed_vars_expr(body: &Expr) -> HashSet<String> {
-    let mut scan = BoxScan::default();
+fn boxed_vars_expr(body: &Expr, by_name_callees: &HashSet<String>) -> HashSet<String> {
+    let mut scan = BoxScan::new(by_name_callees);
     scan.expr(body, false);
     scan.finish()
 }
 
 /// One walk collecting both halves of [`boxed_vars`]: the `var`s declared in
 /// this frame and the names assigned from inside a nested lambda.
-#[derive(Default)]
-struct BoxScan {
+struct BoxScan<'a> {
     declared: HashSet<String>,
     assigned_in_lambda: HashSet<String>,
+    /// See [`Compiler::by_name_callees`] — an argument in one of these calls is
+    /// a thunk by the time it runs, so it is walked as a lambda body.
+    by_name_callees: &'a HashSet<String>,
 }
 
-impl BoxScan {
+impl<'a> BoxScan<'a> {
+    fn new(by_name_callees: &'a HashSet<String>) -> Self {
+        Self {
+            declared: HashSet::new(),
+            assigned_in_lambda: HashSet::new(),
+            by_name_callees,
+        }
+    }
+
     fn finish(self) -> HashSet<String> {
         self.declared
             .intersection(&self.assigned_in_lambda)
@@ -5692,15 +5742,26 @@ impl BoxScan {
                     self.expr(a, in_lambda);
                 }
             }
-            Expr::Call { args, .. } | Expr::New { args, .. } => {
+            Expr::Call { name, args, .. } => {
+                // An argument to a callee with a by-name parameter becomes a
+                // thunk, so it runs in a frame of its own however it is written.
+                let thunk = in_lambda || self.by_name_callees.contains(name);
+                for a in args {
+                    self.expr(a, thunk);
+                }
+            }
+            Expr::New { args, .. } => {
                 for a in args {
                     self.expr(a, in_lambda);
                 }
             }
-            Expr::Method { recv, args, .. } => {
+            Expr::Method {
+                recv, args, name, ..
+            } => {
                 self.expr(recv, in_lambda);
+                let thunk = in_lambda || self.by_name_callees.contains(name);
                 for a in args {
-                    self.expr(a, in_lambda);
+                    self.expr(a, thunk);
                 }
             }
             Expr::Copy { recv, updates, .. } => {
@@ -5728,6 +5789,8 @@ impl BoxScan {
             | Expr::Char(_)
             | Expr::Bool(_)
             | Expr::Null
+            | Expr::MainArg { .. }
+            | Expr::MainArgv
             | Expr::Placeholder
             | Expr::Var(_) => {}
         }
@@ -5949,6 +6012,8 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
         | Expr::Char(_)
         | Expr::Bool(_)
         | Expr::Null
+        | Expr::MainArg { .. }
+        | Expr::MainArgv
         | Expr::Placeholder => {}
     }
 }

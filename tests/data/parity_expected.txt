@@ -200,3 +200,11 @@ object Cfg { var n = 1; var s: String = "c"; def bump(): Int = { n += 1; n } }; 
 class Box(var n: Int, var label: String); object T extends App { val b = new Box(1, "L"); b.n = 7; b.label = "M"; println(b.n); println(b.label); b.n += 4; println(b.n) }	7\nM\n11\n
 class P(val n: Int) { override def toString: String = "P<" + n + ">" }; object T extends App { val p = new P(3); val pre = "pre:"; println(pre + p); var acc = "acc:"; acc += p; println(acc); println(List("e:")(0) + p) }	pre:P<3>\nacc:P<3>\ne:P<3>\n
 object T extends App { try { println(1) }; val v = try { 41 + 1 }; println(v) }	1\n42\n
+@main def go(): Unit = { println("main entry"); println(1 + 2) }	main entry\n3\n
+val base = 10; def twice(x: Int): Int = x * 2; @main def go(): Unit = { println(base); println(twice(base)); println(twice(twice(3))) }	10\n20\n12\n
+@main def go(n: Int, s: String): Unit = { println(n); println(s) }	Illegal command line: more arguments expected\n
+case class P(x: Int); val ps = List(P(1), P(2)); def sum(l: List[P]): Int = l.map(_.x).sum; @main def go(): Unit = { println(ps); println(sum(ps)); println(ps.head == P(1)) }	List(P(1), P(2))\n3\ntrue\n
+var seen = 0; def bump(): Int = { seen += 1; seen }; @main def go(): Unit = { println(bump()); println(bump()); println(seen) }	1\n2\n2\n
+object T { def main(args: Array[String]): Unit = { println(args.length); println(args.mkString("|")); println(args.isEmpty) } }	0\n\ntrue\n
+val order = { println("init"); 1 }; @main def go(n: Int): Unit = println(n + order)	init\nIllegal command line: more arguments expected\n
+@main def go(): Unit = { println(List("b", "A", "é", "a", "Z").sorted); println("café — ☕".length); println("naïve".toUpperCase) }	List(A, Z, a, b, é)\n8\nNAÏVE\n

@@ -62,7 +62,7 @@ fn main() -> ExitCode {
         };
     }
 
-    match scalars::run_str(&src) {
+    match scalars::run_str_with_args(&src, cli.argv) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => fail(&e),
     }

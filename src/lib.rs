@@ -110,6 +110,13 @@ pub fn run_file(path: &str) -> Result<Value, String> {
     run_str(&src)
 }
 
+/// Run a Scala source string with the program arguments a `def main`'s `args`
+/// parameter and a `@main` method's parameters read from.
+pub fn run_str_with_args(src: &str, argv: Vec<String>) -> Result<Value, String> {
+    host::set_argv(argv);
+    run_str(src)
+}
+
 /// Compile `src` and return a human-readable disassembly of the fusevm chunk
 /// (for `scala --disasm`).
 pub fn disassemble(src: &str) -> Result<String, String> {
