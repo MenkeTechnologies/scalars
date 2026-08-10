@@ -1915,6 +1915,8 @@ enum Mode {
     Apply,
     Overflow,
     PlaceAssign,
+    AssignExpr,
+    AppMember,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1961,6 +1963,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Apply => "apply",
         Mode::Overflow => "overflow",
         Mode::PlaceAssign => "placeassign",
+        Mode::AssignExpr => "assignexpr",
+        Mode::AppMember => "appmember",
     }
 }
 
@@ -2008,6 +2012,8 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "apply" => Mode::Apply,
         "overflow" => Mode::Overflow,
         "placeassign" => Mode::PlaceAssign,
+        "assignexpr" => Mode::AssignExpr,
+        "appmember" => Mode::AppMember,
         _ => return None,
     })
 }
@@ -2054,6 +2060,8 @@ const CONCRETE: &[Mode] = &[
     Mode::Apply,
     Mode::Overflow,
     Mode::PlaceAssign,
+    Mode::AssignExpr,
+    Mode::AppMember,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -2378,6 +2386,8 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Apply => g_apply(r),
         Mode::Overflow => g_overflow(r),
         Mode::PlaceAssign => g_placeassign(r),
+        Mode::AssignExpr => g_assignexpr(r),
+        Mode::AppMember => g_appmember(r),
         Mode::All => unreachable!(),
     }
 }
@@ -2463,9 +2473,159 @@ fn g_placeassign(r: &mut Rng) -> String {
     }
 }
 
+/// A compound assignment used for its VALUE rather than for its effect.
+///
+/// Scala's `l op= r` is an expression, and which value it has depends on which
+/// half of the SLS 6.12.4 choice it took: the `op=` MEMBER answers the receiver
+/// (`buf += 1` is `buf`), while the `l = l op r` expansion is an assignment and
+/// answers `()`. Every other mode writes `+=` in STATEMENT position, where that
+/// value is discarded — so a clean score across all of them says nothing about
+/// which of the two a program that reads the value gets.
+///
+/// Both halves are generated on every target shape the statement form accepts:
+/// a plain name, an application (`a(i)`), and a selection (`p.n`). The chained
+/// arm is the one that cannot be satisfied by answering `()` everywhere — it
+/// feeds the result straight back into another `+=`.
+fn g_assignexpr(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, &["1", "2", "3", "5", "7"]);
+    let b = pick(r, &["1", "2", "4", "6"]);
+    // Non-zero, so `/=` and `%=` stay outside the documented `/0` gap.
+    let d = pick(r, &["2", "3", "4"]);
+    let buf = *pick(r, &["mutable.ListBuffer", "mutable.ArrayBuffer"]);
+    match r.below(10) {
+        // The member half, on a name: the value is the buffer itself.
+        0 => format!("{{ val b = {buf}({a}, {b}); println(b += {d}); println(b) }}"),
+        // The arithmetic half, on a name: the value is `()`, and the variable
+        // still moved.
+        1 => format!("{{ var n{u} = {a}; println(n{u} += {b}); println(n{u}) }}"),
+        2 => format!(
+            "{{ var n{u} = 20; val r{u} = (n{u} -= {b}); println(r{u}); println(n{u}); \
+               val q{u} = (n{u} *= {d}); println(q{u}); println(n{u}) }}"
+        ),
+        3 => format!(
+            "{{ val b = {buf}({a}); println(b ++= List({b}, {d})); println(b --= List({b})) }}"
+        ),
+        // `mutable.Set` answers itself; the print is the whole table, so its
+        // iteration order is part of the comparison.
+        4 => format!("{{ val s = mutable.Set({a}, {b}); println(s += {d}); println(s.size) }}"),
+        5 => {
+            let c = pick(r, &["'b'", "'z'", "'0'"]);
+            format!(
+                "{{ val sb = new StringBuilder(\"a\"); println(sb += {c}); \
+                 println(sb ++= \"cd\"); println(sb.length) }}"
+            )
+        }
+        // An application target: an `Int` element takes the arithmetic
+        // expansion through `update`, so the value is `()`.
+        6 => format!(
+            "{{ val a = Array({a}, {b}); println(a(0) += {d}); println(a(1) *= {d}); \
+               println(a.mkString(\",\")) }}"
+        ),
+        // An application target whose element is growable: the member call, so
+        // the value is the ELEMENT, not `()`.
+        7 => format!(
+            "{{ val m = mutable.Map(\"k\" -> mutable.ListBuffer({a})); println(m(\"k\") += {b}); \
+               println(m(\"k\") ++= List({d})) }}"
+        ),
+        // Chained: the first `+=` must answer the buffer for the second to have
+        // a receiver at all.
+        8 => format!("{{ val v = {buf}({a}); println((v += {b}) += {d}); println(v) }}"),
+        // A selection target: a `var` field (arithmetic → `()`) and a growable
+        // field (member → the field's value) through an explicit receiver.
+        _ => format!(
+            "class Q{u}(var n: Int, val items: mutable.ListBuffer[Int])\n{sep}\
+             {{ val p = new Q{u}({a}, mutable.ListBuffer({b})); println(p.n += {d}); \
+               println(p.n); println(p.items += 9) }}"
+        ),
+    }
+}
+
+/// A type declared INSIDE the entry object's body rather than beside it.
+///
+/// Every other mode that needs a `class`/`trait`/`case class` emits it through
+/// [`TOP_SEP`], i.e. outside `object T extends App { … }`. That placement is
+/// the only one the frontend used to parse, so no amount of fuzzing in any
+/// other mode could reach a member declaration — the construct was absent from
+/// the corpus by construction, not by choice. Scala compiles a type declared in
+/// an `App` body exactly like a member of the object.
+///
+/// Every declared name carries a per-probe id, because these land in ONE shared
+/// object body: two probes in the same program would otherwise redeclare it.
+fn g_appmember(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, &["1", "2", "3", "5", "7"]);
+    let b = pick(r, &["1", "2", "4", "6"]);
+    match r.below(10) {
+        // A plain class with a mutable field, constructed and mutated.
+        0 => format!(
+            "class C{u}(var n: Int); val c{u} = new C{u}({a}); c{u}.n += {b}; println(c{u}.n)"
+        ),
+        // A class with a body: a method over its own fields.
+        1 => format!(
+            "class C{u}(val x: Int, val y: Int) {{ def area = x * y; override def toString = \
+             \"C(\" + x + \",\" + y + \")\" }}; val c{u} = new C{u}({a}, {b}); \
+             println(c{u}.area); println(c{u})"
+        ),
+        // `case class` — the generated `toString`, `equals` and `copy`.
+        2 => format!(
+            "case class P{u}(x: Int, y: Int); val p{u} = P{u}({a}, {b}); println(p{u}); \
+             println(p{u}.copy(y = {a})); println(p{u} == P{u}({a}, {b}))"
+        ),
+        // A member `case class` destructured by the pattern matcher.
+        3 => format!(
+            "case class P{u}(x: Int, y: Int); val r{u} = P{u}({a}, {b}) match \
+             {{ case P{u}(x, y) => x + y }}; println(r{u})"
+        ),
+        // A member `trait` with two member implementations, used polymorphically.
+        4 => format!(
+            "trait S{u} {{ def area: Int }}; class Sq{u}(s: Int) extends S{u} \
+             {{ def area = s * s }}; class Rc{u}(w: Int, h: Int) extends S{u} \
+             {{ def area = w * h }}; val xs{u}: List[S{u}] = List(new Sq{u}({a}), \
+             new Rc{u}({a}, {b})); println(xs{u}.map(_.area)); println(xs{u}.map(_.area).sum)"
+        ),
+        // A member singleton `object`.
+        5 => format!(
+            "object U{u} {{ val k = {a}; def f(n: Int) = n * k + {b} }}; println(U{u}.f({b})); \
+             println(U{u}.k)"
+        ),
+        // A sealed ADT of member `case object`s, matched exhaustively.
+        6 => format!(
+            "sealed trait E{u}; case object A{u} extends E{u}; case object B{u} extends E{u}; \
+             val es{u}: List[E{u}] = List(A{u}, B{u}, A{u}); \
+             println(es{u}.map {{ case A{u} => {a}; case B{u} => {b} }})"
+        ),
+        // A member class calling a member `def` — both are hoisted, and the
+        // call has to still resolve after they are.
+        7 => format!(
+            "def h{u}(n: Int) = n * 2 + {a}; class C{u}(val n: Int) {{ def g = h{u}(n) }}; \
+             println(new C{u}({b}).g)"
+        ),
+        // A member `case class` as a hash-set / map key: structural equality and
+        // hashCode both come from the declaration.
+        8 => format!(
+            "case class K{u}(s: String, n: Int); val m{u} = Map(K{u}(\"a\", {a}) -> {b}, \
+             K{u}(\"b\", {b}) -> {a}); println(m{u}(K{u}(\"a\", {a}))); \
+             println(m{u}.contains(K{u}(\"z\", 0)))"
+        ),
+        // A member class declared AFTER the statement that uses it: members are
+        // not ordered the way statements are.
+        _ => format!(
+            "val c{u} = new C{u}({a}); println(c{u}.twice); class C{u}(val n: Int) \
+             {{ def twice = n + n + {b} }}"
+        ),
+    }
+}
+
 /// Separator inside a probe that carries its own top-level declarations: the
-/// text before it is emitted *outside* the entry object (a `trait`/`class` can
-/// only be declared at the top level), the text after it is the body statement.
+/// text before it is emitted *outside* the entry object, the text after it is
+/// the body statement.
+///
+/// Beside the entry object is a PLACEMENT, not a requirement: Scala also
+/// accepts a `class`/`trait`/`object` declared inside the `App` body, which is
+/// what the `appmember` mode generates. Modes that use this separator are
+/// probing the type, not where it was written.
 const TOP_SEP: &str = "//@TOP@";
 
 fn build_program(probes: &[String]) -> String {
