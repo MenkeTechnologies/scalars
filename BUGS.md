@@ -626,6 +626,17 @@ reported as parse/compile errors, never silently mis-run.
   h(x: Int)` answered `h1` twice — no diagnostic either time. They are now
   refused. A CLASS or OBJECT member's overload still resolves by argument count
   (`Owner$method$arity`); only the flat `def` namespace lacks that split.
+- **A forward reference inside a BLOCK is accepted, where Scala rejects it.**
+  Scala's forward-reference rule applies to a block's own definitions, not to a
+  template's members: `def main(…) = { val c = new C(3); …; class C(…) }` and
+  `def main(…) = { println(later); val later: Int = 7 }` are both compile errors
+  ("forward reference to C … extends over the definition of c"), and this
+  frontend runs them — answering `8` and `null` respectively. The `extends App`
+  spelling of the same two programs is LEGAL Scala, because there the `val`s and
+  `class`es are object members; that half is modeled (an object member is
+  visible in any order, and a forward-referenced field reads its type's default).
+  Only the block rule is unchecked. Found by running the `appmember` mode under
+  `--entry mainsig`, which no `app` run could have reached.
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
 
