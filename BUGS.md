@@ -642,6 +642,29 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Modeled with a documented simplification
 
+- **A `String` is indexed by CODE POINT, where the JVM indexes by UTF-16 code
+  unit.** `Char` here is a Rust `char` — a whole scalar value — so a character
+  outside the Basic Multilingual Plane occupies one position instead of the two
+  a JVM `String` gives it. Every index-shaped operation therefore disagrees on a
+  string containing one, and only on such a string. Measured against Scala 3.8.4
+  on JDK 26.0.2 with `"𝕏a"` (`U+1D54F` followed by `a`):
+
+  | expression | Scala | here |
+  | --- | --- | --- |
+  | `.length` | `3` | `2` |
+  | `.indexOf("a")` | `2` | `1` |
+  | `.charAt(0).toInt` | `55349` (the high surrogate) | `120143` (the scalar) |
+  | `.head.toInt` | `55349` | `120143` |
+  | `.substring(0, 2)` | `𝕏` | `𝕏a` |
+  | `.reverse.length` | `3` | `2` |
+
+  This is a REPRESENTATION difference, not a wrong constant: closing it means a
+  `Char` that can hold an unpaired surrogate, which `char` cannot. Every string
+  whose characters are all in the BMP — which is every string in the frozen
+  corpora and every string in the test suite — indexes identically. Noted rather
+  than half-fixed, because a partial conversion (say, `length` counting code
+  units while `charAt` still counts scalars) would be worse than either
+  consistent model.
 - **Types are not checked.** Declared types (`Int`, `String`, …) and type
   parameters (`class Box[A]`, `def id[A]`) are retained for diagnostics but do
   not gate execution — the runtime is dynamically typed on the fusevm value

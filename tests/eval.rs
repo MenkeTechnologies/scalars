@@ -4956,3 +4956,114 @@ fn a_missing_key_and_a_bad_conversion_are_catchable_jvm_exceptions() {
          java.lang.NegativeArraySizeException|-1\n"
     );
 }
+
+#[test]
+fn round_is_the_jdk_algorithm_not_floor_of_x_plus_a_half_nor_rusts_round() {
+    // Two shortcuts, each wrong somewhere the other is right. `floor(x + 0.5)`
+    // answers 1 for 0.49999999999999994 (adding 0.5 rounds up to exactly 1.0
+    // first — JDK-6430675, fixed in Java 7). Rust's `f64::round` is
+    // half-AWAY-from-zero, so it answers -3 for -2.5 where `Math.round` is
+    // half-UP and answers -2.
+    let (out, ok) = run(&wrap(
+        "println(List(2.5, -2.5, 3.5, -3.5, 0.5, -0.5, -1.5, 0.49999999999999994, \
+         -0.49999999999999994).map(_.round))\n  \
+         println(math.round(-2.5)); println(math.round(0.49999999999999994))\n  \
+         println(math.round(Double.NaN)); println(math.round(Double.PositiveInfinity))\n  \
+         println(math.round(1e300))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(3, -2, 4, -3, 1, 0, -1, 0, 0)\n-2\n0\n0\n9223372036854775807\n9223372036854775807\n"
+    );
+}
+
+#[test]
+fn nan_propagates_through_max_and_min_and_sorts_last() {
+    // Rust's `f64::max`/`min` IGNORE a NaN operand; Java's propagate it. And the
+    // implicit `Ordering[Double]` is `TotalOrdering` — `Double.compare` — under
+    // which NaN is above every other value and `-0.0` is below `0.0`. Reading a
+    // `partial_cmp` `None` as `Equal` got both wrong: `List(1.0, NaN, 2.0).max`
+    // answered 2.0, and a NaN stayed wherever `sorted` first found it.
+    let (out, ok) = run(&wrap(
+        "println(math.max(1.0, Double.NaN)); println(math.min(Double.NaN, 1.0))\n  \
+         println(1.0.max(Double.NaN)); println(1.0.min(Double.NaN))\n  \
+         println(List(1.0, Double.NaN, 2.0).max); println(List(1.0, Double.NaN, 2.0).min)\n  \
+         println(List(1.0, Double.NaN, 2.0).maxBy(x => x))\n  \
+         println(List(Double.NaN, 1.0, -0.0, 0.0, 2.0).sorted)\n  \
+         println(Double.NaN.compareTo(1.0)); println((-0.0).compareTo(0.0))\n  \
+         println(scala.math.Ordering.Double.TotalOrdering.compare(-0.0, 0.0))\n  \
+         println(scala.math.Ordering.Double.IeeeOrdering.compare(Double.NaN, 1.0))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "NaN\nNaN\nNaN\nNaN\nNaN\n1.0\nNaN\nList(-0.0, 0.0, 1.0, 2.0, NaN)\n1\n-1\n-1\n1\n"
+    );
+}
+
+#[test]
+fn the_total_order_does_not_leak_into_the_ieee_comparisons() {
+    // `sorted` is a total order; `==` and `<` are not, and must stay IEEE. If
+    // `double_total_cmp` had been wired into equality instead, every one of
+    // these would flip.
+    let (out, ok) = run(&wrap(
+        "println(Double.NaN == Double.NaN); println(-0.0 == 0.0)\n  \
+         println(1.0 < Double.NaN); println(Double.NaN > 1.0)\n  \
+         println(List(Double.NaN).contains(Double.NaN))\n  \
+         println(List(0.0, -0.0).distinct.length); println(Set(0.0, -0.0).size)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "false\ntrue\nfalse\nfalse\nfalse\n1\n1\n");
+}
+
+#[test]
+fn trim_cuts_by_code_point_and_strip_cuts_by_unicode_whitespace() {
+    // `String.trim` predates Unicode-aware trimming: it cuts everything at or
+    // below U+0020 — including control characters Rust's `trim` leaves — and
+    // nothing above it, including the no-break space Rust's `trim` removes.
+    // `strip` is the Unicode-aware one, and it disagrees with `trim` in BOTH
+    // directions: it keeps U+00A0 (`Character.isWhitespace` excludes the
+    // non-breaking separators) and it keeps U+0001 (a control character, but not
+    // a whitespace one) while still cutting the tab and the file separator.
+    let (out, ok) = run(&wrap(
+        "println(\"  a  \".trim + \"|\")\n  \
+         println((160.toChar + \"a\").trim + \"|\")\n  \
+         println((1.toChar + \"a\").trim + \"|\")\n  \
+         println((160.toChar + \"a\").strip + \"|\")\n  \
+         println((1.toChar + \"a\").strip + \"|\")\n  \
+         println((9.toChar + \"a\").strip + \"|\")\n  \
+         println((28.toChar + \"a\").strip + \"|\")",
+    ));
+    assert!(ok);
+    assert_eq!(out, "a|\n\u{a0}a|\na|\n\u{a0}a|\n\u{1}a|\na|\na|\n");
+}
+
+#[test]
+fn the_numeric_methods_that_only_look_like_their_rust_namesakes() {
+    let (out, ok) = run(&wrap(
+        "println(List(-0.0, 0.0, -3.0, 3.0, Double.NaN).map(_.signum))\n  \
+         println(List(-5, 0, 5).map(_.signum))\n  \
+         println(math.signum(-0.0)); println(math.signum(-3.0))\n  \
+         println(3.compareTo(5)); println(5.compareTo(3)); println(3.compareTo(3))\n  \
+         println(Int.MinValue / -1); println(Int.MinValue % -1); println(Int.MinValue.abs)\n  \
+         println(-7 / 2); println(7 / -2); println(-7 % 2); println(7 % -2)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "List(0, 0, -1, 1, 0)\nList(-1, 0, 1)\n-0.0\n-1.0\n-1\n1\n0\n\
+         -2147483648\n0\n-2147483648\n-3\n-3\n-1\n1\n"
+    );
+}
+
+#[test]
+fn strip_margin_drops_the_margin_and_leaves_lines_without_one() {
+    let (out, ok) = run(&wrap(
+        "println(\"|x\\n  |y\".stripMargin)\n  \
+         println(\"#x\\n  #y\".stripMargin('#'))\n  \
+         println(\"a\\n  |b\\n  c\".stripMargin)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "x\ny\nx\ny\na\nb\n  c\n");
+}

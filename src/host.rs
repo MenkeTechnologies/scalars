@@ -5702,10 +5702,9 @@ fn value_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Str(x), Value::Str(y)) => java_str_cmp(x, y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => a
-            .to_float()
-            .partial_cmp(&b.to_float())
-            .unwrap_or(Ordering::Equal),
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+            double_total_cmp(a.to_float(), b.to_float())
+        }
         // `Char` orders by code point, so a `Seq[Char]` sorts like the `String`
         // of the same characters does.
         (Value::Obj(_), Value::Obj(_)) if as_char(a).is_some() && as_char(b).is_some() => {
@@ -5722,6 +5721,154 @@ fn value_cmp(a: &Value, b: &Value) -> Ordering {
         },
         _ => Ordering::Equal,
     }
+}
+
+/// `java.lang.Double.compare`, which is what BOTH `Ordering.Double.TotalOrdering`
+/// (the implicit `Ordering[Double]`, so what `sorted`/`max`/`min`/`sortBy` use)
+/// and `Ordering.Double.IeeeOrdering.compare` answer.
+///
+/// It is a TOTAL order, and that is the whole point: `-0.0` sorts BELOW `0.0`
+/// and `NaN` sorts above everything including `Infinity`, neither of which
+/// `partial_cmp` can express — it answers `None` for NaN, and the old code read
+/// that as `Equal`. Under `Equal`, `List(1.0, NaN, 2.0).max` answered `2.0`
+/// where Scala answers `NaN`, and `List(NaN, 1.0).sorted` left `NaN` in front.
+///
+/// Verified against Scala 3.8.4 on JDK 26.0.2:
+/// `List(Double.NaN, 1.0, -0.0, 0.0, 2.0).sorted` is
+/// `List(-0.0, 0.0, 1.0, 2.0, NaN)`.
+///
+/// The IEEE comparisons stay IEEE: `==`, `<` and friends are VM opcodes and do
+/// not come through here, so `Double.NaN == Double.NaN` is still `false` and
+/// `-0.0 == 0.0` is still `true`.
+fn double_total_cmp(x: f64, y: f64) -> Ordering {
+    // `f64::total_cmp` is `Double.compare`'s bit ordering, but it splits the two
+    // NaN sign bits, and `Double.compare` treats every NaN as one value.
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => x.total_cmp(&y),
+    }
+}
+
+/// `java.lang.Math.max`/`min` for `Double`, which are NOT `f64::max`/`f64::min`.
+///
+/// Rust's IGNORE a NaN operand and answer the other one; Java's PROPAGATE it.
+/// Java also specifies the `±0.0` tie (`max(-0.0, 0.0)` is `0.0`), where Rust
+/// leaves it unspecified. Verified against Scala 3.8.4 on JDK 26.0.2:
+/// `math.max(1.0, Double.NaN)` is `NaN`.
+fn java_double_max(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
+    match double_total_cmp(x, y) {
+        Ordering::Less => y,
+        _ => x,
+    }
+}
+
+fn java_double_min(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
+    match double_total_cmp(x, y) {
+        Ordering::Greater => y,
+        _ => x,
+    }
+}
+
+/// `java.lang.Math.round(double)` — the real JDK body, not `floor(x + 0.5)` and
+/// not Rust's `f64::round`.
+///
+/// Both shortcuts are wrong, in opposite places. `floor(x + 0.5)` answers `1`
+/// for `0.49999999999999994` because adding `0.5` rounds UP to exactly `1.0`
+/// before the floor sees it — the bug JDK-6430675 fixed in Java 7, and the JDK
+/// has not used that formula since. Rust's `f64::round` is half-AWAY-from-zero,
+/// so it answers `-3` for `-2.5` where the JVM answers `-2`; `Math.round` is
+/// half-UP, toward positive infinity.
+///
+/// This is a direct port of `java.lang.Math.round`: read the biased exponent,
+/// derive the shift that puts the rounding bit at position 0, then add one and
+/// drop it. Values too large to have a fractional part take the plain `d2l`
+/// cast, which saturates — so `NaN` is `0` and `Infinity` is `Long.MaxValue`.
+///
+/// Verified against Scala 3.8.4 on JDK 26.0.2: `(-2.5).round` is `-2`,
+/// `(0.49999999999999994).round` is `0`, `math.round(1e300)` is
+/// `9223372036854775807`.
+fn java_round(a: f64) -> i64 {
+    /// `DoubleConsts.SIGNIFICAND_WIDTH`.
+    const SIGNIFICAND_WIDTH: i64 = 53;
+    /// `DoubleConsts.EXP_BIAS`.
+    const EXP_BIAS: i64 = 1023;
+    /// `DoubleConsts.EXP_BIT_MASK`.
+    const EXP_BIT_MASK: i64 = 0x7FF0_0000_0000_0000u64 as i64;
+    /// `DoubleConsts.SIGNIF_BIT_MASK`.
+    const SIGNIF_BIT_MASK: i64 = 0x000F_FFFF_FFFF_FFFF;
+
+    let long_bits = a.to_bits() as i64;
+    let biased_exp = (long_bits & EXP_BIT_MASK) >> (SIGNIFICAND_WIDTH - 1);
+    let shift = (SIGNIFICAND_WIDTH - 2 + EXP_BIAS) - biased_exp;
+    // `shift >= 0 && shift < 64`, written as the JDK writes it.
+    if (shift & -64) == 0 {
+        let mut r = (long_bits & SIGNIF_BIT_MASK) | (SIGNIF_BIT_MASK + 1);
+        if long_bits < 0 {
+            r = -r;
+        }
+        ((r >> shift) + 1) >> 1
+    } else {
+        // The `d2l` cast, which saturates at both ends and answers 0 for NaN.
+        a as i64
+    }
+}
+
+/// `java.lang.String.trim`, which is NOT Rust's `str::trim`.
+///
+/// Java's `trim` predates Unicode-aware trimming and cuts every character with a
+/// code point at or below `U+0020` — including the control characters Rust
+/// leaves alone — and cuts NOTHING above it, including the no-break space Rust
+/// removes. Verified against Scala 3.8.4 on JDK 26.0.2: `"a".trim` is
+/// `"a"` and `" a".trim` is `" a"`.
+fn java_trim(s: &str) -> String {
+    s.trim_matches(|c| c <= '\u{20}').to_string()
+}
+
+/// `java.lang.Character.isWhitespace`, the predicate `String.strip` uses.
+///
+/// It is Unicode-aware where `trim` is not, but it still excludes the three
+/// NO-BREAK space separators — `U+00A0`, `U+2007` and `U+202F` — which Rust's
+/// `char::is_whitespace` counts. It adds the file/group/record/unit separators
+/// `U+001C`..`U+001F`, which Rust does not.
+fn java_is_whitespace(c: char) -> bool {
+    matches!(c,
+        // Zs, minus the three non-breaking ones.
+        '\u{20}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{205F}' | '\u{3000}'
+        // Zl and Zp.
+        | '\u{2028}' | '\u{2029}'
+        // The ASCII control whitespace, and the four information separators.
+        | '\u{09}'..='\u{0D}' | '\u{1C}'..='\u{1F}')
+}
+
+/// `java.lang.String.strip` (Java 11) — `trim`'s Unicode-aware replacement.
+fn java_strip(s: &str) -> String {
+    s.trim_matches(java_is_whitespace).to_string()
+}
+
+/// `scala.collection.StringOps.stripMargin` — drop each line's leading
+/// whitespace up to and including the first `margin` character, leaving lines
+/// without one untouched.
+fn strip_margin(s: &str, margin: char) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let rest = line.trim_start_matches(char::is_whitespace);
+        match rest.strip_prefix(margin) {
+            Some(after) => out.push_str(after),
+            None => out.push_str(line),
+        }
+    }
+    out
 }
 
 /// `java.lang.String.compareTo` — by UTF-16 code unit, then by length.
@@ -6357,12 +6504,12 @@ fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
         ("signum", 1) if ints => Ok(Value::int(args[0].to_int().signum())),
         ("signum", 1) => Ok(Value::float(if f(0) == 0.0 { f(0) } else { f(0).signum() })),
         ("max", 2) if ints => Ok(Value::int(args[0].to_int().max(args[1].to_int()))),
-        ("max", 2) => Ok(Value::float(f(0).max(f(1)))),
+        ("max", 2) => Ok(Value::float(java_double_max(f(0), f(1)))),
         ("min", 2) if ints => Ok(Value::int(args[0].to_int().min(args[1].to_int()))),
-        ("min", 2) => Ok(Value::float(f(0).min(f(1)))),
-        // `Math.round` is "floor(x + 0.5)", which is NOT `f64::round`
-        // (`round(-2.5)` is `-2` on the JVM, `-3` in Rust).
-        ("round", 1) => Ok(Value::int((f(0) + 0.5).floor() as i64)),
+        ("min", 2) => Ok(Value::float(java_double_min(f(0), f(1)))),
+        // `Math.round` is neither `floor(x + 0.5)` nor Rust's `round` — see
+        // `java_round`, which is the JDK body.
+        ("round", 1) => Ok(Value::int(java_round(f(0)))),
         ("floor", 1) => Ok(Value::float(f(0).floor())),
         ("ceil", 1) => Ok(Value::float(f(0).ceil())),
         ("rint", 1) => Ok(Value::float(round_half_even(f(0)))),
@@ -6965,7 +7112,23 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("nonEmpty", 0) => Ok(Value::bool(!s.is_empty())),
         ("toUpperCase", 0) => Ok(Value::str(s.to_uppercase())),
         ("toLowerCase", 0) => Ok(Value::str(s.to_lowercase())),
-        ("trim", 0) => Ok(Value::str(s.trim())),
+        ("trim", 0) => Ok(Value::str(java_trim(s))),
+        ("strip", 0) => Ok(Value::str(java_strip(s))),
+        ("stripLeading", 0) => Ok(Value::str(
+            s.trim_start_matches(java_is_whitespace).to_string(),
+        )),
+        ("stripTrailing", 0) => Ok(Value::str(
+            s.trim_end_matches(java_is_whitespace).to_string(),
+        )),
+        ("stripMargin", 0) => Ok(Value::str(strip_margin(s, '|'))),
+        // The margin may arrive as a `Char` value or, from a one-character
+        // string literal, as a `Str`.
+        ("stripMargin", 1) => Ok(Value::str(strip_margin(
+            s,
+            as_char(&args[0])
+                .or_else(|| one_char(&args[0].as_str_cow()))
+                .unwrap_or('|'),
+        ))),
         ("concat", 1) => Ok(Value::str(format!("{s}{}", args[0].as_str_cow()))),
         // `String.split` answers an `Array[String]`, and its separator is a
         // REGEX (`java.lang.String.split`), not a literal — see [`java_split`].
@@ -7855,9 +8018,14 @@ fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("toChar", 0) => Ok(make_char(char_of_code(n))),
         ("max", 1) => Ok(Value::int(n.max(args[0].to_int()))),
         ("min", 1) => Ok(Value::int(n.min(args[0].to_int()))),
-        ("abs" | "toDouble" | "toFloat" | "toInt" | "toLong" | "max" | "min", _) => {
-            Err(format!("scalars: Int.{name}: wrong number of arguments"))
-        }
+        // `RichInt.signum` and `Integer.compare`, both answering an `Int`.
+        ("signum", 0) => Ok(Value::int(n.signum())),
+        ("compareTo" | "compare", 1) => Ok(Value::int(n.cmp(&args[0].to_int()) as i64)),
+        (
+            "abs" | "toDouble" | "toFloat" | "toInt" | "toLong" | "max" | "min" | "signum"
+            | "compareTo" | "compare",
+            _,
+        ) => Err(format!("scalars: Int.{name}: wrong number of arguments")),
         // The bitwise and shift operators. Scala evaluates these at `Int` width
         // — `1 << 33` is `2`, because the shift distance is masked to five bits
         // and the result wraps at 32 bits — so they are computed on `i32` and
@@ -7920,10 +8088,27 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("toDouble" | "toFloat", 0) => Ok(Value::float(f)),
         ("isNaN", 0) => Ok(Value::bool(f.is_nan())),
         ("isInfinity" | "isInfinite", 0) => Ok(Value::bool(f.is_infinite())),
-        ("round", 0) => Ok(Value::int(f.round() as i64)),
+        ("round", 0) => Ok(Value::int(java_round(f))),
+        // `RichDouble`'s `max`/`min` are `math.max`/`math.min`, so they PROPAGATE
+        // a NaN operand rather than ignoring it.
+        ("max", 1) => Ok(Value::float(java_double_max(f, args[0].to_float()))),
+        ("min", 1) => Ok(Value::float(java_double_min(f, args[0].to_float()))),
+        // `RichDouble.signum` answers an `Int`, and `-0.0`'s is `0`.
+        ("signum", 0) => Ok(Value::int(if f.is_nan() || f == 0.0 {
+            0
+        } else if f < 0.0 {
+            -1
+        } else {
+            1
+        })),
+        // `java.lang.Double.compare` — the total order, so `NaN` is above
+        // everything and `-0.0` is below `0.0`.
+        ("compareTo" | "compare", 1) => {
+            Ok(Value::int(double_total_cmp(f, args[0].to_float()) as i64))
+        }
         (
             "abs" | "toInt" | "toLong" | "toDouble" | "toFloat" | "isNaN" | "isInfinity"
-            | "isInfinite" | "round",
+            | "isInfinite" | "round" | "max" | "min" | "signum" | "compareTo" | "compare",
             _,
         ) => Err(format!("scalars: Double.{name}: wrong number of arguments")),
         // `x.formatted(spec)` on `Any` — the argument is the format string.
