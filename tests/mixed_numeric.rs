@@ -16,10 +16,17 @@
 //! LEXICOGRAPHICALLY.
 //!
 //! `data/mixed_numeric_expected.txt` is the verbatim stdout of a reference
-//! `scala` (Scala code runner 1.16.0, Scala 3.8.4) on a generated program that
-//! prints `<pair>.<order>.<op><TAB><result>` for every combination below, both
-//! operand orders, four arithmetic operations and all six comparisons. Nothing
-//! here is derived from what this frontend does.
+//! `scala` (Scala code runner 1.16.0, Scala 3.8.4, JDK 26.0.2) on a generated
+//! program that prints `<pair>.<order>.<op><TAB><result>` for every combination
+//! below, both operand orders, five arithmetic operations and all six
+//! comparisons. Nothing here is derived from what this frontend does.
+//!
+//! `Div` was absent from the capture until this round: the value assertions
+//! covered `+`, `-`, `*` and `%` while `Div` appeared only in
+//! [`mixed_int_float_pairs_are_never_rejected`], which checks that the hook
+//! answers a `Float` and not WHICH `Float`. A `/` that answered the reciprocal,
+//! or that computed on the rounded integer, passed the whole file. The twelve
+//! `div` records close that.
 
 use fusevm::{NumOp, Value};
 use scalars::host::numeric_hook;
@@ -43,6 +50,7 @@ fn op_of(name: &str) -> NumOp {
         "add" => NumOp::Add,
         "sub" => NumOp::Sub,
         "mul" => NumOp::Mul,
+        "div" => NumOp::Div,
         "mod" => NumOp::Mod,
         "lt" => NumOp::Lt,
         "gt" => NumOp::Gt,
@@ -100,7 +108,7 @@ fn mixed_int_float_pairs_match_reference_scala() {
         checked += 1;
     }
     assert!(
-        checked >= 120,
+        checked >= 132,
         "expected the full reference capture, checked only {checked} records"
     );
     assert!(
