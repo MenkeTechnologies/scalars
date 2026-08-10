@@ -3010,11 +3010,43 @@ fn check_oracle_locale(oracle: &Path) {
     }
 }
 
-const JVM_PROBE: &str =
-    "object T extends App { println(1.0e23); println(System.getProperty(\"java.version\")) }\n";
+/// Line 1 identifies the RUN JVM's `Double.toString`; line 2 names it; line 3
+/// answers whether the COMPILE JVM's rendering can reach the output at all.
+///
+/// `K.S` is the strongest constant-folding candidate the language offers — a
+/// `final val` of type `String` in another object, initialized from a `Double`
+/// literal. `d.toString` reads a local and is unambiguously a runtime call. If a
+/// compiler ever folds the first, and the compile JVM is not the run JVM, the
+/// two renderings differ and line 3 reads `false`.
+const JVM_PROBE: &str = "object K { final val S: String = \"\" + 1.0e23 }\n\
+                         object T extends App { println(1.0e23); \
+                         println(System.getProperty(\"java.version\")); \
+                         val d: Double = 1.0e23; println(K.S == d.toString) }\n";
 
 /// Reject an oracle running on a JVM whose `Double.toString` is the pre-JDK-19
-/// one.
+/// one, or one whose COMPILER's rendering of a Double can reach the output.
+///
+/// Two JVMs are involved in every oracle run, not one: the JVM that compiles and
+/// the JVM that executes. A constant folded at compile time freezes the
+/// COMPILER's rendering while everything else uses the runtime's, so a
+/// compile-on-A run-on-B oracle can print two different spellings of the same
+/// Double in one program — and neither is "the JDK's answer".
+///
+/// Measured on this machine rather than assumed. Scala 3.8.4 folds NOTHING that
+/// renders a Double: `"" + 1.0e23`, `s"${1.0e23}"`, `1.0e23.toString`, and
+/// `final val S: String = "v" + 1.0e23` in a separate object all compile to a
+/// runtime `makeConcatWithConstants` / `Double.toString` (`javap -c` shows
+/// `ldc2_w double` then `String.valueOf`, no String constant in the pool). The
+/// same classes compiled under Corretto 17.0.4.1 print `1.0E23` when run on
+/// OpenJDK 26.0.2 and `9.999999999999999E22` when run on 17 — the run JVM
+/// decides, alone. So the four compile x run combinations collapse to two
+/// distinct outputs here, and the version check below covers both.
+///
+/// That is a property of Scala 3.8.4, not a law, which is why line 3 of
+/// [`JVM_PROBE`] is checked rather than trusted: it compares a folded-if-ever
+/// rendering against an unambiguously-runtime one. It reads `false` exactly when
+/// the compiler's answer leaked into the output — never when the two JVMs agree,
+/// in which case folding is unobservable and harmless.
 ///
 /// The `scala` launcher is a shell script that resolves its JVM from `JAVA_HOME`
 /// FIRST and only falls back to the JDK it was installed against, so an ambient
@@ -3030,6 +3062,7 @@ fn check_oracle_jvm(oracle: &Path) {
     let mut lines = text.lines();
     let repr = lines.next().unwrap_or("").trim().to_string();
     let jvm = lines.next().unwrap_or("unknown").trim().to_string();
+    let fold_agrees = lines.next().unwrap_or("").trim().to_string();
     if repr.is_empty() {
         eprintln!(
             "parity-fuzz: the oracle at {} could not run a program at all \
@@ -3047,6 +3080,19 @@ fn check_oracle_jvm(oracle: &Path) {
              a JDK 19 or newer and re-run.",
             oracle.display(),
             std::env::var("JAVA_HOME").ok()
+        );
+        std::process::exit(2);
+    }
+    if fold_agrees != "true" {
+        eprintln!(
+            "parity-fuzz: the oracle at {} compiles and runs on DIFFERENT JVMs and its compiler \
+             constant-folds a Double rendering — a `final val String` built from a Double literal \
+             reads back differently from the same literal converted at runtime (probe line 3 was \
+             {fold_agrees:?}, expected \"true\"). Part of its output is the COMPILER's \
+             `Double.toString` and part is JVM {jvm}'s, so no single JDK answers what it prints \
+             and every Double comparison against it is meaningless. Point the launcher's compile \
+             and run JVMs at the same JDK and re-run.",
+            oracle.display(),
         );
         std::process::exit(2);
     }

@@ -30,6 +30,25 @@ fn run_full(src: &str) -> (String, String, bool) {
     )
 }
 
+/// Assert that `src` is refused AND that the diagnostic names `because`.
+///
+/// A bare `assert!(!ok)` is satisfied by ANY rejection — a parse error in the
+/// test's own source, a construct that stopped working for an unrelated reason,
+/// or the feature under test being deleted outright. It cannot distinguish the
+/// correct behaviour from several incorrect ones, so it cannot fail for the
+/// reason it was written. Naming the expected cause makes it able to.
+fn rejects(src: &str, because: &str) {
+    let (out, err, ok) = run_full(src);
+    assert!(
+        !ok,
+        "must be refused, but it ran and printed {out:?}\n{src}"
+    );
+    assert!(
+        err.contains(because),
+        "refused for the wrong reason: wanted a diagnostic containing {because:?}, got {err:?}\n{src}"
+    );
+}
+
 fn fasthash(s: &str) -> u64 {
     // A tiny FNV-1a so concurrent tests use distinct temp files.
     let mut h: u64 = 0xcbf29ce484222325;
@@ -186,11 +205,7 @@ fn def_main_entry_form() {
 
 #[test]
 fn missing_entry_point_is_an_error() {
-    let (_out, ok) = run("object NoEntry { val x = 3 }");
-    assert!(
-        !ok,
-        "an object with no main and no `extends App` should fail"
-    );
+    rejects("object NoEntry { val x = 3 }", "no entry point");
 }
 
 #[test]
@@ -232,10 +247,14 @@ fn numeric_plus_string_concatenates() {
 #[test]
 fn boolean_or_null_plus_string_is_rejected() {
     // Scala 3 removed the universal `any2stringadd`, so these do not compile.
-    let (_o1, ok1) = run(&wrap(r#"println(false + "a")"#));
-    assert!(!ok1, "`Boolean + String` must be rejected (no Scala 3 `+`)");
-    let (_o2, ok2) = run(&wrap(r#"println(null + "a")"#));
-    assert!(!ok2, "`null + String` must be rejected (no Scala 3 `+`)");
+    rejects(
+        &wrap(r#"println(false + "a")"#),
+        "`+` is not defined between `false` and `a`",
+    );
+    rejects(
+        &wrap(r#"println(null + "a")"#),
+        "`+` is not defined between `null` and `a`",
+    );
 }
 
 // ── val immutability + arithmetic exceptions ──────────────────────────────
@@ -243,14 +262,20 @@ fn boolean_or_null_plus_string_is_rejected() {
 #[test]
 fn reassigning_a_val_is_a_compile_error() {
     // Scala rejects `x = 2` when `x` is a `val`; scalars does too.
-    let (_out, ok) = run(&wrap("val x = 1; x = 2; println(x)"));
-    assert!(!ok, "reassignment to a `val` must be rejected");
+    rejects(
+        &wrap("val x = 1; x = 2; println(x)"),
+        "reassignment to val `x`",
+    );
 }
 
 #[test]
 fn compound_assign_to_a_val_is_a_compile_error() {
-    let (_out, ok) = run(&wrap("val x = 1; x += 1; println(x)"));
-    assert!(!ok, "compound reassignment to a `val` must be rejected");
+    // `+=` is not a member of an immutable binding's type — which is how Scala
+    // reports it too, rather than as a reassignment.
+    rejects(
+        &wrap("val x = 1; x += 1; println(x)"),
+        "value += is not a member of Int",
+    );
 }
 
 #[test]
@@ -264,8 +289,10 @@ fn reassigning_a_var_is_allowed() {
 #[test]
 fn integer_division_by_zero_throws() {
     // Scala/JVM `idiv` traps: `java.lang.ArithmeticException: / by zero`.
-    let (_out, ok) = run(&wrap("println(1 / 0)"));
-    assert!(!ok, "integer `/ 0` must throw, not yield null");
+    rejects(
+        &wrap("println(1 / 0)"),
+        "java.lang.ArithmeticException: / by zero",
+    );
 }
 
 #[test]
@@ -368,10 +395,11 @@ fn parameterless_def_is_a_parenless_call() {
 #[test]
 fn parameter_reassignment_is_a_compile_error() {
     // Scala method parameters are `val`s.
-    let (_out, ok) = run(
-        "object M { def f(x: Int): Int = { x = 5; x }\n  def main(a: Array[String]): Unit = println(f(1)) }",
+    rejects(
+        "object M { def f(x: Int): Int = { x = 5; x }\n  \
+         def main(a: Array[String]): Unit = println(f(1)) }",
+        "reassignment to val `x`",
     );
-    assert!(!ok, "reassigning a method parameter must be rejected");
 }
 
 // ── postfix `.` method dispatch (core stdlib) ─────────────────────────────
@@ -430,18 +458,19 @@ fn string_to_int_conversion_method() {
 
 #[test]
 fn unknown_method_is_an_error() {
-    let (_out, ok) = run(&wrap(r#"println("x".frobnicate)"#));
-    assert!(
-        !ok,
-        "an unresolved method must be rejected, not silently null"
+    rejects(
+        &wrap(r#"println("x".frobnicate)"#),
+        "value frobnicate is not a member of String",
     );
 }
 
 #[test]
 fn substring_out_of_range_throws() {
     // Faithful to Java `String.substring`'s bounds check.
-    let (_out, ok) = run(&wrap(r#"println("hi".substring(0, 9))"#));
-    assert!(!ok, "an out-of-range substring must throw");
+    rejects(
+        &wrap(r#"println("hi".substring(0, 9))"#),
+        "java.lang.StringIndexOutOfBoundsException: Range [0, 9) out of bounds for length 2",
+    );
 }
 
 // ── string interpolation (`s` / `f` / `raw`) ──────────────────────────────
@@ -596,10 +625,10 @@ fn match_typed_patterns() {
 #[test]
 fn match_without_matching_arm_throws() {
     // A non-exhaustive match that falls through raises `scala.MatchError`.
-    let (_out, ok) = run(&wrap(
-        r#"val x = 5; println(x match { case 1 => "one"; case 2 => "two" })"#,
-    ));
-    assert!(!ok, "a non-exhaustive match must throw scala.MatchError");
+    rejects(
+        &wrap(r#"val x = 5; println(x match { case 1 => "one"; case 2 => "two" })"#),
+        "scala.MatchError: 5 (of class java.lang.Integer)",
+    );
 }
 
 #[test]
@@ -1216,11 +1245,14 @@ fn library_exceptions_carry_their_jdk_messages() {
 #[test]
 fn an_uncaught_throw_stops_the_run_with_a_failing_status() {
     // Output before the raise is kept; nothing after it runs.
-    let (out, ok) = run(&wrap(
+    let (out, err, ok) = run_full(&wrap(
         "println(\"a\")\ntry { println(\"t\") } catch { case e: NumberFormatException => println(\"c\") }\nthrow new IllegalStateException(\"uncaught\")\nprintln(\"never\")",
     ));
     assert!(!ok);
     assert_eq!(out, "a\nt\n");
+    // The status alone would be satisfied by ANY failure, including the `catch`
+    // arm swallowing the wrong exception and something else aborting later.
+    assert_eq!(err, "scalars: java.lang.IllegalStateException: uncaught\n");
 }
 
 #[test]
@@ -1362,11 +1394,15 @@ fn a_capturing_local_def_used_as_a_function_value_still_gets_its_capture() {
 fn assigning_to_a_captured_binding_is_rejected_not_silently_lost() {
     // A capture travels by value, so a write inside the lifted body could not
     // reach the enclosing frame. Reject it rather than drop it.
-    let (out, ok) = run(&wrap(
+    let (out, err, ok) = run_full(&wrap(
         "def f(): Int = { var k = 0; def bump(): Unit = { k += 1 }; bump(); k }\nprintln(f())",
     ));
     assert!(!ok);
     assert_eq!(out, "");
+    assert!(
+        err.contains("local `def bump` assigns to `k` from the enclosing method"),
+        "the refusal must name the write it refused, not merely fail: {err:?}"
+    );
 }
 
 #[test]
@@ -1442,9 +1478,14 @@ fn a_mixin_override_can_call_super_into_the_trait_it_refines() {
 
 #[test]
 fn a_trait_cannot_be_instantiated() {
-    let (out, ok) = run("trait S { def f: Int = 1 }\nobject T extends App { println(new S().f) }");
+    let (out, err, ok) =
+        run_full("trait S { def f: Int = 1 }\nobject T extends App { println(new S().f) }");
     assert!(!ok);
     assert_eq!(out, "");
+    assert!(
+        err.contains("trait S is abstract; it cannot be instantiated"),
+        "{err:?}"
+    );
 }
 
 // ── Range as a value, Array, scala.math ─────────────────────────────────────
@@ -1494,9 +1535,10 @@ fn new_array_fills_with_the_element_types_zero() {
 
 #[test]
 fn a_list_is_immutable_so_it_has_no_update() {
-    let (out, ok) = run(&wrap("val xs = List(1, 2, 3)\nxs(1) = 9\nprintln(xs)"));
+    let (out, err, ok) = run_full(&wrap("val xs = List(1, 2, 3)\nxs(1) = 9\nprintln(xs)"));
     assert!(!ok);
     assert_eq!(out, "");
+    assert!(err.contains("value update is not a member"), "{err:?}");
 }
 
 #[test]
@@ -2752,9 +2794,14 @@ fn a_char_range_is_refused_rather_than_read_as_integers() {
         "for (c <- 'a' to 'd') print(c)",
         "val a = 'a'; val z = 'e'; println((a to z).toList)",
     ] {
-        let (out, ok) = run(&wrap(src));
+        let (out, err, ok) = run_full(&wrap(src));
         assert!(!ok, "a Char range must be refused: {src}");
         assert_eq!(out, "", "a refused Char range must print nothing: {src}");
+        // Without this, a parse error anywhere in `src` would pass the test.
+        assert!(
+            err.contains("a Char range"),
+            "refused for the wrong reason on {src}: {err:?}"
+        );
     }
     // The integer range it would be confused with is untouched.
     let (out, ok) = run(&wrap("println((1 to 4).toList); println((1 until 4).size)"));
@@ -3268,9 +3315,13 @@ fn boxed_primitive_companions_answer_their_own_namespaces_members() {
 fn a_member_of_the_other_boxed_namespace_is_rejected() {
     // `Double.parseDouble` really is "not a member of object Double" in Scala —
     // the split between the two namespaces is faithful, not a superset.
-    let (out, ok) = run(&wrap(r#"println(Double.parseDouble("1.5"))"#));
+    let (out, err, ok) = run_full(&wrap(r#"println(Double.parseDouble("1.5"))"#));
     assert!(!ok);
     assert_eq!(out, "");
+    assert!(
+        err.contains("value parseDouble is not a member of Double"),
+        "{err:?}"
+    );
 }
 
 // ── `getClass` ─────────────────────────────────────────────────────────────
@@ -3295,9 +3346,10 @@ fn getclass_on_a_collection_is_an_error_rather_than_a_guess() {
     // A collection's runtime class is a private implementation detail
     // (`$colon$colon`, `Vector1`, `Tuple2$mcII$sp`), so it fails loudly instead
     // of answering something plausible and wrong.
-    let (out, ok) = run(&wrap("println(List(1).getClass.getName)"));
+    let (out, err, ok) = run_full(&wrap("println(List(1).getClass.getName)"));
     assert!(!ok);
     assert_eq!(out, "");
+    assert!(err.contains("value getClass is not a member"), "{err:?}");
 }
 
 // ── An explicit `Ordering` ─────────────────────────────────────────────────
@@ -3335,9 +3387,13 @@ fn a_spread_outside_a_repeated_parameter_is_rejected() {
     // Scala: "Sequence argument type annotation `*` cannot be used here: the
     // corresponding parameter has type Int which is not a repeated parameter
     // type." Both sides refuse to compile it.
-    let (out, ok) = run(&wrap("def k(a: Int) = a; println(k(List(1): _*))"));
+    let (out, err, ok) = run_full(&wrap("def k(a: Int) = a; println(k(List(1): _*))"));
     assert!(!ok);
     assert_eq!(out, "");
+    assert!(
+        err.contains("a `: _*` argument is only allowed for a repeated parameter"),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -4577,9 +4633,15 @@ fn a_main_parameter_type_with_no_command_line_reader_is_refused() {
     // separate reason that it is not a distinct type in this frontend, so
     // reading one would answer a `Double`'s rendering (`BUGS.md`).
     for ty in ["Char", "Float"] {
-        let (out, _, ok) = run_full(&format!("@main def go(c: {ty}): Unit = println(c)"));
+        let (out, err, ok) = run_full(&format!("@main def go(c: {ty}): Unit = println(c)"));
         assert!(!ok, "`{ty}` must not be read from the command line");
         assert!(out.is_empty());
+        assert!(
+            err.contains(&format!(
+                "`@main def go` cannot read a `{ty}` from the command line"
+            )),
+            "the refusal must name the offending type: {err:?}"
+        );
     }
 }
 
