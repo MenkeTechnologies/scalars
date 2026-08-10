@@ -256,6 +256,13 @@ pub const MAKE_PRIORITYQUEUE: u16 = 769;
 /// compiler-emitted branch to `x.+=(e)`, `false` to `x = x + e` — Scala makes
 /// that choice statically from whether the receiver's type has a `+=` method.
 pub const IS_GROWABLE: u16 = 744;
+/// Builtin id for Scala `+` with an operand whose type the frontend could not
+/// prove: pops the two operands and answers the same value `Op::Add` would,
+/// except that a concatenation renders through [`scala_str_vm`] and so can run a
+/// user `toString` override. `Op::Add`'s numeric hook is a plain
+/// `Fn(NumOp, &Value, &Value)` with no VM to re-enter, which is the whole reason
+/// this exists; see `Compiler::concat_add`.
+pub const SADD: u16 = 770;
 /// Builtin id for the `Option(x)` factory: pops one value and answers `None` for
 /// `null` (fusevm's `Undef`), `Some(x)` for anything else.
 pub const MAKE_OPTION: u16 = 745;
@@ -440,6 +447,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_LINKEDMAP, b_make_linkedmap);
     vm.register_builtin(MAKE_PRIORITYQUEUE, b_make_priorityqueue);
     vm.register_builtin(IS_GROWABLE, b_is_growable);
+    vm.register_builtin(SADD, b_add);
     vm.register_builtin(MAKE_OPTION, b_make_option);
     vm.register_builtin(NLR_RAISE, b_nlr_raise);
     vm.register_builtin(NLR_TAKE, b_nlr_take);
@@ -2069,6 +2077,42 @@ fn b_is_growable(vm: &mut VM, _argc: u8) -> Value {
         Some((HashRep::Mutable(_) | HashRep::Linked, _))
     );
     Value::bool(mutable_seq || mutable_map)
+}
+
+/// `SADD` builtin — Scala `+`, able to run a user `toString` override.
+///
+/// Every answer here is the one [`numeric_hook`] gives for the same pair, which
+/// is what `Op::Add` would have reached; the ONE difference is that a
+/// concatenation renders its operands with [`scala_str_vm`] rather than
+/// [`scala_str`], so an override is honoured. The two concatenating shapes are
+/// Scala 3's only ones (there is no `any2stringadd`): a `String` LEFT operand
+/// takes anything, and a numeric left takes a `String` right. Everything else —
+/// `Set`/`Map` `+`, `Char` arithmetic, `Long` wrap, `Int`/`Double` promotion,
+/// and the rejections — is delegated unchanged.
+fn b_add(vm: &mut VM, _argc: u8) -> Value {
+    let b = vm.stack.pop().unwrap_or(Value::Undef);
+    let a = vm.stack.pop().unwrap_or(Value::Undef);
+    // Suppressed while unwinding: an operand is the `Undef` a raise left behind,
+    // and rejecting it here would displace the real exception.
+    if unwinding() {
+        return Value::Undef;
+    }
+    let concatenates = matches!(a, Value::Str(_))
+        || (matches!(b, Value::Str(_)) && matches!(a, Value::Int(_) | Value::Float(_)));
+    if concatenates {
+        let left = scala_str_vm(vm, &a);
+        let right = scala_str_vm(vm, &b);
+        return Value::str(format!("{left}{right}"));
+    }
+    // Two `Double`s never reach the hook (the VM adds them itself), so answer
+    // them here rather than falling into its rejections.
+    if let (Value::Float(x), Value::Float(y)) = (&a, &b) {
+        return Value::float(x + y);
+    }
+    match numeric_hook(NumOp::Add, &a, &b) {
+        Ok(v) => v,
+        Err(e) => fault(vm, e),
+    }
 }
 
 /// The class tag of a parked non-local return (see [`NLR_RAISE`]).

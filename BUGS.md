@@ -91,6 +91,22 @@ reported as parse/compile errors, never silently mis-run.
   the same run-time `IS_GROWABLE` test a plain-name `+=` already took, so a
   program with no mutable collection still emits exactly the arithmetic it did
   before. Covered by the parity fuzzer's `placeassign` mode.
+- **Plain `=` to a selection, and to a singleton's `var`.** `obj.field = v`,
+  `bs(1).n = 5`, `mk(b).n = 3`, and `Cfg.n = 10` / `Cfg.n += 5` / `Cfg.s += "!"`
+  for an `object Cfg { var n = … }`. `recv.field = v` used to be a parse error
+  (`unexpected token Assign in expression`), which left a `var` field writable
+  only from inside its own class; it takes the same target path the `op=` forms
+  take, with `=` as the operator, so the receiver is still evaluated exactly
+  once. A singleton's `var` is the one target that is NOT a record field —
+  reading `Cfg.n` lowers to `GetVar("Cfg.n")` — so every operator form routes to
+  that global rather than to the heap builtins, which is what makes an outside
+  write visible to the object's own `def`s (`Cfg.n = 10; Cfg.bump()` answers
+  `11`).
+- **`try` with neither a `catch` nor a `finally`.** Reference `scala` 3.8.4
+  compiles it, warns "A try without catch or finally is equivalent to putting
+  its body in a block; no exceptions are handled", and runs the body — so it
+  parses to a plain block here. It handles nothing: a raise inside one still
+  propagates, and the unwind protocol below is not armed for it.
 - **Compound assignment in expression position.** `println(buf += 1)`,
   `val r = (n -= 2)`, `xs.map(x => n += x)`, `(buf += 2) += 3`. Scala's
   `l op= r` is an EXPRESSION, and its value is decided by which half of the SLS
@@ -157,6 +173,22 @@ reported as parse/compile errors, never silently mis-run.
   Both the compiler's concat rerouting and the host's per-value lookup are gated
   on the program declaring an override at all: a program with none emits and
   runs exactly the bytecode it did before.
+
+  The `+` half of that is a WHOLE-OPERATION reroute, not an operand rewrite.
+  fusevm's `Op::Add` reaches a mixed pair through `NumericHook`, a plain
+  `Fn(NumOp, &Value, &Value)` with no VM to re-enter, so a `+` either of whose
+  operands could be a class instance is emitted as the `SADD` builtin instead
+  (`BuiltinHandler` does get a `&mut VM`). `SADD` answers exactly what the hook
+  answers for every other pair — `Set`/`Map` `+`, `Char` arithmetic, `Long`
+  wrap, `Int`/`Double` promotion, and Scala 3's rejections, which have no
+  universal `any2stringadd` — and differs only in rendering a concatenation
+  through the VM-aware path. Deciding it at run time is what reaches the sites
+  with no `String` in the source text: `pre + p` for a `val pre = "…"`,
+  `s + p` for a `String` parameter, `xs(0) + p`, and `acc += p`, whose far
+  operand is the assignment TARGET and so offers no syntax to read. The gate is
+  the operand: a literal, and anything the width analysis has typed `Int` or
+  `Long`, keep the native `Op::Add`, so `n += 1` in a program that happens to
+  declare one override is untouched.
 - **Overloaded methods, resolved by argument count.** A `class`/`object` may
   declare one name at several arities (`def g()`, `def g(x: Int)`, `def g(x:
   Int, y: Int)`); each registers its own subroutine and every call site — direct,

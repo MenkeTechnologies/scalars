@@ -2328,9 +2328,7 @@ impl Compiler {
         // No mutable collection in the program: `+=` can only be arithmetic,
         // so emit exactly the two ops it emitted before this feature existed.
         if !self.has_mutable {
-            self.expr(value)?;
-            self.b.emit(compound_op(op), 0);
-            self.narrow(w, 0);
+            self.compound_arith(op, value, w)?;
             self.assign_result_is_unit();
             return Ok(());
         }
@@ -2347,14 +2345,31 @@ impl Compiler {
         let to_end = self.b.emit(Op::Jump(0), 0);
         let arith = self.b.current_pos();
         self.b.patch_jump(to_arith, arith);
-        self.expr(value)?;
-        self.b.emit(compound_op(op), 0);
         // Only this branch is arithmetic — the growable one answers a collection,
         // which must not be narrowed.
-        self.narrow(w, 0);
+        self.compound_arith(op, value, w)?;
         self.assign_result_is_unit();
         let end = self.b.current_pos();
         self.b.patch_jump(to_end, end);
+        Ok(())
+    }
+
+    /// The `x = x op e` half of a compound assignment: push `e`, apply the
+    /// operator to the current value beneath it, narrow the result.
+    ///
+    /// `s += p` is that same expansion, so it concatenates — and Scala renders
+    /// `p` through its `toString`, which for a user override the `Op::Add`
+    /// numeric hook cannot run. It takes the same [`crate::host::SADD`] reroute
+    /// the binary `+` takes, under the same [`Compiler::needs_render`] gate, so
+    /// an ordinary `n += 1` keeps the two ops it always had.
+    fn compound_arith(&mut self, op: AssignOp, value: &Expr, w: NumTy) -> Result<(), String> {
+        self.expr(value)?;
+        if op == AssignOp::Add && self.needs_render(value) {
+            self.b.emit(Op::CallBuiltin(crate::host::SADD, 2), 0);
+        } else {
+            self.b.emit(compound_op(op), 0);
+        }
+        self.narrow(w, 0);
         Ok(())
     }
 
@@ -2612,8 +2627,9 @@ impl Compiler {
         Ok(())
     }
 
-    /// Lower `obj.field op= e` — a compound assignment through an explicit
-    /// receiver, the counterpart of [`Compiler::field_assign`]'s implicit `this`.
+    /// Lower `obj.field = e` and `obj.field op= e` — an assignment through an
+    /// explicit receiver, the counterpart of [`Compiler::field_assign`]'s
+    /// implicit `this`.
     ///
     /// Scala's "prefer the `op=` member" rule decides more here than it does for
     /// a name: when the current value is growable the member call mutates it in
@@ -2621,6 +2637,9 @@ impl Compiler {
     /// record at all (`buffers.head += 3` selects a method, not a field). So the
     /// growable test picks not just the operation but whether a write-back is
     /// emitted; only the arithmetic branch performs one.
+    ///
+    /// A plain `=` has no current value to read and no operator to apply, so it
+    /// skips all of that and stores straight into the field.
     fn select_assign(
         &mut self,
         recv: &Expr,
@@ -2629,6 +2648,30 @@ impl Compiler {
         value: &Expr,
         line: u32,
     ) -> Result<(), String> {
+        // A singleton's `var` is a GLOBAL, not a heap-record field — the read
+        // path lowers `Cfg.n` to `GetVar("Cfg.n")` — so writing it through the
+        // record builtins would look for a member that was never there. Route
+        // it to the same global the object's own methods write.
+        if let Expr::Var(obj) = recv {
+            if self
+                .objects
+                .get(obj)
+                .is_some_and(|m| m.vals.contains(field))
+            {
+                let obj = obj.clone();
+                return self.object_val_assign(&obj, field, op, value);
+            }
+        }
+        if op == AssignOp::Assign {
+            self.expr(recv)?;
+            let fc = self.b.add_constant(Value::str(field.to_string()));
+            self.b.emit(Op::LoadConst(fc), line);
+            self.expr(value)?;
+            self.b.emit(Op::CallBuiltin(crate::host::OBJ_SET, 3), line);
+            self.assign_result_is_unit();
+            self.b.emit(Op::Pop, 0); // discard the `Unit` result
+            return Ok(());
+        }
         self.obj_counter += 1;
         let n = self.obj_counter;
         self.expr(recv)?;
@@ -4292,22 +4335,26 @@ impl Compiler {
         } else {
             NumTy::Unknown
         };
-        if let BinOp::Add = op {
-            // `"s" + p` renders `p` through its `toString`, and so does `s"$p"`
-            // — the parser desugars an interpolation to exactly this, `"" + p +
-            // ""`. Both reach fusevm's `Op::Add`, whose numeric hook is a plain
-            // `Fn(NumOp, &Value, &Value)` and cannot re-enter the VM to run a
-            // user override. Route the non-`String` side through the `SFORMAT`
-            // builtin instead, which does hold the VM.
-            //
-            // Gated on the program declaring an override at all, so a program
-            // without one emits the `Op::Add` it always did — the JIT-visible
-            // arithmetic path is untouched.
-            self.concat_operand(lhs, rhs)?;
-            self.concat_operand(rhs, lhs)?;
-        } else {
-            self.expr(lhs)?;
-            self.expr(rhs)?;
+        self.expr(lhs)?;
+        self.expr(rhs)?;
+        // `"s" + p` renders `p` through its `toString`, and so does `s"$p"` —
+        // the parser desugars an interpolation to exactly this, `"" + p + ""`.
+        // Both reach fusevm's `Op::Add`, whose numeric hook is a plain
+        // `Fn(NumOp, &Value, &Value)` and cannot re-enter the VM to run a user
+        // override. Route the whole `+` through the `SADD` builtin instead,
+        // which does hold the VM and otherwise answers exactly what the hook
+        // does.
+        //
+        // Gated on the program declaring an override at all, so a program
+        // without one emits the `Op::Add` it always did — the JIT-visible
+        // arithmetic path is untouched. Whether the OTHER side is the `String`
+        // that makes this a concatenation is left to run time: it is a `val`,
+        // a parameter or an element at least as often as it is a literal, and
+        // a syntactic test misses every one of those.
+        if op == BinOp::Add && (self.needs_render(lhs) || self.needs_render(rhs)) {
+            self.b.emit(Op::CallBuiltin(crate::host::SADD, 2), 0);
+            self.narrow(w, 0);
+            return Ok(());
         }
         // Scala `/` truncates for two `Int`s; fusevm's native `Op::Div` always
         // floats, so route division through the type-dispatching host builtin.
@@ -4353,23 +4400,23 @@ impl Compiler {
     /// proved to be an `Int` or a `Long`, are skipped too — neither can be a
     /// class instance, and wrapping them would put a builtin call in every
     /// `s"…$i…"` of a program that happens to define one override somewhere.
-    fn concat_operand(&mut self, e: &Expr, other: &Expr) -> Result<(), String> {
-        self.expr(e)?;
-        if !self.has_user_tostring
-            || yields_strings(e)
-            || !yields_strings(other)
-            || self.num_ty(e) != NumTy::Unknown
-            || matches!(
+    /// Whether an operand of a `+` could be a class instance whose `toString`
+    /// the program overrides — the test that selects [`crate::host::SADD`] over
+    /// `Op::Add`.
+    ///
+    /// A literal, and anything the width analysis has already proved to be an
+    /// `Int` or a `Long`, are excluded: neither can be a class instance, so a
+    /// program that happens to define one override somewhere keeps the native
+    /// `Op::Add` for its arithmetic. So is anything already a `String`, which
+    /// renders as itself.
+    fn needs_render(&self, e: &Expr) -> bool {
+        self.has_user_tostring
+            && !yields_strings(e)
+            && self.num_ty(e) == NumTy::Unknown
+            && !matches!(
                 e,
                 Expr::Int(_) | Expr::Long(_) | Expr::Float(_) | Expr::Char(_) | Expr::Bool(_)
             )
-        {
-            return Ok(());
-        }
-        let c = self.b.add_constant(Value::str("%s".to_string()));
-        self.b.emit(Op::LoadConst(c), 0);
-        self.b.emit(Op::CallBuiltin(crate::host::SFORMAT, 2), 0);
-        Ok(())
     }
 }
 

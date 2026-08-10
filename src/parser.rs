@@ -1037,6 +1037,20 @@ impl Parser {
                     ref args,
                     line,
                 } if name == "apply" => (*recv.clone(), args.clone(), line),
+                // `obj.field = v` — a selection with NO argument list is a
+                // `var` write, not `update` sugar. It is the `op=` forms'
+                // target with `=` as the operator, so it takes the same
+                // [`StmtKind::PlaceAssign`] lowering (which evaluates the
+                // receiver once and routes an object's `val` to its global).
+                place @ Expr::Method { .. } if selection_target(&place) => {
+                    self.advance();
+                    let value = self.expression()?;
+                    return Ok(StmtKind::PlaceAssign {
+                        place,
+                        op: AssignOp::Assign,
+                        value,
+                    });
+                }
                 other => return Ok(StmtKind::Expr(other)),
             };
             self.advance();
@@ -2186,9 +2200,14 @@ impl Parser {
     /// [`branch_expr`](Self::branch_expr)) because a `try` block is usually
     /// several statements; a brace-less one-expression form (`try f() catch …`)
     /// is wrapped into a one-statement list so both shapes lower identically.
-    /// Scala requires at least one of `catch`/`finally`, and so does this.
+    ///
+    /// A `try` with NEITHER a `catch` nor a `finally` is legal Scala — reference
+    /// `scala` 3.8.4 compiles it and warns "A try without catch or finally is
+    /// equivalent to putting its body in a block; no exceptions are handled" —
+    /// so that is exactly what it lowers to here, a plain block. Handing it to
+    /// the `Expr::Try` path instead would arm the whole unwind protocol for a
+    /// construct that handles nothing.
     fn try_expr(&mut self) -> Result<Expr, String> {
-        let line = self.line();
         self.eat(&Tok::Try)?;
         let body = self.braced_or_single()?;
         // A line break may precede `catch`/`finally` (the lexer suppresses the
@@ -2213,9 +2232,7 @@ impl Parser {
             None
         };
         if catches.is_empty() && finalizer.is_none() {
-            return Err(format!(
-                "scalars: `try` requires a `catch` or a `finally` (line {line})"
-            ));
+            return Ok(Expr::Block(body));
         }
         Ok(Expr::Try {
             body,
@@ -2719,6 +2736,17 @@ fn type_tok_text(t: &Tok) -> String {
         Tok::Dot => ".".to_string(),
         _ => String::new(),
     }
+}
+
+/// Whether an expression is a bare SELECTION — `recv.name` with no argument
+/// list — and so can stand left of an `=`.
+///
+/// A selection reaches the parser as a zero-argument [`Expr::Method`], the same
+/// node a zero-arg call makes; `x.foo() = 1` is not assignable in Scala either,
+/// and the two are indistinguishable here, so both are accepted and the
+/// compiler's member lookup is what rejects a non-field.
+fn selection_target(e: &Expr) -> bool {
+    matches!(e, Expr::Method { args, .. } if args.is_empty())
 }
 
 fn assign_op(t: &Tok) -> Option<AssignOp> {

@@ -213,7 +213,11 @@ Implemented and checked against the reference `scala`:
   `counts(w) += 1`, `g(0)(1) += 9`, `obj.field += 5` — which Scala expands to
   `l.update(args, l.apply(args) op r)` unless the element has an `op=` member of
   its own, in which case that member mutates it in place. The receiver and the
-  indices are evaluated exactly once. A compound assignment is also an
+  indices are evaluated exactly once. Plain `=` reaches the same targets:
+  `obj.field = v` writes a `var` field through its receiver, and `Cfg.n = 10` /
+  `Cfg.n += 5` write a singleton `object`'s `var` — which is a global rather
+  than a record field, so both forms reach the same storage the object's own
+  `def`s do. A compound assignment is also an
   EXPRESSION, as in Scala — `println(buf += 1)` prints the buffer (the `op=`
   member answers its receiver), `println(n += 1)` prints `()` (the
   `n = n + 1` expansion is an assignment), and `(buf += 2) += 3` chains.
@@ -285,7 +289,11 @@ Implemented and checked against the reference `scala`:
 - **`override def toString`, everywhere a value is rendered** — `println(p)`,
   `s"$p"`, `"x" + p`, `xs.mkString`, `"%s".format(p)` and every depth of a
   nested collection run the user's override, not only an explicit `p.toString`.
-  An override may itself print, and one raising propagates as Scala's does.
+  The `+` sites include the ones with no `String` in the source text: `pre + p`
+  for a `val pre = "…"`, `s + p` for a `String` parameter, `xs(0) + p`, and
+  `acc += p` — whose far operand is the assignment target, so there is no syntax
+  to read at all. An override may itself print, and one raising propagates as
+  Scala's does.
 - **Overloaded methods** — one name at several arities on a `class` or `object`,
   resolved at the call site by argument count through every dispatch route
   (direct, `super.m`, virtual, unqualified self-call). Overloads differing only

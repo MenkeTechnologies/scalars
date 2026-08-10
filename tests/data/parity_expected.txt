@@ -196,3 +196,7 @@ object T extends App { println("%x".format(-1)); println("%X".format(-42)); prin
 object T extends App { println(List(1, 2, 3).padTo(5, 9)); println(List(1, 2, 3).padTo(2, 9)); println(List(1, 2, 5, 3).segmentLength(_ < 5)); println(List(1, 4, 2, 4).lastIndexWhere(_ == 4)) }	List(1, 2, 3, 9, 9)\nList(1, 2, 3)\n2\n3\n
 object T extends App { val x: Long = 16677181699666569L; println(x == x.toDouble); println(x + 2.5); println(x % 2.5); println(x < 1.667718169966657E16) }	true\n1.667718169966657E16\n0.5\ntrue\n
 object T extends App { val x: Long = 9007199254740993L; val y: Double = 9.007199254740992E15; println(x == y); println(y >= x); println(x - y); println(x * 2.0) }	true\ntrue\n0.0\n1.8014398509481984E16\n
+object Cfg { var n = 1; var s: String = "c"; def bump(): Int = { n += 1; n } }; object T extends App { Cfg.n = 10; Cfg.n += 5; Cfg.n *= 2; Cfg.s = Cfg.s + "!"; Cfg.s += "?"; println(Cfg.n); println(Cfg.s); println(Cfg.bump()); println(Cfg.n) }	30\nc!?\n31\n31\n
+class Box(var n: Int, var label: String); object T extends App { val b = new Box(1, "L"); b.n = 7; b.label = "M"; println(b.n); println(b.label); b.n += 4; println(b.n) }	7\nM\n11\n
+class P(val n: Int) { override def toString: String = "P<" + n + ">" }; object T extends App { val p = new P(3); val pre = "pre:"; println(pre + p); var acc = "acc:"; acc += p; println(acc); println(List("e:")(0) + p) }	pre:P<3>\nacc:P<3>\ne:P<3>\n
+object T extends App { try { println(1) }; val v = try { 41 + 1 }; println(v) }	1\n42\n

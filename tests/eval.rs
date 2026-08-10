@@ -1233,10 +1233,30 @@ fn throw_is_an_expression_usable_in_operand_position() {
 }
 
 #[test]
-fn a_try_without_catch_or_finally_is_rejected() {
-    let (out, ok) = run(&wrap("try { println(1) }"));
+fn a_try_without_catch_or_finally_runs_its_body_and_handles_nothing() {
+    // This test used to assert `try { … }` with no handler was REJECTED. That
+    // was wrong about Scala: reference `scala` 3.8.4 compiles it, warns "A try
+    // without catch or finally is equivalent to putting its body in a block; no
+    // exceptions are handled", and prints `1` then `2`. Re-scoped to what the
+    // construct actually does — the body runs, the `try` answers the body's
+    // value, and nothing is caught, so a raise inside it still aborts.
+    let (out, ok) = run(&wrap("try { println(1) }; println(2)"));
+    assert!(ok);
+    assert_eq!(out, "1\n2\n");
+
+    let (out, ok) = run(&wrap("val v = try { 41 + 1 }; println(v)"));
+    assert!(ok);
+    assert_eq!(out, "42\n");
+
+    // "no exceptions are handled" is the load-bearing half: the bare `try` must
+    // not swallow anything the way a `catch`-bearing one would.
+    let (out, err, ok) = run_full(&wrap("try { 1 / 0 }; println(\"unreached\")"));
     assert!(!ok);
     assert_eq!(out, "");
+    assert!(
+        err.contains("ArithmeticException"),
+        "a bare `try` must let the raise through, got stderr {err:?}"
+    );
 }
 
 #[test]
@@ -3896,6 +3916,44 @@ fn a_program_without_an_override_renders_exactly_as_it_did() {
     );
 }
 
+#[test]
+fn an_override_is_reached_through_a_string_that_is_not_a_literal() {
+    // The reroute used to fire only when one side of the `+` was SYNTACTICALLY
+    // a String — a literal, a `.toString`, a `.mkString`. A `val`, a parameter
+    // and an element are none of those, so `pre + p` rendered `P@0`. The
+    // decision is a run-time one now, and `acc += p` — the `x = x + e`
+    // expansion, whose far operand is the target and so has no syntax to read
+    // at all — takes the same path.
+    //
+    // The last four lines are the control: `n += 2`, `d += 0.25` and a `+` the
+    // width analysis has already typed must stay on the native `Op::Add`, and
+    // must still answer what Scala answers.
+    let (out, ok) = run(
+        "class P(val n: Int) { override def toString: String = \"P<\" + n + \">\" }\n\
+         object T extends App {\n\
+         \x20 val p = new P(3)\n\
+         \x20 val pre = \"pre:\"\n\
+         \x20 println(pre + p)\n\
+         \x20 def tag(s: String): String = s + p\n\
+         \x20 println(tag(\"fn:\"))\n\
+         \x20 val parts = List(\"el:\")\n\
+         \x20 println(parts(0) + p)\n\
+         \x20 var acc = \"acc:\"\n\
+         \x20 acc += p\n\
+         \x20 acc += 1\n\
+         \x20 println(acc)\n\
+         \x20 var n = 5; n += 2; println(n)\n\
+         \x20 var d = 1.5; d += 0.25; println(d)\n\
+         \x20 println(List(1, 2).map(i => \"i\" + i).mkString(\",\"))\n\
+         }\n",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "pre:P<3>\nfn:P<3>\nel:P<3>\nacc:P<3>1\n7\n1.75\ni1,i2\n"
+    );
+}
+
 // ── mutable.PriorityQueue ───────────────────────────────────────────────────
 //
 // Its `toString` and its iteration expose the RAW heap array, so every string
@@ -4066,6 +4124,53 @@ fn a_compound_assign_evaluates_its_target_exactly_once() {
     ));
     assert!(ok);
     assert_eq!(out, "6\n1\n");
+}
+
+#[test]
+fn a_field_is_written_through_its_receiver_with_a_plain_equals() {
+    // `recv.field = v` used to be a parse error ("unexpected token Assign"),
+    // which left a `var` field writable only from inside its own class. It is
+    // the `op=` target with `=` as the operator, and the receiver is subject to
+    // the same evaluate-once rule: `mk(b).n = 3` calls `mk` once, and so does
+    // `mk(b).n += 4`, so the call counter reads 1 then 2.
+    let (out, ok) = run("class Box(var n: Int, var label: String)\n\
+         object T extends App {\n\
+         \x20 var calls = 0\n\
+         \x20 def mk(b: Box): Box = { calls += 1; b }\n\
+         \x20 val b = new Box(1, \"L\")\n\
+         \x20 b.n = 7; println(b.n)\n\
+         \x20 b.label = \"M\"; println(b.label)\n\
+         \x20 mk(b).n = 3; println(b.n); println(calls)\n\
+         \x20 mk(b).n += 4; println(b.n); println(calls)\n\
+         \x20 val bs = Array(new Box(0, \"a\"), new Box(0, \"b\"))\n\
+         \x20 bs(1).n = 5; println(bs(0).n); println(bs(1).n)\n\
+         }\n");
+    assert!(ok);
+    assert_eq!(out, "7\nM\n3\n1\n7\n2\n0\n5\n");
+}
+
+#[test]
+fn a_singleton_var_is_written_through_the_object_name() {
+    // A singleton's `var` is a GLOBAL, not a heap-record field — reading `Cfg.n`
+    // lowers to `GetVar("Cfg.n")` — so writing it through the record builtins
+    // used to fail at run time with `value n is not a member of Cfg` even once
+    // the parse succeeded. Every operator form has to reach the same global the
+    // object's own `def`s write, or `Cfg.bump()` would not see the update.
+    let (out, ok) = run(
+        "object Cfg { var n = 1; var s: String = \"c\"; val fixed = 9; \
+         def bump(): Int = { n += 1; n } }\n\
+         object T extends App {\n\
+         \x20 Cfg.n = 10; println(Cfg.n)\n\
+         \x20 Cfg.n += 5; println(Cfg.n)\n\
+         \x20 Cfg.n *= 2; println(Cfg.n)\n\
+         \x20 Cfg.s = Cfg.s + \"!\"; println(Cfg.s)\n\
+         \x20 Cfg.s += \"?\"; println(Cfg.s)\n\
+         \x20 println(Cfg.bump()); println(Cfg.n)\n\
+         \x20 println(Cfg.fixed)\n\
+         }\n",
+    );
+    assert!(ok);
+    assert_eq!(out, "10\n15\n30\nc!\nc!?\n31\n31\n9\n");
 }
 
 #[test]
