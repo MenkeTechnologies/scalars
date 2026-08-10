@@ -7856,6 +7856,18 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
 /// The shortest digits and the base-10 exponent come from Rust's `{:e}` (which,
 /// like Java, emits the shortest representation that round-trips) normalized to a
 /// single leading digit; only the *placement* (plain vs `E`-notation) is Java's.
+///
+/// **Java's two-significant-digit floor is a rounding rule, not padding.** Its
+/// spec asks for the shortest decimal that round-trips *except* that when one
+/// digit already suffices it takes the closest decimal of length one OR two.
+/// Those differ whenever the value sits far from the one-digit decimal, which
+/// takes an ULP of the same order as the value itself — so it happens only in
+/// the deep subnormals, where `Double.MinPositiveValue` is `4.9E-324` and not
+/// the `5E-324` padded to `5.0E-324`. For every normal double the relative ULP
+/// is at most 2^-52, far below the 0.05-of-a-step that would move the second
+/// digit off zero, so the rule changes nothing there — including everywhere the
+/// plain decimal notation applies, which starts at 1e-3 and is therefore out of
+/// subnormal reach entirely.
 fn format_double(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -7872,6 +7884,17 @@ fn format_double(f: f64) -> String {
     let sci = format!("{m:e}");
     let (mant, exp_str) = sci.split_once('e').expect("`{:e}` always contains `e`");
     let exp: i32 = exp_str.parse().expect("`{:e}` exponent is an integer");
+    // One significant digit: re-ask for two, correctly rounded off the VALUE.
+    // `{:.1e}` renormalizes, so the exponent can move too (a value whose
+    // shortest form is `1e-322` is `9.9e-323` at two digits).
+    let two;
+    let (mant, exp) = if mant.contains('.') {
+        (mant, exp)
+    } else {
+        two = format!("{m:.1e}");
+        let (m2, e2) = two.split_once('e').expect("`{:e}` always contains `e`");
+        (m2, e2.parse().expect("`{:e}` exponent is an integer"))
+    };
 
     let body = if (-3..=6).contains(&exp) {
         // Decimal notation. The plain shortest form matches Java's digits in this
@@ -7884,11 +7907,6 @@ fn format_double(f: f64) -> String {
         }
     } else {
         // Scientific notation: `mantissa` (with a fractional digit) + `E` + exp.
-        let mant = if mant.contains('.') {
-            mant.to_string()
-        } else {
-            format!("{mant}.0")
-        };
         format!("{mant}E{exp}")
     };
     if neg {

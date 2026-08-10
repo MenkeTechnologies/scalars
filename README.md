@@ -76,7 +76,10 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **`Double.toString` fidelity** — whole/decimal values in `[1e-3, 1e7)` print
   plain (`3.0`, `9999999.0`), everything else in Java's computerized scientific
   notation (`1.0E7`, `1.23456789E8`, `1.0E-4`), and exponent literals (`6.022e23`,
-  `1E10`) lex — all matching `scala`.
+  `1E10`) lex — all matching `scala`. Java's two-significant-digit floor is a
+  rounding rule and is applied as one: `Double.MinPositiveValue` is `4.9E-324`,
+  the closest two-digit decimal, not the shortest `5E-324` padded with a zero.
+  Every one of the first 60000 subnormals now matches.
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend

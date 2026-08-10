@@ -4264,3 +4264,34 @@ fn a_growable_operator_assign_in_expression_position_answers_its_receiver() {
     assert!(ok);
     assert_eq!(out, "ab\nabcd\n");
 }
+
+#[test]
+fn a_subnormal_double_renders_java_two_significant_digits() {
+    // Java's `Double.toString` takes the shortest decimal that round-trips
+    // EXCEPT that when one digit suffices it takes the closest decimal of
+    // length one OR two. `Double.MinPositiveValue` is 4.9406…E-324, so the
+    // answer is `4.9E-324` — not the one-digit `5E-324` padded to `5.0E-324`.
+    // The padded form is what this printed before.
+    let (out, ok) = run(&wrap(
+        "val mp = Double.MinPositiveValue; println(mp); println(mp * 2); \
+         println(mp * 20); println(mp * 128); println(mp * 2048)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "4.9E-324\n9.9E-324\n9.9E-323\n6.3E-322\n1.012E-320\n");
+}
+
+#[test]
+fn the_two_digit_rule_leaves_every_normal_double_alone() {
+    // The rule can only move the second digit off zero when the ULP is of the
+    // same order as the value, which no normal double reaches — so these must
+    // render exactly as they did.
+    let (out, ok) = run(&wrap(
+        "println(1.0E7); println(1.0E-4); println(3.0); println(0.001); \
+         println(100.0); println(1e23); println(Double.MaxValue)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "1.0E7\n1.0E-4\n3.0\n0.001\n100.0\n1.0E23\n1.7976931348623157E308\n"
+    );
+}
