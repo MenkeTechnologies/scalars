@@ -2879,11 +2879,62 @@ fn resolve_oracle(ours: &Path) -> PathBuf {
             continue; // never the frontend under test
         }
         if scala_version(&cp).is_some() {
+            check_oracle_jvm(&cp);
             return cp;
         }
     }
     eprintln!("parity-fuzz: no reference scala found; set SCALARS_FUZZ_SCALA to a real `scala`");
     std::process::exit(2);
+}
+
+/// A program whose output identifies the JVM the oracle launcher picked, and
+/// pins the one observable that pick changes.
+///
+/// `Double.toString` was reimplemented in the JDK (the shortest decimal that
+/// round-trips, JDK-4511638): an older JVM answers `1.0e23` with
+/// `9.999999999999999E22`, a newer one with `1.0E23`. Verified on this machine —
+/// Corretto 17.0.4.1 prints the former, OpenJDK 21.0.12 and 26.0.2 the latter.
+const JVM_PROBE: &str =
+    "object T extends App { println(1.0e23); println(System.getProperty(\"java.version\")) }\n";
+
+/// Reject an oracle running on a JVM whose `Double.toString` is the pre-JDK-19
+/// one.
+///
+/// The `scala` launcher is a shell script that resolves its JVM from `JAVA_HOME`
+/// FIRST and only falls back to the JDK it was installed against, so an ambient
+/// `JAVA_HOME` — a `jenv` shim, a per-project `.java-version` — silently
+/// re-points the reference at another JVM. `Double.toString` notation is one of
+/// the axes this fuzzer is biased toward, so that pick decides whether a whole
+/// class of "divergences" is real or is the oracle disagreeing with itself.
+/// Comparing against it would answer a different question, so it is a hard error
+/// rather than a warning.
+fn check_oracle_jvm(oracle: &Path) {
+    let out = run_prog(oracle, JVM_PROBE, Duration::from_secs(120));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut lines = text.lines();
+    let repr = lines.next().unwrap_or("").trim().to_string();
+    let jvm = lines.next().unwrap_or("unknown").trim().to_string();
+    if repr.is_empty() {
+        eprintln!(
+            "parity-fuzz: the oracle at {} could not run a program at all \
+             (JAVA_HOME={:?}); it cannot be a reference",
+            oracle.display(),
+            std::env::var("JAVA_HOME").ok()
+        );
+        std::process::exit(2);
+    }
+    if repr != "1.0E23" {
+        eprintln!(
+            "parity-fuzz: the oracle at {} runs on JVM {jvm} (JAVA_HOME={:?}), whose \
+             `Double.toString` is the pre-JDK-19 one — it prints 1.0e23 as {repr}, not 1.0E23. \
+             Every Double-notation comparison against it would be spurious. Point JAVA_HOME at \
+             a JDK 19 or newer and re-run.",
+            oracle.display(),
+            std::env::var("JAVA_HOME").ok()
+        );
+        std::process::exit(2);
+    }
+    eprintln!("parity-fuzz: oracle {} on JVM {jvm}", oracle.display());
 }
 
 fn scala_version(prog: &Path) -> Option<String> {
