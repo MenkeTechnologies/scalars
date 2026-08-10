@@ -3896,6 +3896,91 @@ fn a_program_without_an_override_renders_exactly_as_it_did() {
     );
 }
 
+// ── mutable.PriorityQueue ───────────────────────────────────────────────────
+//
+// Its `toString` and its iteration expose the RAW heap array, so every string
+// below is an artifact of Scala's exact sift algorithm rather than of the
+// abstract "max-heap" idea. Diffed byte-for-byte against `scala` 3.8.4.
+
+#[test]
+fn a_priority_queue_prints_its_raw_heap_array() {
+    // `PriorityQueue(3,1,4,1,5,9,2,6)` is `9, 6, 4, 1, 5, 3, 2, 1`: neither the
+    // input order, nor sorted, nor `9, 6, 5, 4, 1, 3, 2, 1` — which is what
+    // repeated sift-up insertion leaves. The factory appends every element raw
+    // and then runs ONE bottom-up `fixDown` sweep, and only that reproduces it.
+    let (out, ok) = run("import scala.collection.mutable\n\
+         object T extends App {\n\
+         \x20 println(mutable.PriorityQueue(3,1,4,1,5,9,2,6))\n\
+         \x20 println(mutable.PriorityQueue(\"b\",\"a\",\"c\"))\n\
+         \x20 println(mutable.PriorityQueue[Int]())\n\
+         \x20 println(mutable.PriorityQueue(3,1,2).toList)\n\
+         \x20 println(mutable.PriorityQueue(5,3,8).dequeueAll)\n\
+         }\n");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "PriorityQueue(9, 6, 4, 1, 5, 3, 2, 1)\nPriorityQueue(c, a, b)\nPriorityQueue()\n\
+         List(3, 1, 2)\nArraySeq(8, 5, 3)\n"
+    );
+}
+
+#[test]
+fn a_priority_queue_add_sifts_up_and_addall_reheapifies() {
+    // The two are NOT the same operation and do not leave the same array:
+    // `+= x` sifts the one new arrival up, while `++= xs` appends them all and
+    // heapifies from the first new position. Implementing `++=` as repeated
+    // `+=` answers a different (still valid) heap, which is why both are here.
+    // `dequeue` moves the LAST element to the root and sifts it down.
+    let (out, ok) = run("import scala.collection.mutable\n\
+         object T extends App {\n\
+         \x20 val q = mutable.PriorityQueue(3,1,4,1,5,9,2,6)\n\
+         \x20 println(q.dequeue()); println(q)\n\
+         \x20 q += 7; println(q)\n\
+         \x20 q ++= List(0, 8); println(q)\n\
+         \x20 println(q.dequeue()); println(q.dequeue()); println(q)\n\
+         \x20 val e = mutable.PriorityQueue[Int]()\n\
+         \x20 e.enqueue(2); e.enqueue(5); e.enqueue(1)\n\
+         \x20 println(e); println(e.dequeue()); println(e.size); println(e.isEmpty)\n\
+         }\n");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "9\nPriorityQueue(6, 5, 4, 1, 1, 3, 2)\n\
+         PriorityQueue(7, 6, 4, 5, 1, 3, 2, 1)\n\
+         PriorityQueue(8, 7, 4, 5, 6, 3, 2, 1, 0, 1)\n\
+         8\n7\nPriorityQueue(6, 5, 4, 1, 1, 3, 2, 0)\n\
+         PriorityQueue(5, 2, 1)\n5\n2\nfalse\n"
+    );
+}
+
+#[test]
+fn a_priority_queue_uses_a_user_ordering_and_the_right_result_factory() {
+    // The heap consults the user's `compare`, and ties keep arrival order
+    // because both sift comparisons are STRICT. `map` answers an `ArrayBuffer`
+    // — a `PriorityQueue`'s builder needs an `Ordering` for the RESULT element
+    // type, which `map` cannot supply — where the selecting `filter` stays one.
+    // `clone` is independent of the original.
+    let (out, ok) = run(
+        "import scala.collection.mutable\n\
+         case class J(p: Int, n: String) extends Ordered[J] { def compare(that: J): Int = p - that.p }\n\
+         object T extends App {\n\
+         \x20 val q = mutable.PriorityQueue(J(1,\"a\"), J(5,\"b\"), J(3,\"c\"), J(5,\"d\"))\n\
+         \x20 println(q); println(q.dequeue()); println(q.dequeue()); println(q)\n\
+         \x20 println(mutable.PriorityQueue(1,2,3).map(_ * 10))\n\
+         \x20 println(mutable.PriorityQueue(4,2,9).filter(_ > 3))\n\
+         \x20 val c = mutable.PriorityQueue(3,1,2); val cc = c.clone(); cc.dequeue()\n\
+         \x20 println(c); println(cc)\n\
+         }\n",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "PriorityQueue(J(5,b), J(5,d), J(3,c), J(1,a))\nJ(5,b)\nJ(5,d)\n\
+         PriorityQueue(J(3,c), J(1,a))\nArrayBuffer(30, 20, 10)\nPriorityQueue(9, 4)\n\
+         PriorityQueue(3, 1, 2)\nPriorityQueue(2, 1)\n"
+    );
+}
+
 // ── Compound assignment to a target that is not a plain name ────────────────
 //
 // Scala resolves `l op= r` by preferring an `op=` MEMBER on `l` and falling

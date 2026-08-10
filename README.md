@@ -106,7 +106,8 @@ immutable collections `List`/`Seq`/`Vector`/`Set`/`Map` (the full combinator set
 `HashSet`/`HashMap` trie ordering past four entries — including for a set or map
 keyed by another collection, through the ported `MurmurHash3` seq/set/map
 hashes), the mutable collections
-(`ListBuffer`, `ArrayBuffer`, `Queue`, `Stack`, `ArrayDeque` and `StringBuilder`;
+(`ListBuffer`, `ArrayBuffer`, `Queue`, `Stack`, `ArrayDeque`, the raw-heap-order
+`PriorityQueue` and `StringBuilder`;
 `mutable.Set`/`Map` with their hash table's own iteration order and the
 insertion-ordered `LinkedHashSet`/`LinkedHashMap`; the `+=`/`-=`/`++=`
 mutators), `Array`, first-class `Range` values, an explicit `Ordering`, the
@@ -338,6 +339,8 @@ Implemented and checked against the reference `scala`:
   non-matching element; `applyOrElse`, `lift`, `orElse`, `andThen` and
   `compose` compose function values.
 - **`scala.collection.mutable`** — `ListBuffer`, `ArrayBuffer`, `Queue`,
+  `PriorityQueue` (a binary max-heap whose `toString` and iteration expose the
+  raw heap array, ported from the library's own `fixUp`/`fixDown`/`heapify`),
   `Stack`, `ArrayDeque`, `StringBuilder`, `mutable.Set`/`Map` and the
   insertion-ordered `LinkedHashSet`/`LinkedHashMap`, with `+=`/`-=`/`++=`/`--=`,
   `append`/`prepend`/`insert`/`remove`/`clear`,

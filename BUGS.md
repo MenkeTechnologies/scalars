@@ -412,16 +412,23 @@ reported as parse/compile errors, never silently mis-run.
   namespaces are kept apart where the JDK lacks an overload
   (`Math.signum(5)` is `1.0`, `math.signum(5)` is `1`).
 
+- **`scala.collection.mutable.PriorityQueue`.** `enqueue`/`+=`/`++=`, `dequeue`,
+  `dequeueAll`, `head`/`max`, `clone`, `clear`, and the shared read-only
+  sequence surface. Its `toString` and its iteration are the raw order of the
+  binary HEAP ARRAY behind it — `PriorityQueue(3,1,4,1,5,9,2,6)` prints
+  `PriorityQueue(9, 6, 4, 1, 5, 3, 2, 1)`, neither the input order, nor sorted,
+  nor the `9, 6, 5, 4, 1, 3, 2, 1` that repeated sift-up insertion leaves — so
+  the library's own `fixUp`/`fixDown`/`heapify` are ported rather than a
+  max-heap written from scratch. `++=` heapifies from the first new position
+  where `+=` sifts one element up, which are different arrays; the factory
+  appends raw and runs one bottom-up sweep. `map` answers an `ArrayBuffer` (the
+  result element type carries no implied `Ordering`) where `filter` stays a
+  `PriorityQueue`. The ordering is the implicit one, including a user
+  `Ordered`/`Comparable` class's `compare`; an explicitly passed `Ordering`
+  argument is not accepted.
+
 ## Not implemented (parse errors / unresolved today)
 
-- **`scala.collection.mutable.PriorityQueue`.** It is the one mutable collection
-  still absent. Its `toString` and its iteration are the raw order of the binary
-  HEAP ARRAY behind it (`PriorityQueue(3,1,4,1,5,9,2,6)` prints
-  `PriorityQueue(9, 6, 4, 1, 5, 3, 2, 1)`), which no ad-hoc implementation
-  reproduces — matching it needs a faithful port of the library's own
-  `addAll`/`heapify`/`fixUp`/`fixDown`, not just a max-heap. Until that port
-  exists the name stays unresolved rather than answering a plausible-looking
-  wrong order.
 - **An unqualified `Set`/`Map` always means the immutable one.** `import` lines
   are skipped, not tracked, so `import scala.collection.mutable.Set` followed by
   a bare `Set(1, 2)` builds the immutable set. Write `mutable.Set(1, 2)`.

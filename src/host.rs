@@ -246,6 +246,11 @@ pub const MAKE_LINKEDSET: u16 = 767;
 /// Builtin id for a `mutable.LinkedHashMap(...)` literal: pops `argc` `Tuple2`
 /// pairs into an insertion-ordered map.
 pub const MAKE_LINKEDMAP: u16 = 768;
+/// Builtin id for a `mutable.PriorityQueue(...)` literal: pops `argc` elements,
+/// appends them raw and then heapifies, which is exactly what Scala's builder
+/// does and is why the stored order is neither the input's nor sorted (see
+/// [`heapify`]).
+pub const MAKE_PRIORITYQUEUE: u16 = 769;
 /// Builtin id for the run-time half of `x += e` / `x -= e`: pops one value and
 /// answers whether it is a collection that mutates in place. `true` sends the
 /// compiler-emitted branch to `x.+=(e)`, `false` to `x = x + e` — Scala makes
@@ -433,6 +438,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_STRINGBUILDER, b_make_stringbuilder);
     vm.register_builtin(MAKE_LINKEDSET, b_make_linkedset);
     vm.register_builtin(MAKE_LINKEDMAP, b_make_linkedmap);
+    vm.register_builtin(MAKE_PRIORITYQUEUE, b_make_priorityqueue);
     vm.register_builtin(IS_GROWABLE, b_is_growable);
     vm.register_builtin(MAKE_OPTION, b_make_option);
     vm.register_builtin(NLR_RAISE, b_nlr_raise);
@@ -915,6 +921,12 @@ enum SeqKind {
     /// `scala.collection.mutable.ArrayDeque` — growable at both ends
     /// (`prepend`/`append`, `removeHead`/`removeLast`).
     ArrayDeque,
+    /// `scala.collection.mutable.PriorityQueue` — a binary MAX-HEAP in an array.
+    /// Its stored order is the raw heap array, which is what `toString` and
+    /// iteration expose: `PriorityQueue(3,1,4,1,5,9,2,6)` prints
+    /// `PriorityQueue(9, 6, 4, 1, 5, 3, 2, 1)`, neither the input order nor a
+    /// sorted one. Only the head is guaranteed to be the maximum.
+    PriorityQueue,
     /// `scala.collection.mutable.StringBuilder` — a growable sequence of `Char`.
     /// It is a `Seq[Char]` (so `length`, `apply`, `map`, `mkString` all work off
     /// the same element vector) but its `toString` is the CONTENTS, with no
@@ -947,6 +959,7 @@ impl SeqKind {
             SeqKind::Queue => "Queue",
             SeqKind::Stack => "Stack",
             SeqKind::ArrayDeque => "ArrayDeque",
+            SeqKind::PriorityQueue => "PriorityQueue",
             SeqKind::StrBuf => "StringBuilder",
             SeqKind::Range { .. } => "Range",
         }
@@ -990,6 +1003,9 @@ fn derive_seq(kind: SeqKind, items: Vec<Value>) -> Value {
     match kind {
         SeqKind::Set(rep) => new_set(rep, items),
         SeqKind::Range { .. } => new_seq(SeqKind::Vector, items),
+        // A transformed `PriorityQueue` is rebuilt through the same builder, so
+        // the result is heapified rather than carrying the source array order.
+        SeqKind::PriorityQueue => new_priority_queue(items),
         // `immutable.Iterable`'s own factory is `List`, so mapping a `Map`'s
         // `values` view answers `List(…)` where the view itself printed
         // `Iterable(…)`.
@@ -1751,6 +1767,7 @@ fn b_from_seq(vm: &mut VM, _argc: u8) -> Value {
         "Queue" => new_seq(SeqKind::Queue, items),
         "Stack" => new_seq(SeqKind::Stack, items),
         "ArrayDeque" => new_seq(SeqKind::ArrayDeque, items),
+        "PriorityQueue" => new_priority_queue(items),
         "StringBuilder" => new_seq(SeqKind::StrBuf, items.iter().flat_map(str_chars).collect()),
         "Set" => new_set(HashRep::Small, items),
         "LinkedHashSet" => new_set(HashRep::Linked, items),
@@ -1786,6 +1803,215 @@ fn b_make_stack(vm: &mut VM, argc: u8) -> Value {
 
 fn b_make_arraydeque(vm: &mut VM, argc: u8) -> Value {
     new_seq(SeqKind::ArrayDeque, pop_n(vm, argc))
+}
+
+// ── mutable.PriorityQueue: the raw heap array's order ──────────────────────
+//
+// Scala's `PriorityQueue` is a binary max-heap in an `ArrayBuffer` whose index 0
+// is unused, and its `toString`/iteration expose that array VERBATIM. So the
+// printed order is an artifact of the exact sift algorithm, and only Scala's own
+// `fixUp`/`fixDown`/`heapify` reproduce it — `PriorityQueue(3,1,4,1,5,9,2,6)`
+// prints `PriorityQueue(9, 6, 4, 1, 5, 3, 2, 1)`, which is neither the input
+// order, nor sorted, nor what repeated sift-up insertion would leave
+// (`9, 6, 5, 4, 1, 3, 2, 1`).
+//
+// The three below are ports of `scala.collection.mutable.PriorityQueue`. Scala's
+// array is 1-based; `items` here is 0-based, so heap position `k` is
+// `items[k - 1]` throughout — `pos` does that one conversion.
+
+/// The element at 1-based heap position `k`.
+fn pos(items: &[Value], k: usize) -> &Value {
+    &items[k - 1]
+}
+
+/// Scala's `fixUp`: sift the element at position `m` toward the root while it is
+/// greater than its parent. A tie does NOT swap (the comparison is strict),
+/// which is what keeps equal elements in the order they arrived.
+fn fix_up(vm: &mut VM, items: &mut [Value], m: usize) -> Result<(), String> {
+    let mut k = m;
+    while k > 1 {
+        if cmp_vm(vm, pos(items, k / 2), pos(items, k))? != Ordering::Less {
+            break;
+        }
+        items.swap(k - 1, k / 2 - 1);
+        k /= 2;
+    }
+    Ok(())
+}
+
+/// Scala's `fixDown`: sift the element at position `m` toward the leaves, always
+/// through the GREATER child, over a heap whose last position is `n`.
+fn fix_down(vm: &mut VM, items: &mut [Value], m: usize, n: usize) -> Result<(), String> {
+    let mut k = m;
+    while n >= 2 * k {
+        let mut j = 2 * k;
+        if j < n && cmp_vm(vm, pos(items, j), pos(items, j + 1))? == Ordering::Less {
+            j += 1;
+        }
+        if cmp_vm(vm, pos(items, k), pos(items, j))? != Ordering::Less {
+            return Ok(());
+        }
+        items.swap(k - 1, j - 1);
+        k = j;
+    }
+    Ok(())
+}
+
+/// Scala's `heapify(start)`: restore the heap property over positions
+/// `start..=n`.
+///
+/// The two branches are Scala's, and they are NOT interchangeable — they leave
+/// different arrays, and the array is what prints. Building from empty
+/// (`start == 1`) is Floyd's bottom-up `fixDown` sweep; adding a few elements to
+/// an existing heap sifts each new arrival UP instead.
+fn heapify(vm: &mut VM, items: &mut [Value], start: usize) -> Result<(), String> {
+    let n = items.len();
+    if start == 1 {
+        let mut i = n / 2;
+        while i >= 1 {
+            fix_down(vm, items, i, n)?;
+            i -= 1;
+        }
+    } else {
+        for i in start..=n {
+            fix_up(vm, items, i)?;
+        }
+    }
+    Ok(())
+}
+
+/// A `PriorityQueue` over `items`, built as Scala's builder does: every element
+/// appended raw, then one `heapify` over the whole array.
+///
+/// Ordering failures cannot be reported from here, so an element pair the
+/// runtime cannot compare leaves the array in whatever order the partial sweep
+/// reached — the same non-answer `sorted` gives such a pair.
+fn new_priority_queue_vm(vm: &mut VM, mut items: Vec<Value>) -> Value {
+    let _ = heapify(vm, &mut items, 1);
+    new_seq(SeqKind::PriorityQueue, items)
+}
+
+/// [`new_priority_queue_vm`] for the callers with no VM in hand. A user
+/// `Ordered` class cannot be consulted without one, so this orders by the
+/// structural [`value_cmp`] — which is what every non-user type uses anyway.
+fn new_priority_queue(items: Vec<Value>) -> Value {
+    let mut items = items;
+    let n = items.len();
+    // The same Floyd sweep as `heapify(_, 1)`, against the infallible comparison.
+    let mut i = n / 2;
+    while i >= 1 {
+        let mut k = i;
+        while n >= 2 * k {
+            let mut j = 2 * k;
+            if j < n && value_cmp(&items[j - 1], &items[j]) == Ordering::Less {
+                j += 1;
+            }
+            if value_cmp(&items[k - 1], &items[j - 1]) != Ordering::Less {
+                break;
+            }
+            items.swap(k - 1, j - 1);
+            k = j;
+        }
+        i -= 1;
+    }
+    new_seq(SeqKind::PriorityQueue, items)
+}
+
+/// `MAKE_PRIORITYQUEUE` builtin — see [`MAKE_PRIORITYQUEUE`].
+fn b_make_priorityqueue(vm: &mut VM, argc: u8) -> Value {
+    let items = pop_n(vm, argc);
+    new_priority_queue_vm(vm, items)
+}
+
+/// The `PriorityQueue`-specific members, which the generic sequence dispatcher
+/// would answer wrongly: `+=` must sift rather than append, and `dequeue`/`head`
+/// read the heap's root rather than the sequence's front. `None` falls through
+/// to the shared read-only paths (`size`, `isEmpty`, `toList`, `mkString`,
+/// `foreach`, …), all of which see the raw array exactly as Scala's do.
+fn priority_queue_method(
+    vm: &mut VM,
+    recv: &Value,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let set = |v: Vec<Value>| set_seq_items(recv, SeqKind::PriorityQueue, v);
+    Some(match (name, args.len()) {
+        // `addOne`: append, then sift the new arrival up.
+        ("+=" | "addOne" | "enqueue", 1) => {
+            let mut v = items.to_vec();
+            v.push(args[0].clone());
+            let n = v.len();
+            if let Err(e) = fix_up(vm, &mut v, n) {
+                return Some(Err(e));
+            }
+            set(v);
+            Ok(recv.clone())
+        }
+        // `addAll`: append them ALL, then one `heapify` from the first new
+        // position — not a sift per element, which would leave a different array.
+        ("++=" | "addAll" | "enqueue", _) if !args.is_empty() => {
+            let mut v = items.to_vec();
+            let start = v.len() + 1;
+            for a in args {
+                match as_seq_or_tuple(a) {
+                    Some(xs) if name != "enqueue" => v.extend(xs.iter().cloned()),
+                    _ => v.push(a.clone()),
+                }
+            }
+            if let Err(e) = heapify(vm, &mut v, start) {
+                return Some(Err(e));
+            }
+            set(v);
+            Ok(recv.clone())
+        }
+        ("dequeue", 0) => {
+            if items.is_empty() {
+                return Some(Err(
+                    "scalars: java.util.NoSuchElementException: no element to remove from heap"
+                        .into(),
+                ));
+            }
+            let mut v = items.to_vec();
+            let head = v.swap_remove(0);
+            let n = v.len();
+            if n > 1 {
+                if let Err(e) = fix_down(vm, &mut v, 1, n) {
+                    return Some(Err(e));
+                }
+            }
+            set(v);
+            Ok(head)
+        }
+        // `dequeueAll` drains into an `ArraySeq`, so it IS the sorted order.
+        ("dequeueAll", 0) => {
+            let mut v = items.to_vec();
+            let mut out = Vec::with_capacity(v.len());
+            while !v.is_empty() {
+                let head = v.swap_remove(0);
+                out.push(head);
+                let n = v.len();
+                if n > 1 {
+                    if let Err(e) = fix_down(vm, &mut v, 1, n) {
+                        return Some(Err(e));
+                    }
+                }
+            }
+            set(v);
+            Ok(new_seq(SeqKind::ArraySeq, out))
+        }
+        ("head" | "max", 0) => match items.first() {
+            Some(v) => Ok(v.clone()),
+            None => Err("scalars: java.util.NoSuchElementException: empty collection".into()),
+        },
+        ("headOption", 0) => Ok(opt(items.first().cloned())),
+        ("clone", 0) => Ok(new_seq(SeqKind::PriorityQueue, items.to_vec())),
+        ("clear", 0) => {
+            set(Vec::new());
+            Ok(unit_value())
+        }
+        _ => return None,
+    })
 }
 
 /// `MAKE_STRINGBUILDER` builtin — pop `argc` values and seed the builder with
@@ -4152,12 +4378,23 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // falls back to that trait's factory: `sb.map(_.toUpper)` is an
     // `ArrayBuffer`, where the selecting `sb.filter(…)` is a `StringBuilder`.
     let mapped = |v: Vec<Value>| match kind {
-        SeqKind::StrBuf => new_seq(SeqKind::ArrayBuffer, v),
+        // A `PriorityQueue` is likewise not an `IterableFactory`: its builder
+        // needs an `Ordering` for the result's element type, which `map` cannot
+        // supply, so `pq.map(f)` is an `ArrayBuffer` where the selecting
+        // `pq.filter(p)` is still a `PriorityQueue`.
+        SeqKind::StrBuf | SeqKind::PriorityQueue => new_seq(SeqKind::ArrayBuffer, v),
         _ => derive_seq(kind, v),
     };
     // In-place mutation (`+=`, `clear()`, …) — before the pure paths, because
     // several names (`+`, `-`, `++`) mean "mutate me" on a mutable receiver and
     // "build a new one" on an immutable one.
+    // The heap members, before the generic mutable ones: `+=` on a
+    // `PriorityQueue` sifts rather than appends, and `head` is the heap's root.
+    if kind == SeqKind::PriorityQueue {
+        if let Some(r) = priority_queue_method(vm, recv, &items, name, args) {
+            return r;
+        }
+    }
     if kind.is_mutable() {
         // What a `StringBuilder` addition contributes is the argument's
         // `String.valueOf`, so an appended instance renders through its

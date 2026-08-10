@@ -578,7 +578,16 @@ println(q.dequeue())   // =&gt; 1
 println(q)             // =&gt; Queue(2, 3)</code></pre>
         </article>
         <article class="doc-entry" id="doc-collection-constructors-22">
-          <h3><a class="doc-anchor" href="#doc-collection-constructors-22">#</a> <code>Stack</code></h3>
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-22">#</a> <code>PriorityQueue</code></h3>
+          <p>The growable mutable max-heap. `enqueue`/`+=` add, `dequeue` removes and answers the greatest element, `head` peeks at it, `dequeueAll` drains into a sorted `ArraySeq`. Its `toString` and its iteration expose the RAW heap array, so only the head is ordered; `map` answers an `ArrayBuffer` (the result's element type has no implied `Ordering`) where `filter` stays a `PriorityQueue`.</p>
+          <pre><code class="lang-scala">mutable.PriorityQueue(e, …): PriorityQueue[A]
+val q = mutable.PriorityQueue(3, 1, 4, 1, 5)
+println(q)             // =&gt; PriorityQueue(5, 3, 4, 1, 1)
+println(q.dequeue())   // =&gt; 5
+println(q.dequeueAll)  // =&gt; ArraySeq(4, 3, 1, 1)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-constructors-23">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-23">#</a> <code>Stack</code></h3>
           <p>The growable mutable LIFO, whose HEAD is its top: `push` prepends, `pop` takes the head and answers it, `top` peeks. `+=` is still `Growable.addOne`, so it APPENDS — `Stack(1,2,3) += 8` is `Stack(1, 2, 3, 8)` where `push(8)` would be `Stack(8, 1, 2, 3)`.</p>
           <pre><code class="lang-scala">mutable.Stack(e, …): Stack[A]
 val s = mutable.Stack(1, 2)
@@ -586,8 +595,8 @@ s.push(3)
 println(s.pop())   // =&gt; 3
 println(s)         // =&gt; Stack(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-constructors-23">
-          <h3><a class="doc-anchor" href="#doc-collection-constructors-23">#</a> <code>ArrayDeque</code></h3>
+        <article class="doc-entry" id="doc-collection-constructors-24">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-24">#</a> <code>ArrayDeque</code></h3>
           <p>The mutable sequence that grows at BOTH ends: `append`/`+=`, `prepend`, `removeHead` and `removeLast`, plus indexed `d(i)` reads and `d(i) = v` writes.</p>
           <pre><code class="lang-scala">mutable.ArrayDeque(e, …): ArrayDeque[A]
 val d = mutable.ArrayDeque(1, 2)
@@ -595,24 +604,24 @@ d.prepend(0)
 println(d.removeLast())   // =&gt; 2
 println(d)                // =&gt; ArrayDeque(0, 1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-constructors-24">
-          <h3><a class="doc-anchor" href="#doc-collection-constructors-24">#</a> <code>LinkedHashSet</code></h3>
+        <article class="doc-entry" id="doc-collection-constructors-25">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-25">#</a> <code>LinkedHashSet</code></h3>
           <p>The mutable set that iterates and prints in INSERTION order rather than the hash table's. A re-added element keeps its original position; one removed and re-added moves to the end.</p>
           <pre><code class="lang-scala">mutable.LinkedHashSet(e, …): LinkedHashSet[A]
 val s = mutable.LinkedHashSet(3, 1, 2)
 s += 9
 println(s)   // =&gt; LinkedHashSet(3, 1, 2, 9)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-constructors-25">
-          <h3><a class="doc-anchor" href="#doc-collection-constructors-25">#</a> <code>LinkedHashMap</code></h3>
+        <article class="doc-entry" id="doc-collection-constructors-26">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-26">#</a> <code>LinkedHashMap</code></h3>
           <p>The mutable map that iterates and prints in INSERTION order. A repeated key keeps its position and takes the later value; the mutators are `mutable.Map`'s.</p>
           <pre><code class="lang-scala">mutable.LinkedHashMap(k -&gt; v, …): LinkedHashMap[K, V]
 val m = mutable.LinkedHashMap(3 -&gt; "c", 1 -&gt; "a")
 m(2) = "b"
 println(m)   // =&gt; LinkedHashMap(3 -&gt; c, 1 -&gt; a, 2 -&gt; b)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-constructors-26">
-          <h3><a class="doc-anchor" href="#doc-collection-constructors-26">#</a> <code>StringBuilder</code></h3>
+        <article class="doc-entry" id="doc-collection-constructors-27">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-27">#</a> <code>StringBuilder</code></h3>
           <p>The growable `Seq[Char]` whose `toString` is its CONTENTS rather than a rendered collection. `append` takes `String.valueOf` of any value, `+=` a `Char` and `++=` a `String` or `Char` sequence; `insert`, `setCharAt`, `deleteCharAt`, `setLength`, `clear` and `result()` mutate or freeze it, and it answers the `CharSequence` members `substring`/`indexOf`/`charAt` alongside every sequence one. A selecting op (`take`, `filter`, `reverse`) answers another `StringBuilder`; `map`, whose element type may change, answers an `ArrayBuffer`.</p>
           <pre><code class="lang-scala">new StringBuilder(s?): StringBuilder
 val b = new StringBuilder("ab")
@@ -620,14 +629,14 @@ b += 'c'
 b.append(7)
 println(b)   // =&gt; abc7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-constructors-27">
-          <h3><a class="doc-anchor" href="#doc-collection-constructors-27">#</a> <code>Ordering</code></h3>
+        <article class="doc-entry" id="doc-collection-constructors-28">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-28">#</a> <code>Ordering</code></h3>
           <p>An explicit comparison for `sorted`/`sortBy`/`max`/`min`/`maxBy`/`minBy`. `Ordering.Int` and its siblings are the natural ordering, `.reverse` flips it, `Ordering.by(f)` sorts by `f`'s result, `Ordering.fromLessThan(lt)` builds one from a `&lt;` test, and the value itself answers `compare`, `lt`, `gt`, `lteq`, `gteq`, `equiv`, `max`, `min` and `on`.</p>
           <pre><code class="lang-scala">Ordering.Int | Ordering.by(f) | ord.reverse
 println(List(3, 1, 2).sorted(Ordering.Int.reverse))   // =&gt; List(3, 2, 1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-constructors-28">
-          <h3><a class="doc-anchor" href="#doc-collection-constructors-28">#</a> <code>PartialFunction</code></h3>
+        <article class="doc-entry" id="doc-collection-constructors-29">
+          <h3><a class="doc-anchor" href="#doc-collection-constructors-29">#</a> <code>PartialFunction</code></h3>
           <p>A function defined only on some arguments — what a `{ case … }` literal builds. Beyond `apply` it answers `isDefinedAt`, which is what `collect`/`collectFirst` use to skip a non-matching element, and it composes through `applyOrElse`, `lift`, `orElse`, `andThen` and `compose`.</p>
           <pre><code class="lang-scala">val pf: PartialFunction[A, B] = { case … =&gt; … }
 val pf: PartialFunction[Int, String] = { case 1 =&gt; "one" }

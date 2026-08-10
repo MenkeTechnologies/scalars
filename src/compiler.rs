@@ -1454,6 +1454,7 @@ impl Compiler {
             "mutable.Set" => crate::host::MAKE_MUTSET,
             "mutable.Map" => crate::host::MAKE_MUTMAP,
             "Queue" => crate::host::MAKE_QUEUE,
+            "PriorityQueue" => crate::host::MAKE_PRIORITYQUEUE,
             "Stack" => crate::host::MAKE_STACK,
             "ArrayDeque" => crate::host::MAKE_ARRAYDEQUE,
             "StringBuilder" => crate::host::MAKE_STRINGBUILDER,
@@ -4469,6 +4470,7 @@ fn mutable_buffer_literal(ctor: &str) -> bool {
         "ListBuffer"
             | "ArrayBuffer"
             | "Queue"
+            | "PriorityQueue"
             | "Stack"
             | "ArrayDeque"
             | "StringBuilder"
@@ -4894,6 +4896,7 @@ fn mutable_ctor(name: &str) -> Option<&'static str> {
         "Set" | "HashSet" => "mutable.Set",
         "Map" | "HashMap" => "mutable.Map",
         "Queue" => "Queue",
+        "PriorityQueue" => "PriorityQueue",
         "Stack" => "Stack",
         "ArrayDeque" => "ArrayDeque",
         "StringBuilder" => "StringBuilder",

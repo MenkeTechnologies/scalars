@@ -497,6 +497,12 @@ pub const CORPUS: &[Entry] = &[
         "mutable.Queue(e, …): Queue[A]\nval q = mutable.Queue(1, 2)\nq.enqueue(3)\nprintln(q.dequeue())   // => 1\nprintln(q)             // => Queue(2, 3)",
     ),
     (
+        "PriorityQueue",
+        "Collection Constructors",
+        "The growable mutable max-heap. `enqueue`/`+=` add, `dequeue` removes and answers the greatest element, `head` peeks at it, `dequeueAll` drains into a sorted `ArraySeq`. Its `toString` and its iteration expose the RAW heap array, so only the head is ordered; `map` answers an `ArrayBuffer` (the result's element type has no implied `Ordering`) where `filter` stays a `PriorityQueue`.",
+        "mutable.PriorityQueue(e, …): PriorityQueue[A]\nval q = mutable.PriorityQueue(3, 1, 4, 1, 5)\nprintln(q)             // => PriorityQueue(5, 3, 4, 1, 1)\nprintln(q.dequeue())   // => 5\nprintln(q.dequeueAll)  // => ArraySeq(4, 3, 1, 1)",
+    ),
+    (
         "Stack",
         "Collection Constructors",
         "The growable mutable LIFO, whose HEAD is its top: `push` prepends, `pop` takes the head and answers it, `top` peeks. `+=` is still `Growable.addOne`, so it APPENDS — `Stack(1,2,3) += 8` is `Stack(1, 2, 3, 8)` where `push(8)` would be `Stack(8, 1, 2, 3)`.",
