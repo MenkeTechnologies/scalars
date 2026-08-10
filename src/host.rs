@@ -7857,17 +7857,8 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
 /// like Java, emits the shortest representation that round-trips) normalized to a
 /// single leading digit; only the *placement* (plain vs `E`-notation) is Java's.
 ///
-/// **Java's two-significant-digit floor is a rounding rule, not padding.** Its
-/// spec asks for the shortest decimal that round-trips *except* that when one
-/// digit already suffices it takes the closest decimal of length one OR two.
-/// Those differ whenever the value sits far from the one-digit decimal, which
-/// takes an ULP of the same order as the value itself — so it happens only in
-/// the deep subnormals, where `Double.MinPositiveValue` is `4.9E-324` and not
-/// the `5E-324` padded to `5.0E-324`. For every normal double the relative ULP
-/// is at most 2^-52, far below the 0.05-of-a-step that would move the second
-/// digit off zero, so the rule changes nothing there — including everywhere the
-/// plain decimal notation applies, which starts at 1e-3 and is therefore out of
-/// subnormal reach entirely.
+/// Java picks a decimal VALUE first ([`java_decimal`]) and only then lays it out,
+/// so both notations render the same chosen digits.
 fn format_double(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -7879,40 +7870,175 @@ fn format_double(f: f64) -> String {
         return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }
     let neg = f < 0.0;
-    let m = f.abs();
-    // `{:e}` → "d[.ddd]e<exp>" with one leading digit and a clean base-10 exponent.
-    let sci = format!("{m:e}");
-    let (mant, exp_str) = sci.split_once('e').expect("`{:e}` always contains `e`");
-    let exp: i32 = exp_str.parse().expect("`{:e}` exponent is an integer");
-    // One significant digit: re-ask for two, correctly rounded off the VALUE.
-    // `{:.1e}` renormalizes, so the exponent can move too (a value whose
-    // shortest form is `1e-322` is `9.9e-323` at two digits).
-    let two;
-    let (mant, exp) = if mant.contains('.') {
-        (mant, exp)
-    } else {
-        two = format!("{m:.1e}");
-        let (m2, e2) = two.split_once('e').expect("`{:e}` always contains `e`");
-        (m2, e2.parse().expect("`{:e}` exponent is an integer"))
-    };
-
+    let (digits, exp) = java_decimal(f.abs());
     let body = if (-3..=6).contains(&exp) {
-        // Decimal notation. The plain shortest form matches Java's digits in this
-        // range; just guarantee a fractional digit (`5` → `5.0`).
-        let plain = format!("{m}");
-        if plain.contains('.') {
-            plain
-        } else {
-            format!("{plain}.0")
-        }
+        render_plain(&digits, exp)
     } else {
-        // Scientific notation: `mantissa` (with a fractional digit) + `E` + exp.
-        format!("{mant}E{exp}")
+        render_scientific(&digits, exp)
     };
     if neg {
         format!("-{body}")
     } else {
         body
+    }
+}
+
+/// The decimal Java renders for a positive finite `m`, as `(digits, exp)` — the
+/// significant digits with no radix point, and the base-10 exponent of the
+/// first one, so the value is `d.ddd × 10^exp`.
+///
+/// `Double.toString` is specified over decimal VALUES, not strings. Let R be the
+/// decimals that round back to `m` and `p` the minimal length in R. If `p >= 2`
+/// the answer is the length-`p` member; otherwise it is the closest member of
+/// length 1 **or** 2. Ties go to the candidate whose last digit is even. Three
+/// steps, in that order:
+///
+/// 1. **Shortest.** Rust's `{:e}` emits the shortest round-tripping form, which
+///    is Java's length-`p` member.
+/// 2. **The two-digit floor is a rounding rule, not padding.** When `p` is 1 the
+///    closest two-digit decimal can differ from the one-digit answer with a zero
+///    stuck on: `Double.MinPositiveValue` is `4.9E-324`, not `5.0E-324`. It
+///    takes an ULP within about 1% of the value's own magnitude to move that
+///    second digit off zero, so only the deep subnormals are affected — every
+///    normal double has relative ULP at most 2^-52.
+/// 3. **An exact tie goes to the even digit.** A double whose exact decimal
+///    expansion ends in a lone `5` one place past the chosen length is
+///    equidistant between two candidates, and Rust does not break that tie the
+///    way Java does: `2^-25` is exactly `2.98023223876953125E-8`, which Java
+///    renders `…312E-8` and `{:e}` renders `…313E-8`.
+///
+/// Trailing zeros are dropped last, because they carry no value: the two-digit
+/// step turns `0.001` into digits `10`, and `0.0010` is the same decimal as
+/// `0.001`. Java's "at least one fractional digit" is a LAYOUT rule, applied by
+/// the two renderers rather than by padding the digits.
+fn java_decimal(m: f64) -> (String, i32) {
+    let sci = format!("{m:e}");
+    let (mant, exp_str) = sci.split_once('e').expect("`{:e}` always contains `e`");
+    let mut exp: i32 = exp_str.parse().expect("`{:e}` exponent is an integer");
+    let mut digits: String = mant.chars().filter(|c| *c != '.').collect();
+    // Step 2. `{:.1e}` renormalizes, so the exponent can move with it: the value
+    // whose shortest form is `1e-322` is `9.9e-323` at two digits.
+    if digits.len() == 1 {
+        let two = format!("{m:.1e}");
+        let (m2, e2) = two.split_once('e').expect("`{:e}` always contains `e`");
+        digits = m2.chars().filter(|c| *c != '.').collect();
+        exp = e2.parse().expect("`{:e}` exponent is an integer");
+    }
+    // Step 3.
+    if let Some((d, e)) = break_tie_to_even(m, &digits, exp) {
+        digits = d;
+        exp = e;
+    }
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    (digits, exp)
+}
+
+/// The even-digit answer when `m` is EXACTLY equidistant between two decimals of
+/// length `digits.len()` that BOTH round back to it, else `None`.
+///
+/// Two conditions, and both are load-bearing.
+///
+/// *Exactly* equidistant has to be read off the exact value, not a rounding of
+/// it: an expansion continuing `…5004` also rounds to a trailing `5` and is no
+/// tie at all. A double's decimal expansion always terminates (it is a binary
+/// fraction) and Rust prints it in full at a high enough precision — 751
+/// significant digits is the worst case, for the smallest subnormal.
+///
+/// *Both round back* is what separates `2^-24` from `5 * 2^-23`. Their exact
+/// expansions carry the SAME digits (`5.9604644775390625`), yet Java renders one
+/// `5.960464477539063E-8` and the other `5.960464477539062E-7`. Java's tie-break
+/// only ranges over decimals that round to the value, and at an exact power of
+/// two the gap below is half the gap above — so `2^-24`'s lower candidate falls
+/// outside the rounding interval and is not a candidate at all, leaving one
+/// answer and no tie. Parsing each candidate back is exact (Rust's `f64`
+/// `FromStr` is correctly rounded), so it decides this directly rather than by
+/// reasoning about the exponent.
+fn break_tie_to_even(m: f64, digits: &str, exp: i32) -> Option<(String, i32)> {
+    let n = digits.len();
+    // Cheap gate first: one more digit, and only a trailing `5` can be a tie.
+    let probe = format!("{m:.*e}", n);
+    let (pm, pe) = probe.split_once('e')?;
+    if pe.parse::<i32>().ok()? != exp || !pm.ends_with('5') {
+        return None;
+    }
+    let exact = format!("{m:.1099e}");
+    let (em, ee) = exact.split_once('e')?;
+    if ee.parse::<i32>().ok()? != exp {
+        return None;
+    }
+    let ed: Vec<u8> = em.bytes().filter(|b| *b != b'.').collect();
+    if ed.len() <= n || ed[n] != b'5' || ed[n + 1..].iter().any(|b| *b != b'0') {
+        return None;
+    }
+    // The two decimals `m` sits exactly between: the truncation, and the
+    // truncation plus one in its last place.
+    let low = String::from_utf8(ed[..n].to_vec()).ok()?;
+    let (high, high_exp) = increment_last_digit(&low, exp);
+    if !round_trips(&low, exp, m) || !round_trips(&high, high_exp, m) {
+        return None;
+    }
+    // A genuine tie. The two differ in the parity of their last digit, so
+    // exactly one is the even significand Java takes. Neither can end in `0`
+    // here: that decimal would have a SHORTER significand, and a shorter one
+    // that round-trips would have been the shortest form to begin with.
+    if (low.as_bytes()[n - 1] - b'0') % 2 == 0 {
+        Some((low, exp))
+    } else {
+        Some((high, high_exp))
+    }
+}
+
+/// `digits` plus one in its last place, carrying — `("19", 3)` is `("20", 3)`
+/// and `("99", 3)` is `("10", 4)`, keeping the digit count.
+fn increment_last_digit(digits: &str, exp: i32) -> (String, i32) {
+    let mut d: Vec<u8> = digits.as_bytes().to_vec();
+    for i in (0..d.len()).rev() {
+        if d[i] == b'9' {
+            d[i] = b'0';
+        } else {
+            d[i] += 1;
+            return (String::from_utf8(d).expect("ASCII digits"), exp);
+        }
+    }
+    // Every digit carried (`99…9` + 1 is `10…0`), one exponent up.
+    d.pop();
+    let mut up = vec![b'1'];
+    up.append(&mut d);
+    (String::from_utf8(up).expect("ASCII digits"), exp + 1)
+}
+
+/// Whether the decimal `d.ddd × 10^exp` rounds back to exactly `m`.
+fn round_trips(digits: &str, exp: i32, m: f64) -> bool {
+    let (head, rest) = digits.split_at(1);
+    let rest = if rest.is_empty() { "0" } else { rest };
+    format!("{head}.{rest}e{exp}")
+        .parse::<f64>()
+        .is_ok_and(|v| v == m)
+}
+
+/// `d.dddEexp` — Java's computerized scientific notation, with the mandatory
+/// fractional digit.
+fn render_scientific(digits: &str, exp: i32) -> String {
+    let (head, rest) = digits.split_at(1);
+    let rest = if rest.is_empty() { "0" } else { rest };
+    format!("{head}.{rest}E{exp}")
+}
+
+/// `ddd.ddd` — Java's plain notation, used for `1e-3 <= |x| < 1e7`, with the
+/// mandatory fractional digit.
+fn render_plain(digits: &str, exp: i32) -> String {
+    if exp < 0 {
+        let zeros = (-exp - 1) as usize;
+        return format!("0.{}{digits}", "0".repeat(zeros));
+    }
+    let int_len = exp as usize + 1;
+    if digits.len() > int_len {
+        let (head, rest) = digits.split_at(int_len);
+        format!("{head}.{rest}")
+    } else {
+        format!("{digits}{}.0", "0".repeat(int_len - digits.len()))
     }
 }
 

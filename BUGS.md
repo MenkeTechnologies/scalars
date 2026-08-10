@@ -107,6 +107,22 @@ reported as parse/compile errors, never silently mis-run.
   reading, since there is nothing to store back into. A `var` written this way
   from inside a closure is boxed exactly as the statement form boxes it.
   Covered by the parity fuzzer's `assignexpr` mode.
+- **`Double.toString`, as a choice of DECIMAL rather than of digits.** Java
+  picks the decimal `d` for a value `v` and only then lays it out: `d` is the
+  shortest that rounds back to `v`, except that when one significant digit
+  already suffices it is the closest decimal of length one **or** two, and a tie
+  goes to the even significand. Both exceptions are implemented, and both are
+  observable only where an ULP is of the same order as the value or its exact
+  expansion is one digit longer than its shortest form:
+  `Double.MinPositiveValue` is `4.9E-324` (not the one-digit `5E-324` with a
+  zero stuck on), and `5 * 2^-23` — exactly `5.9604644775390625E-7` — is
+  `5.960464477539062E-7`, the even one. The tie test reads the double's EXACT
+  decimal expansion (which always terminates) and requires both candidates to
+  round back, which is what makes `2^-24` answer the odd `5.960464477539063E-8`
+  off the very same digits: at an exact power of two the gap below is half the
+  gap above, so the lower candidate is out of range and there is no tie.
+  Layout is then Java's — plain for `1e-3 <= |x| < 1e7`, computerized
+  scientific otherwise, always with one fractional digit.
 - **Postfix method dispatch on core values.** `s.length`/`.size`,
   `.toUpperCase`/`.toLowerCase`, `.trim`, `.reverse`, `.isEmpty`/`.nonEmpty`,
   `.substring`, `.charAt`, `.contains`/`.startsWith`/`.endsWith`,
@@ -609,34 +625,6 @@ reported as parse/compile errors, never silently mis-run.
 - **`grouped`/`sliding` answer a `List` of windows**, not an `Iterator`. Every
   consumption Scala programs use (`.toList`, `.foreach`, `.map`) matches;
   printing the un-consumed result does not (Scala prints `<iterator>`).
-- **An exact decimal TIE in the shortest digits breaks the other way.** When a
-  double's exact decimal expansion ends in a final `5` one digit past its
-  shortest round-tripping form, the value is equidistant between two equally
-  short decimals. Java takes the one whose last digit is EVEN; Rust's `{:e}`,
-  which `host::format_double` takes its digits from, takes the other. So `2^-25`
-  (exactly `2.98023223876953125E-8`) prints `2.9802322387695312E-8` there and
-  `2.9802322387695313E-8` here, and `5 * 2^-23` (exactly
-  `5.9604644775390625E-7`) prints `5.960464477539062E-7` there and `…063E-7`
-  here.
-
-  Measured, not estimated, against Scala 3.8.4 on JVM 26 (debug profile). Every
-  power of two in the whole range plus their 3x and 5x odd multiples — 6276
-  values — disagrees in exactly **2** places, both above. A separate 7507-value
-  walk across the entire exponent range (subnormal floor to `MaxValue`, with
-  `*1.5`, `*7/3`, `/3` and `*1.0000000001` perturbations at each step)
-  disagrees in exactly **1**, the same `2^-25`.
-
-  Closing it needs the double's exact decimal expansion, to tell a true tie
-  from a value that merely rounds to a trailing `5`. That expansion always
-  terminates and Rust prints it in full at a high enough precision, so this is
-  a real fix rather than the `FDBigInteger` port an earlier revision of this
-  entry described. That earlier entry was about a different thing and is
-  **retracted**: it claimed the JVM's legacy `FloatingDecimal` renders
-  `128 * MinPositiveValue` as `6.32E-322` and that ten subnormals disagree at
-  `k ∈ {1, 10, 12, 14, 16, 18, 32, 128, 2048, 16384}`. Neither holds on JDK 19+,
-  which replaced `FloatingDecimal` for `Double.toString`: measured here, `128 *
-  MinPositiveValue` is `6.3E-322` on BOTH sides, and `k ∈ {32, 128, 2048,
-  16384}` all agree.
 - **Integer arithmetic narrows to 32 bits only where the width is PROVEN.**
   `Int` overflow now wraps — `2147483647 + 1` is `-2147483648` — and a `Long`
   anywhere in an expression promotes it so it does not

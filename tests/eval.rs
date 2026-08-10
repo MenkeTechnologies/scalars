@@ -4295,3 +4295,35 @@ fn the_two_digit_rule_leaves_every_normal_double_alone() {
         "1.0E7\n1.0E-4\n3.0\n0.001\n100.0\n1.0E23\n1.7976931348623157E308\n"
     );
 }
+
+#[test]
+fn an_exact_decimal_tie_goes_to_the_even_digit() {
+    // `5 * 2^-23` is exactly `5.9604644775390625E-7`, equidistant between the
+    // two 16-digit decimals around it, and Java takes the even significand.
+    // Rust's shortest form takes the other, so this printed `…063E-7`.
+    let (out, ok) = run(&wrap(
+        "var a = 1.0; var i = 0; while (i < 23) { a = a / 2.0; i += 1 }; println(a * 5.0); \
+         var b = 1.0; var j = 0; while (j < 25) { b = b / 2.0; j += 1 }; println(b)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "5.960464477539062E-7\n2.9802322387695312E-8\n");
+}
+
+#[test]
+fn a_tie_needs_both_candidates_to_round_trip() {
+    // `2^-24` carries the SAME digits as `5 * 2^-23` above
+    // (`5.9604644775390625`) and yet answers the ODD one, because at an exact
+    // power of two the gap below is half the gap above: the lower candidate
+    // falls outside the rounding interval, so it is not a candidate and there
+    // is no tie to break. A digits-only tie rule answers `…062E-8` here.
+    let (out, ok) = run(&wrap(
+        "var c = 1.0; var k = 0; while (k < 24) { c = c / 2.0; k += 1 }; println(c); \
+         var d = 1.0; var l = 0; while (l < 26) { d = d / 2.0; l += 1 }; \
+         println(d); println(d * 3.0)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "5.960464477539063E-8\n1.4901161193847656E-8\n4.470348358154297E-8\n"
+    );
+}
