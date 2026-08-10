@@ -209,3 +209,27 @@ object T { def main(args: Array[String]): Unit = { println(args.length); println
 val order = { println("init"); 1 }; @main def go(n: Int): Unit = println(n + order)	init\nIllegal command line: more arguments expected\n
 @main def go(): Unit = { println(List("b", "A", "é", "a", "Z").sorted); println("café — ☕".length); println("naïve".toUpperCase) }	List(A, Z, a, b, é)\n8\nNAÏVE\n
 object T extends App { println(i); println(l); println(d); println(b); println(s); println(xs); println(ii); println(dd); val i: Int = 7; val l: Long = 8L; val d: Double = 1.5; val b: Boolean = true; val s: String = "s"; val xs: List[Int] = List(1); val ii = 7; val dd = 1.5; println(i + ii) }	0\n0\n0.0\nfalse\nnull\nnull\n0\n0.0\n14\n
+object T extends App { println("a"); println(1 / 0); println("never") }	a\n	java.lang.ArithmeticException: / by zero
+object T extends App { println("a"); println(1 % 0); println("never") }	a\n	java.lang.ArithmeticException: / by zero
+object T extends App { println(Array(1,2)(5)) }		java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 2
+object T extends App { println(Vector(1,2)(5)) }		java.lang.IndexOutOfBoundsException: 5 is out of bounds (min 0, max 1)
+object T extends App { println(List(1,2)(5)) }		java.lang.IndexOutOfBoundsException: 5
+object T extends App { print("x"); println(List[Int]().head) }	x	java.util.NoSuchElementException: head of empty list
+object T extends App { println(Vector[Int]().head) }		java.util.NoSuchElementException: empty.head
+object T extends App { println(Map[Int,Int]().head) }		java.util.NoSuchElementException: next on empty iterator
+object T extends App { println(List[Int]().init) }		java.lang.UnsupportedOperationException: init of empty list
+object T extends App { println("".tail) }		java.lang.UnsupportedOperationException: tail of empty String
+object T extends App { println("".last) }		java.util.NoSuchElementException: last of empty String
+object T extends App { println(Map(1 -> 2)(5)) }		java.util.NoSuchElementException: key not found: 5
+object T extends App { println("zz".toInt) }		java.lang.NumberFormatException: For input string: "zz"
+object T extends App { println("hi".substring(0, 9)) }		java.lang.StringIndexOutOfBoundsException: Range [0, 9) out of bounds for length 2
+object T extends App { println(new Array[Int](-1).length) }		java.lang.NegativeArraySizeException: -1
+object T extends App { println(List(1,2,3).grouped(0).toList) }		java.lang.IllegalArgumentException: requirement failed: size=0 and step=0, but both must be positive
+object T extends App { println(List(1,2,3).sliding(0).toList) }		java.lang.IllegalArgumentException: requirement failed: size=0 and step=1, but both must be positive
+object T extends App { println("(a)(b)".r.findFirstMatchIn("ab").get.group(7)) }		java.lang.ArrayIndexOutOfBoundsException: Index 7 out of bounds for length 3
+object T extends App { println("%q".format("x")) }		java.util.UnknownFormatConversionException: Conversion = 'q'
+object T extends App { val x = 5; println(x match { case 1 => "one" }) }		scala.MatchError: 5 (of class java.lang.Integer)
+object T extends App { println("a"); throw new IllegalStateException("boom") }	a\n	java.lang.IllegalStateException: boom
+object T extends App { println((1 to 10 by 0).toList) }		java.lang.IllegalArgumentException: step cannot be 0.
+object T extends App { println(scala.collection.mutable.PriorityQueue[Int]().head) }		java.util.NoSuchElementException: queue is empty
+object T extends App { println(scala.collection.mutable.Stack[Int]().pop()) }		java.util.NoSuchElementException: empty collection
