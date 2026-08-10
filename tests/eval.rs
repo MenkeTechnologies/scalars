@@ -3761,6 +3761,141 @@ fn an_overloaded_compare_still_reaches_the_hosts_ordering_path() {
     assert_eq!(out, "List(V(3), V(2), V(1))\nfalse\n1\n");
 }
 
+// ── A user `toString` override, everywhere a value is rendered ──────────────
+//
+// Scala renders EVERY value through its `toString`, so an override has to be
+// honoured by `println`, by interpolation, by `+` concatenation and at every
+// depth of a collection. Only an explicit `p.toString` used to reach it — the
+// compiler resolves that one statically — so `println(p)`, `s"$p"`, `"x" + p`
+// and `List(p)` all printed `P@0`. Every expected string below was diffed
+// byte-for-byte against `scala` 3.8.4.
+
+/// A class whose `toString` is overridden, for the rendering tests below.
+const P_CLASS: &str = "class P(val a: Int, val b: Int) {\n\
+                       \x20 override def toString: String = \"P[\" + a + \",\" + b + \"]\"\n\
+                       }\n";
+
+#[test]
+fn a_tostring_override_reaches_every_rendering_surface() {
+    let (out, ok) = run(&format!(
+        "{P_CLASS}\
+         case class Q(n: Int) {{ override def toString: String = \"Q<\" + n + \">\" }}\n\
+         object T extends App {{\n\
+         \x20 val p = new P(1, 2)\n\
+         \x20 println(p.toString); println(p); println(s\"$p\"); println(\"x\" + p)\n\
+         \x20 println(List(p)); println(Map(1 -> p)); println(Some(p)); println((p, p))\n\
+         \x20 println(String.valueOf(p)); println(f\"$p%s\")\n\
+         \x20 val q = Q(5)\n\
+         \x20 println(q); println(s\"$q\"); println(List(q))\n\
+         }}\n"
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "P[1,2]\nP[1,2]\nP[1,2]\nxP[1,2]\nList(P[1,2])\nMap(1 -> P[1,2])\nSome(P[1,2])\n\
+         (P[1,2],P[1,2])\nP[1,2]\nP[1,2]\nQ<5>\nQ<5>\nList(Q<5>)\n"
+    );
+}
+
+#[test]
+fn a_tostring_override_reaches_the_string_building_methods() {
+    // These four reach the renderer by different routes than `println` does:
+    // `mkString` from inside the sequence dispatcher, `format` from the string
+    // dispatcher, `.toString` on a COLLECTION from the universal one, and
+    // `StringBuilder.append` through the character expansion of
+    // `String.valueOf`. All four held no VM before.
+    let (out, ok) = run(&format!(
+        "{P_CLASS}\
+         object T extends App {{\n\
+         \x20 val p = new P(1, 2)\n\
+         \x20 println(List(p, p).mkString(\"[\", \";\", \"]\"))\n\
+         \x20 println(Array(p).mkString(\",\"))\n\
+         \x20 println(\"%s!\".format(p))\n\
+         \x20 println(List(p).toString)\n\
+         \x20 val sb = new StringBuilder; sb.append(p); println(sb.toString)\n\
+         }}\n"
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "[P[1,2];P[1,2]]\nP[1,2]\nP[1,2]!\nList(P[1,2])\nP[1,2]\n"
+    );
+}
+
+#[test]
+fn a_tostring_inherited_from_a_trait_is_found() {
+    // The subroutine is registered under the type that IMPLEMENTS it
+    // (`Named$toString`), not under the receiver's tag, so resolving only
+    // `Impl$toString` missed every trait-provided rendering. An `object`
+    // override and a nested one are the same lookup by a different route.
+    let (out, ok) = run(
+        "trait Named { override def toString: String = \"named:\" + tag; def tag: String }\n\
+         class Impl(val tag: String) extends Named\n\
+         class Nested(val inner: Impl) { override def toString: String = \"N{\" + inner + \"}\" }\n\
+         object Solo { override def toString: String = \"SOLO\" }\n\
+         object T extends App {\n\
+         \x20 println(new Impl(\"z\"))\n\
+         \x20 println(Solo)\n\
+         \x20 println(new Nested(new Impl(\"y\")))\n\
+         \x20 println(List(new Impl(\"a\"), new Impl(\"b\")))\n\
+         }\n",
+    );
+    assert!(ok);
+    assert_eq!(out, "named:z\nSOLO\nN{named:y}\nList(named:a, named:b)\n");
+}
+
+#[test]
+fn a_tostring_override_may_print_and_may_raise() {
+    // Running an override re-enters the VM from inside the renderer, which is
+    // where two things can go wrong. `println` renders BEFORE taking the stdout
+    // lock, or an override that prints would deadlock — and the interleaving is
+    // observable, since Scala runs each `toString` as it reaches it. An override
+    // that RAISES leaves the exception in flight, and the `println` it was being
+    // rendered for must not run: the pre-render unwinding check happens before
+    // the override does, so it is re-checked after.
+    let (out, ok) = run(
+        "class Loud(val n: Int) {\n\
+         \x20 override def toString: String = { println(\"side\"); \"L\" + n }\n\
+         }\n\
+         class Boom { override def toString: String = throw new RuntimeException(\"bad\") }\n\
+         object T extends App {\n\
+         \x20 println(new Loud(1))\n\
+         \x20 println(List(new Loud(2), new Loud(3)))\n\
+         \x20 try { println(new Boom) } catch { case e: RuntimeException => println(\"caught \" + e.getMessage) }\n\
+         \x20 println(\"after\")\n\
+         }\n",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "side\nL1\nside\nside\nList(L2, L3)\ncaught bad\nafter\n"
+    );
+}
+
+#[test]
+fn a_program_without_an_override_renders_exactly_as_it_did() {
+    // The control for the whole feature. Both the compiler's concat rerouting
+    // and the host's per-value method lookup are gated on the program declaring
+    // an override at all; with none declared, every one of these has to answer
+    // the derived rendering, on the same `Op::Add` bytecode as before.
+    let (out, ok) = run(
+        "case class C(n: Int)\n\
+         class Plain(val n: Int)\n\
+         object T extends App {\n\
+         \x20 val c = C(1)\n\
+         \x20 println(c); println(s\"$c\"); println(\"x\" + c); println(List(c)); println((c, c))\n\
+         \x20 println(Map(\"k\" -> c)); println(List(c).mkString(\"|\")); println(\"%s\".format(c))\n\
+         \x20 println(new Plain(1).toString.startsWith(\"Plain@\"))\n\
+         \x20 println(1 + 2); println(\"n=\" + 3); println(s\"${1 + 2}\")\n\
+         }\n",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "C(1)\nC(1)\nxC(1)\nList(C(1))\n(C(1),C(1))\nMap(k -> C(1))\nC(1)\nC(1)\ntrue\n3\nn=3\n3\n"
+    );
+}
+
 // ── Compound assignment to a target that is not a plain name ────────────────
 //
 // Scala resolves `l op= r` by preferring an `op=` MEMBER on `l` and falling

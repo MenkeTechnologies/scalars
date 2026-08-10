@@ -113,6 +113,26 @@ reported as parse/compile errors, never silently mis-run.
   Built-in `Option` (`Some(v)`, the `None` case object) rides the same model.
   Plain (non-`case`) classes use reference-identity `equals`/`hashCode` and a
   `Class@hex` `toString`, matching Scala.
+- **`override def toString`, honoured wherever a value is rendered.** Scala
+  renders every value through its `toString`, so an override answers for
+  `println(p)`, `s"$p"` / `f"$p%s"`, `"x" + p`, `String.valueOf(p)`,
+  `xs.mkString(…)`, `"%s".format(p)`, `sb.append(p)`, and at every depth of a
+  `List`/`Set`/`Map`/tuple/`Option` — not only for an explicit `p.toString`. An
+  override on a `case class` replaces the derived `Class(f0,…)` form, and one
+  provided by a `trait` is found through the receiver's linearization. Running
+  one re-enters the VM, so it may itself print (rendering happens before stdout
+  is locked) and it may raise (the `println` it was rendering for does not run).
+  Both the compiler's concat rerouting and the host's per-value lookup are gated
+  on the program declaring an override at all: a program with none emits and
+  runs exactly the bytecode it did before.
+- **Overloaded methods, resolved by argument count.** A `class`/`object` may
+  declare one name at several arities (`def g()`, `def g(x: Int)`, `def g(x:
+  Int, y: Int)`); each registers its own subroutine and every call site — direct,
+  `super.m`, virtual dispatch off a runtime tag, and an unqualified self-call —
+  picks the one matching the arity it passes. Overloads that differ only in
+  parameter TYPE (`f(Int)` / `f(String)`) are refused at compile time: Scala
+  resolves those by type, which this frontend does not model, and answering the
+  first silently is the worse failure.
 - **Traits and inheritance.** `trait T { … }` with abstract members (`def f:
   Int`, `val x: String`) and concrete ones; `class C(x) extends P(x) with T1
   with T2`; `override def`; `super.m(…)`; and virtual dispatch — a method call
@@ -431,16 +451,13 @@ reported as parse/compile errors, never silently mis-run.
   still escapes both checks is a *counted `for` loop* whose endpoints are BOTH
   `Char` variables (`val a = 'a'; val z = 'z'; for (c <- a to z)`), which lowers
   to inline loop bytecode rather than through either builtin.
-- **A user class's `toString` override is ignored everywhere but an explicit
-  call.** `class P(val n: Int) { override def toString = s"P($n)" }` answers
-  `P(1)` for `p.toString` — that spelling is a method call, so it reaches the
-  class's own subroutine — but `println(p)`, `s"$p"`, `"" + p` and `List(p)` all
-  print `P@0`, and a `case class` override loses to the derived `Class(f0,…)`
-  form. Rendering runs through the pure `host::scala_str`, which has no VM to
-  re-enter, and `obj_to_string` renders a collection's elements while holding the
-  heap borrow, so consulting the override needs `scala_str` to become VM-aware
-  (50 call sites) and `obj_to_string` to clone its elements out before
-  recursing. Until then the override is only honoured where it is written out.
+- **Overloads that differ only in parameter type.** `def f(x: Int)` and `def
+  f(x: String)` in one class are a compile error, not a dispatch: both would key
+  the same `C$f$1` subroutine, and the runtime is dynamically typed, so the
+  argument's static type — which is what Scala resolves on — is not available.
+  Argument COUNT is modelled (see above); argument type is not.
+- **`printf`.** `println`, `print`, `"…".format(…)` and `x.formatted(spec)` are
+  wired; the bare `printf(fmt, args…)` spelling is not.
 - **Symbolic operators beyond the wired set.** `/:`, `:\` and user-defined
   symbolic method names.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a

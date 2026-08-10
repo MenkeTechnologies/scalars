@@ -1125,6 +1125,7 @@ pub fn reset_heap() {
     // Method entries are offsets into the OUTGOING chunk; the next program
     // compiles its own, so a stale hit would jump into unrelated bytecode.
     METHOD_ENTRIES.with(|t| t.borrow_mut().clear());
+    USER_TOSTRING.with(|t| t.set(None));
     reset_regex_cache();
 }
 
@@ -3047,7 +3048,7 @@ fn scala_eq(a: &Value, b: &Value) -> bool {
 fn b_format(vm: &mut VM, _argc: u8) -> Value {
     let spec = vm.pop().as_str_cow().into_owned();
     let v = vm.pop();
-    match format_one(&spec, &v) {
+    match format_one(&spec, &v, Some(vm)) {
         Ok(s) => Value::str(s),
         Err(e) => fault(vm, e),
     }
@@ -3134,7 +3135,7 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
 /// conversion to [`format_one`]. `%%` is a literal percent and `%n` a newline;
 /// neither consumes an argument. A conversion with no argument left is Java's
 /// `MissingFormatArgumentException`, which a Scala program can catch.
-fn format_all(fmt: &str, args: &[Value]) -> Result<String, String> {
+fn format_all(fmt: &str, args: &[Value], mut vm: Option<&mut VM>) -> Result<String, String> {
     let b = fmt.as_bytes();
     let mut out = String::with_capacity(fmt.len());
     let (mut i, mut next) = (0usize, 0usize);
@@ -3172,14 +3173,14 @@ fn format_all(fmt: &str, args: &[Value]) -> Result<String, String> {
                     ));
                 };
                 next += 1;
-                out.push_str(&format_one(&fmt[start..i], v)?);
+                out.push_str(&format_one(&fmt[start..i], v, vm.as_deref_mut())?);
             }
         }
     }
     Ok(out)
 }
 
-fn format_one(spec: &str, v: &Value) -> Result<String, String> {
+fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, String> {
     let sb = spec.as_bytes();
     if sb.first() != Some(&b'%') || sb.len() < 2 {
         return Err(format!("scalars: malformed format spec `{spec}`"));
@@ -3217,7 +3218,13 @@ fn format_one(spec: &str, v: &Value) -> Result<String, String> {
 
     match conv {
         's' | 'S' => {
-            let mut s = scala_str(v);
+            // `%s` is the one conversion that renders through `toString`, so it
+            // is the one that can need the VM. A caller that has none renders
+            // structurally, exactly as before.
+            let mut s = match vm {
+                Some(vm) => scala_str_vm(vm, v),
+                None => scala_str(v),
+            };
             if let Some(p) = prec {
                 s = s.chars().take(p).collect();
             }
@@ -3594,6 +3601,22 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
             };
         }
     }
+    // `dispatch_method` deliberately holds no VM handle, so the two members it
+    // answers that can run user code are resolved here instead, where the VM is
+    // in hand: `toString`, defined on every value, and `"…".format(…)`, whose
+    // `%s` conversions are `toString` calls on the arguments.
+    if name == "toString" && args.is_empty() {
+        return Value::str(scala_str_vm(vm, &recv));
+    }
+    if name == "format" {
+        if let Value::Str(fmt) = &recv {
+            let fmt = fmt.to_string();
+            return match format_all(&fmt, &args, Some(vm)) {
+                Ok(s) => Value::str(s),
+                Err(e) => fault(vm, e),
+            };
+        }
+    }
     match dispatch_method(&recv, &name, &args) {
         Ok(v) => v,
         Err(e) => fault(vm, e),
@@ -3651,7 +3674,7 @@ fn heap_kind(v: &Value) -> Option<u8> {
 /// operations re-enter the VM (via [`invoke_closure`]) to run their function arg.
 fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     if name == "toString" && args.is_empty() {
-        return Ok(Value::str(scala_str(recv)));
+        return Ok(Value::str(scala_str_vm(vm, recv)));
     }
     if (name == "equals" || name == "==") && args.len() == 1 {
         return Ok(Value::bool(obj_eq(recv, &args[0])));
@@ -4136,6 +4159,24 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // several names (`+`, `-`, `++`) mean "mutate me" on a mutable receiver and
     // "build a new one" on an immutable one.
     if kind.is_mutable() {
+        // What a `StringBuilder` addition contributes is the argument's
+        // `String.valueOf`, so an appended instance renders through its
+        // `toString`. `mut_seq_method` holds no VM, so the argument is rendered
+        // here — the string it becomes then appends character by character
+        // exactly as a literal would.
+        let rendered: Vec<Value>;
+        let args = if kind == SeqKind::StrBuf && matches!(args.first(), Some(Value::Obj(_))) {
+            rendered = args
+                .iter()
+                .map(|a| match a {
+                    Value::Obj(_) => Value::str(scala_str_vm(vm, a)),
+                    other => other.clone(),
+                })
+                .collect();
+            &rendered[..]
+        } else {
+            args
+        };
         if let Some(r) = mut_seq_method(recv, kind, &items, name, args) {
             return r;
         }
@@ -4277,14 +4318,10 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         ("reverse", 0) => Ok(same(items.iter().rev().cloned().collect())),
         ("sum", 0) => Ok(seq_sum(&items)),
-        ("mkString", 0) => Ok(Value::str(
-            items.iter().map(scala_str).collect::<Vec<_>>().join(""),
-        )),
+        ("mkString", 0) => Ok(Value::str(join_vm(vm, &items, ""))),
         ("mkString", 1) => {
             let sep = args[0].as_str_cow().into_owned();
-            Ok(Value::str(
-                items.iter().map(scala_str).collect::<Vec<_>>().join(&sep),
-            ))
+            Ok(Value::str(join_vm(vm, &items, &sep)))
         }
         ("contains", 1) => Ok(Value::bool(items.iter().any(|x| value_eq(x, &args[0])))),
         ("apply", 1) => list_index(&items, args[0].to_int()),
@@ -4447,11 +4484,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         ("lastOption", 0) => Ok(opt(items.last().cloned())),
         ("product", 0) => Ok(seq_product(&items)),
         ("mkString", 3) => {
-            let joined = items
-                .iter()
-                .map(scala_str)
-                .collect::<Vec<_>>()
-                .join(&args[1].as_str_cow());
+            let joined = join_vm(vm, &items, &args[1].as_str_cow());
             Ok(Value::str(format!(
                 "{}{joined}{}",
                 args[0].as_str_cow(),
@@ -5151,11 +5184,25 @@ fn user_method_entry(vm: &VM, class: &Arc<str>, name: &'static str, argc: usize)
             .position(|n| n == want)
             .and_then(|idx| vm.chunk.find_sub(idx as u16))
     };
-    let plain = format!("{class}${name}");
-    // The unoverloaded name first: it is what all but a handful of programs
-    // register, so the overload probe costs a second scan only when it is the
-    // one that can succeed.
-    let found = find(&plain).or_else(|| find(&format!("{plain}${argc}")));
+    // The class itself, then its linearization: a method the class INHERITS is
+    // registered under the supertype that implements it (`Named$toString`), so
+    // looking only at the receiver's own tag misses every trait-provided member.
+    // `TYPES` holds that linearization, nearest first, which is Scala's own
+    // resolution order.
+    let mut owners = vec![class.to_string()];
+    owners.extend(TYPES.with(|t| {
+        t.borrow()
+            .get(&**class)
+            .map(|i| i.supers.clone())
+            .unwrap_or_default()
+    }));
+    let found = owners.iter().find_map(|owner| {
+        let plain = format!("{owner}${name}");
+        // The unoverloaded name first: it is what all but a handful of programs
+        // register, so the overload probe costs a second scan only when it is
+        // the one that can succeed.
+        find(&plain).or_else(|| find(&format!("{plain}${argc}")))
+    });
     METHOD_ENTRIES.with(|t| t.borrow_mut().insert(key, found));
     found
 }
@@ -5519,6 +5566,13 @@ fn b_boxed(vm: &mut VM, argc: u8) -> Value {
     let (module, member) = qualified
         .rsplit_once('.')
         .expect("the compiler always emits `Module.member`");
+    // `String.valueOf(x)` IS `x.toString`, so a user override has to run — and
+    // `boxed_member` has no VM to run it with.
+    if (module, member, args.len()) == ("java.String", "valueOf", 1) {
+        if let Value::Obj(_) = &args[0] {
+            return Value::str(scala_str_vm(vm, &args[0]));
+        }
+    }
     match boxed_member(module, member, &args) {
         Ok(v) => v,
         Err(e) => fault(vm, e),
@@ -6394,12 +6448,13 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             s.strip_prefix(&*args[0].as_str_cow()).unwrap_or(s),
         )),
         // `"…".format(args)` — Java's `Formatter` over a whole format string.
-        ("format", _) => Ok(Value::str(format_all(s, args)?)),
+        ("format", _) => Ok(Value::str(format_all(s, args, None)?)),
         // `x.formatted(spec)` is the mirror image: the RECEIVER is the value and
         // the argument is the format string.
         ("formatted", 1) => Ok(Value::str(format_all(
             &args[0].as_str_cow(),
             std::slice::from_ref(&Value::str(s.to_string())),
+            None,
         )?)),
         ("stripSuffix", 1) => Ok(Value::str(
             s.strip_suffix(&*args[0].as_str_cow()).unwrap_or(s),
@@ -7206,6 +7261,7 @@ fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("formatted", 1) => Ok(Value::str(format_all(
             &args[0].as_str_cow(),
             std::slice::from_ref(&Value::int(n)),
+            None,
         )?)),
         _ => Err(no_such_method(&Value::int(n), name)),
     }
@@ -7249,6 +7305,7 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("formatted", 1) => Ok(Value::str(format_all(
             &args[0].as_str_cow(),
             std::slice::from_ref(&Value::float(f)),
+            None,
         )?)),
         _ => Err(no_such_method(&Value::float(f), name)),
     }
@@ -7366,10 +7423,19 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool) -> Value {
     if unwinding() {
         return Value::Undef;
     }
+    // Rendered BEFORE the lock is taken: a user `toString` may itself `println`,
+    // and holding stdout across that would deadlock.
+    let rendered: Vec<String> = vals.iter().map(|v| scala_str_vm(vm, v)).collect();
+    // A user `toString` that raised leaves the exception in flight, and Scala
+    // never reaches the `println` it was being rendered for. Re-checked here
+    // because the check above ran before any of that code did.
+    if unwinding() {
+        return Value::Undef;
+    }
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    for v in &vals {
-        let _ = write!(lock, "{}", scala_str(v));
+    for s in &rendered {
+        let _ = write!(lock, "{s}");
     }
     if newline {
         let _ = writeln!(lock);
@@ -7399,6 +7465,145 @@ pub fn scala_str(v: &Value) -> String {
         // for a plain class (see [`obj_to_string`]).
         Value::Obj(_) => obj_to_string(v),
         other => other.as_str_cow().into_owned(),
+    }
+}
+
+thread_local! {
+    /// Whether the running program defines any `toString` of its own, resolved
+    /// once per chunk. `None` until asked; cleared by [`reset_heap`].
+    static USER_TOSTRING: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the compiled program defines a `toString` on any of its types.
+///
+/// `compiler::Compiler::sub_name` registers a class method as `Class$toString`,
+/// so one scan of the chunk's name table answers it for the whole run. This is
+/// what keeps [`scala_str_vm`] free: a program with no override takes exactly
+/// the [`scala_str`] path it always did, with no per-value method lookup and no
+/// heap snapshotting.
+fn user_tostring_present(vm: &VM) -> bool {
+    USER_TOSTRING.with(|c| match c.get() {
+        Some(known) => known,
+        None => {
+            let found = vm.chunk.names.iter().any(|n| n.ends_with("$toString"));
+            c.set(Some(found));
+            found
+        }
+    })
+}
+
+/// [`scala_str`], able to run a user `toString` override.
+///
+/// Scala renders every value through its `toString`, so an override has to be
+/// honoured by `println`, by interpolation, and at every depth of a collection —
+/// not only by an explicit `p.toString`, which the compiler resolves statically
+/// and never routes here. Running one means re-entering the VM, so this is the
+/// entry point for the call sites that hold a `&mut VM`; [`scala_str`] stays as
+/// the rendering for those that do not (see its callers).
+pub fn scala_str_vm(vm: &mut VM, v: &Value) -> String {
+    if !user_tostring_present(vm) {
+        return scala_str(v);
+    }
+    match v {
+        Value::Array(items) => {
+            let items = items.clone();
+            let inner = join_vm(vm, &items, ", ");
+            format!("Vector({inner})")
+        }
+        Value::Obj(_) => obj_to_string_vm(vm, v),
+        other => scala_str(other),
+    }
+}
+
+/// `sep`-join the vm-aware rendering of each of `items`.
+fn join_vm(vm: &mut VM, items: &[Value], sep: &str) -> String {
+    let parts: Vec<String> = items.iter().map(|e| scala_str_vm(vm, e)).collect();
+    parts.join(sep)
+}
+
+/// The parts of a heap value that have to be re-rendered element by element,
+/// snapshotted so the heap borrow can be released before recursing.
+enum Renderable {
+    /// A `case` instance: its class name and its constructor fields.
+    Case(Arc<str>, Vec<Value>),
+    /// A sequence with a label — `List(…)`, `Vector(…)`, `Set(…)`.
+    Seq(&'static str, Vec<Value>),
+    /// A map with a label, as `k -> v` pairs.
+    Map(&'static str, Vec<(Value, Value)>),
+    /// A tuple: `(a,b)`, no spaces.
+    Tuple(Vec<Value>),
+    /// A `by-name`/lazy cell, rendered as its contents.
+    Cell(Value),
+    /// Everything whose rendering contains no nested value — a plain
+    /// `Class@hex`, a `case object`, a `Range`, a closure, a throwable, a
+    /// `Regex`, a `StringBuilder`. [`obj_to_string`] already answers these and
+    /// no override can be reached through them.
+    Leaf,
+}
+
+/// [`obj_to_string`], able to run a user `toString` override.
+///
+/// Two things make this a separate function rather than a flag on the original.
+/// A user override runs USER BYTECODE, which needs the VM. And `obj_to_string`
+/// holds `HEAP.borrow()` across its whole body, recursing into `scala_str` with
+/// it live — re-entering the VM there would panic the moment the override read
+/// one of its own fields, since that takes the heap again. So the shape is
+/// snapshotted, the borrow dropped, and only then is anything run.
+fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
+    // The override wins outright: Scala's derived `case class` rendering is
+    // itself just a `toString`, and overriding it replaces it.
+    if let Some(r) = call_user_method(vm, v, "toString", &[]) {
+        match r {
+            // A `toString` that answers a non-`String` cannot be re-entered
+            // again — render its result structurally and stop.
+            Ok(s) => return scala_str(&s),
+            // A raise inside `toString` leaves the exception pending for the
+            // statement boundary to pick up; the value still has to render.
+            Err(_) => return obj_to_string(v),
+        }
+    }
+    let id = if let Value::Obj(i) = v { *i } else { 0 };
+    let shape = HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(id as usize) {
+            Some(HeapVal::Record(o)) if o.is_case && !o.is_object && &*o.class != CLASS_CLASS => {
+                let n = ctor_arity(&o.class, o.fields.len());
+                let fields = o.fields[..n].iter().map(|(_, val)| val.clone()).collect();
+                Renderable::Case(Arc::clone(&o.class), fields)
+            }
+            // A `Range` renders from its bounds and a `StringBuilder` from its
+            // characters; neither can hold a record.
+            Some(HeapVal::Seq(SeqKind::Range { .. } | SeqKind::StrBuf, _)) => Renderable::Leaf,
+            Some(HeapVal::Seq(kind, items)) => Renderable::Seq(kind.label(), items.clone()),
+            Some(HeapVal::Map(rep, entries)) => {
+                let label = match rep {
+                    HashRep::Hashed | HashRep::Mutable(_) => "HashMap",
+                    HashRep::Linked => "LinkedHashMap",
+                    HashRep::Small => "Map",
+                };
+                Renderable::Map(label, entries.clone())
+            }
+            Some(HeapVal::Tuple(items)) => Renderable::Tuple(items.clone()),
+            Some(HeapVal::Cell(c)) => Renderable::Cell(c.clone()),
+            _ => Renderable::Leaf,
+        }
+    });
+    match shape {
+        Renderable::Leaf => obj_to_string(v),
+        Renderable::Case(class, fields) => format!("{class}({})", join_vm(vm, &fields, ",")),
+        Renderable::Seq(label, items) => format!("{label}({})", join_vm(vm, &items, ", ")),
+        Renderable::Map(label, entries) => {
+            let parts: Vec<String> = entries
+                .iter()
+                .map(|(k, val)| {
+                    let k = scala_str_vm(vm, k);
+                    format!("{k} -> {}", scala_str_vm(vm, val))
+                })
+                .collect();
+            format!("{label}({})", parts.join(", "))
+        }
+        Renderable::Tuple(items) => format!("({})", join_vm(vm, &items, ",")),
+        Renderable::Cell(c) => scala_str_vm(vm, &c),
     }
 }
 

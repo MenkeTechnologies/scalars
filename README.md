@@ -262,6 +262,14 @@ Implemented and checked against the reference `scala`:
   the primary-constructor parameters only, as Scala derives them. Built-in
   `Option` (`Some(v)` / `None`). All of it rides a host-side object heap behind
   fusevm's `Value::Obj` handle (`src/host.rs`) — no fusevm changes, no JVM.
+- **`override def toString`, everywhere a value is rendered** — `println(p)`,
+  `s"$p"`, `"x" + p`, `xs.mkString`, `"%s".format(p)` and every depth of a
+  nested collection run the user's override, not only an explicit `p.toString`.
+  An override may itself print, and one raising propagates as Scala's does.
+- **Overloaded methods** — one name at several arities on a `class` or `object`,
+  resolved at the call site by argument count through every dispatch route
+  (direct, `super.m`, virtual, unqualified self-call). Overloads differing only
+  in parameter type are refused rather than silently answered by the first.
 - **Traits and inheritance** — `trait T { def f: Int; def g = … }` with abstract
   and concrete members, `class C(x) extends P(x) with T1 with T2`, `override
   def`, `super.m(…)`, and virtual dispatch off the receiver's runtime class tag

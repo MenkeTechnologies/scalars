@@ -120,6 +120,10 @@ struct Compiler {
     /// [`Compiler::sub_name`]), which is the only key the call site can pick
     /// from what it statically knows.
     overloads: HashMap<String, Vec<usize>>,
+    /// Whether any declared type overrides `toString`. When none does, a `+`
+    /// with a `String` operand keeps the raw `Op::Add` lowering it always had
+    /// (see [`Compiler::concat_operand`]).
+    has_user_tostring: bool,
     /// `Some((name, fields))` while compiling a class method: the enclosing
     /// class's name and field-name set, so a bare identifier naming a field
     /// resolves to `this.field` and a bare sibling-method call to `this.m(...)`.
@@ -579,6 +583,11 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         objects: obj_meta,
         method_index,
         overloads,
+        has_user_tostring: classes
+            .iter()
+            .flat_map(|cd| cd.methods.iter())
+            .chain(objects.iter().flat_map(|od| od.methods.iter()))
+            .any(|m| m.name == "toString"),
         current_class: None,
         current_object: None,
         obj_counter: 0,
@@ -4154,8 +4163,23 @@ impl Compiler {
         } else {
             NumTy::Unknown
         };
-        self.expr(lhs)?;
-        self.expr(rhs)?;
+        if let BinOp::Add = op {
+            // `"s" + p` renders `p` through its `toString`, and so does `s"$p"`
+            // — the parser desugars an interpolation to exactly this, `"" + p +
+            // ""`. Both reach fusevm's `Op::Add`, whose numeric hook is a plain
+            // `Fn(NumOp, &Value, &Value)` and cannot re-enter the VM to run a
+            // user override. Route the non-`String` side through the `SFORMAT`
+            // builtin instead, which does hold the VM.
+            //
+            // Gated on the program declaring an override at all, so a program
+            // without one emits the `Op::Add` it always did — the JIT-visible
+            // arithmetic path is untouched.
+            self.concat_operand(lhs, rhs)?;
+            self.concat_operand(rhs, lhs)?;
+        } else {
+            self.expr(lhs)?;
+            self.expr(rhs)?;
+        }
         // Scala `/` truncates for two `Int`s; fusevm's native `Op::Div` always
         // floats, so route division through the type-dispatching host builtin.
         if let BinOp::Div = op {
@@ -4188,6 +4212,34 @@ impl Compiler {
         };
         self.b.emit(vop, 0);
         self.narrow(w, 0);
+        Ok(())
+    }
+
+    /// Push one operand of a `+`, pre-rendering it through `SFORMAT` when the
+    /// concatenation would otherwise stringify it behind the VM's back.
+    ///
+    /// `other` is the operand on the far side: only a `+` with a `String` on one
+    /// side is a concatenation, and only the side that is NOT already a `String`
+    /// needs converting. A literal, and anything the width analysis has already
+    /// proved to be an `Int` or a `Long`, are skipped too — neither can be a
+    /// class instance, and wrapping them would put a builtin call in every
+    /// `s"…$i…"` of a program that happens to define one override somewhere.
+    fn concat_operand(&mut self, e: &Expr, other: &Expr) -> Result<(), String> {
+        self.expr(e)?;
+        if !self.has_user_tostring
+            || yields_strings(e)
+            || !yields_strings(other)
+            || self.num_ty(e) != NumTy::Unknown
+            || matches!(
+                e,
+                Expr::Int(_) | Expr::Long(_) | Expr::Float(_) | Expr::Char(_) | Expr::Bool(_)
+            )
+        {
+            return Ok(());
+        }
+        let c = self.b.add_constant(Value::str("%s".to_string()));
+        self.b.emit(Op::LoadConst(c), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SFORMAT, 2), 0);
         Ok(())
     }
 }
