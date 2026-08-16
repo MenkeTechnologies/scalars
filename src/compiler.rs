@@ -1680,6 +1680,32 @@ impl Compiler {
             // A trailing expression (including `println`, which leaves `Unit`) is
             // the block's value.
             StmtKind::Expr(e) => self.expr(e)?,
+            // A trailing `if` is the block's value too — Scala's `if` is an
+            // EXPRESSION everywhere, so `{ val a = 1; if (a > 0) "p" else "n" }`
+            // is `"p"`, not `()`. The parser files an `if` in statement position
+            // as [`StmtKind::If`] rather than an [`Expr::If`], so without this
+            // arm it fell to the run-for-effect case below and every such block
+            // answered `()` — silently, and in the shape a brace-argument lambda
+            // body most often takes (`xs.map { x => if (p(x)) a else b }`
+            // answered `List((), ())`). The `def`-body path already reads it as a
+            // value (see [`Compiler::tail`]); this is the same reading for a
+            // block that is not a function body. A branch-less `if` still yields
+            // `Unit`, as in Scala.
+            StmtKind::If { cond, then, els } => {
+                self.expr(cond)?;
+                let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+                self.block_expr(then)?;
+                let jend = self.b.emit(Op::Jump(0), 0);
+                let else_start = self.b.current_pos();
+                self.b.patch_jump(jf, else_start);
+                if els.is_empty() {
+                    self.emit_unit(0);
+                } else {
+                    self.block_expr(els)?;
+                }
+                let end = self.b.current_pos();
+                self.b.patch_jump(jend, end);
+            }
             // A non-expression last statement runs for effect; the block is `Unit`.
             _ => {
                 self.stmt(last)?;
@@ -3068,6 +3094,10 @@ impl Compiler {
     /// the narrowing covers EVERY lowering path — the math builtin, the operator
     /// spellings, and the generic `SMETHOD` fallback all funnel through here.
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        // `use(3)(g)` / `use(3) { g }` — one clause of a curried `def`.
+        if let Some(call) = self.uncurry(recv, name, args, line) {
+            return self.expr(&call);
+        }
         let w = self.method_width(recv, name, args);
         // A lambda argument's parameters are typed by the traversal, so the
         // widths are decided HERE — the lambda body itself is compiled much
@@ -3083,6 +3113,46 @@ impl Compiler {
             self.narrow(w, line);
         }
         Ok(())
+    }
+
+    /// Fold a trailing argument clause back into the call it continues.
+    ///
+    /// `def use(n: Int)(f: Int => Int)` declares ONE function of two parameters
+    /// — [`crate::parser::Parser::param_list`] flattens the clauses — but the
+    /// call `use(3)(g)` parses as an `apply` on `use(3)`, and `use(3)` alone is
+    /// an under-applied `def`, so the `apply` would land on whatever the first
+    /// clause returned (`value 3 cannot be applied to arguments`).
+    ///
+    /// Rejoin the clauses when the callee is a `def` whose declared arity is
+    /// exactly what the two clauses together supply. That is the only reading
+    /// which can be right, and it deliberately does NOT fire when the arity is
+    /// already satisfied: `def mk(n: Int): Int => Int`, called `mk(1)(2)`, is a
+    /// complete call whose RESULT is applied, and must keep dispatching through
+    /// `apply`. A name that is not a `def` at all (a `val` holding a function,
+    /// a collection being indexed) never matches either.
+    fn uncurry(&self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+        if name != "apply" {
+            return None;
+        }
+        let Expr::Call {
+            name: callee,
+            args: first,
+            ..
+        } = recv
+        else {
+            return None;
+        };
+        let arity = *self.func_arity.get(callee)?;
+        if first.len() >= arity || first.len() + args.len() != arity {
+            return None;
+        }
+        let mut all = first.clone();
+        all.extend_from_slice(args);
+        Some(Expr::Call {
+            name: callee.clone(),
+            args: all,
+            line,
+        })
     }
 
     /// The widths a lambda passed to `recv.name(…)` binds its parameters to.

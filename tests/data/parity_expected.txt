@@ -251,3 +251,35 @@ object T extends App { println(Integer.decode("08")) }		java.lang.NumberFormatEx
 object T extends App { println("x".toBoolean) }		java.lang.IllegalArgumentException: For input string: "x"
 object T extends App { println(Integer.parseUnsignedInt("4294967296")) }		java.lang.NumberFormatException: String value 4294967296 exceeds range of unsigned int.
 object T extends App { print("a"); println(Integer.decode("")) }	a	java.lang.NumberFormatException: Zero length string
+object T extends App { println(List(1, 2, 3).map { _ * 2 }) }	List(2, 4, 6)\n
+object T extends App { println(List(1, 2, 3).filter { _ > 1 }) }	List(2, 3)\n
+object T extends App { println(List(1, 2, 3).filterNot { _ > 1 }) }	List(1)\n
+object T extends App { println(List(1, 2, 3).foldLeft(0) { _ + _ }) }	6\n
+object T extends App { println(List(1, 2, 3).foldRight(0) { _ - _ }) }	2\n
+object T extends App { println(List("a", "bb", "ccc").map { _.length }) }	List(1, 2, 3)\n
+object T extends App { println(List(3, 1, 2).sortWith { _ < _ }) }	List(1, 2, 3)\n
+object T extends App { println(List(3, 1, 2).sortBy { -_ }) }	List(3, 2, 1)\n
+object T extends App { println(List(1, 2, 3).reduce { _ + _ }) }	6\n
+object T extends App { println("" + (List(1, 2, 3).exists { _ > 2 }) + " " + (List(1, 2, 3).forall { _ > 2 }) + " " + (List(1, 2, 3).count { _ > 1 }) + " " + (List(1, 2, 3).find { _ > 1 }) + " " + (List(1, 2, 3).indexWhere { _ > 1 })) }	true false 2 Some(2) 1\n
+object T extends App { println("" + (List(1, 2, 3).takeWhile { _ < 3 }) + " " + (List(1, 2, 3).dropWhile { _ < 3 }) + " " + (List(1, 2, 3).partition { _ > 1 }) + " " + (List(1, 2, 3).span { _ < 2 })) }	List(1, 2) List(3) (List(2, 3),List(1)) (List(1),List(2, 3))\n
+object T extends App { { def once(v: Int): Int = v * 2; println(once { 7 }); println(once { val a = 3; a + 1 }) } }	14\n8\n
+object T extends App { { def use(n: Int)(f: Int => Int): Int = f(n); println(use(3) { _ + 1 }); println(use(3) { x => x * x }); println(use(3)(_ * 2)) } }	4\n9\n6\n
+object T extends App { { val f: Int => Int = _ * 3; println(f(4)); println(List(1, 2).map(f)) } }	12\nList(3, 6)\n
+object T extends App { { val g = (_: Int) + 1; println(g(5)); println(List(1, 2).map(g)) } }	6\nList(2, 3)\n
+object T extends App { println(List(1, 2).map { println("once"); _ + 1 }) }	once\nList(2, 3)\n
+object T extends App { println(List(1, 2, 3).map { x => if (x > 1) "hi" else "lo" }) }	List(lo, hi, hi)\n
+object T extends App { println({ val a = 1; if (a > 0) "p" else "n" }) }	p\n
+object T extends App { println({ if (true) 7 else 8 }) }	7\n
+object T extends App { println({ if (false) 1 }) }	()\n
+object T extends App { println(List(List(1, 2), List(3)).flatMap { _.map { _ * 2 } }) }	List(2, 4, 6)\n
+object T extends App { println(List(1, 2, 3).map { _ + 1 }.filter { _ > 2 }.map { _ * 10 }) }	List(30, 40)\n
+object T extends App { List(1, 2, 3).foreach { println(_) } }	1\n2\n3\n
+object T extends App { println(List(1, 2, 3).groupBy { _ % 2 }) }	HashMap(0 -> List(2), 1 -> List(1, 3))\n
+object T extends App { println(List(1, 2, 3).map { _ + 1 }.sum) }	9\n
+object T extends App { println((1 to 3).map { _ * 2 }) }	Vector(2, 4, 6)\n
+object T extends App { println(Option(3).map { _ + 1 }) }	Some(4)\n
+object T extends App { println(List(1, 2, 3).map { _ * 2 }.mkString(",")) }	2,4,6\n
+object T extends App { println(List(1, 2, 3) map { _ * 2 }) }	List(2, 4, 6)\n
+object T extends App { println(List(1, 2, 3).map { x => val d = x * 3; if (d > 5) d else -d }) }	List(-3, 6, 9)\n
+object T extends App { { def mk(n: Int): Int => Int = (x: Int) => x + n; println(mk(1)(2)) } }	3\n
+object T extends App { println(List(1, 2, 3).maxBy { -_ }) }	1\n

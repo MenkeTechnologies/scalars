@@ -943,7 +943,8 @@ impl Parser {
     /// through, so `--dap` markers land on real lines).
     fn statement(&mut self) -> Result<Stmt, String> {
         let line = self.line();
-        let kind = self.statement_kind()?;
+        let mut kind = self.statement_kind()?;
+        expand_statement_placeholders(&mut kind);
         Ok(Stmt { line, kind })
     }
 
@@ -1781,10 +1782,28 @@ impl Parser {
                 if self.is(&Tok::LParen) {
                     let line = self.line();
                     let args = self.arg_list()?;
-                    e = Expr::Method {
+                    e = eta_bare_args(Expr::Method {
                         recv: Box::new(e),
                         name: "apply".to_string(),
                         args,
+                        line,
+                    });
+                    continue;
+                }
+                // `use(3) { f }` — a further argument clause, written as a brace
+                // group, on a plain function call. Restricted to an
+                // [`Expr::Call`] receiver: that is the one shape whose parse
+                // just consumed a parenthesized clause and so can still be a
+                // partially-applied curried `def`. The compiler decides, from
+                // the callee's declared arity, whether the clauses belong to one
+                // call or are an `apply` on its result.
+                if matches!(e, Expr::Call { .. }) && self.is(&Tok::LBrace) {
+                    let line = self.line();
+                    let arg = self.brace_arg()?;
+                    e = Expr::Method {
+                        recv: Box::new(e),
+                        name: "apply".to_string(),
+                        args: vec![arg],
                         line,
                     };
                     continue;
@@ -1859,12 +1878,12 @@ impl Parser {
             if self.is(&Tok::LBrace) {
                 args.push(self.brace_arg()?);
             }
-            e = Expr::Method {
+            e = eta_bare_args(Expr::Method {
                 recv: Box::new(e),
                 name,
                 args,
                 line,
-            };
+            });
         }
         Ok(e)
     }
@@ -2205,16 +2224,31 @@ impl Parser {
                         "List" | "Map" | "Array" | "Seq" | "Vector" | "Set" | "IndexedSeq"
                     ) {
                         let elems = self.arg_list()?;
-                        return Ok(Expr::Collection { ctor: name, elems });
+                        return Ok(eta_bare_args(Expr::Collection { ctor: name, elems }));
                     }
                     if let Some(ctor) = mutable_buffer_ctor(&name) {
                         let elems = self.arg_list()?;
-                        return Ok(Expr::Collection {
+                        return Ok(eta_bare_args(Expr::Collection {
                             ctor: ctor.to_string(),
                             elems,
-                        });
+                        }));
                     }
                     return self.call(name, line);
+                }
+                // `once { … }` — a brace group standing in for a plain call's
+                // single parenthesized argument, the same substitution
+                // `postfix_from` already makes on a method (`xs.map { … }`).
+                // The `{` must be on this line: an inferred `Newline` separator
+                // sits between a bare name and a block that merely FOLLOWS it,
+                // so a statement `foo` and a following `{ … }` block stay two
+                // statements.
+                if self.is(&Tok::LBrace) {
+                    let arg = self.brace_arg()?;
+                    return Ok(Expr::Call {
+                        name,
+                        args: vec![arg],
+                        line,
+                    });
                 }
                 Ok(Expr::Var(name))
             }
@@ -2233,7 +2267,15 @@ impl Parser {
     /// the same `toDouble` conversion Scala's implicit widening performs.
     fn ascribed(&mut self) -> Result<Expr, String> {
         let line = self.line();
-        let e = wrap_placeholders(self.expression()?);
+        // A group that is nothing BUT a placeholder does not become a function
+        // here. `(_: Int) + 1` is Scala's TYPED placeholder — the parentheses
+        // carry the ascription, not the function boundary, so the expansion
+        // belongs to the enclosing expression and the whole thing is
+        // `x => x + 1`. Wrapping at the parenthesis instead made it the identity
+        // function and then added `1` to it. A bare `(_)` therefore stays a
+        // placeholder and, if nothing encloses it, is rejected — which is what
+        // Scala 3 does with it ("Unbound placeholder parameter").
+        let e = wrap_arg_placeholders(self.expression()?);
         if !self.is(&Tok::Colon) {
             return Ok(e);
         }
@@ -2255,7 +2297,7 @@ impl Parser {
     /// `__rust_compile` FFI-block builtin or a call to an FFI-exported bareword.
     fn call(&mut self, name: String, line: u32) -> Result<Expr, String> {
         let args = self.arg_list()?;
-        Ok(Expr::Call { name, args, line })
+        Ok(eta_bare_args(Expr::Call { name, args, line }))
     }
 
     /// `new Class[Types](args)` — construct a host-heap instance (the cursor is
@@ -2314,7 +2356,7 @@ impl Parser {
                 elems: args,
             });
         }
-        Ok(Expr::New { name, args, line })
+        Ok(eta_bare_args(Expr::New { name, args, line }))
     }
 
     /// Parse a parenthesized, comma-separated argument list (cursor on `(`);
@@ -2865,6 +2907,72 @@ fn wrap_arg_placeholders(e: Expr) -> Expr {
         return e;
     }
     wrap_placeholders(e)
+}
+
+/// Expand the placeholders of a call whose argument list holds a BARE `_`.
+///
+/// Scala expands at the smallest expression that PROPERLY contains the
+/// placeholder. An argument that is nothing but `_` is not that expression — the
+/// call around it is: `xs.map(f(_))` is `xs.map(x => f(x))`, `math.abs(_)` is
+/// `x => math.abs(x)`, and `println(xs.map(_))` prints the function
+/// `x => xs.map(x)` (verified against Scala 3.8.4, which answers a
+/// `T$$$Lambda@…` there rather than a list). [`wrap_arg_placeholders`] therefore
+/// declines to wrap a bare argument, and THIS is the boundary that picks it up —
+/// applied wherever an argument list becomes a node.
+///
+/// Without it the bare placeholder escapes outward to the enclosing statement,
+/// where [`expand_statement_placeholders`] would lift the WHOLE statement into a
+/// function: `println(xs.map(_))` would build `$ph0 => println(xs.map($ph0))`,
+/// evaluate it, discard it, and print nothing at all.
+fn eta_bare_args(e: Expr) -> Expr {
+    let bare = match &e {
+        Expr::Method { args, .. }
+        | Expr::Call { args, .. }
+        | Expr::New { args, .. }
+        | Expr::Collection { elems: args, .. } => {
+            args.iter().any(|a| matches!(a, Expr::Placeholder))
+        }
+        _ => false,
+    };
+    if bare {
+        wrap_placeholders(e)
+    } else {
+        e
+    }
+}
+
+/// Expand `_` placeholders at a STATEMENT boundary.
+///
+/// Scala expands a placeholder at the smallest enclosing *expression*, and a
+/// block statement is one of those boundaries — which is what makes the brace
+/// form of an argument (`xs.map { _ * 2 }`) mean the same function the
+/// parenthesized form (`xs.map(_ * 2)`) does, and what lets a placeholder stand
+/// as a `val`'s initializer (`val f: Int => Int = _ + 1`). A brace argument
+/// parses as [`Expr::Block`], whose statements all flow through
+/// [`Parser::statement`], so expanding here covers every nesting of it
+/// (`{ println("s"); _ + 1 }` expands the trailing statement and leaves the
+/// leading one alone, exactly as Scala does).
+///
+/// Only a statement that is nothing BUT a placeholder is left alone, matching
+/// [`wrap_arg_placeholders`]: Scala 3 rejects `xs.map { _ }` with "Unbound
+/// placeholder parameter", so wrapping it into the identity function here would
+/// answer where the reference refuses.
+///
+/// This can only ever change a tree that CONTAINS a placeholder, and every such
+/// tree was a hard compile error before ("`_` placeholder outside an argument"),
+/// so no program that ran can observe the difference.
+fn expand_statement_placeholders(kind: &mut StmtKind) {
+    let slot = match kind {
+        StmtKind::Expr(e) => e,
+        StmtKind::Local { init: Some(e), .. } => e,
+        StmtKind::Return(Some(e)) => e,
+        StmtKind::Assign { value, .. } => value,
+        StmtKind::PlaceAssign { value, .. } => value,
+        StmtKind::Destructure { init, .. } => init,
+        _ => return,
+    };
+    let taken = std::mem::replace(slot, Expr::Tuple(Vec::new()));
+    *slot = wrap_arg_placeholders(taken);
 }
 
 fn wrap_placeholders(e: Expr) -> Expr {

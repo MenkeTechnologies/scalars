@@ -95,7 +95,7 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
-  against a live `scala` across forty generators — this wave added the
+  against a live `scala` across its whole generator set — this wave added the
   `--entry` axis, which runs any of them under `@main` / `def main` /
   `extends App` rather than the one shape every probe used to be written in.
 
@@ -315,8 +315,14 @@ Implemented and checked against the reference `scala`:
   hierarchy.
 - **First-class functions** — lambdas (`x => e`, `(a, b) => e`, block bodies
   `x => { … }`, `Int => Int` function-type annotations) and the `_`-placeholder
-  form (`_ + 1`, `_ * 2`, `_ + _`, the applied `_(1)`, and the bare `_` argument
-  that eta-expands its enclosing call, `xs.map(f(_))`). A lambda captures its enclosing frame, so it
+  form (`_ + 1`, `_ * 2`, `_ + _`, the applied `_(1)`, the typed `(_: Int) + 1`,
+  and the bare `_` argument
+  that eta-expands its enclosing call, `xs.map(f(_))`). Both spellings work in
+  the BRACE form of an argument as well as the parenthesized one —
+  `xs.map { _ * 2 }`, `xs.foldLeft(0) { _ + _ }`, `xs.sortBy { -_ }`,
+  `once { 7 }`, and the trailing clause of a curried `def`, `use(3) { _ + 1 }` —
+  since a brace group is a block whose value is the argument and a block
+  statement is one of the boundaries a placeholder expands at. A lambda captures its enclosing frame, so it
   can be stored in a `val`, passed as an argument, returned, and invoked (`f(x)` /
   `f.apply(x)`) — curried closures (`def adder(n: Int): Int => Int = x => x + n`)
   see their upvalues after the defining frame returns. A lambda that ASSIGNS an
@@ -547,7 +553,7 @@ probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
 `nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, `breaks`,
-`params`, `fmt`, `apply`, `narrow`, …). It needs a real `scala` on
+`params`, `fmt`, `apply`, `narrow`, `braces`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -603,6 +609,28 @@ Rust's `from_str_radix`, which panics rather than returning an error, so
 `Integer.parseInt("12", 40)` aborted the process with a Rust backtrace instead of
 throwing a catchable `NumberFormatException`. Its `Char` operands then found
 `'\uXXXX'` escapes unlexed in every literal form.
+
+The `braces` mode covers the shape a corpus is likeliest to miss precisely
+because it is everywhere: the BRACE form of an argument. Every brace group the
+other modes had ever emitted was a `{ case … }` pattern-matching literal
+(`collect`, `collectFirst`, `PartialFunction`), and every `_` placeholder they
+emitted sat inside PARENTHESES — two different boundaries in Scala's grammar,
+since a brace group is a block whose value is the argument and the placeholder
+then expands at a block-statement boundary rather than at an argument one. With
+no probe crossing the second, a clean score over the first said nothing, and
+`xs.map { _ * 2 }` — the single most common line in written Scala — did not
+parse at all (`` `_` placeholder outside an argument ``). Neither did
+`once { 7 }` or `use(3) { _ + 1 }`, where the brace stands in for a whole
+argument clause on a plain `def` (the curried case had a second failure behind
+it: `use(3)(g)` applied `g` to whatever the FIRST clause returned rather than
+completing the call, so it reported `value 3 cannot be applied to arguments`).
+Two more scoping bugs sat under the same mode: Scala's typed placeholder
+`(_: Int) + 1` read the parentheses as the function boundary, making the group
+the identity function and then adding `1` to a function; and the trailing `if`
+of a block was compiled as a statement run for effect, so every block whose
+value was a conditional answered `()` — silently, and in exactly the shape a
+brace-argument lambda body most often takes
+(`xs.map { x => if (p(x)) a else b }` answered `List((), ())`).
 
 Two things the harness could not report at all, and now can. **The entry point
 was a constant, not an axis:** every probe ever generated was placed in one

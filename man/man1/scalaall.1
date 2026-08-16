@@ -152,7 +152,10 @@ construction and method / field access; function literals
 .RB ( "x => e" ,
 .BR "{ case ... }" ,
 .B _
-placeholders); tuples; and the collection literals.
+placeholders, in the parenthesized and the brace form of an argument alike \-
+.BR "xs.map { _ * 2 }" ,
+.BR "xs.foldLeft(0) { _ + _ }" );
+tuples; and the collection literals.
 .SS Operators
 .B + - * / %
 (arithmetic),

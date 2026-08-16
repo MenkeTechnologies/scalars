@@ -1871,6 +1871,121 @@ fn g_mixed(r: &mut Rng) -> String {
     )
 }
 
+/// The BRACE form of an argument, and the `_` placeholder inside it.
+///
+/// `xs.map { _ * 2 }` is the single most common shape in written Scala, and no
+/// probe in this file had ever emitted it: every brace argument the other modes
+/// generate is a `{ case … }` pattern-matching literal (`collect`, `collectFirst`,
+/// `PartialFunction`), and every placeholder they generate sits inside
+/// PARENTHESES (`xs.map(_ * 2)`). Those are two different boundaries in Scala's
+/// grammar — a brace group is a BLOCK whose value is the argument, so the
+/// placeholder expands at a block-statement boundary rather than at an argument
+/// one — and a corpus that never crossed the second could report a clean score
+/// over the first forever.
+///
+/// What the probes here cover:
+///   * a placeholder under a brace argument, one (`_ * 2`) and two (`_ + _`),
+///     with a selection (`_.length`) and under a prefix operator (`-_`);
+///   * a brace argument on a plain `def` call (`once { 7 }`) and on the trailing
+///     clause of a CURRIED one (`use(3) { _ + 1 }`), which is a second argument
+///     clause and not an `apply` on the first clause's result;
+///   * a placeholder as a `val`'s initializer (`val f: Int => Int = _ + 1`) and
+///     Scala's TYPED placeholder (`(_: Int) + 1`), where the parentheses carry an
+///     ascription and the function boundary is still the enclosing expression;
+///   * a brace block with a leading statement before the placeholder
+///     (`{ println("s"); _ + 1 }`), which must run that statement exactly once —
+///     the block is evaluated once, to produce the function, not once per
+///     element;
+///   * a brace lambda whose body ENDS IN AN `if`, since a block's value is its
+///     trailing expression and Scala's `if` is one.
+///
+/// Deliberately absent: a bare `{ _ }`. Scala 3 rejects it ("Unbound placeholder
+/// parameter"), so it is a compile error on both sides and teaches nothing.
+fn g_braces(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let n = 3 + r.below(3) as usize;
+    let xs = format!("List({})", int_elems(r, n));
+    let ws = format!("List({})", str_elems(r, 3));
+    let k = pick(r, &["1", "2", "3", "-2"]);
+    let lim = pick(r, &["0", "2", "-3", "5"]);
+    match r.below(23) {
+        // The transformations, with one placeholder.
+        0 => format!("println({xs}.map {{ _ * {k} }})"),
+        1 => format!("println({xs}.filter {{ _ > {lim} }})"),
+        2 => format!("println({xs}.filterNot {{ _ > {lim} }})"),
+        3 => format!("println({ws}.map {{ _.length }})"),
+        4 => format!("println({ws}.map {{ _.toUpperCase }})"),
+        // A prefix operator applied to the placeholder.
+        5 => format!("println({xs}.sortBy {{ -_ }})"),
+        // Two placeholders — successive parameters, left to right.
+        6 => format!("println({xs}.foldLeft(0) {{ _ + _ }})"),
+        7 => format!("println({xs}.foldRight(0) {{ _ - _ }})"),
+        8 => format!("println({xs}.reduce {{ _ + _ }})"),
+        9 => format!("println({xs}.sortWith {{ _ < _ }})"),
+        // The predicates, which answer a scalar rather than a collection.
+        10 => println_all(&[
+            format!("{xs}.exists {{ _ > {lim} }}"),
+            format!("{xs}.forall {{ _ > {lim} }}"),
+            format!("{xs}.count {{ _ > {lim} }}"),
+            format!("{xs}.find {{ _ > {lim} }}"),
+            format!("{xs}.indexWhere {{ _ > {lim} }}"),
+        ]),
+        11 => println_all(&[
+            format!("{xs}.takeWhile {{ _ > {lim} }}"),
+            format!("{xs}.dropWhile {{ _ > {lim} }}"),
+            format!("{xs}.partition {{ _ > {lim} }}"),
+            format!("{xs}.span {{ _ > {lim} }}"),
+        ]),
+        // Chained brace arguments: each `{ … }` is its own placeholder scope.
+        12 => format!("println({xs}.map {{ _ + {k} }}.filter {{ _ > {lim} }}.map {{ _ * 2 }})"),
+        // Nested: the inner placeholder belongs to the inner brace.
+        13 => format!("println(List({xs}, {xs}).flatMap {{ _.map {{ _ * {k} }} }})"),
+        // A brace argument on a plain `def` call — the brace stands in for the
+        // whole parenthesized clause.
+        14 => format!(
+            "{{ def o{u}(v: Int): Int = v * {k}; println(o{u} {{ {lim} }}); \
+             println(o{u} {{ val a = {k}; a + {lim} }}) }}"
+        ),
+        // A CURRIED `def`: the brace is the second argument clause, not an
+        // `apply` on what the first clause returned.
+        15 => format!(
+            "{{ def u{u}(n: Int)(f: Int => Int): Int = f(n); \
+             println(u{u}({k}) {{ _ + {lim} }}); println(u{u}({k}) {{ x => x * x }}); \
+             println(u{u}({k})(_ * 2)) }}"
+        ),
+        // A placeholder as an initializer, then applied.
+        16 => format!(
+            "{{ val f{u}: Int => Int = _ * {k}; println(f{u}({lim})); println({xs}.map(f{u})) }}"
+        ),
+        // Scala's typed placeholder.
+        17 => format!("{{ val g{u} = (_: Int) + {k}; println(g{u}({lim})); println({xs}.map(g{u})) }}"),
+        // A leading statement in the brace block: it runs ONCE, when the block is
+        // evaluated to produce the function — not once per element.
+        18 => format!("println({xs}.map {{ println(\"once\"); _ + {k} }})"),
+        // A brace lambda whose body ends in an `if`: the block's value is the
+        // `if`'s, so this is not `Unit`.
+        19 => format!("println({xs}.map {{ x => if (x > {lim}) \"hi\" else \"lo\" }})"),
+        20 => format!(
+            "println({xs}.map {{ x => val d = x * {k}; if (d > {lim}) d else -d }})"
+        ),
+        // A bare `_` as a whole ARGUMENT: the expansion belongs to the call
+        // around it, not to the statement the call sits in. Bound to a `val`
+        // here, which is the placement the other modes never wrote — they only
+        // ever put `f(_)` inside another argument list.
+        21 => format!(
+            "{{ def h{u}(x: Int): Int = x * {k}; val e{u}: Int => Int = h{u}(_); \
+             println(e{u}({lim})); println({xs}.map(h{u}(_))); \
+             val b{u}: Int => Int = math.abs(_); println(b{u}({lim})) }}"
+        ),
+        // An explicit-parameter brace lambda beside a placeholder one, so the two
+        // spellings of the same function are compared in one probe.
+        _ => println_all(&[
+            format!("{xs}.map {{ x => x * {k} }}"),
+            format!("{xs}.map {{ _ * {k} }}"),
+        ]),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     All,
@@ -1918,6 +2033,7 @@ enum Mode {
     AssignExpr,
     AppMember,
     Narrow,
+    Braces,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1967,6 +2083,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::AssignExpr => "assignexpr",
         Mode::AppMember => "appmember",
         Mode::Narrow => "narrow",
+        Mode::Braces => "braces",
     }
 }
 
@@ -2017,6 +2134,7 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "assignexpr" => Mode::AssignExpr,
         "appmember" => Mode::AppMember,
         "narrow" => Mode::Narrow,
+        "braces" => Mode::Braces,
         _ => return None,
     })
 }
@@ -2066,6 +2184,7 @@ const CONCRETE: &[Mode] = &[
     Mode::AssignExpr,
     Mode::AppMember,
     Mode::Narrow,
+    Mode::Braces,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -2393,6 +2512,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::AssignExpr => g_assignexpr(r),
         Mode::AppMember => g_appmember(r),
         Mode::Narrow => g_narrow(r),
+        Mode::Braces => g_braces(r),
         Mode::All => unreachable!(),
     }
 }

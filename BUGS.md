@@ -52,6 +52,32 @@ reported as parse/compile errors, never silently mis-run.
   (`xs.map(f(_))` is `xs.map(x => f(x))`, per Scala's "smallest expression
   properly containing the underscore" rule) instead of passing the identity
   function. Covered by the parity fuzzer's `apply` mode.
+- **The BRACE form of an argument, and `_` inside it.** `xs.map { _ * 2 }`,
+  `xs.foldLeft(0) { _ + _ }`, `xs.sortBy { -_ }`, `xs.map { x => … }` and
+  `{ case … }` are all the same substitution: a `{ … }` group standing in for a
+  parenthesized argument clause. It works on a method (`xs.map { … }`), on a
+  plain `def` call (`once { 7 }`), and on the trailing clause of a CURRIED `def`
+  (`use(3) { _ + 1 }`, where the braces are a second argument clause and not an
+  `apply` on what the first clause returned — the compiler rejoins the clauses
+  when the callee's declared arity is exactly what they supply, so
+  `def mk(n: Int): Int => Int` called `mk(1)(2)` still dispatches through
+  `apply`).
+
+  A brace group is a BLOCK whose value is the argument, so it may hold several
+  statements and is evaluated ONCE, to produce the function — `xs.map { c += 1;
+  _ + 1 }` increments `c` once, not once per element. The block's value is its
+  trailing expression, including a trailing `if` (`xs.map { x => if (p(x)) a else
+  b }`).
+
+  A placeholder expands at the smallest expression that PROPERLY contains it, and
+  a block statement is one of those boundaries — which is what makes the brace
+  and parenthesized spellings mean the same function. So is a `val`'s initializer
+  (`val f: Int => Int = _ + 1`). Two consequences follow, both matching Scala
+  3.8.4: `(_: Int) + 1` is the TYPED placeholder — the parentheses carry the
+  ascription, not the function boundary, so the whole thing is `x => x + 1` — and
+  a statement that is nothing but `_` (`xs.map { _ }`) is refused, since there is
+  no containing expression to expand at ("Unbound placeholder parameter" in
+  Scala). Covered by the parity fuzzer's `braces` mode.
 - **User-defined methods (`def`), lexically scoped.** Helper `def`s alongside
   `main` (or inside an `extends App` body) are compiled to fusevm's native
   `Op::Call` frame ABI: parameters bind to per-call frame slots, recursion and
@@ -710,6 +736,17 @@ reported as parse/compile errors, never silently mis-run.
   than half-fixed, because a partial conversion (say, `length` counting code
   units while `charAt` still counts scalars) would be worse than either
   consistent model.
+- **A function value prints `<function1>`, not the JVM lambda's identity.**
+  Scala 3.8.4 renders a function through `Object.toString`, which is a class name
+  plus an identity hash (`T$$$Lambda/0x0000180001099c0@64c64813`) — a fresh
+  number on every run, so it is unreproducible by construction, the same category
+  as `Array.toString`. `<function1>` is Scala 2's rendering and at least names the
+  arity. It becomes observable wherever a function reaches `println` directly,
+  which now includes the eta-expansion of a bare argument placeholder
+  (`println(xs.map(_))` prints the function `x => xs.map(x)`, not a list — see the
+  placeholder rule below). Nothing DOWNSTREAM of a function value differs: only
+  printing the function itself does. For the same reason no frozen corpus record
+  prints one.
 - **Types are not checked.** Declared types (`Int`, `String`, …) and type
   parameters (`class Box[A]`, `def id[A]`) are retained for diagnostics but do
   not gate execution — the runtime is dynamically typed on the fusevm value

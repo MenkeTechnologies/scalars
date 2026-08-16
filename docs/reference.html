@@ -2301,70 +2301,79 @@ println(add(1, 2))   // =&gt; 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-function-values-2">
           <h3><a class="doc-anchor" href="#doc-function-values-2">#</a> <code>_ (placeholder)</code></h3>
-          <p>The placeholder that makes an expression a one-argument function: `_ * 2` is `x =&gt; x * 2`. Each `_` stands for a distinct successive parameter.</p>
+          <p>The placeholder that makes an expression a one-argument function: `_ * 2` is `x =&gt; x * 2`. Each `_` stands for a distinct successive parameter. It expands at the smallest expression that properly CONTAINS it, so it works inside a brace argument (`xs.map { _ * 2 }`) and as a `val`'s initializer (`val f: Int =&gt; Int = _ + 1`), while a bare `_` argument expands its enclosing call (`xs.map(f(_))` is `xs.map(x =&gt; f(x))`). `(_: Int) + 1` is the typed form — the parentheses carry the ascription, not the boundary.</p>
           <pre><code class="lang-scala">expr containing _
-println(List(1, 2).map(_ * 2))   // =&gt; List(2, 4)</code></pre>
+println(List(1, 2).map(_ * 2))     // =&gt; List(2, 4)
+println(List(1, 2).map { _ * 2 })  // =&gt; List(2, 4)
+println(List(1, 2, 3).foldLeft(0) { _ + _ })   // =&gt; 6</code></pre>
         </article>
         <article class="doc-entry" id="doc-function-values-3">
-          <h3><a class="doc-anchor" href="#doc-function-values-3">#</a> <code>eta-expansion</code></h3>
+          <h3><a class="doc-anchor" href="#doc-function-values-3">#</a> <code>{ … } (argument)</code></h3>
+          <p>A brace group standing in for a parenthesized argument clause. It is a BLOCK whose value is the argument, so it may hold several statements and is evaluated once — to produce the function, not once per element. Works on a method (`xs.map { … }`), on a plain call (`once { 7 }`), and on the trailing clause of a curried `def` (`use(3) { _ + 1 }`).</p>
+          <pre><code class="lang-scala">recv.m { … }
+println(List(1, 2, 3).filter { _ &gt; 1 })          // =&gt; List(2, 3)
+println(List(1, 2).map { x =&gt; if (x &gt; 1) "hi" else "lo" })   // =&gt; List(lo, hi)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-function-values-4">
+          <h3><a class="doc-anchor" href="#doc-function-values-4">#</a> <code>eta-expansion</code></h3>
           <p>Naming a `def` where a function value is expected wraps it in a closure automatically, so a method can be passed to `map`, `filter` or any other combinator.</p>
           <pre><code class="lang-scala">xs.map(namedDef)
 def inc(x: Int) = x + 1
 println(List(1, 2).map(inc))   // =&gt; List(2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-function-values-4">
-          <h3><a class="doc-anchor" href="#doc-function-values-4">#</a> <code>apply (function)</code></h3>
+        <article class="doc-entry" id="doc-function-values-5">
+          <h3><a class="doc-anchor" href="#doc-function-values-5">#</a> <code>apply (function)</code></h3>
           <p>Invoke a function value — the method `f(x)` calls.</p>
           <pre><code class="lang-scala">f.apply(args): R
 val f = (x: Int) =&gt; x + 1
 println(f.apply(1))   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-function-values-5">
-          <h3><a class="doc-anchor" href="#doc-function-values-5">#</a> <code>call</code></h3>
+        <article class="doc-entry" id="doc-function-values-6">
+          <h3><a class="doc-anchor" href="#doc-function-values-6">#</a> <code>call</code></h3>
           <p>An alias for `apply` on a function value.</p>
           <pre><code class="lang-scala">f.call(args): R
 val f = (x: Int) =&gt; x + 1
 println(f.call(1))   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-function-values-6">
-          <h3><a class="doc-anchor" href="#doc-function-values-6">#</a> <code>isDefinedAt</code></h3>
+        <article class="doc-entry" id="doc-function-values-7">
+          <h3><a class="doc-anchor" href="#doc-function-values-7">#</a> <code>isDefinedAt</code></h3>
           <p>Whether a partial function has an arm matching the argument. A plain lambda is total, so it answers true for everything — matching Scala's implicit `Function1` to `PartialFunction` lift.</p>
           <pre><code class="lang-scala">pf.isDefinedAt(x: A): Boolean
 val pf: PartialFunction[Int, String] = { case 1 =&gt; "one" }
 println(pf.isDefinedAt(2))   // =&gt; false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-function-values-7">
-          <h3><a class="doc-anchor" href="#doc-function-values-7">#</a> <code>applyOrElse</code></h3>
+        <article class="doc-entry" id="doc-function-values-8">
+          <h3><a class="doc-anchor" href="#doc-function-values-8">#</a> <code>applyOrElse</code></h3>
           <p>Apply the partial function, or the default when it is not defined at the argument. One `isDefinedAt` test runs and then exactly one body, so no arm runs twice. The default is itself a function of the argument.</p>
           <pre><code class="lang-scala">pf.applyOrElse(x: A, default: A =&gt; B): B
 val pf: PartialFunction[Int, String] = { case 1 =&gt; "one" }
 println(pf.applyOrElse(2, (x: Int) =&gt; "no"))   // =&gt; no</code></pre>
         </article>
-        <article class="doc-entry" id="doc-function-values-8">
-          <h3><a class="doc-anchor" href="#doc-function-values-8">#</a> <code>lift</code></h3>
+        <article class="doc-entry" id="doc-function-values-9">
+          <h3><a class="doc-anchor" href="#doc-function-values-9">#</a> <code>lift</code></h3>
           <p>Turn a partial function into a total one answering `Some(v)` where it is defined and `None` where it is not. A trailing application is folded into the same call, so `pf.lift(x)` both builds and applies it.</p>
           <pre><code class="lang-scala">pf.lift: A =&gt; Option[B]
 val pf: PartialFunction[Int, Int] = { case 1 =&gt; 10 }
 println(pf.lift(2))   // =&gt; None</code></pre>
         </article>
-        <article class="doc-entry" id="doc-function-values-9">
-          <h3><a class="doc-anchor" href="#doc-function-values-9">#</a> <code>orElse</code></h3>
+        <article class="doc-entry" id="doc-function-values-10">
+          <h3><a class="doc-anchor" href="#doc-function-values-10">#</a> <code>orElse</code></h3>
           <p>A partial function that tries the receiver and falls back to the argument where the receiver is not defined.</p>
           <pre><code class="lang-scala">pf.orElse(other: PartialFunction[A, B]): PartialFunction[A, B]
 val a: PartialFunction[Int, Int] = { case 1 =&gt; 10 }
 val b: PartialFunction[Int, Int] = { case 2 =&gt; 20 }
 println((a orElse b)(2))   // =&gt; 20</code></pre>
         </article>
-        <article class="doc-entry" id="doc-function-values-10">
-          <h3><a class="doc-anchor" href="#doc-function-values-10">#</a> <code>andThen</code></h3>
+        <article class="doc-entry" id="doc-function-values-11">
+          <h3><a class="doc-anchor" href="#doc-function-values-11">#</a> <code>andThen</code></h3>
           <p>Compose left to right: `(f andThen g)(x)` is `g(f(x))`.</p>
           <pre><code class="lang-scala">f.andThen(g: B =&gt; C): A =&gt; C
 val f = (x: Int) =&gt; x + 1
 val g = (x: Int) =&gt; x * 2
 println((f andThen g)(3))   // =&gt; 8</code></pre>
         </article>
-        <article class="doc-entry" id="doc-function-values-11">
-          <h3><a class="doc-anchor" href="#doc-function-values-11">#</a> <code>compose</code></h3>
+        <article class="doc-entry" id="doc-function-values-12">
+          <h3><a class="doc-anchor" href="#doc-function-values-12">#</a> <code>compose</code></h3>
           <p>Compose right to left: `(f compose g)(x)` is `f(g(x))`.</p>
           <pre><code class="lang-scala">f.compose(g: C =&gt; A): C =&gt; B
 val f = (x: Int) =&gt; x + 1

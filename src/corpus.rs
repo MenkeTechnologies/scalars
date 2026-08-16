@@ -2092,8 +2092,14 @@ pub const CORPUS: &[Entry] = &[
     (
         "_ (placeholder)",
         "Function Values",
-        "The placeholder that makes an expression a one-argument function: `_ * 2` is `x => x * 2`. Each `_` stands for a distinct successive parameter.",
-        "expr containing _\nprintln(List(1, 2).map(_ * 2))   // => List(2, 4)",
+        "The placeholder that makes an expression a one-argument function: `_ * 2` is `x => x * 2`. Each `_` stands for a distinct successive parameter. It expands at the smallest expression that properly CONTAINS it, so it works inside a brace argument (`xs.map { _ * 2 }`) and as a `val`'s initializer (`val f: Int => Int = _ + 1`), while a bare `_` argument expands its enclosing call (`xs.map(f(_))` is `xs.map(x => f(x))`). `(_: Int) + 1` is the typed form — the parentheses carry the ascription, not the boundary.",
+        "expr containing _\nprintln(List(1, 2).map(_ * 2))     // => List(2, 4)\nprintln(List(1, 2).map { _ * 2 })  // => List(2, 4)\nprintln(List(1, 2, 3).foldLeft(0) { _ + _ })   // => 6",
+    ),
+    (
+        "{ … } (argument)",
+        "Function Values",
+        "A brace group standing in for a parenthesized argument clause. It is a BLOCK whose value is the argument, so it may hold several statements and is evaluated once — to produce the function, not once per element. Works on a method (`xs.map { … }`), on a plain call (`once { 7 }`), and on the trailing clause of a curried `def` (`use(3) { _ + 1 }`).",
+        "recv.m { … }\nprintln(List(1, 2, 3).filter { _ > 1 })          // => List(2, 3)\nprintln(List(1, 2).map { x => if (x > 1) \"hi\" else \"lo\" })   // => List(lo, hi)",
     ),
     (
         "eta-expansion",

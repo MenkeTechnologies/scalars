@@ -5434,3 +5434,144 @@ fn unicode_escapes_decode_in_char_string_and_interpolated_literals() {
     assert!(ok);
     assert_eq!(out, "Ab\nA\nxAy\n1\nA\n65535\n255\n0\n");
 }
+
+#[test]
+fn a_brace_group_is_an_argument_and_a_placeholder_inside_it_expands_there() {
+    // Scala's two spellings of one argument: `xs.map(_ * 2)` puts it in
+    // parentheses, `xs.map { _ * 2 }` puts it in a BLOCK whose value is the
+    // argument. The placeholder expands at the smallest enclosing expression,
+    // and a block statement is one — so both spellings are `x => x * 2`.
+    // Successive placeholders take successive parameters left to right, which
+    // is what makes `{ _ - _ }` an asymmetric fold and not `{ _ + _ }` in
+    // disguise.
+    let (out, ok) = run(&wrap(
+        "println(List(1, 2, 3).map { _ * 2 })\n  \
+         println(List(1, 2, 3).filter { _ > 1 })\n  \
+         println(List(1, 2, 3).foldLeft(0) { _ - _ })\n  \
+         println(List(\"a\", \"bb\").map { _.length })\n  \
+         println(List(3, 1, 2).sortBy { -_ })",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "List(2, 4, 6)\nList(2, 3)\n-6\nList(1, 2)\nList(3, 2, 1)\n");
+}
+
+#[test]
+fn each_brace_group_is_its_own_placeholder_scope() {
+    // Nested brace arguments must NOT pool their placeholders into one lambda:
+    // the inner `_` belongs to the inner block. Pooling them would make the
+    // outer function two-parameter and the inner one zero-parameter, which
+    // `map` would still accept from a dynamically typed runtime — and answer
+    // wrongly rather than fail.
+    let (out, ok) = run(&wrap(
+        "println(List(List(1, 2), List(3)).flatMap { _.map { _ * 2 } })\n  \
+         println(List(1, 2).map { _ * 2 }.map { _ + 100 })",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "List(2, 4, 6)\nList(102, 104)\n");
+}
+
+#[test]
+fn a_brace_argument_is_evaluated_once_not_once_per_element() {
+    // The block produces the FUNCTION; the traversal then calls that function
+    // per element. A lowering that spliced the block into the lambda body
+    // instead would run the leading statement four times here and still print
+    // the same list — only the counter can tell the two apart.
+    let (out, ok) = run(&wrap(
+        "var c = 0\n  \
+         println(List(1, 2, 3, 4).map { c += 1; _ * 2 })\n  \
+         println(c)",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "List(2, 4, 6, 8)\n1\n");
+}
+
+#[test]
+fn a_brace_group_can_stand_in_for_a_plain_calls_argument_clause() {
+    // `once { 7 }` is the brace form of `once(7)`, and `use(3) { f }` is the
+    // TRAILING CLAUSE of a curried `def` — not an `apply` on what `use(3)`
+    // returned. The distinction is the whole test: `def mk(n: Int): Int => Int`
+    // called `mk(1)(2)` IS a complete call whose result is applied, and it must
+    // keep working.
+    let (out, ok) = run(&wrap(
+        "def once(v: Int): Int = v * 2\n  \
+         def use(n: Int)(f: Int => Int): Int = f(n)\n  \
+         def mk(n: Int): Int => Int = (x: Int) => x + n\n  \
+         println(once { 7 })\n  \
+         println(once { val a = 3; a + 1 })\n  \
+         println(use(3) { _ + 1 })\n  \
+         println(use(3) { x => x * x })\n  \
+         println(use(3)(_ * 2))\n  \
+         println(mk(1)(2))",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "14\n8\n4\n9\n6\n3\n");
+}
+
+#[test]
+fn a_placeholder_expands_at_a_val_initializer_and_under_an_ascription() {
+    // A `val`'s initializer is an expression boundary too, so `_ * 3` is a
+    // function there. `(_: Int) + 1` is Scala's TYPED placeholder: the
+    // parentheses carry the ascription, NOT the function boundary, so the
+    // expansion still belongs to the enclosing expression — reading them as the
+    // boundary made the group the identity function and then added 1 to a
+    // function.
+    let (out, ok) = run(&wrap(
+        "val f: Int => Int = _ * 3\n  \
+         val g = (_: Int) + 1\n  \
+         println(f(4)); println(g(5)); println(List(1, 2).map(f)); println(List(1, 2).map(g))",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "12\n6\nList(3, 6)\nList(2, 3)\n");
+}
+
+#[test]
+fn a_bare_placeholder_block_is_refused_the_way_scala_refuses_it() {
+    // Scala 3 rejects `xs.map { _ }` with "Unbound placeholder parameter": a
+    // block statement that is NOTHING BUT a placeholder is not an expression
+    // that CONTAINS one, so there is nothing to expand. Wrapping it into the
+    // identity function would answer where the reference refuses.
+    rejects(
+        &wrap("println(List(1, 2).map { _ })"),
+        "`_` placeholder outside an argument",
+    );
+}
+
+#[test]
+fn a_bare_placeholder_argument_expands_at_the_call_around_it() {
+    // The other half of the same rule: an argument that is nothing but `_` is
+    // not the expression that contains it — the CALL is. So `math.abs(_)` is
+    // `x => math.abs(x)` wherever it appears, and `xs.map(f(_))` passes
+    // `x => f(x)` rather than `f` itself (which a dynamically typed runtime
+    // would accept and answer wrongly, not reject). Expanding at the enclosing
+    // STATEMENT instead would lift the whole `println(…)` into a function and
+    // print nothing at all.
+    let (out, ok) = run(&wrap(
+        "val f: Int => Int = math.abs(_)\n  \
+         def g(x: Int): Int = x * 10\n  \
+         println(f(-3))\n  \
+         println(List(-1, 2).map(math.abs(_)))\n  \
+         println(List(1, 2).map(g(_)))\n  \
+         List(1, 2).foreach(println(_))",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\nList(1, 2)\nList(10, 20)\n1\n2\n");
+}
+
+#[test]
+fn a_blocks_value_is_its_trailing_if() {
+    // Scala's `if` is an expression everywhere, so a block that ends in one has
+    // the branch's value — including the block a brace-argument lambda body
+    // becomes, which is where this matters most (`xs.map { x => if (p) a else b }`
+    // is the ordinary way to write a conditional mapping). Reading the trailing
+    // `if` as a statement run for effect made every one of those answer `()`,
+    // silently. A branch-less `if` still yields `Unit`, as in Scala.
+    let (out, ok) = run(&wrap(
+        "println(List(1, 2, 3).map { x => if (x > 1) \"hi\" else \"lo\" })\n  \
+         println({ val a = 1; if (a > 0) \"p\" else \"n\" })\n  \
+         println({ if (true) 7 else 8 })\n  \
+         println({ if (false) 1 })\n  \
+         println(List(1, 2, 3).map { x => val d = x * 3; if (d > 5) d else -d })",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "List(lo, hi, hi)\np\n7\n()\nList(-3, 6, 9)\n");
+}
