@@ -1897,42 +1897,60 @@ println("abc".reverse)   // =&gt; cba</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-17">
           <h3><a class="doc-anchor" href="#doc-string-methods-17">#</a> <code>toInt</code></h3>
-          <p>Parse the string as an integer, tolerating surrounding whitespace. A malformed string raises `java.lang.NumberFormatException: For input string: "…"`.</p>
+          <p>Parse the string as an `Int`. This is `java.lang.Integer.parseInt`, so it does NOT trim — `" 42".toInt` raises where `" 42".trim.toInt` answers 42 — and a value outside an `Int`'s range raises even though its digits are legal. Both failures are `java.lang.NumberFormatException: For input string: "…"`.</p>
           <pre><code class="lang-scala">s.toInt: Int
 println("42".toInt + 1)   // =&gt; 43</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-18">
-          <h3><a class="doc-anchor" href="#doc-string-methods-18">#</a> <code>toDouble</code></h3>
-          <p>Parse the string as a floating-point number, tolerating surrounding whitespace. A malformed string raises `NumberFormatException`.</p>
+          <h3><a class="doc-anchor" href="#doc-string-methods-18">#</a> <code>toByte</code></h3>
+          <p>Parse the string as a `Byte`. The digits are read as for `toInt` and then range-checked, so a string that parses but does not fit raises the different `java.lang.NumberFormatException: Value out of range. Value:"…" Radix:10`.</p>
+          <pre><code class="lang-scala">s.toByte: Byte
+println("127".toByte)   // =&gt; 127</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-19">
+          <h3><a class="doc-anchor" href="#doc-string-methods-19">#</a> <code>toShort</code></h3>
+          <p>Parse the string as a `Short` — `toByte`'s range check one width up.</p>
+          <pre><code class="lang-scala">s.toShort: Short
+println("-32768".toShort)   // =&gt; -32768</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-20">
+          <h3><a class="doc-anchor" href="#doc-string-methods-20">#</a> <code>toBoolean</code></h3>
+          <p>Parse `"true"` or `"false"`, ignoring case and WITHOUT trimming. Anything else raises `java.lang.IllegalArgumentException: For input string: "…"` — not the `NumberFormatException` the numeric conversions raise.</p>
+          <pre><code class="lang-scala">s.toBoolean: Boolean
+println("TRUE".toBoolean)   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-21">
+          <h3><a class="doc-anchor" href="#doc-string-methods-21">#</a> <code>toDouble</code></h3>
+          <p>Parse the string as a floating-point number. `java.lang.Double.parseDouble` DOES accept surrounding whitespace, which is the asymmetry with `toInt`. A malformed string raises `NumberFormatException`.</p>
           <pre><code class="lang-scala">s.toDouble: Double
 println("1.5".toDouble * 2)   // =&gt; 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-19">
-          <h3><a class="doc-anchor" href="#doc-string-methods-19">#</a> <code>charAt</code></h3>
+        <article class="doc-entry" id="doc-string-methods-22">
+          <h3><a class="doc-anchor" href="#doc-string-methods-22">#</a> <code>charAt</code></h3>
           <p>The character at an index, as a one-character string. Out of range it raises `StringIndexOutOfBoundsException` with the JDK's own message.</p>
           <pre><code class="lang-scala">s.charAt(i: Int): String
 println("abc".charAt(1))   // =&gt; b</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-20">
-          <h3><a class="doc-anchor" href="#doc-string-methods-20">#</a> <code>contains</code></h3>
+        <article class="doc-entry" id="doc-string-methods-23">
+          <h3><a class="doc-anchor" href="#doc-string-methods-23">#</a> <code>contains</code></h3>
           <p>Whether the argument occurs as a substring.</p>
           <pre><code class="lang-scala">s.contains(sub: String): Boolean
 println("abc".contains("bc"))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-21">
-          <h3><a class="doc-anchor" href="#doc-string-methods-21">#</a> <code>startsWith</code></h3>
+        <article class="doc-entry" id="doc-string-methods-24">
+          <h3><a class="doc-anchor" href="#doc-string-methods-24">#</a> <code>startsWith</code></h3>
           <p>Whether the string begins with the argument.</p>
           <pre><code class="lang-scala">s.startsWith(prefix: String): Boolean
 println("abc".startsWith("a"))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-22">
-          <h3><a class="doc-anchor" href="#doc-string-methods-22">#</a> <code>endsWith</code></h3>
+        <article class="doc-entry" id="doc-string-methods-25">
+          <h3><a class="doc-anchor" href="#doc-string-methods-25">#</a> <code>endsWith</code></h3>
           <p>Whether the string ends with the argument.</p>
           <pre><code class="lang-scala">s.endsWith(suffix: String): Boolean
 println("abc".endsWith("c"))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-23">
-          <h3><a class="doc-anchor" href="#doc-string-methods-23">#</a> <code>substring</code></h3>
+        <article class="doc-entry" id="doc-string-methods-26">
+          <h3><a class="doc-anchor" href="#doc-string-methods-26">#</a> <code>substring</code></h3>
           <p>The characters in the half-open range `[begin, end)`, or from `begin` to the end with one argument. An out-of-range or inverted range raises `StringIndexOutOfBoundsException`.</p>
           <pre><code class="lang-scala">s.substring(begin: Int[, end: Int]): String
 println("abc".substring(1))      // =&gt; bc
@@ -1999,15 +2017,16 @@ println(Int.MaxValue)   // =&gt; 2147483647</code></pre>
         </article>
         <article class="doc-entry" id="doc-int-methods-3">
           <h3><a class="doc-anchor" href="#doc-int-methods-3">#</a> <code>parseInt</code></h3>
-          <p>A `java.lang.Integer` static: `parseInt`/`parseLong` (with an optional radix), `valueOf`, `toString`, `compare`, `max`, `min`, `sum`, `signum` and `bitCount`, plus `MAX_VALUE`/`MIN_VALUE`. A malformed input raises `java.lang.NumberFormatException`. `java.lang.Double.parseDouble` and `java.lang.Boolean.parseBoolean` are the other boxes' parsers.</p>
+          <p>A `java.lang.Integer` static: the parses (`parseInt`/`parseLong`/`parseByte`/`parseShort`/`parseUnsignedInt`/`decode`/`valueOf`, most taking an optional radix), the renderings (`toString`, `toUnsignedString`, `toUnsignedLong`), the comparisons (`compare`, `compareUnsigned`, `max`, `min`, `sum`, `signum`, `hashCode`), the unsigned arithmetic (`divideUnsigned`, `remainderUnsigned`) and the bit twiddling (`bitCount`, `reverse`, `reverseBytes`, `highestOneBit`, `lowestOneBit`, `numberOfLeadingZeros`, `numberOfTrailingZeros`, `rotateLeft`, `rotateRight`), plus `MAX_VALUE`/`MIN_VALUE`. Every one of them works at the BOX's own width, so the `java.lang.Long` spelling of the same call can answer differently. A malformed input raises `java.lang.NumberFormatException`; a radix outside 2..36 raises with its own `Character.MIN_RADIX`/`MAX_RADIX` message. `java.lang.Double.parseDouble` and `java.lang.Boolean.parseBoolean` are the other boxes' parsers.</p>
           <pre><code class="lang-scala">Integer.parseInt(s: String, radix?: Int): Int
 println(Integer.parseInt("ff", 16))   // =&gt; 255</code></pre>
         </article>
         <article class="doc-entry" id="doc-int-methods-4">
           <h3><a class="doc-anchor" href="#doc-int-methods-4">#</a> <code>toHexString</code></h3>
-          <p>The two's-complement bit pattern in base 16, at the BOX's width: `Integer.toHexString(-1)` is 8 digits and `java.lang.Long.toHexString(-1L)` is 16. `toBinaryString` and `toOctalString` are the other two; the signed `Integer.toString(i, radix)` renders a `-` instead.</p>
+          <p>The two's-complement bit pattern in base 16, at the BOX's width: `Integer.toHexString(-1)` is 8 digits and `java.lang.Long.toHexString(-1L)` is 16. `toBinaryString` and `toOctalString` are the other two, and all three are also `RichInt` methods (`(-1).toHexString`), where the width comes from the receiver's own type. The signed `Integer.toString(i, radix)` renders a `-` instead; `toUnsignedString` renders the same bits with no sign at all.</p>
           <pre><code class="lang-scala">Integer.toHexString(i: Int): String
-println(Integer.toHexString(-1))   // =&gt; ffffffff</code></pre>
+println(Integer.toHexString(-1))   // =&gt; ffffffff
+println((-1L).toHexString)         // =&gt; ffffffffffffffff</code></pre>
         </article>
         <article class="doc-entry" id="doc-int-methods-5">
           <h3><a class="doc-anchor" href="#doc-int-methods-5">#</a> <code>isDigit</code></h3>
@@ -2046,56 +2065,70 @@ println(7.toDouble)   // =&gt; 7.0</code></pre>
 println(7.toFloat)   // =&gt; 7.0</code></pre>
         </article>
         <article class="doc-entry" id="doc-int-methods-11">
-          <h3><a class="doc-anchor" href="#doc-int-methods-11">#</a> <code>max</code></h3>
+          <h3><a class="doc-anchor" href="#doc-int-methods-11">#</a> <code>toByte</code></h3>
+          <p>The low eight bits, sign-extended — the JVM's `i2b`. It TRUNCATES rather than clamping, so the sign can change; the result re-enters arithmetic as an `Int`. A `Double` receiver saturates to an `Int` first and then truncates.</p>
+          <pre><code class="lang-scala">n.toByte: Byte
+println(300.toByte)        // =&gt; 44
+println(128.toByte)        // =&gt; -128
+println(128.toByte + 1)    // =&gt; -127</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-int-methods-12">
+          <h3><a class="doc-anchor" href="#doc-int-methods-12">#</a> <code>toShort</code></h3>
+          <p>The low sixteen bits, sign-extended — `toByte` one width up.</p>
+          <pre><code class="lang-scala">n.toShort: Short
+println(70000.toShort)   // =&gt; 4464</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-int-methods-13">
+          <h3><a class="doc-anchor" href="#doc-int-methods-13">#</a> <code>max</code></h3>
           <p>The larger of the receiver and the argument, staying an `Int`.</p>
           <pre><code class="lang-scala">n.max(other: Int): Int
 println(5.max(9))   // =&gt; 9</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-12">
-          <h3><a class="doc-anchor" href="#doc-int-methods-12">#</a> <code>min</code></h3>
+        <article class="doc-entry" id="doc-int-methods-14">
+          <h3><a class="doc-anchor" href="#doc-int-methods-14">#</a> <code>min</code></h3>
           <p>The smaller of the receiver and the argument, staying an `Int`.</p>
           <pre><code class="lang-scala">n.min(other: Int): Int
 println(5.min(9))   // =&gt; 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-13">
-          <h3><a class="doc-anchor" href="#doc-int-methods-13">#</a> <code>&amp; (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-15">
+          <h3><a class="doc-anchor" href="#doc-int-methods-15">#</a> <code>&amp; (Int)</code></h3>
           <p>Bitwise AND of two integers.</p>
           <pre><code class="lang-scala">n &amp; (other: Int): Int
 println(6 &amp; 3)   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-14">
-          <h3><a class="doc-anchor" href="#doc-int-methods-14">#</a> <code>| (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-16">
+          <h3><a class="doc-anchor" href="#doc-int-methods-16">#</a> <code>| (Int)</code></h3>
           <p>Bitwise OR of two integers.</p>
           <pre><code class="lang-scala">n | (other: Int): Int
 println(6 | 3)   // =&gt; 7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-15">
-          <h3><a class="doc-anchor" href="#doc-int-methods-15">#</a> <code>^ (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-17">
+          <h3><a class="doc-anchor" href="#doc-int-methods-17">#</a> <code>^ (Int)</code></h3>
           <p>Bitwise XOR of two integers.</p>
           <pre><code class="lang-scala">n ^ (other: Int): Int
 println(6 ^ 3)   // =&gt; 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-16">
-          <h3><a class="doc-anchor" href="#doc-int-methods-16">#</a> <code>unary_~</code></h3>
+        <article class="doc-entry" id="doc-int-methods-18">
+          <h3><a class="doc-anchor" href="#doc-int-methods-18">#</a> <code>unary_~</code></h3>
           <p>Bitwise complement, computed at 32-bit width as Scala does. Parenthesize a negative operand — Scala lexes `~-` as a single operator name.</p>
           <pre><code class="lang-scala">~n: Int
 println(~6)   // =&gt; -7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-17">
-          <h3><a class="doc-anchor" href="#doc-int-methods-17">#</a> <code>&lt;&lt; (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-19">
+          <h3><a class="doc-anchor" href="#doc-int-methods-19">#</a> <code>&lt;&lt; (Int)</code></h3>
           <p>Left shift at `Int` width: the distance masks to five bits and the result wraps at 32 bits, so `1 &lt;&lt; 33` is `2`, not `8589934592`.</p>
           <pre><code class="lang-scala">n &lt;&lt; (dist: Int): Int
 println(1 &lt;&lt; 4)    // =&gt; 16
 println(1 &lt;&lt; 33)   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-18">
-          <h3><a class="doc-anchor" href="#doc-int-methods-18">#</a> <code>&gt;&gt; (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-20">
+          <h3><a class="doc-anchor" href="#doc-int-methods-20">#</a> <code>&gt;&gt; (Int)</code></h3>
           <p>Arithmetic right shift at `Int` width: the sign bit is replicated, so a negative value stays negative.</p>
           <pre><code class="lang-scala">n &gt;&gt; (dist: Int): Int
 println(-16 &gt;&gt; 2)   // =&gt; -4</code></pre>
         </article>
-        <article class="doc-entry" id="doc-int-methods-19">
-          <h3><a class="doc-anchor" href="#doc-int-methods-19">#</a> <code>&gt;&gt;&gt; (Int)</code></h3>
+        <article class="doc-entry" id="doc-int-methods-21">
+          <h3><a class="doc-anchor" href="#doc-int-methods-21">#</a> <code>&gt;&gt;&gt; (Int)</code></h3>
           <p>Logical right shift at `Int` width: zeros are shifted in, so a negative value becomes a large positive one.</p>
           <pre><code class="lang-scala">n &gt;&gt;&gt; (dist: Int): Int
 println(-16 &gt;&gt;&gt; 2)   // =&gt; 1073741820</code></pre>

@@ -5185,3 +5185,252 @@ fn string_to_long_parses_and_fails_the_way_to_int_does() {
     assert!(ok);
     assert_eq!(out, "12\n9999999999\nFor input string: \"x\"\n");
 }
+
+#[test]
+fn the_narrowing_conversions_truncate_rather_than_clamp() {
+    // `toByte`/`toShort` are the JVM's `i2b`/`i2s`: the low bits of the two's
+    // complement, sign-extended. Nothing here saturates, so 300 becomes 44 and
+    // 128 changes SIGN — the opposite of `Double.toInt`, which clamps.
+    // A `Double` receiver composes the two rules in that order (`d2i` then
+    // `i2b`), which is why 1e20 narrows to -1 rather than to 0, and a `Char` is
+    // unsigned and sixteen bits wide, so a high code point also turns negative.
+    let (out, ok) = run(&wrap(
+        "println(300.toByte); println(128.toByte); println((-129).toByte)\n  \
+         println(70000.toShort); println(65535.toShort)\n  \
+         println(1000L.toByte); println(100000L.toShort)\n  \
+         println(3.7.toByte); println(1e20.toByte); println(Double.NaN.toShort)\n  \
+         println(Char.MaxValue.toByte); println('z'.toByte)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "44\n-128\n127\n4464\n-1\n-24\n-31072\n3\n-1\n0\n-1\n122\n"
+    );
+}
+
+#[test]
+fn a_narrowed_value_re_enters_arithmetic_at_int_width() {
+    // `Byte` and `Short` have no arithmetic of their own — both widen to `Int`
+    // immediately — so `128.toByte + 1` is -127, not 129 and not a second
+    // truncation. The `Char` round trip is the same rule at sixteen bits:
+    // `200.toByte` is -56, whose low sixteen bits as a code point are 65480.
+    let (out, ok) = run(&wrap(
+        "println(128.toByte + 1); println(200.toByte.toChar.toInt); println(255.toByte.toInt)",
+    ));
+    assert!(ok);
+    assert_eq!(out, "-127\n65480\n-1\n");
+}
+
+#[test]
+fn the_radix_renderings_show_the_bit_pattern_at_the_receivers_width() {
+    // `toHexString` and its siblings print the two's complement, NOT a sign, so
+    // the answer's length is the receiver's width — and the width is the one
+    // thing a single `i64` per integer cannot carry. `(-1)` and `(-1L)` are the
+    // same runtime value and must still render eight digits and sixteen.
+    let (out, ok) = run(&wrap(
+        "println(255.toHexString); println((-1).toHexString); println((-8).toBinaryString)\n  \
+         println((-1).toOctalString); println(255L.toHexString); println((-1L).toHexString)\n  \
+         println((-1L).toOctalString)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "ff\nffffffff\n11111111111111111111111111111000\n37777777777\nff\n\
+         ffffffffffffffff\n1777777777777777777777\n"
+    );
+}
+
+#[test]
+fn the_integer_parses_do_not_trim_and_check_their_own_range() {
+    // `StringOps.toInt` IS `Integer.parseInt`, which rejects the padding that
+    // `trim` would have removed and refuses a value outside the box's range even
+    // when every digit is legal. The two failures are DIFFERENT exceptions'
+    // messages: an `Int` out of range is still a format error, while a `Byte`
+    // out of range names the value and the radix.
+    let (out, ok) = run(&wrap(
+        "println(\"42\".toInt); println(\"  42  \".trim.toInt); println(\"127\".toByte)\n  \
+         println(\"-32768\".toShort)\n  \
+         println(try { \" 42\".toInt } catch { case e: Throwable => e.getMessage })\n  \
+         println(try { \"2147483648\".toInt } catch { case e: Throwable => e.getMessage })\n  \
+         println(try { \"128\".toByte } catch { case e: Throwable => e.getMessage })\n  \
+         println(try { \"7f\".toByte } catch { case e: Throwable => e.getMessage })",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "42\n42\n127\n-32768\n\
+         For input string: \" 42\"\n\
+         For input string: \"2147483648\"\n\
+         Value out of range. Value:\"128\" Radix:10\n\
+         For input string: \"7f\"\n"
+    );
+}
+
+#[test]
+fn string_to_boolean_ignores_case_and_fails_with_an_illegal_argument() {
+    // `toBoolean` is the one conversion on `String` whose failure is NOT a
+    // `NumberFormatException`, and it does not trim either — so `" true"` throws
+    // where `"TRUE"` succeeds. A handler that only catches `NumberFormatException`
+    // must therefore NOT see it.
+    let (out, ok) = run(&wrap(
+        "println(\"true\".toBoolean); println(\"FALSE\".toBoolean); println(\"True\".toBoolean)\n  \
+         println(try { \"x\".toBoolean } catch { case e: IllegalArgumentException => e.getMessage })\n  \
+         println(try { \" true\".toBoolean } catch { case e: IllegalArgumentException => e.getMessage })\n  \
+         println(try { \"\".toBoolean } catch \
+           { case e: NumberFormatException => \"wrong handler\"; case e: Throwable => e.getMessage })",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true\nfalse\ntrue\n\
+         For input string: \"x\"\n\
+         For input string: \" true\"\n\
+         For input string: \"\"\n"
+    );
+}
+
+#[test]
+fn a_radix_outside_the_character_bounds_throws_instead_of_aborting() {
+    // The JDK checks `Character.MIN_RADIX`/`MAX_RADIX` BEFORE it reads a digit,
+    // and each bound has its own message that never quotes the input. This is
+    // also the one arm here that was not a wrong answer: Rust's `from_str_radix`
+    // PANICS outside `2..=36`, so `Integer.parseInt("12", 40)` used to abort the
+    // process with a Rust backtrace rather than raise anything catchable.
+    let (out, ok) = run(&wrap(
+        "println(Integer.parseInt(\"ff\", 16)); println(Integer.parseInt(\"z\", 36))\n  \
+         println(java.lang.Long.parseLong(\"777\", 8))\n  \
+         println(try { Integer.parseInt(\"12\", 40) } catch { case e: Throwable => e.getMessage })\n  \
+         println(try { Integer.parseInt(\"12\", 1) } catch { case e: Throwable => e.getMessage })\n  \
+         println(try { Integer.parseInt(\"zz\", 16) } catch { case e: Throwable => e.getMessage })",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "255\n35\n511\n\
+         radix 40 greater than Character.MAX_RADIX\n\
+         radix 1 less than Character.MIN_RADIX\n\
+         For input string: \"zz\" under radix 16\n"
+    );
+}
+
+#[test]
+fn integer_decode_reads_every_prefix_and_blames_the_subject() {
+    // `decode` has a grammar `parseInt` does not: a sign, then `0x`/`0X`/`#`, or
+    // a bare leading `0` that makes the REST octal. Its failure quotes what is
+    // left after the prefix under the radix the prefix chose — so `"08"` blames
+    // `"8" under radix 8`, not `"08"` — and a sign in the wrong place and an
+    // empty string each get a message of their own.
+    let (out, ok) = run(&wrap(
+        "println(Integer.decode(\"0x1f\")); println(Integer.decode(\"0X1F\")); \
+         println(Integer.decode(\"#1f\"))\n  \
+         println(Integer.decode(\"017\")); println(Integer.decode(\"0\")); \
+         println(Integer.decode(\"-0x10\")); println(Integer.decode(\"+0x10\"))\n  \
+         println(java.lang.Long.decode(\"0xff\"))\n  \
+         println(try { Integer.decode(\"08\") } catch { case e: Throwable => e.getMessage })\n  \
+         println(try { Integer.decode(\"0x-1\") } catch { case e: Throwable => e.getMessage })\n  \
+         println(try { Integer.decode(\"\") } catch { case e: Throwable => e.getMessage })\n  \
+         println(try { Integer.decode(\"0xffffffff\") } catch { case e: Throwable => e.getMessage })",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "31\n31\n31\n15\n0\n-16\n16\n255\n\
+         For input string: \"8\" under radix 8\n\
+         Sign character in wrong position\n\
+         Zero length string\n\
+         For input string: \"ffffffff\" under radix 16\n"
+    );
+}
+
+#[test]
+fn the_java_lang_bit_statics_work_at_the_boxs_own_width() {
+    // Every one of these is defined on a fixed number of bits, so the SAME
+    // argument answers differently through `Integer` and through `Long`:
+    // reversing 1 lands on each width's minimum value, and counting the leading
+    // zeros of 1 gives 31 or 63. The rotations mask their distance to the width,
+    // which is what makes a negative distance well defined.
+    let (out, ok) = run(&wrap(
+        "println(Integer.reverse(1)); println(java.lang.Long.reverse(1L))\n  \
+         println(Integer.numberOfLeadingZeros(1)); println(java.lang.Long.numberOfLeadingZeros(1L))\n  \
+         println(Integer.numberOfTrailingZeros(0)); println(java.lang.Long.numberOfTrailingZeros(0L))\n  \
+         println(Integer.reverseBytes(1)); println(Integer.highestOneBit(100)); \
+         println(Integer.lowestOneBit(12))\n  \
+         println(Integer.rotateLeft(1, -1)); println(Integer.rotateRight(1, 1)); \
+         println(java.lang.Long.rotateLeft(1L, 1))",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "-2147483648\n-9223372036854775808\n31\n63\n32\n64\n\
+         16777216\n64\n4\n-2147483648\n-2147483648\n2\n"
+    );
+}
+
+#[test]
+fn the_unsigned_surface_reads_the_bits_without_a_sign() {
+    // The unsigned family reinterprets the same bits: -1 renders as 4294967295
+    // through `Integer` and as 18446744073709551615 through `Long`, and an
+    // unsigned quotient whose high bit is set comes back NEGATIVE because the
+    // result is a bit pattern again. `parseUnsignedInt` runs the trip in
+    // reverse, and it is the only parse here that tells bad DIGITS
+    // (`For input string:`) apart from a legal value that is too large — however
+    // large, so a 26-digit number is still a range error rather than a format one.
+    let (out, ok) = run(&wrap(
+        "println(java.lang.Integer.toUnsignedString(-1)); \
+         println(java.lang.Long.toUnsignedString(-1L))\n  \
+         println(java.lang.Integer.toUnsignedString(-1, 16)); \
+         println(java.lang.Integer.toUnsignedLong(-1))\n  \
+         println(java.lang.Integer.divideUnsigned(-1, 2)); \
+         println(java.lang.Integer.remainderUnsigned(-1, 3)); \
+         println(java.lang.Integer.compareUnsigned(-1, 1))\n  \
+         println(Integer.parseUnsignedInt(\"4294967295\")); \
+         println(Integer.parseUnsignedInt(\"ffffffff\", 16))\n  \
+         println(try { Integer.parseUnsignedInt(\"4294967296\") } \
+           catch { case e: Throwable => e.getMessage })\n  \
+         println(try { Integer.parseUnsignedInt(\"99999999999999999999999999\") } \
+           catch { case e: Throwable => e.getMessage })\n  \
+         println(try { Integer.parseUnsignedInt(\"zz\") } catch { case e: Throwable => e.getMessage })\n  \
+         println(try { Integer.parseUnsignedInt(\"-1\") } catch { case e: Throwable => e.getMessage })",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "4294967295\n18446744073709551615\nffffffff\n4294967295\n\
+         2147483647\n0\n1\n-1\n-1\n\
+         String value 4294967296 exceeds range of unsigned int.\n\
+         String value 99999999999999999999999999 exceeds range of unsigned int.\n\
+         For input string: \"zz\"\n\
+         Illegal leading minus sign on unsigned string -1.\n"
+    );
+}
+
+#[test]
+fn the_float_companions_non_finite_constants_are_the_doubles() {
+    // `Float.NaN` and the two infinities have ONE spelling at both widths, so
+    // they are exactly representable in this frontend's single floating value
+    // type. The finite `Float` constants are deliberately not: they would have
+    // to render through `Float.toString`, which needs a single-precision value
+    // (BUGS.md). `Double.toString` is the same shortest-round-trip rendering the
+    // implicit `"" + d` uses, so a negative zero keeps its sign.
+    let (out, ok) = run(&wrap(
+        "println(\"\" + Float.NaN + \" \" + Float.PositiveInfinity + \" \" + Float.NegativeInfinity)\n  \
+         println(java.lang.Double.toString(-0.0)); println(java.lang.Double.toString(1.5))",
+    ));
+    assert!(ok);
+    assert_eq!(out, "NaN Infinity -Infinity\n-0.0\n1.5\n");
+}
+
+#[test]
+fn unicode_escapes_decode_in_char_string_and_interpolated_literals() {
+    // A `\uXXXX` escape is read by the LEXER, in all three literal forms,
+    // and Java allows a run of `u`s before the digits (`\uuu0041` is the same
+    // `A`). It is also the only way to write a `Char` this frontend cannot get
+    // from a keystroke: `'\uffff'` is the code point `Char.MaxValue` names, and
+    // narrowing it is what makes the sixteen-bit-unsigned rule visible.
+    // A `\u00e9` is ONE character, not the six that spell it.
+    let (out, ok) = run(&wrap(
+        r#"println("\u0041b"); println("\uuu0041"); println(s"x\u0041y"); println("\u00e9".length); println('\u0041'); println('\uffff'.toInt); println('\u00ff'.toShort); println('\u0100'.toByte)"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "Ab\nA\nxAy\n1\nA\n65535\n255\n0\n");
+}

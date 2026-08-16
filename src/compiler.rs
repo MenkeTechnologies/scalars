@@ -3124,15 +3124,25 @@ impl Compiler {
         // distance to five bits and answers 256, while `1L << 40` masks to six
         // and answers 1099511627776. The host cannot tell the two apart from the
         // value alone, so a `Long` receiver is dispatched under a distinct name.
-        if args.len() == 1
-            && matches!(name, "<<" | ">>" | ">>>")
-            && self.num_ty(recv) == NumTy::Long
-        {
+        // The radix renderings are the same problem without an argument: they
+        // print the two's-complement BIT PATTERN, so `(-1).toHexString` is eight
+        // digits and `(-1L).toHexString` is sixteen. Both receivers are one
+        // `i64` at run time, so the width has to travel in the name.
+        let long_recv = self.num_ty(recv) == NumTy::Long;
+        let widthed = (args.len() == 1 && matches!(name, "<<" | ">>" | ">>>"))
+            || (args.is_empty()
+                && matches!(name, "toHexString" | "toBinaryString" | "toOctalString"));
+        if widthed && long_recv {
             self.expr(recv)?;
-            self.expr(&args[0])?;
+            for a in args {
+                self.expr(a)?;
+            }
             let nc = self.b.add_constant(Value::str(format!("{name}#long")));
             self.b.emit(Op::LoadConst(nc), line);
-            self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 3), line);
+            self.b.emit(
+                Op::CallBuiltin(crate::host::SMETHOD, args.len() as u8 + 2),
+                line,
+            );
             return Ok(());
         }
         // `Ordering.Int` / `Ordering.String` / … — the companion's members are
@@ -5093,6 +5103,13 @@ const INT_RESULT_METHODS: &[&str] = &[
     "size",
     "knownSize",
     "toInt",
+    // `Byte` and `Short` have no arithmetic of their own — both widen to `Int`
+    // the moment they enter an expression — so a `toByte`/`toShort` result types
+    // its enclosing arithmetic exactly as a `toInt` does. Without this,
+    // `128.toByte + 1` was computed at an unproven width instead of wrapping at
+    // 32 bits.
+    "toByte",
+    "toShort",
     "indexOf",
     "lastIndexOf",
     "indexWhere",

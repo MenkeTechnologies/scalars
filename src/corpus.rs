@@ -1755,13 +1755,31 @@ pub const CORPUS: &[Entry] = &[
     (
         "toInt",
         "String Methods",
-        "Parse the string as an integer, tolerating surrounding whitespace. A malformed string raises `java.lang.NumberFormatException: For input string: \"…\"`.",
+        "Parse the string as an `Int`. This is `java.lang.Integer.parseInt`, so it does NOT trim — `\" 42\".toInt` raises where `\" 42\".trim.toInt` answers 42 — and a value outside an `Int`'s range raises even though its digits are legal. Both failures are `java.lang.NumberFormatException: For input string: \"…\"`.",
         "s.toInt: Int\nprintln(\"42\".toInt + 1)   // => 43",
+    ),
+    (
+        "toByte",
+        "String Methods",
+        "Parse the string as a `Byte`. The digits are read as for `toInt` and then range-checked, so a string that parses but does not fit raises the different `java.lang.NumberFormatException: Value out of range. Value:\"…\" Radix:10`.",
+        "s.toByte: Byte\nprintln(\"127\".toByte)   // => 127",
+    ),
+    (
+        "toShort",
+        "String Methods",
+        "Parse the string as a `Short` — `toByte`'s range check one width up.",
+        "s.toShort: Short\nprintln(\"-32768\".toShort)   // => -32768",
+    ),
+    (
+        "toBoolean",
+        "String Methods",
+        "Parse `\"true\"` or `\"false\"`, ignoring case and WITHOUT trimming. Anything else raises `java.lang.IllegalArgumentException: For input string: \"…\"` — not the `NumberFormatException` the numeric conversions raise.",
+        "s.toBoolean: Boolean\nprintln(\"TRUE\".toBoolean)   // => true",
     ),
     (
         "toDouble",
         "String Methods",
-        "Parse the string as a floating-point number, tolerating surrounding whitespace. A malformed string raises `NumberFormatException`.",
+        "Parse the string as a floating-point number. `java.lang.Double.parseDouble` DOES accept surrounding whitespace, which is the asymmetry with `toInt`. A malformed string raises `NumberFormatException`.",
         "s.toDouble: Double\nprintln(\"1.5\".toDouble * 2)   // => 3.0",
     ),
     (
@@ -1811,14 +1829,14 @@ pub const CORPUS: &[Entry] = &[
     (
         "parseInt",
         "Int Methods",
-        "A `java.lang.Integer` static: `parseInt`/`parseLong` (with an optional radix), `valueOf`, `toString`, `compare`, `max`, `min`, `sum`, `signum` and `bitCount`, plus `MAX_VALUE`/`MIN_VALUE`. A malformed input raises `java.lang.NumberFormatException`. `java.lang.Double.parseDouble` and `java.lang.Boolean.parseBoolean` are the other boxes' parsers.",
+        "A `java.lang.Integer` static: the parses (`parseInt`/`parseLong`/`parseByte`/`parseShort`/`parseUnsignedInt`/`decode`/`valueOf`, most taking an optional radix), the renderings (`toString`, `toUnsignedString`, `toUnsignedLong`), the comparisons (`compare`, `compareUnsigned`, `max`, `min`, `sum`, `signum`, `hashCode`), the unsigned arithmetic (`divideUnsigned`, `remainderUnsigned`) and the bit twiddling (`bitCount`, `reverse`, `reverseBytes`, `highestOneBit`, `lowestOneBit`, `numberOfLeadingZeros`, `numberOfTrailingZeros`, `rotateLeft`, `rotateRight`), plus `MAX_VALUE`/`MIN_VALUE`. Every one of them works at the BOX's own width, so the `java.lang.Long` spelling of the same call can answer differently. A malformed input raises `java.lang.NumberFormatException`; a radix outside 2..36 raises with its own `Character.MIN_RADIX`/`MAX_RADIX` message. `java.lang.Double.parseDouble` and `java.lang.Boolean.parseBoolean` are the other boxes' parsers.",
         "Integer.parseInt(s: String, radix?: Int): Int\nprintln(Integer.parseInt(\"ff\", 16))   // => 255",
     ),
     (
         "toHexString",
         "Int Methods",
-        "The two's-complement bit pattern in base 16, at the BOX's width: `Integer.toHexString(-1)` is 8 digits and `java.lang.Long.toHexString(-1L)` is 16. `toBinaryString` and `toOctalString` are the other two; the signed `Integer.toString(i, radix)` renders a `-` instead.",
-        "Integer.toHexString(i: Int): String\nprintln(Integer.toHexString(-1))   // => ffffffff",
+        "The two's-complement bit pattern in base 16, at the BOX's width: `Integer.toHexString(-1)` is 8 digits and `java.lang.Long.toHexString(-1L)` is 16. `toBinaryString` and `toOctalString` are the other two, and all three are also `RichInt` methods (`(-1).toHexString`), where the width comes from the receiver's own type. The signed `Integer.toString(i, radix)` renders a `-` instead; `toUnsignedString` renders the same bits with no sign at all.",
+        "Integer.toHexString(i: Int): String\nprintln(Integer.toHexString(-1))   // => ffffffff\nprintln((-1L).toHexString)         // => ffffffffffffffff",
     ),
     (
         "isDigit",
@@ -1855,6 +1873,18 @@ pub const CORPUS: &[Entry] = &[
         "Int Methods",
         "The integer widened to floating point. There is no distinct 32-bit float, so this is `toDouble`.",
         "n.toFloat: Double\nprintln(7.toFloat)   // => 7.0",
+    ),
+    (
+        "toByte",
+        "Int Methods",
+        "The low eight bits, sign-extended — the JVM's `i2b`. It TRUNCATES rather than clamping, so the sign can change; the result re-enters arithmetic as an `Int`. A `Double` receiver saturates to an `Int` first and then truncates.",
+        "n.toByte: Byte\nprintln(300.toByte)        // => 44\nprintln(128.toByte)        // => -128\nprintln(128.toByte + 1)    // => -127",
+    ),
+    (
+        "toShort",
+        "Int Methods",
+        "The low sixteen bits, sign-extended — `toByte` one width up.",
+        "n.toShort: Short\nprintln(70000.toShort)   // => 4464",
     ),
     (
         "max",

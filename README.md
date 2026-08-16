@@ -547,7 +547,7 @@ probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
 `nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, `breaks`,
-`params`, `fmt`, `apply`, …). It needs a real `scala` on
+`params`, `fmt`, `apply`, `narrow`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -587,6 +587,22 @@ rejects prints nothing and exits non-zero, a frontend that rejects it too then
 "agrees", and the run scores clean having compared nothing. A run where no
 program carried signal — including `--count 0` and `--probes 0`, which both used
 to report a clean score — now exits 2 instead of green.
+
+The `narrow` mode covers the one axis the arithmetic modes cannot see: a value's
+WIDTH. Every probe in it reads an integer at a width the runtime does not carry —
+the low eight bits for `toByte`, the low sixteen for `toShort`, 32 versus 64 for
+the radix renderings and every `java.lang` bit-twiddling static, an `Int`'s range
+for `parseInt` versus a `Byte`'s for `parseByte` — so a frontend that treats them
+all as "the number" scores clean on `overflow` and wrong on all of these. It
+found the whole family missing (`toByte`/`toShort` on every receiver,
+`String.toByte`/`toShort`/`toBoolean`, the `RichInt` radix renderings,
+`Integer.decode` and the bit statics), `String.toInt` TRIMMING where
+`Integer.parseInt` does not and skipping the 32-bit range check, and the one
+divergence that was not a wrong answer at all: an out-of-range radix reached
+Rust's `from_str_radix`, which panics rather than returning an error, so
+`Integer.parseInt("12", 40)` aborted the process with a Rust backtrace instead of
+throwing a catchable `NumberFormatException`. Its `Char` operands then found
+`'\uXXXX'` escapes unlexed in every literal form.
 
 Two things the harness could not report at all, and now can. **The entry point
 was a constant, not an axis:** every probe ever generated was placed in one

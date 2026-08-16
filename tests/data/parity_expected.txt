@@ -233,3 +233,21 @@ object T extends App { println("a"); throw new IllegalStateException("boom") }	a
 object T extends App { println((1 to 10 by 0).toList) }		java.lang.IllegalArgumentException: step cannot be 0.
 object T extends App { println(scala.collection.mutable.PriorityQueue[Int]().head) }		java.util.NoSuchElementException: queue is empty
 object T extends App { println(scala.collection.mutable.Stack[Int]().pop()) }		java.util.NoSuchElementException: empty collection
+object T extends App { println(300.toByte); println(128.toByte); println(70000.toShort); println(1000L.toByte); println(3.7.toByte); println(1e20.toByte) }	44\n-128\n4464\n-24\n3\n-1\n
+object T extends App { println(128.toByte + 1); println(200.toByte.toChar.toInt); println(255.toByte.toInt) }	-127\n65480\n-1\n
+object T extends App { println(255.toHexString); println((-1).toHexString); println((-1L).toHexString); println((-8).toBinaryString); println((-1).toOctalString) }	ff\nffffffff\nffffffffffffffff\n11111111111111111111111111111000\n37777777777\n
+object T extends App { println(Integer.reverse(2)); println(Integer.highestOneBit(100)); println(Integer.numberOfLeadingZeros(0)); println(Integer.rotateLeft(1, -1)); println(java.lang.Long.reverse(1L)) }	1073741824\n64\n32\n-2147483648\n-9223372036854775808\n
+object T extends App { println(java.lang.Integer.toUnsignedString(-1)); println(java.lang.Long.toUnsignedString(-1L)); println(java.lang.Integer.divideUnsigned(-1, 2)); println(java.lang.Integer.compareUnsigned(-1, 1)) }	4294967295\n18446744073709551615\n2147483647\n1\n
+object T extends App { println(Integer.decode("0x1f")); println(Integer.decode("#1f")); println(Integer.decode("017")); println(Integer.decode("-0x10")); println(Integer.decode("0")) }	31\n31\n15\n-16\n0\n
+object T extends App { println("true".toBoolean); println("FALSE".toBoolean); println("127".toByte); println("-32768".toShort) }	true\nfalse\n127\n-32768\n
+object T extends App { println("\u0041b"); println('\uffff'.toInt); println('\u00ff'.toShort); println(s"x\u0041y") }	Ab\n65535\n255\nxAy\n
+object T extends App { println("" + Float.NaN + " " + Float.PositiveInfinity); println(java.lang.Double.toString(-0.0)) }	NaN Infinity\n-0.0\n
+object T extends App { println(" 42".toInt) }		java.lang.NumberFormatException: For input string: " 42"
+object T extends App { println("2147483648".toInt) }		java.lang.NumberFormatException: For input string: "2147483648"
+object T extends App { println("128".toByte) }		java.lang.NumberFormatException: Value out of range. Value:"128" Radix:10
+object T extends App { println(Integer.parseInt("12", 40)) }		java.lang.NumberFormatException: radix 40 greater than Character.MAX_RADIX
+object T extends App { println(Integer.parseInt("12", 1)) }		java.lang.NumberFormatException: radix 1 less than Character.MIN_RADIX
+object T extends App { println(Integer.decode("08")) }		java.lang.NumberFormatException: For input string: "8" under radix 8
+object T extends App { println("x".toBoolean) }		java.lang.IllegalArgumentException: For input string: "x"
+object T extends App { println(Integer.parseUnsignedInt("4294967296")) }		java.lang.NumberFormatException: String value 4294967296 exceeds range of unsigned int.
+object T extends App { print("a"); println(Integer.decode("")) }	a	java.lang.NumberFormatException: Zero length string

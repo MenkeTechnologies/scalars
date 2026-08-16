@@ -6341,6 +6341,203 @@ fn to_radix(mut v: i64, radix: u32) -> String {
     digits.iter().rev().collect()
 }
 
+/// The digits of an UNSIGNED 64-bit value in `radix` — what
+/// `Integer.toUnsignedString(i, radix)` and `Long.toUnsignedString(l, radix)`
+/// render. It differs from [`to_radix`] in exactly the way the JDK's two
+/// families differ: there is no sign to emit, because the bit pattern IS the
+/// number. The out-of-range radix falls back to ten, as every JDK renderer does.
+fn to_radix_unsigned(mut v: u64, radix: u32) -> String {
+    if !(2..=36).contains(&radix) {
+        return v.to_string();
+    }
+    if v == 0 {
+        return "0".to_string();
+    }
+    let mut digits = Vec::new();
+    while v != 0 {
+        let d = (v % u64::from(radix)) as u32;
+        digits.push(std::char::from_digit(d, radix).expect("digit below radix"));
+        v /= u64::from(radix);
+    }
+    digits.iter().rev().collect()
+}
+
+/// The JVM's `i2b` narrowing conversion: the low eight bits of the two's
+/// complement, sign-extended. It TRUNCATES rather than clamps, so `300.toByte`
+/// is 44 and `128.toByte` is -128 — the one place a Scala numeric conversion
+/// silently changes a value's sign.
+fn to_byte(v: i64) -> i64 {
+    i64::from(v as i8)
+}
+
+/// The JVM's `i2s` — [`to_byte`] one width up (`70000.toShort` is 4464).
+fn to_short(v: i64) -> i64 {
+    i64::from(v as i16)
+}
+
+/// `java.lang.NumberFormatException.forInputString` — the JDK names the radix in
+/// the message for every base BUT ten, which is how `Integer.decode("08")`
+/// reports `"8" under radix 8` while `"zz".toInt` reports only the string.
+fn number_format_radix(s: &str, radix: i64) -> String {
+    if radix == 10 {
+        number_format(s)
+    } else {
+        format!(
+            "scalars: java.lang.NumberFormatException: \
+             For input string: \"{s}\" under radix {radix}"
+        )
+    }
+}
+
+/// `Byte.parseByte`/`Short.parseShort`'s out-of-range message. A string whose
+/// digits parse but whose VALUE does not fit reports differently from one that
+/// does not parse at all, and the message quotes the radix it was read in.
+fn value_out_of_range(s: &str, radix: i64) -> String {
+    format!(
+        "scalars: java.lang.NumberFormatException: \
+         Value out of range. Value:\"{s}\" Radix:{radix}"
+    )
+}
+
+/// `Character.MIN_RADIX`/`MAX_RADIX`, checked BEFORE any digit is read — the
+/// order matters because each bound has its own message and neither mentions the
+/// input. This check is also what keeps a bad radix from reaching Rust's
+/// `from_str_radix`, which PANICS outside `2..=36` rather than returning an
+/// error.
+fn check_radix(radix: i64) -> Result<u32, String> {
+    if radix < 2 {
+        Err(format!(
+            "scalars: java.lang.NumberFormatException: \
+             radix {radix} less than Character.MIN_RADIX"
+        ))
+    } else if radix > 36 {
+        Err(format!(
+            "scalars: java.lang.NumberFormatException: \
+             radix {radix} greater than Character.MAX_RADIX"
+        ))
+    } else {
+        Ok(radix as u32)
+    }
+}
+
+/// `java.lang.Long.parseLong(s, radix)`. No trimming: the JDK rejects the
+/// padding that `String.trim` would have removed, which is why `" 42".toLong`
+/// throws where `" 42".trim.toLong` does not.
+fn java_parse_long(s: &str, radix: i64) -> Result<i64, String> {
+    let r = check_radix(radix)?;
+    i64::from_str_radix(s, r).map_err(|_| number_format_radix(s, radix))
+}
+
+/// `java.lang.Integer.parseInt(s, radix)` — [`java_parse_long`] plus the 32-bit
+/// range, which the JDK enforces DURING accumulation and reports as an ordinary
+/// format error: `"2147483648".toInt` is a `NumberFormatException`, not a wrap.
+fn java_parse_int(s: &str, radix: i64) -> Result<i64, String> {
+    let v = java_parse_long(s, radix)?;
+    if v < i64::from(i32::MIN) || v > i64::from(i32::MAX) {
+        return Err(number_format_radix(s, radix));
+    }
+    Ok(v)
+}
+
+/// `Byte.parseByte`/`Short.parseShort`: `parseInt` first, then the box's own
+/// range — so `"7f".toByte` fails on the DIGITS (radix ten has no `f`) while
+/// `"128".toByte` fails on the VALUE, with the two different messages.
+fn java_parse_narrow(s: &str, radix: i64, lo: i64, hi: i64) -> Result<i64, String> {
+    let v = java_parse_int(s, radix)?;
+    if v < lo || v > hi {
+        return Err(value_out_of_range(s, radix));
+    }
+    Ok(v)
+}
+
+/// `Integer.decode`/`Long.decode` — a sign, then an optional base prefix
+/// (`0x`, `0X`, `#`, or a leading `0` with digits after it), then the digits.
+///
+/// Its two failures are its own, not `parseInt`'s: an empty string is
+/// `Zero length string`, and a sign AFTER the prefix is `Sign character in wrong
+/// position`. Everything else is reported by re-parsing the SUBJECT — the text
+/// past the prefix with the sign put back — under the radix the prefix chose,
+/// which is why `decode("08")` blames `"8" under radix 8` rather than `"08"`.
+fn java_decode(s: &str, long: bool) -> Result<i64, String> {
+    if s.is_empty() {
+        return Err("scalars: java.lang.NumberFormatException: Zero length string".to_string());
+    }
+    let mut i = 0;
+    let negative = s.starts_with('-');
+    if negative || s.starts_with('+') {
+        i = 1;
+    }
+    let rest = &s[i..];
+    let radix = if rest.starts_with("0x") || rest.starts_with("0X") {
+        i += 2;
+        16
+    } else if rest.starts_with('#') {
+        i += 1;
+        16
+    } else if rest.starts_with('0') && s.len() > i + 1 {
+        i += 1;
+        8
+    } else {
+        10
+    };
+    let body = &s[i..];
+    if body.starts_with('-') || body.starts_with('+') {
+        return Err(
+            "scalars: java.lang.NumberFormatException: Sign character in wrong position"
+                .to_string(),
+        );
+    }
+    let subject = if negative {
+        format!("-{body}")
+    } else {
+        body.to_string()
+    };
+    if long {
+        java_parse_long(&subject, radix)
+    } else {
+        java_parse_int(&subject, radix)
+    }
+}
+
+/// `Integer.parseUnsignedInt` — the 32-bit UNSIGNED range, answered as the
+/// signed bit pattern (`"4294967295"` decodes to -1).
+///
+/// It separates the two ways a string can fail in a way no other parse here
+/// does: BAD DIGITS report `For input string:`, while legal digits whose value
+/// is too large report `exceeds range of unsigned int.` — and that stays true
+/// however large the value is, so `"99999999999999999999999999"` is a range
+/// error rather than the format error a 64-bit parse of it would raise.
+fn java_parse_unsigned_int(s: &str, radix: i64) -> Result<i64, String> {
+    let r = check_radix(radix)?;
+    if s.starts_with('-') {
+        return Err(format!(
+            "scalars: java.lang.NumberFormatException: \
+             Illegal leading minus sign on unsigned string {s}."
+        ));
+    }
+    let body = s.strip_prefix('+').unwrap_or(s);
+    if body.is_empty() || body.chars().any(|c| c.to_digit(r).is_none()) {
+        return Err(number_format_radix(s, radix));
+    }
+    let too_big = || {
+        format!(
+            "scalars: java.lang.NumberFormatException: \
+             String value {s} exceeds range of unsigned int."
+        )
+    };
+    let mut v: u64 = 0;
+    for c in body.chars() {
+        let d = u64::from(c.to_digit(r).expect("digit checked above"));
+        // Every digit only grows the value, so leaving the range once is final.
+        v = v
+            .checked_mul(u64::from(r))
+            .and_then(|x| x.checked_add(d))
+            .filter(|x| *x <= u64::from(u32::MAX))
+            .ok_or_else(too_big)?;
+    }
+    Ok(i64::from(v as u32 as i32))
+}
+
 /// A boxed-primitive or `String` companion member. The Scala companions
 /// (`Int`, `Double`, …) carry only the `MaxValue`-family constants; the
 /// `java.lang` boxes (`java.Integer`, `java.Character`, …) carry the JDK
@@ -6378,6 +6575,16 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         ("Double", "PositiveInfinity", 0) => Ok(Value::float(f64::INFINITY)),
         ("Double", "NegativeInfinity", 0) => Ok(Value::float(f64::NEG_INFINITY)),
         ("Double", "NaN", 0) => Ok(Value::float(f64::NAN)),
+        // `Float`'s three non-finite constants, which are the ones a `Double`
+        // holds EXACTLY — `Float.NaN` and the two infinities have a single
+        // spelling at both widths, so no precision is claimed here that the
+        // value model does not have. The finite `Float` constants
+        // (`MaxValue`/`MinValue`/`MinPositiveValue`) are deliberately absent:
+        // they round-trip through `Float.toString`, and this frontend has no
+        // single-precision value to render (see BUGS.md).
+        ("Float", "NaN", 0) => Ok(Value::float(f64::NAN)),
+        ("Float", "PositiveInfinity", 0) => Ok(Value::float(f64::INFINITY)),
+        ("Float", "NegativeInfinity", 0) => Ok(Value::float(f64::NEG_INFINITY)),
         // ── The `java.lang` boxes' constants ─────────────────────────────────
         ("java.Integer", "MAX_VALUE", 0) => Ok(Value::int(i32::MAX as i64)),
         ("java.Integer", "MIN_VALUE", 0) => Ok(Value::int(i32::MIN as i64)),
@@ -6392,24 +6599,61 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         ("java.Double", "NaN", 0) => Ok(Value::float(f64::NAN)),
         ("java.Double", "POSITIVE_INFINITY", 0) => Ok(Value::float(f64::INFINITY)),
         ("java.Double", "NEGATIVE_INFINITY", 0) => Ok(Value::float(f64::NEG_INFINITY)),
+        ("java.Float", "NaN", 0) => Ok(Value::float(f64::NAN)),
+        ("java.Float", "POSITIVE_INFINITY", 0) => Ok(Value::float(f64::INFINITY)),
+        ("java.Float", "NEGATIVE_INFINITY", 0) => Ok(Value::float(f64::NEG_INFINITY)),
         // ── Parsing ──────────────────────────────────────────────────────────
         // The JDK does NOT trim, so `Integer.parseInt(" 1")` throws where
         // `" 1".trim.toInt` does not.
+        //
+        // Which WIDTH the digits are checked against is the method's, not the
+        // module's: every one of these reads at 64 bits and then applies its own
+        // range, and the range is where the three distinct JDK messages come
+        // from — `For input string:` when the digits (or an `Int`'s 32-bit
+        // range) reject the text, `Value out of range.` when a `Byte`/`Short`
+        // does, and the two `Character.*_RADIX` texts when the base itself is
+        // impossible. That last one used to reach Rust's `from_str_radix`, which
+        // PANICS outside `2..=36`: `Integer.parseInt("12", 40)` aborted the
+        // process with a Rust backtrace instead of throwing.
         (
             "java.Integer" | "java.Long" | "java.Short" | "java.Byte",
             "parseInt" | "parseLong" | "parseShort" | "parseByte" | "valueOf" | "decode",
-            1,
+            1 | 2,
         ) if matches!(args[0], Value::Str(_)) => {
             let s = args[0].as_str_cow();
-            s.parse::<i64>()
-                .map(Value::int)
-                .map_err(|_| number_format(&s))
+            let radix = if args.len() == 2 { i(1) } else { 10 };
+            let byte = || java_parse_narrow(&s, radix, i64::from(i8::MIN), i64::from(i8::MAX));
+            let short = || java_parse_narrow(&s, radix, i64::from(i16::MIN), i64::from(i16::MAX));
+            let v = match name {
+                "decode" => java_decode(&s, module == "java.Long"),
+                "parseLong" => java_parse_long(&s, radix),
+                "parseByte" => byte(),
+                "parseShort" => short(),
+                // `valueOf` is the box's OWN parse, so it is the one member here
+                // whose width comes from the module rather than the name.
+                "valueOf" => match module {
+                    "java.Long" => java_parse_long(&s, radix),
+                    "java.Byte" => byte(),
+                    "java.Short" => short(),
+                    _ => java_parse_int(&s, radix),
+                },
+                _ => java_parse_int(&s, radix),
+            }?;
+            Ok(Value::int(v))
         }
-        ("java.Integer" | "java.Long", "parseInt" | "parseLong" | "valueOf", 2) => {
+        // A `null` argument is its own message — the JDK checks for it before it
+        // looks at any character, so it never becomes `For input string: "null"`.
+        (
+            "java.Integer" | "java.Long" | "java.Short" | "java.Byte",
+            "parseInt" | "parseLong" | "parseShort" | "parseByte" | "parseUnsignedInt",
+            1 | 2,
+        ) if matches!(args[0], Value::Undef) => {
+            Err("scalars: java.lang.NumberFormatException: Cannot parse null string".to_string())
+        }
+        ("java.Integer", "parseUnsignedInt", 1 | 2) => {
             let s = args[0].as_str_cow();
-            i64::from_str_radix(&s, i(1) as u32)
-                .map(Value::int)
-                .map_err(|_| number_format(&s))
+            let radix = if args.len() == 2 { i(1) } else { 10 };
+            java_parse_unsigned_int(&s, radix).map(Value::int)
         }
         ("java.Integer" | "java.Long" | "java.Short" | "java.Byte", "valueOf", 1) => {
             Ok(Value::int(i(0)))
@@ -6448,6 +6692,24 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         ("java.Integer" | "java.Long", "toString", 2) => {
             Ok(Value::str(to_radix(i(0), i(1) as u32)))
         }
+        // `toUnsignedString` reads the same bits as the number's OWN width but
+        // prints them without a sign, so `Integer.toUnsignedString(-1)` is
+        // 4294967295 and the `Long` spelling of the same bits is
+        // 18446744073709551615.
+        ("java.Integer" | "java.Long", "toUnsignedString", 1) => {
+            Ok(Value::str(unsigned(i(0)).to_string()))
+        }
+        ("java.Integer" | "java.Long", "toUnsignedString", 2) => {
+            Ok(Value::str(to_radix_unsigned(unsigned(i(0)), i(1) as u32)))
+        }
+        // `Integer.toUnsignedLong` is the widening that makes that bit pattern a
+        // number again — the only way to see an `Int`'s unsigned value as one.
+        ("java.Integer", "toUnsignedLong", 1) => Ok(Value::int(i64::from(i(0) as i32 as u32))),
+        // `Double.toString(d)` is the same shortest-round-trip rendering the
+        // implicit `"" + d` uses, so `-0.0` keeps its sign.
+        ("java.Double" | "java.Float", "toString", 1) => {
+            Ok(Value::str(format_double(args[0].to_float())))
+        }
         ("java.String", "valueOf", 1) => Ok(Value::str(scala_str(&args[0]))),
         // ── Arithmetic statics ───────────────────────────────────────────────
         ("java.Integer" | "java.Long", "compare", 2) => Ok(Value::int(match i(0).cmp(&i(1)) {
@@ -6459,8 +6721,110 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         ("java.Integer" | "java.Long", "min", 2) => Ok(Value::int(i(0).min(i(1)))),
         ("java.Integer" | "java.Long", "sum", 2) => Ok(Value::int(i(0) + i(1))),
         ("java.Integer" | "java.Long", "signum", 1) => Ok(Value::int(i(0).signum())),
-        ("java.Integer", "bitCount", 1) => Ok(Value::int((i(0) as i32).count_ones() as i64)),
-        ("java.Long", "bitCount", 1) => Ok(Value::int(i(0).count_ones() as i64)),
+        ("java.Integer", "bitCount", 1) => Ok(Value::int(i64::from((i(0) as i32).count_ones()))),
+        ("java.Long", "bitCount", 1) => Ok(Value::int(i64::from(i(0).count_ones()))),
+        // `hashCode` of a box: an `Integer`'s is the value, a `Long`'s folds the
+        // two halves together so that `5L` and `5` hash alike.
+        ("java.Integer", "hashCode", 1) => Ok(Value::int(i64::from(i(0) as i32))),
+        ("java.Long", "hashCode", 1) => {
+            let n = i(0);
+            Ok(Value::int(i64::from(
+                (n ^ ((n as u64) >> 32) as i64) as i32,
+            )))
+        }
+        // ── Bit twiddling ────────────────────────────────────────────────────
+        // Every one of these is defined on the box's OWN width, which the value
+        // model cannot recover from an `i64`: `Integer.reverse(1)` is
+        // -2147483648 and `Long.reverse(1L)` is -9223372036854775808. The module
+        // is the only place that width survives, so each is written twice rather
+        // than once over a widened value.
+        ("java.Integer", "reverse", 1) => Ok(Value::int(i64::from((i(0) as i32).reverse_bits()))),
+        ("java.Long", "reverse", 1) => Ok(Value::int(i(0).reverse_bits())),
+        ("java.Integer", "reverseBytes", 1) => {
+            Ok(Value::int(i64::from((i(0) as i32).swap_bytes())))
+        }
+        ("java.Long", "reverseBytes", 1) => Ok(Value::int(i(0).swap_bytes())),
+        ("java.Integer", "highestOneBit", 1) => {
+            let n = i(0) as i32;
+            Ok(Value::int(i64::from(if n == 0 {
+                0
+            } else {
+                1i32 << (31 - n.leading_zeros())
+            })))
+        }
+        ("java.Long", "highestOneBit", 1) => {
+            let n = i(0);
+            Ok(Value::int(if n == 0 {
+                0
+            } else {
+                1i64 << (63 - n.leading_zeros())
+            }))
+        }
+        ("java.Integer", "lowestOneBit", 1) => {
+            let n = i(0) as i32;
+            Ok(Value::int(i64::from(n & n.wrapping_neg())))
+        }
+        ("java.Long", "lowestOneBit", 1) => {
+            let n = i(0);
+            Ok(Value::int(n & n.wrapping_neg()))
+        }
+        // The two counts answer the FULL width for zero (32 and 64), which is
+        // the one input where a naive "index of the first set bit" disagrees.
+        ("java.Integer", "numberOfLeadingZeros", 1) => {
+            Ok(Value::int(i64::from((i(0) as i32).leading_zeros())))
+        }
+        ("java.Long", "numberOfLeadingZeros", 1) => Ok(Value::int(i64::from(i(0).leading_zeros()))),
+        ("java.Integer", "numberOfTrailingZeros", 1) => {
+            Ok(Value::int(i64::from((i(0) as i32).trailing_zeros())))
+        }
+        ("java.Long", "numberOfTrailingZeros", 1) => {
+            Ok(Value::int(i64::from(i(0).trailing_zeros())))
+        }
+        // The JDK masks the distance to the width's own bit count, so a negative
+        // or oversized rotation is well defined rather than an error.
+        ("java.Integer", "rotateLeft" | "rotateRight", 2) => {
+            let (n, d) = (i(0) as i32, i(1) as u32 & 31);
+            Ok(Value::int(i64::from(if name == "rotateLeft" {
+                n.rotate_left(d)
+            } else {
+                n.rotate_right(d)
+            })))
+        }
+        ("java.Long", "rotateLeft" | "rotateRight", 2) => {
+            let (n, d) = (i(0), i(1) as u32 & 63);
+            Ok(Value::int(if name == "rotateLeft" {
+                n.rotate_left(d)
+            } else {
+                n.rotate_right(d)
+            }))
+        }
+        // ── Unsigned arithmetic ──────────────────────────────────────────────
+        ("java.Integer" | "java.Long", "compareUnsigned", 2) => {
+            Ok(Value::int(match unsigned(i(0)).cmp(&unsigned(i(1))) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }))
+        }
+        ("java.Integer" | "java.Long", "divideUnsigned" | "remainderUnsigned", 2) => {
+            let (a, b) = (unsigned(i(0)), unsigned(i(1)));
+            if b == 0 {
+                return Err("scalars: java.lang.ArithmeticException: / by zero".to_string());
+            }
+            let r = if name == "divideUnsigned" {
+                a / b
+            } else {
+                a % b
+            };
+            // The quotient is a bit pattern at the box's own width again: an
+            // `Int` division whose result has the high bit set comes back
+            // negative.
+            Ok(Value::int(if module == "java.Long" {
+                r as i64
+            } else {
+                i64::from(r as u32 as i32)
+            }))
+        }
         // ── `java.lang.Character` ────────────────────────────────────────────
         ("java.Character", _, 1) => {
             let c = as_char(&args[0])
@@ -6898,8 +7262,13 @@ fn char_method(c: char, name: &str, args: &[Value]) -> Result<Value, String> {
     // `isDigit` is Java's ASCII-and-Unicode-decimal test, not `is_numeric`.
     let cls = |b: bool| Ok(Value::bool(b));
     match (name, args.len()) {
-        // Numeric conversions — the code point, never a parse of the text.
-        ("toInt" | "toLong" | "toShort" | "toByte", 0) => Ok(Value::int(code)),
+        // Numeric conversions — the code point, never a parse of the text. A
+        // `Char` is UNSIGNED and sixteen bits wide, so the two narrowing
+        // conversions can turn a high code point negative: `Char.MaxValue.toByte`
+        // and `.toShort` are both -1.
+        ("toInt" | "toLong", 0) => Ok(Value::int(code)),
+        ("toShort", 0) => Ok(Value::int(to_short(code))),
+        ("toByte", 0) => Ok(Value::int(to_byte(code))),
         ("toDouble" | "toFloat", 0) => Ok(Value::float(code as f64)),
         ("toChar", 0) => Ok(make_char(c)),
         // `Char.hashCode` is the code point (as `java.lang.Character`'s is).
@@ -7154,14 +7523,39 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // exactly that view here.
         ("toSeq", 0) => Ok(Value::str(s)),
         ("reverse", 0) => Ok(Value::str(s.chars().rev().collect::<String>())),
-        // `toLong` shares the parse: the value model is one `i64`, so the two
-        // differ only in the STATIC width, which is read off the AST.
-        ("toInt" | "toLong", 0) => s.trim().parse::<i64>().map(Value::int).map_err(|_| {
+        // `StringOps.toInt` IS `Integer.parseInt`, and the JDK's integer parses
+        // do not trim: `" 42".toInt` throws where `" 42".trim.toInt` answers 42,
+        // and `"2147483648".toInt` is out of an `Int`'s range even though every
+        // digit is legal. `toLong` is the same parse one width up, and the two
+        // narrowing conversions add the box's own range check on top.
+        ("toInt", 0) => java_parse_int(s, 10).map(Value::int),
+        ("toLong", 0) => java_parse_long(s, 10).map(Value::int),
+        ("toByte", 0) => {
+            java_parse_narrow(s, 10, i64::from(i8::MIN), i64::from(i8::MAX)).map(Value::int)
+        }
+        ("toShort", 0) => {
+            java_parse_narrow(s, 10, i64::from(i16::MIN), i64::from(i16::MAX)).map(Value::int)
+        }
+        // `Double.parseDouble` DOES accept surrounding whitespace, which is the
+        // asymmetry above: the same padding that makes `toInt` throw is fine
+        // here.
+        ("toDouble" | "toFloat", 0) => s.trim().parse::<f64>().map(Value::float).map_err(|_| {
             format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
         }),
-        ("toDouble", 0) => s.trim().parse::<f64>().map(Value::float).map_err(|_| {
-            format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
-        }),
+        // `StringOps.toBoolean` is case-insensitive but NOT trimming, and its
+        // failure is an `IllegalArgumentException` rather than the
+        // `NumberFormatException` every other conversion here raises.
+        ("toBoolean", 0) => {
+            if s.eq_ignore_ascii_case("true") {
+                Ok(Value::Bool(true))
+            } else if s.eq_ignore_ascii_case("false") {
+                Ok(Value::Bool(false))
+            } else {
+                Err(format!(
+                    "scalars: java.lang.IllegalArgumentException: For input string: \"{s}\""
+                ))
+            }
+        }
         ("charAt", 1) => {
             let i = args[0].to_int();
             let chars: Vec<char> = s.chars().collect();
@@ -7347,8 +7741,8 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // unrecognized name is "no such method".
         (
             "length" | "size" | "isEmpty" | "nonEmpty" | "toUpperCase" | "toLowerCase" | "trim"
-            | "reverse" | "toInt" | "toLong" | "toDouble" | "charAt" | "contains" | "startsWith"
-            | "endsWith" | "substring",
+            | "reverse" | "toInt" | "toLong" | "toByte" | "toShort" | "toDouble" | "toBoolean"
+            | "charAt" | "contains" | "startsWith" | "endsWith" | "substring",
             _,
         ) => Err(arity_err()),
         _ => Err(no_such_method(&Value::str(s), name)),
@@ -8020,16 +8414,34 @@ fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("abs", 0) => Ok(Value::int(n.wrapping_abs())),
         ("toDouble" | "toFloat", 0) => Ok(Value::float(n as f64)),
         ("toInt" | "toLong", 0) => Ok(Value::int(n)),
+        // The narrowing conversions. `toInt` above is a no-op here because the
+        // compiler already wraps an `Int`-typed result to 32 bits; these two have
+        // no such lowering, so the truncation happens at the call.
+        ("toByte", 0) => Ok(Value::int(to_byte(n))),
+        ("toShort", 0) => Ok(Value::int(to_short(n))),
         // `('a' + 1).toChar` — the round trip back from code point to `Char`.
         ("toChar", 0) => Ok(make_char(char_of_code(n))),
+        // `RichInt`'s radix renderings, which show the two's-complement BIT
+        // PATTERN rather than a sign: `(-1).toHexString` is eight `f`s. The
+        // receiver's width decides how many digits that is, and the value model
+        // cannot tell an `Int` from a `Long`, so a `Long` receiver is dispatched
+        // under the `#long` name the compiler picks from the static type — the
+        // same mechanism the shift operators use.
+        ("toHexString", 0) => Ok(Value::str(format!("{:x}", n as i32 as u32))),
+        ("toBinaryString", 0) => Ok(Value::str(format!("{:b}", n as i32 as u32))),
+        ("toOctalString", 0) => Ok(Value::str(format!("{:o}", n as i32 as u32))),
+        ("toHexString#long", 0) => Ok(Value::str(format!("{:x}", n as u64))),
+        ("toBinaryString#long", 0) => Ok(Value::str(format!("{:b}", n as u64))),
+        ("toOctalString#long", 0) => Ok(Value::str(format!("{:o}", n as u64))),
         ("max", 1) => Ok(Value::int(n.max(args[0].to_int()))),
         ("min", 1) => Ok(Value::int(n.min(args[0].to_int()))),
         // `RichInt.signum` and `Integer.compare`, both answering an `Int`.
         ("signum", 0) => Ok(Value::int(n.signum())),
         ("compareTo" | "compare", 1) => Ok(Value::int(n.cmp(&args[0].to_int()) as i64)),
         (
-            "abs" | "toDouble" | "toFloat" | "toInt" | "toLong" | "max" | "min" | "signum"
-            | "compareTo" | "compare",
+            "abs" | "toDouble" | "toFloat" | "toInt" | "toLong" | "toByte" | "toShort" | "max"
+            | "min" | "signum" | "compareTo" | "compare" | "toHexString" | "toBinaryString"
+            | "toOctalString",
             _,
         ) => Err(format!("scalars: Int.{name}: wrong number of arguments")),
         // The bitwise and shift operators. Scala evaluates these at `Int` width
@@ -8090,6 +8502,11 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         // 1.45, at both widths, so `d2l` is the same cast one size up.
         ("toInt", 0) => Ok(Value::int(i64::from(f as i32))),
         ("toLong", 0) => Ok(Value::int(f as i64)),
+        // The JVM has no `d2b`/`d2s`: `d.toByte` is `d2i` followed by `i2b`, so
+        // the SATURATING cast happens first and the truncation second. That is
+        // why `1e20.toByte` is -1 (Int.MaxValue's low byte) rather than 0.
+        ("toByte", 0) => Ok(Value::int(to_byte(i64::from(f as i32)))),
+        ("toShort", 0) => Ok(Value::int(to_short(i64::from(f as i32)))),
         ("toChar", 0) => Ok(make_char(char_of_code(f as i64))),
         ("toDouble" | "toFloat", 0) => Ok(Value::float(f)),
         ("isNaN", 0) => Ok(Value::bool(f.is_nan())),
@@ -8113,8 +8530,9 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::int(double_total_cmp(f, args[0].to_float()) as i64))
         }
         (
-            "abs" | "toInt" | "toLong" | "toDouble" | "toFloat" | "isNaN" | "isInfinity"
-            | "isInfinite" | "round" | "max" | "min" | "signum" | "compareTo" | "compare",
+            "abs" | "toInt" | "toLong" | "toByte" | "toShort" | "toDouble" | "toFloat" | "isNaN"
+            | "isInfinity" | "isInfinite" | "round" | "max" | "min" | "signum" | "compareTo"
+            | "compare",
             _,
         ) => Err(format!("scalars: Double.{name}: wrong number of arguments")),
         // `x.formatted(spec)` on `Any` — the argument is the format string.

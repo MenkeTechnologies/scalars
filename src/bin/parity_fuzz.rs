@@ -1917,6 +1917,7 @@ enum Mode {
     PlaceAssign,
     AssignExpr,
     AppMember,
+    Narrow,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1965,6 +1966,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::PlaceAssign => "placeassign",
         Mode::AssignExpr => "assignexpr",
         Mode::AppMember => "appmember",
+        Mode::Narrow => "narrow",
     }
 }
 
@@ -2014,6 +2016,7 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "placeassign" => Mode::PlaceAssign,
         "assignexpr" => Mode::AssignExpr,
         "appmember" => Mode::AppMember,
+        "narrow" => Mode::Narrow,
         _ => return None,
     })
 }
@@ -2062,6 +2065,7 @@ const CONCRETE: &[Mode] = &[
     Mode::PlaceAssign,
     Mode::AssignExpr,
     Mode::AppMember,
+    Mode::Narrow,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -2388,6 +2392,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::PlaceAssign => g_placeassign(r),
         Mode::AssignExpr => g_assignexpr(r),
         Mode::AppMember => g_appmember(r),
+        Mode::Narrow => g_narrow(r),
         Mode::All => unreachable!(),
     }
 }
@@ -2615,6 +2620,232 @@ fn g_appmember(r: &mut Rng) -> String {
             "val c{u} = new C{u}({a}); println(c{u}.twice); class C{u}(val n: Int) \
              {{ def twice = n + n + {b} }}"
         ),
+    }
+}
+
+/// Operands chosen so that the low eight and low sixteen bits are interesting:
+/// each one either straddles a byte boundary, sits exactly on one, or has a sign
+/// that only appears after truncation.
+const NARROW_INTS: &[&str] = &[
+    "0",
+    "1",
+    "127",
+    "128",
+    "255",
+    "256",
+    "300",
+    "-1",
+    "-128",
+    "-129",
+    "-200",
+    "32767",
+    "32768",
+    "65535",
+    "65536",
+    "70000",
+    "-70000",
+    "2147483647",
+    "-2147483648",
+];
+
+/// The same values written as `Long`s, plus two that only a `Long` can hold.
+/// They matter because the RENDERINGS are width-sensitive and the value model is
+/// not: `(-1).toHexString` is eight digits and `(-1L).toHexString` is sixteen,
+/// and nothing at run time distinguishes the two receivers.
+const NARROW_LONGS: &[&str] = &[
+    "0L",
+    "1L",
+    "-1L",
+    "255L",
+    "1000L",
+    "100000L",
+    "-100000L",
+    "4294967296L",
+    "9223372036854775807L",
+    "-9223372036854775808L",
+];
+
+/// Radix arguments, including the two the JDK rejects by name and the two
+/// boundary bases it accepts.
+const RADIXES: &[&str] = &["2", "8", "10", "16", "36", "1", "0", "37", "40", "-1"];
+
+/// Strings for the integral parses: valid at some base, valid but out of some
+/// box's range, padded (which the integer parses reject and `toDouble` accepts),
+/// and outright malformed.
+const NUM_STRS: &[&str] = &[
+    "\"42\"",
+    "\"-42\"",
+    "\"+5\"",
+    "\"0\"",
+    "\"007\"",
+    "\"127\"",
+    "\"128\"",
+    "\"-128\"",
+    "\"32768\"",
+    "\"2147483647\"",
+    "\"2147483648\"",
+    "\"-2147483649\"",
+    "\"9223372036854775807\"",
+    "\"9223372036854775808\"",
+    "\"ff\"",
+    "\"7f\"",
+    "\"zz\"",
+    "\"z\"",
+    "\" 42\"",
+    "\"42 \"",
+    "\"\"",
+    "\"1.5\"",
+    "\"1_0\"",
+];
+
+/// Strings shaped like `Integer.decode` input: every prefix it recognizes, the
+/// sign in both the legal and the illegal position, and the leading zero whose
+/// digits are then read in base EIGHT.
+const DECODE_STRS: &[&str] = &[
+    "\"0x1f\"",
+    "\"0X1F\"",
+    "\"#1f\"",
+    "\"017\"",
+    "\"08\"",
+    "\"0\"",
+    "\"-0x10\"",
+    "\"+0x10\"",
+    "\"0x-1\"",
+    "\"10\"",
+    "\" 10\"",
+    "\"\"",
+    "\"2147483648\"",
+    "\"0xffffffff\"",
+    "\"-#ff\"",
+];
+
+/// The JVM's integral conversions and the `java.lang` integer statics: the
+/// places where a value's WIDTH, not its magnitude, decides the answer.
+///
+/// This is the surface where "one `i64` per integer" stops being enough. Every
+/// probe here reads a value at a width the runtime cannot see — the low eight
+/// bits for `toByte`, the low sixteen for `toShort`, thirty-two versus sixty-four
+/// for the radix renderings and every bit-twiddling static, an `Int`'s range for
+/// `parseInt` versus a `Byte`'s for `parseByte` — so a frontend that treats them
+/// all as "the number" scores clean on arithmetic and wrong on all of these.
+///
+/// The failing arms are as load-bearing as the succeeding ones: the JDK has FOUR
+/// distinct messages here (`For input string:`, the same with ` under radix n`
+/// appended, `Value out of range.`, and the two `Character.*_RADIX` texts), and
+/// which one a given input earns is the whole specification of where the check
+/// happens. The radix bounds also cover a case that is not a wrong answer at all
+/// — Rust's `from_str_radix` PANICS outside `2..=36`, so `Integer.parseInt(s, 40)`
+/// aborted the process rather than throwing.
+fn g_narrow(r: &mut Rng) -> String {
+    let i = pick(r, NARROW_INTS);
+    let j = pick(r, NARROW_INTS);
+    let l = pick(r, NARROW_LONGS);
+    let s = pick(r, NUM_STRS);
+    let d = pick(r, DECODE_STRS);
+    let radix = pick(r, RADIXES);
+    let ch = *pick(
+        r,
+        &["'a'", "'Z'", "'0'", "'\\u00ff'", "'\\uffff'", "'\\u0100'"],
+    );
+    let f = *pick(
+        r,
+        &[
+            "3.7",
+            "-3.7",
+            "1.5",
+            "-1.5",
+            "255.9",
+            "1e20",
+            "-1e20",
+            "0.0",
+            "Double.NaN",
+        ],
+    );
+    // Anything that can raise is wrapped, so one bad input does not truncate the
+    // rest of the packed program's output on either side.
+    let caught = |e: &str| {
+        format!(
+            "try {{ println({e}) }} catch \
+             {{ case e: Throwable => println(e.getClass.getName + \": \" + e.getMessage) }}"
+        )
+    };
+    match r.below(14) {
+        // `i2b` / `i2s` off an `Int` and off a `Long`, and the `Int` arithmetic
+        // the result then enters (`Byte` and `Short` widen immediately).
+        0 => format!("println(({i}).toByte + \" \" + ({i}).toShort + \" \" + (({i}).toByte + 1))"),
+        1 => format!("println(({l}).toByte + \" \" + ({l}).toShort + \" \" + ({l}).toInt)"),
+        // `d2i` then `i2b`: the saturating cast happens first, so a huge Double
+        // narrows to the low byte of `Int.MaxValue`, not to zero.
+        2 => format!("println(({f}).toByte + \" \" + ({f}).toShort + \" \" + ({f}).toInt)"),
+        // A `Char` is unsigned and sixteen bits, so a high code point turns
+        // negative under both narrowings while `toInt` stays positive.
+        3 => format!("println({ch}.toByte + \" \" + {ch}.toShort + \" \" + {ch}.toInt)"),
+        // The round trip through `Char`, which masks to sixteen bits.
+        4 => format!("println(({i}).toChar.toInt + \" \" + ({i}).toByte.toChar.toInt)"),
+        // `RichInt`'s renderings: the bit pattern at the RECEIVER's width.
+        5 => format!(
+            "println(({i}).toHexString + \" \" + ({i}).toBinaryString + \" \" + ({i}).toOctalString)"
+        ),
+        6 => format!(
+            "println(({l}).toHexString + \" \" + ({l}).toBinaryString + \" \" + ({l}).toOctalString)"
+        ),
+        // The same three as `java.lang` statics, which take the width from the
+        // BOX rather than from the argument.
+        7 => format!(
+            "println(Integer.toHexString({i}) + \" \" + java.lang.Long.toHexString({l}) + \
+             \" \" + Integer.toUnsignedString({i}) + \" \" + java.lang.Long.toUnsignedString({l}))"
+        ),
+        // Bit twiddling, at both widths.
+        8 => format!(
+            "println(Integer.reverse({i}) + \" \" + Integer.reverseBytes({i}) + \" \" + \
+             Integer.highestOneBit({i}) + \" \" + Integer.lowestOneBit({i}))"
+        ),
+        9 => format!(
+            "println(Integer.numberOfLeadingZeros({i}) + \" \" + \
+             Integer.numberOfTrailingZeros({i}) + \" \" + Integer.bitCount({i}) + \" \" + \
+             Integer.rotateLeft({i}, {}) + \" \" + Integer.rotateRight({i}, {}))",
+            r.below(40) as i64 - 8,
+            r.below(40) as i64 - 8
+        ),
+        10 => format!(
+            "println(java.lang.Long.reverse({l}) + \" \" + java.lang.Long.highestOneBit({l}) + \
+             \" \" + java.lang.Long.numberOfTrailingZeros({l}) + \" \" + \
+             java.lang.Long.rotateLeft({l}, {}))",
+            r.below(80) as i64 - 8
+        ),
+        // Unsigned arithmetic, where an `Int` result with the high bit set comes
+        // back negative.
+        11 => caught(&format!(
+            "Integer.divideUnsigned({i}, {j}) + \" \" + Integer.remainderUnsigned({i}, {j}) + \
+             \" \" + Integer.compareUnsigned({i}, {j}) + \" \" + Integer.toUnsignedLong({i})"
+        )),
+        // The parses: the same string read at four widths and at a chosen radix,
+        // each reporting its own failure.
+        12 => {
+            let which = r.below(6);
+            let call = match which {
+                0 => format!("{s}.toInt"),
+                1 => format!("{s}.toLong"),
+                2 => format!("{s}.toByte"),
+                3 => format!("{s}.toShort"),
+                4 => format!("Integer.parseInt({s}, {radix})"),
+                _ => format!("java.lang.Long.parseLong({s}, {radix})"),
+            };
+            caught(&call)
+        }
+        // `decode`'s own prefix grammar and its two exclusive messages, plus the
+        // `Boolean` parse whose failure is an `IllegalArgumentException`.
+        _ => {
+            let which = r.below(5);
+            let call = match which {
+                0 => format!("Integer.decode({d})"),
+                1 => format!("java.lang.Long.decode({d})"),
+                2 => format!("Integer.parseUnsignedInt({s})"),
+                3 => format!("\"\" + {s}.toBoolean"),
+                _ => format!("java.lang.Byte.parseByte({s}, {radix})"),
+            };
+            caught(&call)
+        }
     }
 }
 

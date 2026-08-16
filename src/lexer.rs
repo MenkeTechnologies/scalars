@@ -450,8 +450,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             while i < bytes.len() && bytes[i] != b'"' {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
                     i += 1;
-                    s.push(unescape(bytes[i] as char));
-                    i += 1;
+                    match unicode_escape(bytes, &mut i) {
+                        Some(c) => s.push(c),
+                        None => {
+                            s.push(unescape(bytes[i] as char));
+                            i += 1;
+                        }
+                    }
                 } else {
                     // Decode a full UTF-8 char so multibyte literals survive.
                     let ch = src[i..].chars().next().unwrap();
@@ -477,9 +482,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             i += 1;
             let ch = if bytes[i] == b'\\' {
                 i += 1;
-                let c = unescape(bytes[i] as char);
-                i += 1;
-                c
+                match unicode_escape(bytes, &mut i) {
+                    Some(c) => c,
+                    None => {
+                        let c = unescape(bytes[i] as char);
+                        i += 1;
+                        c
+                    }
+                }
             } else {
                 let c = src[i..].chars().next().unwrap();
                 i += c.len_utf8();
@@ -641,8 +651,17 @@ fn lex_interp(
                 cur.push(ch);
                 i += 1 + ch.len_utf8();
             } else {
-                cur.push(unescape(bytes[i + 1] as char));
-                i += 2;
+                let mut j = i + 1;
+                match unicode_escape(bytes, &mut j) {
+                    Some(ch) => {
+                        cur.push(ch);
+                        i = j;
+                    }
+                    None => {
+                        cur.push(unescape(bytes[i + 1] as char));
+                        i += 2;
+                    }
+                }
             }
             continue;
         }
@@ -767,6 +786,29 @@ fn read_fmt(bytes: &[u8], i: &mut usize) -> Option<String> {
         *i = start; // not a valid spec — leave the `%` as literal text
         None
     }
+}
+
+/// Read a `\uXXXX` escape's code point, with the backslash already consumed and
+/// `i` on the `u`.
+///
+/// Java — and so Scala's literals — allows a RUN of `u`s before the four hex
+/// digits, which is why `"\uuu0041"` is the same `A` as `"A"`. On success
+/// `i` is left past the last digit; on failure it is untouched and the caller
+/// falls back to the one-character [`unescape`] table, so a literal that merely
+/// starts with `\u` (or names a lone UTF-16 surrogate, which is not a Rust
+/// `char`) still lexes rather than aborting the parse.
+fn unicode_escape(bytes: &[u8], i: &mut usize) -> Option<char> {
+    let mut j = *i;
+    if bytes.get(j) != Some(&b'u') {
+        return None;
+    }
+    while bytes.get(j) == Some(&b'u') {
+        j += 1;
+    }
+    let hex = std::str::from_utf8(bytes.get(j..j + 4)?).ok()?;
+    let c = char::from_u32(u32::from_str_radix(hex, 16).ok()?)?;
+    *i = j + 4;
+    Some(c)
 }
 
 fn unescape(c: char) -> char {

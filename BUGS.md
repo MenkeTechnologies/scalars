@@ -338,16 +338,39 @@ reported as parse/compile errors, never silently mis-run.
 - **Boxed-primitive and `String` companion statics.** `scala.Int`'s
   `MaxValue`/`MinValue` family (and `Double`'s `MinPositiveValue`,
   `PositiveInfinity`, `NegativeInfinity`, `NaN`), and the `java.lang` boxes'
-  statics: `Integer.parseInt`/`parseLong` (with an optional radix), `valueOf`,
-  `toString(i, radix)`, `toBinaryString`/`toHexString`/`toOctalString`,
-  `compare`, `max`, `min`, `sum`, `signum`, `bitCount`, `MAX_VALUE`/`MIN_VALUE`;
-  `Double.parseDouble`/`isNaN`/`isInfinite`; `Boolean.parseBoolean`;
+  statics: the parses `Integer.parseInt`/`parseLong`/`parseByte`/`parseShort`/
+  `parseUnsignedInt`/`decode`/`valueOf` (most taking an optional radix), the
+  renderings `toString(i, radix)`, `toBinaryString`/`toHexString`/
+  `toOctalString`, `toUnsignedString`, `toUnsignedLong`, the comparisons
+  `compare`, `compareUnsigned`, `max`, `min`, `sum`, `signum`, `hashCode`, the
+  unsigned arithmetic `divideUnsigned`/`remainderUnsigned`, the bit twiddling
+  `bitCount`, `reverse`, `reverseBytes`, `highestOneBit`, `lowestOneBit`,
+  `numberOfLeadingZeros`, `numberOfTrailingZeros`, `rotateLeft`, `rotateRight`,
+  and `MAX_VALUE`/`MIN_VALUE`;
+  `Double.parseDouble`/`isNaN`/`isInfinite`/`toString`; `Boolean.parseBoolean`;
   `Character.isDigit`/`isLetter`/`isLetterOrDigit`/`isWhitespace`/`isUpperCase`/
   `isLowerCase`/`toUpperCase`/`toLowerCase`/`getNumericValue`; and
   `String.valueOf`. The two namespaces stay APART, exactly as Scala's do —
   `Double.parseDouble` really is "not a member of object Double" there — and a
   fixed-width rendering follows its box, so `Integer.toHexString(-1)` is
-  `ffffffff` and `java.lang.Long.toHexString(-1L)` is `ffffffffffffffff`.
+  `ffffffff` and `java.lang.Long.toHexString(-1L)` is `ffffffffffffffff`. The
+  same is true of every bit-twiddling static (`Integer.reverse(1)` is
+  `-2147483648`, `Long.reverse(1L)` is `-9223372036854775808`), and of the
+  parses: which range a string is checked against is the METHOD's, which is why
+  `"128".toByte` reports `Value out of range. Value:"128" Radix:10` while
+  `"2147483648".toInt` reports `For input string: "2147483648"`. A radix outside
+  `2..36` is rejected before any digit is read, with `Character.MIN_RADIX` /
+  `MAX_RADIX` naming the bound.
+- **The narrowing conversions.** `toByte` and `toShort` are the JVM's `i2b`/
+  `i2s` — the low bits of the two's complement, sign-extended — on an `Int`, a
+  `Long`, a `Char` and a `Double` receiver, and the result re-enters arithmetic
+  at `Int` width (`128.toByte + 1` is `-127`). A `Double` composes the two JVM
+  steps in order, saturating to an `Int` first and truncating second, so
+  `1e20.toByte` is `-1`. `String` has the parsing side of the same widths
+  (`toByte`/`toShort`/`toBoolean` alongside `toInt`/`toLong`/`toDouble`), and
+  none of the INTEGER parses trim: `" 42".toInt` raises where `" 42".trim.toInt`
+  answers 42, while `toDouble` accepts the padding because
+  `Double.parseDouble` does.
 - **`getClass`.** Answers a `java.lang.Class` carrying `getName` and
   `getSimpleName`, and printing as `class <name>` (a reference type) or the bare
   name (`int`, `double`, `boolean`, `char`). Modeled for a `String`, the
@@ -605,20 +628,29 @@ reported as parse/compile errors, never silently mis-run.
   about how a program runs and goes stale with every library release. Refusing
   it is the intended behaviour, so a program asking for it gets `value getClass
   is not a member of value` rather than a plausible-looking wrong name.
-- **`Float` is not a distinct type.** There is one `Double` numeric type, so
-  `Float.MaxValue`/`MinValue`/`MinPositiveValue` are not answered. The constant
-  is the visible half of it; single precision is the rest. `0.1f + 0.2f` answers
+- **`Float` is not a distinct type.** There is one `Double` numeric type, so the
+  FINITE `Float` constants — `Float.MaxValue`/`MinValue`/`MinPositiveValue` and
+  the `java.lang.Float` spellings of them — are not answered. The constant is the
+  visible half of it; single precision is the rest. `0.1f + 0.2f` answers
   `0.30000000000000004` where Scala answers `0.3`, `1.0f / 3.0f` answers
-  `0.3333333333333333` where Scala answers `0.33333334`, and `(1.1f).getClass`
+  `0.3333333333333333` where Scala answers `0.33333334`, `Int.MaxValue.toFloat`
+  answers `2.147483647E9` where Scala answers `2.1474836E9`, `0.1f.toDouble`
+  answers `0.1` where Scala answers `0.10000000149011612`, and `(1.1f).getClass`
   is `double`, not `float`.
 
-  This is why the constants stay an ERROR rather than becoming `f32::MAX as
-  f64`: that renders `3.4028234663852886E38`, not Scala's `3.4028235E38`.
+  This is why the finite constants stay an ERROR rather than becoming `f32::MAX
+  as f64`: that renders `3.4028234663852886E38`, not Scala's `3.4028235E38`.
   Storing the shortest `Float` decimal as a `Double` instead would fix the
   printing and leave `Float.MaxValue.toDouble` wrong — a plausible-looking wrong
-  answer in place of an honest rejection. The constants land when `Float` becomes
-  a real value type with its own `f32` arithmetic and `Float.toString`
-  rendering. Every other value-class companion bound is answered.
+  answer in place of an honest rejection. They land when `Float` becomes a real
+  value type with its own `f32` arithmetic and `Float.toString` rendering.
+
+  The three NON-finite ones are answered, because they are the ones a `Double`
+  holds exactly: `Float.NaN`, `Float.PositiveInfinity` and
+  `Float.NegativeInfinity` (and `java.lang.Float`'s `NaN`/`POSITIVE_INFINITY`/
+  `NEGATIVE_INFINITY`) print `NaN`, `Infinity` and `-Infinity` at either width,
+  so no precision is claimed that the value model does not have. Every other
+  value-class companion bound is answered.
 - **`given`/`using`.** A `given` declaration and a `using` parameter list are
   both parse errors.
 
