@@ -281,7 +281,8 @@ Implemented and checked against the reference `scala`:
   `IllegalArgumentException` as Scala's `Range` does.
 - **String interpolation** — `s"…"` with `$id` and `${expr}` splices, `f"…"`
   with Java-`Formatter` specs (`%d`, `%.2f`, `%-5s`, `%05d`, `%x`, `%b`, …), and
-  `raw"…"` (escapes stay literal).
+  `raw"…"` (escapes stay literal). A `${…}` splice holds a BLOCK, as Scala's
+  does, so it may declare and sequence: `s"${ val q = 3; q * 2 }"` is `6`.
 - **Pattern matching** — `expr match { case … }` over literal, `_` wildcard,
   variable-binding, typed (`case s: String`), guarded (`case x if x > 0`), and
   constructor / case-class patterns (`case Point(x, y)`, `case Some(v)`,

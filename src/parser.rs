@@ -2969,7 +2969,35 @@ fn parse_fragment(src: &str) -> Result<Expr, String> {
         objects: Vec::new(),
     };
     p.skip_seps();
-    p.expression()
+    // Scala's `${…}` holds a BLOCK, not just an expression, so a splice may
+    // declare and sequence (`s"${ val q = 3; q * 2 }"`, which used to be
+    // `unexpected token Val in expression`). Statements are read to the end of
+    // the fragment.
+    //
+    // A lone expression statement is handed back UNWRAPPED so the ordinary
+    // `$id` / `${a + b}` splice reaches `build_interp` as the expression it
+    // always did — that function infers the first splice's numeric type to
+    // decide whether `+` concatenates or adds, and a `Block` around it would
+    // hide that.
+    let mut stmts = Vec::new();
+    while !p.is(&Tok::Eof) {
+        stmts.push(p.statement()?);
+        p.skip_seps();
+    }
+    if let [Stmt {
+        kind: StmtKind::Expr(_),
+        ..
+    }] = stmts.as_slice()
+    {
+        if let Some(Stmt {
+            kind: StmtKind::Expr(e),
+            ..
+        }) = stmts.pop()
+        {
+            return Ok(e);
+        }
+    }
+    Ok(Expr::Block(stmts))
 }
 
 /// If `e` contains underscore placeholders, rewrite it into a [`Expr::Lambda`]

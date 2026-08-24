@@ -407,3 +407,9 @@ object T extends App { println((Left("e"): Either[String, Int]).forall(_ > 9)) }
 object T extends App { val r: Either[String, Int] = Right(5); println(r.contains(5)); println(r.contains(6)) }	true\nfalse\n
 object T extends App { val r: Either[String, Int] = Right(5); println(r.fold(s => "L" + s, i => "R" + i)); println((Left("e"): Either[String, Int]).fold(s => "L" + s, i => "R" + i)) }	R5\nLe\n
 object T extends App { val r: Either[String, Int] = Right(5); println(r.filterOrElse(_ > 9, "no")); println(r.filterOrElse(_ > 1, "no")) }	Left(no)\nRight(5)\n
+object T extends App { println(s"${ val q = 3; q * 2 }") }	6\n
+object T extends App { println(s"${ var z = 1; z += 1; z }") }	2\n
+object T extends App { println(f"${ val d = 1.5; d }%.2f") }	1.50\n
+object T extends App { println(s"${ def f(x: Int) = x * 3; f(2) }") }	6\n
+object T extends App { println(s"outer ${ s"inner ${1 + 1}" } end") }	outer inner 2 end\n
+object T extends App { val n = 7; println(s"${n + 1}"); println(s"$n + 1") }	8\n7 + 1\n
