@@ -632,8 +632,11 @@ reported as parse/compile errors, never silently mis-run.
   iteration order byte-reproducible (the CHAMP trie order, the mutable table
   order); a lookup therefore scans, where Scala's hashes. Filling a
   `mutable.Map` by key measured 1.27s / 5.06s / 20.41s of user time at n = 4k /
-  8k / 16k. Element WRITES on a sequence do not have this shape — an append and
-  an `a(i) = v` are both amortized O(1) (`append_in_place`). Closing this needs
+  8k / 16k — 4x per doubling, the growth class rather than a constant factor.
+  Element WRITES on a sequence do NOT have this shape: `ListBuffer`/`ArrayBuffer`
+  `+=`, `Queue.enqueue`, `StringBuilder.append` and `a(i) = v` all measure
+  0.01-0.02 / 0.02-0.03 / 0.04-0.06s across the same n, which is 2x per doubling
+  (`append_in_place`). Closing this needs
   a hash index beside the entry vector, which has to preserve that vector as the
   order of record; it is not done, and the cost is stated here rather than
   hidden.
@@ -706,6 +709,16 @@ reported as parse/compile errors, never silently mis-run.
   answers `2.147483647E9` where Scala answers `2.1474836E9`, `0.1f.toDouble`
   answers `0.1` where Scala answers `0.10000000149011612`, and `(1.1f).getClass`
   is `double`, not `float`.
+
+  The divergence starts at the LITERAL, not just at arithmetic, which is what
+  makes a `Float`-flavoured `toString` alone insufficient: an `f` literal is
+  rounded to single precision before it is ever used, so `16777217.0f` is
+  `1.6777216E7` in Scala (the odd integer is not representable as an `f32`) and
+  `1.0e-45f` is `1.4E-45` (the smallest `f32` subnormal). Both are read at
+  double precision here and answer `1.6777217E7` and `1.0E-45`. A real `Float`
+  therefore has to round at three places — the literal, every arithmetic
+  result, and the rendering — and fixing any one alone moves the wrong answer
+  rather than removing it.
 
   This is why the finite constants stay an ERROR rather than becoming `f32::MAX
   as f64`: that renders `3.4028234663852886E38`, not Scala's `3.4028235E38`.
