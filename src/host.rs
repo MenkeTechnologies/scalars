@@ -3719,6 +3719,15 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
             Ok(n) => matches!(seq_or_tuple_len(v), Some(len) if len == n),
             Err(_) => false,
         },
+        // A THROWABLE tested outside a `catch` — `e match { case _:
+        // ArithmeticException => … }`, and the `isDefinedAt` behind the partial
+        // function `Try.recover` takes. `catch` has its own JVM-hierarchy test
+        // ([`EXC_MATCH`]), but a plain `match` reaches here, where a throwable is
+        // not a record, so EVERY typed arm used to fail. It walks the same
+        // hierarchy table, off the simple class name that table is keyed by.
+        _ if as_exc(v).is_some() => {
+            ty == "Throwable" || thrown_class(v).is_some_and(|thrown| throwable_is_a(&thrown, ty))
+        }
         // A user instance conforms to its own class and to every supertype the
         // compiler registered for it (`case c: Shape` on a `Circle`).
         _ => with_obj(v, |o| class_conforms(&o.class, ty)).unwrap_or(false),
@@ -4164,6 +4173,27 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
     // still answers `Some(x).value`, `hashCode`, `equals`, ….
     if let Some(inner) = as_option(&recv) {
         if let Some(r) = option_method(vm, inner, &name, &args) {
+            return match r {
+                Ok(v) => v,
+                Err(e) => fault(vm, e),
+            };
+        }
+    }
+
+    // `Either`'s surface, same reason and same fall-through.
+    if let Some(outcome) = as_either(&recv) {
+        if let Some(r) = either_method(vm, &recv, outcome, &name, &args) {
+            return match r {
+                Ok(v) => v,
+                Err(e) => fault(vm, e),
+            };
+        }
+    }
+
+    // `scala.util.Try`'s surface, for the same reason and with the same
+    // fall-through: `map`/`recover`/`foreach` run a closure body.
+    if let Some(outcome) = as_try(&recv) {
+        if let Some(r) = try_method(vm, &recv, outcome, &name, &args) {
             return match r {
                 Ok(v) => v,
                 Err(e) => fault(vm, e),
@@ -7276,6 +7306,26 @@ fn hash_rep(rep: HashRep, len: usize) -> HashRep {
 }
 
 /// Build a built-in `Some(v)` case-class record.
+/// Build the built-in `Success(v)` record — `scala.util.Try`'s success case.
+fn make_try_success(v: Value) -> Value {
+    heap_alloc(ScalaObj {
+        class: Arc::from("Success"),
+        is_case: true,
+        is_object: false,
+        fields: vec![(Arc::from("value"), v)],
+    })
+}
+
+/// Build the built-in `Failure(e)` record — `scala.util.Try`'s failure case.
+fn make_try_failure(e: Value) -> Value {
+    heap_alloc(ScalaObj {
+        class: Arc::from("Failure"),
+        is_case: true,
+        is_object: false,
+        fields: vec![(Arc::from("exception"), e)],
+    })
+}
+
 fn make_some(v: Value) -> Value {
     heap_alloc(ScalaObj {
         class: Arc::from("Some"),
@@ -7318,6 +7368,189 @@ fn as_option(v: &Value) -> Option<Option<Value>> {
         _ => None,
     })
     .flatten()
+}
+
+/// View a value as an `Either`: `Some(Ok(v))` for a `Right` record, `Some(Err(v))`
+/// for a `Left`, `None` for anything else. The class tag is the whole test, as
+/// in [`as_option`].
+fn as_either(v: &Value) -> Option<Result<Value, Value>> {
+    with_obj(v, |o| {
+        let field = o.fields.first().map(|(_, v)| v.clone())?;
+        match &*o.class {
+            "Right" => Some(Ok(field)),
+            "Left" => Some(Err(field)),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
+/// `scala.util.Either`'s method surface. Returns `None` when `name` is not an
+/// `Either` method, so the caller falls through to the record dispatcher (which
+/// still answers `Right(x).value`, `hashCode`, `equals`, …).
+///
+/// Scala 2.13 made `Either` RIGHT-BIASED: `map`/`flatMap`/`getOrElse`/`exists`
+/// and friends all operate on the `Right` and pass a `Left` through unchanged,
+/// which is why `outcome` is a `Result` with `Right` as the `Ok` side.
+fn either_method(
+    vm: &mut VM,
+    recv: &Value,
+    outcome: Result<Value, Value>,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    Some(match (name, args.len(), &outcome) {
+        ("isRight", 0, _) => Ok(Value::bool(outcome.is_ok())),
+        ("isLeft", 0, _) => Ok(Value::bool(outcome.is_err())),
+        ("getOrElse", 1, Ok(v)) => Ok(v.clone()),
+        ("getOrElse", 1, Err(_)) => Ok(args[0].clone()),
+        ("orElse", 1, Ok(_)) => Ok(recv.clone()),
+        ("orElse", 1, Err(_)) => Ok(args[0].clone()),
+        ("toOption", 0, _) => Ok(opt(outcome.clone().ok())),
+        ("toSeq" | "toList", 0, _) => Ok(new_list(outcome.clone().ok().into_iter().collect())),
+        // `swap` exchanges the two sides.
+        ("swap", 0, Ok(v)) => Ok(make_either(false, v.clone())),
+        ("swap", 0, Err(v)) => Ok(make_either(true, v.clone())),
+        ("contains", 1, Ok(v)) => Ok(Value::bool(value_eq(v, &args[0]))),
+        ("contains", 1, Err(_)) => Ok(Value::bool(false)),
+        // The right-biased combinators. A `Left` is returned UNCHANGED by
+        // `map`/`flatMap`/`foreach`, and answers the empty result for the
+        // predicates — `forall` on a `Left` is vacuously true, `exists` false.
+        ("map", 1, Ok(v)) => match invoke_closure(vm, &args[0], std::slice::from_ref(v)) {
+            Ok(r) => Ok(make_either(true, r)),
+            Err(e) => Err(e),
+        },
+        ("flatMap", 1, Ok(v)) => invoke_closure(vm, &args[0], std::slice::from_ref(v)),
+        ("foreach", 1, Ok(v)) => {
+            invoke_closure(vm, &args[0], std::slice::from_ref(v)).map(|_| unit_value())
+        }
+        ("map" | "flatMap", 1, Err(_)) => Ok(recv.clone()),
+        ("foreach", 1, Err(_)) => Ok(unit_value()),
+        ("exists" | "forall", 1, Ok(v)) => invoke_closure(vm, &args[0], std::slice::from_ref(v))
+            .map(|hit| Value::bool(truthy(&hit))),
+        ("exists", 1, Err(_)) => Ok(Value::bool(false)),
+        ("forall", 1, Err(_)) => Ok(Value::bool(true)),
+        // `fold(fa, fb)` applies the FIRST function to a `Left` and the second
+        // to a `Right`, so it is the one member that runs on both sides.
+        ("fold", 2, _) => {
+            let (f, v) = match &outcome {
+                Ok(v) => (&args[1], v),
+                Err(v) => (&args[0], v),
+            };
+            invoke_closure(vm, f, std::slice::from_ref(v))
+        }
+        // A `Right` failing the predicate becomes `Left(zero)`; a `Left` is
+        // already left and passes through.
+        ("filterOrElse", 2, Ok(v)) => match invoke_closure(vm, &args[0], std::slice::from_ref(v)) {
+            Ok(hit) if truthy(&hit) => Ok(recv.clone()),
+            Ok(_) => Ok(make_either(false, args[1].clone())),
+            Err(e) => Err(e),
+        },
+        ("filterOrElse", 2, Err(_)) => Ok(recv.clone()),
+        _ => return None,
+    })
+}
+
+/// View a value as a `scala.util.Try`: `Some(Ok(v))` for a `Success` record,
+/// `Some(Err(e))` for a `Failure`, `None` for anything else.
+///
+/// As with [`as_option`], the class tag is the whole test — the compiler injects
+/// these two case classes unless the user shadows them, in which case the user's
+/// own record dispatches here and gets the same surface.
+fn as_try(v: &Value) -> Option<Result<Value, Value>> {
+    with_obj(v, |o| {
+        let field = o.fields.first().map(|(_, v)| v.clone())?;
+        match &*o.class {
+            "Success" => Some(Ok(field)),
+            "Failure" => Some(Err(field)),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
+/// `scala.util.Try`'s method surface. Returns `None` when `name` is not a `Try`
+/// method, so the caller falls through to the record dispatcher (which still
+/// answers `Success(x).value`, `Failure(e).exception`, `hashCode`, `equals`, …).
+///
+/// `outcome` is the receiver already viewed as success-or-failure; `recv` is the
+/// receiver itself, which several members answer unchanged (`recover` on a
+/// `Success`, `map` on a `Failure`) — Scala returns the SAME instance there, and
+/// so does this.
+fn try_method(
+    vm: &mut VM,
+    recv: &Value,
+    outcome: Result<Value, Value>,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    // Re-raise a `Failure`'s exception as this frontend's own fault text, which
+    // is how `get` reports. `scala_str` already renders a throwable as
+    // `<fqcn>: <message>`, which is exactly the shape a fault carries.
+    let throw = |e: &Value| Err(format!("scalars: {}", scala_str(e)));
+    Some(match (name, args.len(), &outcome) {
+        ("isSuccess", 0, _) => Ok(Value::bool(outcome.is_ok())),
+        ("isFailure", 0, _) => Ok(Value::bool(outcome.is_err())),
+        // `get` on a `Failure` RETHROWS the exception it holds.
+        ("get", 0, Ok(v)) => Ok(v.clone()),
+        ("get", 0, Err(e)) => throw(e),
+        ("getOrElse", 1, Ok(v)) => Ok(v.clone()),
+        ("getOrElse", 1, Err(_)) => Ok(args[0].clone()),
+        ("orElse", 1, Ok(_)) => Ok(recv.clone()),
+        ("orElse", 1, Err(_)) => Ok(args[0].clone()),
+        ("toOption", 0, _) => Ok(opt(outcome.ok())),
+        ("toEither", 0, Ok(v)) => Ok(make_either(true, v.clone())),
+        ("toEither", 0, Err(e)) => Ok(make_either(false, e.clone())),
+        ("toSeq" | "toList", 0, _) => Ok(new_list(outcome.ok().into_iter().collect())),
+        // `map`/`flatMap`/`filter`/`foreach` are all no-ops on a `Failure`,
+        // which is what makes a chain short-circuit at the first throw.
+        ("map", 1, Ok(v)) => match invoke_closure(vm, &args[0], std::slice::from_ref(v)) {
+            Ok(r) => Ok(make_try_success(r)),
+            Err(e) => Err(e),
+        },
+        ("flatMap", 1, Ok(v)) => invoke_closure(vm, &args[0], std::slice::from_ref(v)),
+        ("foreach", 1, Ok(v)) => {
+            invoke_closure(vm, &args[0], std::slice::from_ref(v)).map(|_| unit_value())
+        }
+        ("foreach", 1, Err(_)) => Ok(unit_value()),
+        // A `Success` whose value fails the predicate becomes a `Failure`, with
+        // the message `Try.filter` builds.
+        ("filter" | "withFilter", 1, Ok(v)) => {
+            match invoke_closure(vm, &args[0], std::slice::from_ref(v)) {
+                Ok(hit) if truthy(&hit) => Ok(recv.clone()),
+                Ok(_) => Ok(make_try_failure(new_throwable(
+                    "java.util.NoSuchElementException",
+                    Some(&format!("Predicate does not hold for {}", scala_str(v))),
+                ))),
+                Err(e) => Err(e),
+            }
+        }
+        ("map" | "flatMap" | "filter" | "withFilter", 1, Err(_)) => Ok(recv.clone()),
+        // `recover` takes a PartialFunction and only applies where it is
+        // defined, so an arm-less exception stays a `Failure`.
+        ("recover", 1, Err(e)) => match is_defined_at(vm, &args[0], e) {
+            Ok(true) => match invoke_closure(vm, &args[0], std::slice::from_ref(e)) {
+                Ok(r) => Ok(make_try_success(r)),
+                Err(err) => Err(err),
+            },
+            Ok(false) => Ok(recv.clone()),
+            Err(err) => Err(err),
+        },
+        ("recoverWith", 1, Err(e)) => match is_defined_at(vm, &args[0], e) {
+            Ok(true) => invoke_closure(vm, &args[0], std::slice::from_ref(e)),
+            Ok(false) => Ok(recv.clone()),
+            Err(err) => Err(err),
+        },
+        ("recover" | "recoverWith", 1, Ok(_)) => Ok(recv.clone()),
+        // `failed` INVERTS the two cases: a `Failure`'s exception becomes a
+        // `Success`, and a `Success` becomes a `Failure` saying so.
+        ("failed", 0, Err(e)) => Ok(make_try_success(e.clone())),
+        ("failed", 0, Ok(_)) => Ok(make_try_failure(new_throwable(
+            "java.lang.UnsupportedOperationException",
+            Some("Success.failed"),
+        ))),
+        _ => return None,
+    })
 }
 
 /// `scala.Option`'s method surface. Returns `None` when `name` is not an

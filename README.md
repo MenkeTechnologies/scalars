@@ -534,7 +534,9 @@ virtual dispatch, inherited fields and constructor-argument threading, and
 first-class `Range` values and `scala.math`**; the **full pattern grammar** —
 `@` binders, `|` alternations, `h :: t` and `Nil`, sequence patterns with a
 trailing `_*`, and pattern definitions (`val (a, b) = pair`); **`scala.Option`'s
-method surface** plus the `Option(x)` factory and `Either`'s `Left`/`Right`;
+method surface** plus the `Option(x)` factory, `Either`'s `Left`/`Right` and
+its right-biased method surface, and `scala.util.Try` (`Try(e)` expanding to the
+`try Success(e) catch Failure(t)` it is defined as);
 `Product` on every case class and tuple; a wider `String`/`StringOps` surface
 including the closure-taking combinators; **non-local `return`** — a
 `return` inside a lambda (or inside the closures a `for` desugars to) leaves the
@@ -664,8 +666,10 @@ Next waves, in priority order:
 
 1. **Lazy views** — `.view` and `LazyList`. (`Iterator` itself is done: it is a
    real consumable iterator, not a strict `Iterable`.)
-2. **The broader standard library** — `scala.io`, `scala.util.Try`/`Random`,
-   `BigInt`, and `scala.collection.*` as a namespace.
+2. **The broader standard library** — `scala.io`, `scala.util.Random`, `BigInt`
+   and `BigDecimal`, and `scala.collection.*` as a namespace. (`scala.util.Try`
+   is done, with `Either`'s right-biased surface beside it; `Either.left`'s
+   `LeftProjection` is not.)
 3. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement. Both
    are refused rather than approximated: reading one by name used to answer the
    whole match and `${name}` in a replacement used to be copied through

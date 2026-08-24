@@ -477,9 +477,26 @@ reported as parse/compile errors, never silently mis-run.
   `filterNot`, `exists`, `forall`, `count`, `foreach`, `fold(ifEmpty)(f)`,
   `orElse`, `collect`, `flatten`, `head`, `headOption`, `toList`/`toSeq`/
   `toVector`/`iterator`, and `toRight`/`toLeft`. The `Option(x)` factory answers
-  `None` for `null`. `Either`'s `Left`/`Right` are built-in case classes, so
-  `Right(1)`, `case Left(e) =>` and `List[Either[…]].collect` all work.
-  `List[Option[A]].flatten` drops the empties.
+  `None` for `null`. `List[Option[A]].flatten` drops the empties.
+- **`Either`, right-biased as Scala 2.13 made it.** `Left`/`Right` are built-in
+  case classes, so `Right(1)`, `case Left(e) =>` and `List[Either[…]].collect`
+  work, and the method surface operates on the `Right` while passing a `Left`
+  through: `isLeft`/`isRight`, `getOrElse`, `orElse`, `map`, `flatMap`,
+  `foreach`, `exists`/`forall` (vacuously true on a `Left`), `contains`, `fold`,
+  `swap`, `filterOrElse`, `toOption` and `toSeq`/`toList`. `Either.left`'s
+  `LeftProjection` is NOT modeled — it is a distinct type, not a member set —
+  so `e.left.getOrElse(…)` is refused rather than approximated.
+- **`scala.util.Try`.** `Try(e)` expands in the parser to
+  `try Success(e) catch { case t: Throwable => Failure(t) }`, so `e` is by-name
+  and evaluated inside the `try`; `Success`/`Failure` are built-in case classes
+  like `Left`/`Right`, which is what makes `case Success(v) =>` and
+  `Failure(e).exception` work. The surface is `isSuccess`/`isFailure`, `get`
+  (which rethrows), `getOrElse`, `orElse`, `map`, `flatMap`, `foreach`,
+  `filter`, `recover`/`recoverWith`, `failed`, `toOption`, `toEither` and
+  `toSeq`/`toList`. Two deviations: Scala catches only `NonFatal` throwables and
+  lets a fatal one (`StackOverflowError`, `OutOfMemoryError`) propagate, where
+  this catches every `Throwable`; and a program defining its own `Try` cannot
+  shadow the factory, the same way it cannot shadow `List(…)`.
 - **`Product` on every `case class`/`case object` and tuple.** `productArity`,
   `productPrefix`, `productElement(i)`, `productElementName(i)`,
   `productIterator` and `productElementNames`, all over the

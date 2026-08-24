@@ -938,14 +938,22 @@ impl Parser {
     ///
     /// Shared by the top-level prologue and the block-statement form so the two
     /// cannot disagree about where a clause ends.
+    /// A `{a, b => c}` selector list is skipped whole, so the `}` that CLOSES it
+    /// does not read as the end of the enclosing block. Only a `}` at depth zero
+    /// stops the clause, which is what makes a block-local
+    /// `import scala.util.{Try, Success}` end at the right token.
     fn skip_import_clause(&mut self) {
         self.advance(); // package/import/export
-        while !self.is(&Tok::Newline)
-            && !self.is(&Tok::Semi)
-            && !self.is(&Tok::Eof)
-            && !self.is(&Tok::RBrace)
-            && !self.at_declaration_start()
-        {
+        let mut depth = 0u32;
+        loop {
+            match self.peek() {
+                Tok::LBrace => depth += 1,
+                Tok::RBrace if depth == 0 => return,
+                Tok::RBrace => depth -= 1,
+                Tok::Newline | Tok::Semi | Tok::Eof if depth == 0 => return,
+                _ if depth == 0 && self.at_declaration_start() => return,
+                _ => {}
+            }
             self.advance();
         }
     }
@@ -2259,6 +2267,19 @@ impl Parser {
                         let elems = self.arg_list()?;
                         return Ok(eta_bare_args(Expr::Collection { ctor: name, elems }));
                     }
+                    // `Try(e)` — `scala.util.Try`'s factory. Desugared HERE,
+                    // not in the compiler, because the expansion introduces a
+                    // `catch` binder and only the AST that `crate::resolve`
+                    // still sees can have a frame slot allocated for it. A
+                    // compiler-side expansion ran after resolve, so the binder
+                    // was unbound and the `catch` silently failed to catch.
+                    if name == "Try" {
+                        let args = self.arg_list()?;
+                        if let [body] = args.as_slice() {
+                            return Ok(try_factory(body, line));
+                        }
+                        return Ok(eta_bare_args(Expr::Call { name, args, line }));
+                    }
                     if let Some(ctor) = mutable_buffer_ctor(&name) {
                         let elems = self.arg_list()?;
                         return Ok(eta_bare_args(Expr::Collection {
@@ -3262,4 +3283,47 @@ fn mutable_buffer_ctor(name: &str) -> Option<&'static str> {
         "StringBuilder" => "StringBuilder",
         _ => return None,
     })
+}
+
+/// `Try(e)` as the expression `scala.util.Try` defines it to be:
+/// `try Success(e) catch { case t: Throwable => Failure(t) }`.
+///
+/// `Try` needs no runtime support of its own — its two cases are ordinary
+/// built-in case classes (registered beside `Left`/`Right` in the compiler), and
+/// its factory is exactly this `try`/`catch`. Expanding it rather than adding a
+/// builtin is what makes `e` BY-NAME without a special calling convention: the
+/// expression is compiled inside the `try` body, so it is evaluated there and
+/// whatever it throws is caught, which is the entire point of the factory.
+///
+/// The expansion happens in the PARSER so that `crate::resolve` still walks it
+/// and gives the `catch` binder a frame slot; expanded after resolve, the binder
+/// is unbound and the `catch` silently fails to catch.
+///
+/// Two deviations, both in `BUGS.md`: Scala's `Try` catches only `NonFatal`
+/// throwables and lets a fatal one (`StackOverflowError`, …) propagate, where
+/// this catches every `Throwable`; and a program that defines its own `Try`
+/// cannot shadow this, the same way it cannot shadow `List(…)`.
+fn try_factory(body: &Expr, line: u32) -> Expr {
+    let wrap = |ctor: &str, arg: Expr| Stmt {
+        line,
+        kind: StmtKind::Expr(Expr::Call {
+            name: ctor.to_string(),
+            args: vec![arg],
+            line,
+        }),
+    };
+    Expr::Try {
+        body: vec![wrap("Success", body.clone())],
+        catches: vec![MatchArm {
+            // Not a legal Scala identifier, so nothing in `body` can shadow it
+            // or be captured by it.
+            pat: Pattern::Typed {
+                name: "_$try".to_string(),
+                ty: "Throwable".to_string(),
+            },
+            guard: None,
+            body: vec![wrap("Failure", Expr::Var("_$try".to_string()))],
+        }],
+        finalizer: None,
+    }
 }

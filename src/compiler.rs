@@ -386,7 +386,17 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
     // `Either`'s two cases, so `Right(v)` / `case Left(e) =>` and the
     // `Option.toRight`/`toLeft` results all round-trip through one record shape.
-    for (name, field) in [("Left", "value"), ("Right", "value")] {
+    // `Either`'s two cases and `scala.util.Try`'s, so `Right(v)` /
+    // `case Left(e) =>` / `case Success(v) =>` and the `Option.toRight`/`toLeft`
+    // results all round-trip through one record shape. `Try` itself is not a
+    // class here: `Try(e)` is a compiler desugar onto these two (see
+    // [`try_factory`] in the parser).
+    for (name, field) in [
+        ("Left", "value"),
+        ("Right", "value"),
+        ("Success", "value"),
+        ("Failure", "exception"),
+    ] {
         if !classes.iter().any(|c| c.name == name) {
             classes.push(builtin_case1(name, field));
         }

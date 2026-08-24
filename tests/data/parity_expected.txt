@@ -371,3 +371,39 @@ object T extends App { println(Map(1 -> 1, 2 -> 2, 3 -> 3, 4 -> 4, 5 -> 5).group
 object T extends App { println(Map[String, Int]().groupBy(_._2)) }	HashMap()\n
 object T extends App { import scala.collection.mutable; val lm = mutable.LinkedHashMap("z" -> 1, "a" -> 2); println(lm.mkString(",")); println(lm.groupBy(_._2)) }	z -> 1,a -> 2\nHashMap(1 -> LinkedHashMap(z -> 1), 2 -> LinkedHashMap(a -> 2))\n
 object T extends App { import scala.collection.mutable; val mm = mutable.Map("q" -> 5); println(mm.mkString(",")); println(mm.groupBy(_._2)) }	q -> 5\nHashMap(5 -> HashMap(q -> 5))\n
+object T extends App { import scala.util.Try; println(Try(5)) }	Success(5)\n
+object T extends App { import scala.util.Try; println(Try(1 / 0)) }	Failure(java.lang.ArithmeticException: / by zero)\n
+object T extends App { import scala.util.Try; println(Try("x".toInt)) }	Failure(java.lang.NumberFormatException: For input string: "x")\n
+object T extends App { import scala.util.Success; println(Success(5)) }	Success(5)\n
+object T extends App { import scala.util.Failure; println(Failure(new RuntimeException("b"))) }	Failure(java.lang.RuntimeException: b)\n
+object T extends App { import scala.util.Try; println(Try(5).isSuccess); println(Try(1 / 0).isFailure) }	true\ntrue\n
+object T extends App { import scala.util.Try; println(Try(5).get) }	5\n
+object T extends App { import scala.util.Try; println(Try(1 / 0).getOrElse(0)) }	0\n
+object T extends App { import scala.util.Try; println(Try(5).map(_ + 1)); println(Try(1 / 0).map(_ + 1)) }	Success(6)\nFailure(java.lang.ArithmeticException: / by zero)\n
+object T extends App { import scala.util.Try; println(Try(5).flatMap(x => Try(x * 2))) }	Success(10)\n
+object T extends App { import scala.util.Try; println(Try(5).toOption); println(Try(1 / 0).toOption) }	Some(5)\nNone\n
+object T extends App { import scala.util.Try; println(Try(5).toEither); println(Try(1 / 0).toEither.isLeft) }	Right(5)\ntrue\n
+object T extends App { import scala.util.Try; println(Try(5).filter(_ > 9)) }	Failure(java.util.NoSuchElementException: Predicate does not hold for 5)\n
+object T extends App { import scala.util.Try; println(Try(1 / 0).orElse(Try(9))) }	Success(9)\n
+object T extends App { import scala.util.Try; println(Try(1 / 0).recover { case _: ArithmeticException => -1 }) }	Success(-1)\n
+object T extends App { import scala.util.Try; println(Try(1 / 0).recover { case _: NumberFormatException => -4 }) }	Failure(java.lang.ArithmeticException: / by zero)\n
+object T extends App { import scala.util.Try; println(Try(1 / 0).recoverWith { case _: ArithmeticException => Try(7) }) }	Success(7)\n
+object T extends App { import scala.util.{Try, Success, Failure}; println(Try(1 / 0) match { case Success(v) => "s" + v; case Failure(e) => "f:" + e.getMessage }) }	f:/ by zero\n
+object T extends App { import scala.util.Try; println(Try(5).failed); println(Try(1 / 0).failed) }	Failure(java.lang.UnsupportedOperationException: Success.failed)\nSuccess(java.lang.ArithmeticException: / by zero)\n
+object T extends App { import scala.util.Try; var n = 0; Try({ n += 1; n }); println(n) }	1\n
+object T extends App { val e: Throwable = new ArithmeticException("x"); println(e match { case _: ArithmeticException => "A"; case _ => "?" }) }	A\n
+object T extends App { val e: Throwable = new ArithmeticException("x"); println(e match { case _: NumberFormatException => "N"; case _: RuntimeException => "R"; case _ => "?" }) }	R\n
+object T extends App { import scala.util.Success; println(Success(5) == Success(5)); println(Success(5) == Success(6)) }	true\nfalse\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.isRight); println(r.isLeft) }	true\nfalse\n
+object T extends App { val l: Either[String, Int] = Left("e"); println(l.isLeft); println(l.getOrElse(0)) }	true\n0\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.map(_ + 1)) }	Right(6)\n
+object T extends App { val l: Either[String, Int] = Left("e"); println(l.map(_ + 1)) }	Left(e)\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.flatMap(x => Right(x * 2))) }	Right(10)\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.toOption); println((Left("e"): Either[String, Int]).toOption) }	Some(5)\nNone\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.toSeq); println((Left("e"): Either[String, Int]).toSeq) }	List(5)\nList()\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.swap); println((Left("e"): Either[String, Int]).swap) }	Left(5)\nRight(e)\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.exists(_ > 1)); println((Left("e"): Either[String, Int]).exists(_ > 1)) }	true\nfalse\n
+object T extends App { println((Left("e"): Either[String, Int]).forall(_ > 9)) }	true\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.contains(5)); println(r.contains(6)) }	true\nfalse\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.fold(s => "L" + s, i => "R" + i)); println((Left("e"): Either[String, Int]).fold(s => "L" + s, i => "R" + i)) }	R5\nLe\n
+object T extends App { val r: Either[String, Int] = Right(5); println(r.filterOrElse(_ > 9, "no")); println(r.filterOrElse(_ > 1, "no")) }	Left(no)\nRight(5)\n
