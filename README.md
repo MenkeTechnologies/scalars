@@ -347,7 +347,11 @@ Implemented and checked against the reference `scala`:
   `init`/`tail`/`headOption`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
   `grouped`/`sliding`), `groupBy`, `mkString`, the `to*` conversions, the set
   algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`), and
-  `Map`'s `apply`/`get`/`getOrElse`/`keys`/`values`/`updated`. `toString` is
+  `Map`'s `apply`/`get`/`getOrElse`/`keys`/`values`/`updated`, and the
+  companions' `IterableFactory` members — `List.empty`, `List.fill(n)(v)` (whose
+  fill expression is by-name and re-evaluated per element),
+  `Vector.tabulate(n)(f)`, `List.range(a, b[, step])`, `List.concat(…)` and
+  `List.from(xs)`. `toString` is
   byte-faithful, which for `Set`/`Map` means reproducing Scala's representation
   split: up to four entries the insertion-ordered `Set(…)`/`Map(…)`, beyond that
   a CHAMP `HashSet(…)`/`HashMap(…)` in trie order (the JVM hash codes, the
@@ -650,7 +654,8 @@ locale is now a hard gate beside the version.
 
 Next waves, in priority order:
 
-1. **Lazy views** — `.view` and `LazyList` (`.iterator` is wired, but strictly).
+1. **Lazy views** — `.view` and `LazyList`. (`Iterator` itself is done: it is a
+   real consumable iterator, not a strict `Iterable`.)
 2. **The broader standard library** — `scala.io`, `scala.util.Try`/`Random`,
    `BigInt`, and `scala.collection.*` as a namespace.
 3. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement. Both

@@ -601,12 +601,15 @@ reported as parse/compile errors, never silently mis-run.
   allows it — as an argument — and rejected everywhere else, which is also what
   Scala does. A spread handed to a parameter that is not repeated is a compile
   error on both sides.
-- **Lazy views and a real `Iterator`.** `.view` and `LazyList`. `.iterator` and
-  `.reverseIterator` answer a STRICT `Iterable` carrying the same elements, so
-  every downstream combinator (`.toList`, `.map`, `.size`, …) matches; only
-  printing the iterator itself differs, and Scala's own `Iterator.toString` is
-  unreproducible anyway. Likewise `grouped`/`sliding` answer the `List` of
-  windows rather than an `Iterator`.
+- **Lazy views.** `.view` and `LazyList`. `Iterator` itself is no longer one of
+  these gaps: `.iterator`/`.reverseIterator` (and `grouped`/`sliding`) answer a
+  real [`SeqKind::Iterator`], which renders `<iterator>`, answers
+  `hasNext`/`next()`, and is CONSUMED by traversing it — `it.toList` twice gives
+  the elements and then `List()`, and `next()` past the end throws
+  `NoSuchElementException: next on empty iterator`. Its elements are still
+  MATERIALIZED when it is built, so it is strict in the one way that stays
+  unobservable: a downstream combinator sees the same elements Scala's lazy one
+  would, but an infinite source cannot be represented.
 - **A `Char` range — `'a' to 'e'`, `'a' until 'z'`, `for (c <- 'a' to 'd')`.**
   Scala's is a `NumericRange[Char]`, which this frontend has no representation
   for: a `Char` is a heap value here, so reading the endpoints as integers built
@@ -845,9 +848,6 @@ reported as parse/compile errors, never silently mis-run.
   in the map's order; that is what is built, so a five-entry map's `keys` prints
   `Set(…)` rather than `HashSet(…)`. Mapping or filtering the view renormalizes
   it into a real `Set`/`HashSet`.
-- **`grouped`/`sliding` answer a `List` of windows**, not an `Iterator`. Every
-  consumption Scala programs use (`.toList`, `.foreach`, `.map`) matches;
-  printing the un-consumed result does not (Scala prints `<iterator>`).
 - **A `Long` shift inside a `def` body truncates to 32 bits.** `<<`, `>>` and
   `>>>` are evaluated at the RECEIVER's width, and the host cannot tell an `Int`
   from a `Long` by value, so `compiler::method_inner` selects the 64-bit

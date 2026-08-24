@@ -2225,7 +2225,14 @@ impl Parser {
                     // `Map` stay immutable — see `BUGS.md`.
                     if matches!(
                         name.as_str(),
-                        "List" | "Map" | "Array" | "Seq" | "Vector" | "Set" | "IndexedSeq"
+                        "List"
+                            | "Map"
+                            | "Array"
+                            | "Seq"
+                            | "Vector"
+                            | "Set"
+                            | "IndexedSeq"
+                            | "Iterator"
                     ) {
                         let elems = self.arg_list()?;
                         return Ok(eta_bare_args(Expr::Collection { ctor: name, elems }));

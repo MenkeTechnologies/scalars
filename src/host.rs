@@ -253,6 +253,10 @@ pub const MAKE_LINKEDMAP: u16 = 768;
 /// does and is why the stored order is neither the input's nor sorted (see
 /// `heapify`).
 pub const MAKE_PRIORITYQUEUE: u16 = 769;
+/// Builtin id for an `Iterator(...)` literal: pops `argc` elements into a
+/// consumable [`SeqKind::Iterator`]. `Iterator.empty` lowers to the same builtin
+/// with no arguments.
+pub const MAKE_ITERATOR: u16 = 772;
 /// Builtin id for the run-time half of `x += e` / `x -= e`: pops one value and
 /// answers whether it is a collection that mutates in place. `true` sends the
 /// compiler-emitted branch to `x.+=(e)`, `false` to `x = x + e` — Scala makes
@@ -542,6 +546,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SMATH, b_math);
     vm.register_builtin(MAKE_VECTOR, b_make_vector);
     vm.register_builtin(MAKE_ARRAYSEQ, b_make_arrayseq);
+    vm.register_builtin(MAKE_ITERATOR, b_make_iterator);
     vm.register_builtin(MAKE_SET, b_make_set);
     vm.register_builtin(MAKE_LISTBUFFER, b_make_listbuffer);
     vm.register_builtin(MAKE_ARRAYBUFFER, b_make_arraybuffer);
@@ -1024,6 +1029,20 @@ enum SeqKind {
     /// `HashSet` (see [`HashRep`]).
     Set(HashRep),
     Iterable,
+    /// A `scala.collection.Iterator` — the one sequence kind that is CONSUMED by
+    /// traversing it.
+    ///
+    /// The elements are still materialized (this frontend is strict), but the
+    /// receiver is DRAINED by every terminal or transforming op, because that is
+    /// the only part of an iterator's laziness that is observable: Scala's
+    /// `it.toList` answers the elements once and `List()` the second time, and a
+    /// `next()` past the end throws. A strict `Iterable` answered the full list
+    /// both times and had no `next`/`hasNext` at all.
+    ///
+    /// It renders as `<iterator>` — `Iterator.toString` is a fixed string in the
+    /// standard library, not the JVM identity form, so unlike an `Array` it is
+    /// perfectly reproducible.
+    Iterator,
     /// `scala.collection.immutable.ArraySeq` — the `IndexedSeq` a `StringOps`
     /// combinator answers when its function's result type is not `Char`
     /// (`"abc".map(_.toInt)` is an `ArraySeq`, not a `Vector`).
@@ -1099,6 +1118,7 @@ impl SeqKind {
             SeqKind::Set(HashRep::Hashed | HashRep::Mutable(_)) => "HashSet",
             SeqKind::Set(HashRep::Linked) => "LinkedHashSet",
             SeqKind::Iterable => "Iterable",
+            SeqKind::Iterator => "Iterator",
             SeqKind::ArraySeq => "ArraySeq",
             SeqKind::Array => "Array",
             SeqKind::ListBuffer => "ListBuffer",
@@ -1135,7 +1155,11 @@ impl SeqKind {
                 "scalars: java.lang.StringIndexOutOfBoundsException: Index {i} out of bounds for length {len}"
             ),
             // Linear sequences pass the raw index through.
-            SeqKind::List | SeqKind::Iterable | SeqKind::ListBuffer => {
+            // `Iterator` rides along in both fault tables for exhaustiveness only:
+            // it exposes neither `apply` nor `head`/`last`/`tail`/`init`, so
+            // Scala rejects those at compile time and neither message is
+            // reachable from a valid program.
+            SeqKind::List | SeqKind::Iterable | SeqKind::Iterator | SeqKind::ListBuffer => {
                 format!("scalars: java.lang.IndexOutOfBoundsException: {i}")
             }
             // Every indexed sequence formats the legal span.
@@ -1165,7 +1189,9 @@ impl SeqKind {
         };
         let text: Option<String> = match self {
             SeqKind::Range { .. } => Some(format!("{} on empty Range", op.word())),
-            SeqKind::List | SeqKind::Iterable => Some(format!("{} of empty list", op.word())),
+            SeqKind::List | SeqKind::Iterable | SeqKind::Iterator => {
+                Some(format!("{} of empty list", op.word()))
+            }
             // `Vector`/`IndexedSeq` name the operation on an `empty` receiver —
             // and `last` reports `empty.tail`, because it is implemented as one.
             SeqKind::Vector => Some(match op {
@@ -1250,6 +1276,34 @@ impl SeqKind {
 /// one yields a `Vector` — exactly as Scala's `IndexedSeq` result does; a `Set`
 /// re-deduplicates and re-orders (a hashed receiver stays hashed, and a small one
 /// grows into a `HashSet` past four elements).
+/// Empty an `Iterator`'s backing element vector in place — how a traversal
+/// CONSUMES it. The caller has already read the elements out, so this only makes
+/// the exhaustion observable to the next traversal.
+fn drain_iterator(recv: &Value) {
+    if let Value::Obj(id) = recv {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Seq(SeqKind::Iterator, xs)) = h.borrow_mut().get_mut(*id as usize)
+            {
+                xs.clear();
+            }
+        });
+    }
+}
+
+/// Drop an `Iterator`'s first element — the single element `next()` consumes.
+fn take_iterator_head(recv: &Value) {
+    if let Value::Obj(id) = recv {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Seq(SeqKind::Iterator, xs)) = h.borrow_mut().get_mut(*id as usize)
+            {
+                if !xs.is_empty() {
+                    xs.remove(0);
+                }
+            }
+        });
+    }
+}
+
 fn derive_seq(kind: SeqKind, items: Vec<Value>) -> Value {
     match kind {
         SeqKind::Set(rep) => new_set(rep, items),
@@ -1959,6 +2013,12 @@ fn b_make_vector(vm: &mut VM, argc: u8) -> Value {
 
 fn b_make_arrayseq(vm: &mut VM, argc: u8) -> Value {
     new_seq(SeqKind::ArraySeq, pop_n(vm, argc))
+}
+
+/// `MAKE_ITERATOR` builtin — pop `argc` element values into an `Iterator`.
+/// Backs both `Iterator(a, b, c)` and `Iterator.empty` (`argc` 0).
+fn b_make_iterator(vm: &mut VM, argc: u8) -> Value {
+    new_seq(SeqKind::Iterator, pop_n(vm, argc))
 }
 
 /// `MAKE_SET` builtin — pop `argc` element values (deepest first) into a `Set`.
@@ -3028,6 +3088,10 @@ fn obj_to_string(v: &Value) -> String {
             Some(HeapVal::Seq(SeqKind::StrBuf, items)) => {
                 items.iter().map(scala_str).collect::<String>()
             }
+            // `Iterator.toString` is a FIXED string in the standard library, not
+            // the elements and not the JVM identity form — printing an iterator
+            // must not consume it, so it cannot report what it holds.
+            Some(HeapVal::Seq(SeqKind::Iterator, _)) => "<iterator>".to_string(),
             Some(HeapVal::Seq(kind, items)) => {
                 let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(", ");
                 format!("{}({inner})", kind.label())
@@ -4675,6 +4739,22 @@ fn index_out_of_bounds(i: i64, len: usize) -> String {
 /// ops run their function argument through [`invoke_closure`].
 fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
+    // A `scala.collection.Iterator` is CONSUMED by traversing it, and that is
+    // the one part of its laziness a strict frontend must still reproduce: the
+    // elements were read into `items` just above, so emptying the receiver now
+    // makes the SECOND traversal see an exhausted iterator the way Scala's does
+    // (`it.toList` answers the elements, then `List()`).
+    //
+    // Only the ops that ask whether it is exhausted leave it alone. `next`
+    // consumes exactly one element and drains itself on its own arm below.
+    if kind == SeqKind::Iterator
+        && !matches!(
+            name,
+            "hasNext" | "next" | "isEmpty" | "nonEmpty" | "knownSize"
+        )
+    {
+        drain_iterator(recv);
+    }
     // A transforming op keeps the receiver's collection kind (`List.map` → `List`,
     // a range-derived `Vector.map` → `Vector`).
     let same = |v: Vec<Value>| derive_seq(kind, v);
@@ -4840,16 +4920,28 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         ("toArray", 0) => Ok(new_seq(SeqKind::Array, items)),
         ("toVector", 0) => Ok(new_seq(SeqKind::Vector, items)),
-        // `iterator`/`reverseIterator` are strict here: the result is an
-        // `Iterable` carrying the same elements, so the downstream combinators
-        // (`.toList`, `.map`, `.size`, …) answer exactly what Scala's lazy
-        // iterator would. Only printing the iterator itself would differ, and
-        // Scala's own `Iterator.toString` is unreproducible anyway.
-        ("iterator", 0) => Ok(new_seq(SeqKind::Iterable, items)),
+        // `iterator`/`reverseIterator` materialize their elements — this
+        // frontend is strict — but answer an `Iterator`, not an `Iterable`, so
+        // the two behaviors that ARE observable without laziness hold: it
+        // renders as `<iterator>`, and traversing it consumes it.
+        ("iterator", 0) => Ok(new_seq(SeqKind::Iterator, items)),
         ("reverseIterator", 0) => Ok(new_seq(
-            SeqKind::Iterable,
+            SeqKind::Iterator,
             items.into_iter().rev().collect(),
         )),
+        // The `Iterator` protocol itself. Guarded on the kind because Scala
+        // declares neither on any other collection — `List(1).hasNext` is a
+        // compile error there and stays a missing method here.
+        ("hasNext", 0) if kind == SeqKind::Iterator => Ok(Value::bool(!items.is_empty())),
+        ("next", 0) if kind == SeqKind::Iterator => {
+            let Some(first) = items.first().cloned() else {
+                return Err(
+                    "scalars: java.util.NoSuchElementException: next on empty iterator".to_string(),
+                );
+            };
+            take_iterator_head(recv);
+            Ok(first)
+        }
         ("length" | "size", 0) => Ok(Value::int(items.len() as i64)),
         ("isEmpty", 0) => Ok(Value::bool(items.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!items.is_empty())),
@@ -5148,7 +5240,10 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     out.push(same(w.to_vec()));
                 }
             }
-            Ok(new_list(out))
+            // Both answer an `Iterator` of windows, not a `List` of them, so the
+            // un-consumed result prints `<iterator>` and a second traversal
+            // sees it exhausted.
+            Ok(new_seq(SeqKind::Iterator, out))
         }
         ("toSet", 0) => Ok(new_set(HashRep::Small, items)),
         ("toSeq" | "toIterable", 0) => Ok(new_list(items)),
@@ -5537,7 +5632,8 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         (
             "exists" | "forall" | "count" | "find" | "collectFirst" | "foldLeft" | "foldRight"
             | "fold" | "reduce" | "maxBy" | "minBy" | "groupBy" | "toList" | "toSeq" | "toVector"
-            | "toArray" | "toSet" | "mkString" | "sortBy" | "unzip" | "zipWithIndex",
+            | "toArray" | "toSet" | "mkString" | "sortBy" | "unzip" | "zipWithIndex"
+            | "iterator",
             _,
         ) => {
             let seq = new_list(pairs);
@@ -7119,7 +7215,9 @@ fn option_method(
         ("contains", 1) => Ok(Value::bool(inner.is_some_and(|v| value_eq(&v, &args[0])))),
         ("toList" | "toSeq", 0) => Ok(new_list(inner.into_iter().collect())),
         ("toVector", 0) => Ok(new_seq(SeqKind::Vector, inner.into_iter().collect())),
-        ("iterator", 0) => Ok(new_list(inner.into_iter().collect())),
+        // An `Option` iterates as zero or one element, and its `iterator` is a
+        // real consumable `Iterator` like every other collection's.
+        ("iterator", 0) => Ok(new_seq(SeqKind::Iterator, inner.into_iter().collect())),
         ("toRight", 1) => Ok(match inner {
             Some(v) => make_either(true, v),
             None => make_either(false, args[0].clone()),
@@ -7521,6 +7619,34 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // one out hands out a `Char` — that is what makes `"abc".toList.map(_.toInt)`
         // the code points rather than a parse of each character.
         ("toList", 0) => Ok(new_list(s.chars().map(make_char).collect())),
+        // `StringOps.iterator` — the characters as a CONSUMABLE `Iterator`,
+        // not a `List`, so it renders as `<iterator>` and a second traversal
+        // sees it exhausted (see [`SeqKind::Iterator`]).
+        ("iterator", 0) => Ok(new_seq(SeqKind::Iterator, s.chars().map(make_char).collect())),
+        // `StringOps.grouped`/`sliding` — an `Iterator` whose windows are
+        // `String`s, not `List`s of `Char` (`"abcd".grouped(2).toList` is
+        // `List(ab, cd)`), because `StringOps` rebuilds through its own builder.
+        ("grouped" | "sliding", 1) => {
+            let n = args[0].to_int();
+            if n < 1 {
+                let step = if name == "grouped" { n } else { 1 };
+                return Err(format!(
+                    "scalars: java.lang.IllegalArgumentException: requirement failed: \
+                     size={n} and step={step}, but both must be positive"
+                ));
+            }
+            let chars: Vec<char> = s.chars().collect();
+            let n = n as usize;
+            let window = |w: &[char]| Value::str(w.iter().collect::<String>());
+            let out: Vec<Value> = if name == "grouped" {
+                chars.chunks(n).map(window).collect()
+            } else if chars.len() < n {
+                vec![window(&chars)]
+            } else {
+                chars.windows(n).map(window).collect()
+            };
+            Ok(new_seq(SeqKind::Iterator, out))
+        }
         // `"abc".toSeq` is a `WrappedString` — a VIEW of the same characters,
         // which prints as the string itself (`abc`, not `List(a, b, c)`) and
         // answers every `Seq` operation through `StringOps`. The string is

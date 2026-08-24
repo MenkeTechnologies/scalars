@@ -1440,6 +1440,7 @@ impl Compiler {
             // Scala 3 `Seq` is `List`; `IndexedSeq` is `Vector`.
             "List" | "Seq" => crate::host::MAKE_LIST,
             "Vector" | "IndexedSeq" => crate::host::MAKE_VECTOR,
+            "Iterator" => crate::host::MAKE_ITERATOR,
             // Only produced by the varargs collection in `adapt_args`.
             "ArraySeq" => crate::host::MAKE_ARRAYSEQ,
             "Set" => crate::host::MAKE_SET,
@@ -3238,6 +3239,17 @@ impl Compiler {
                 }
             }
         }
+        // `List.empty` / `List.fill(n)(v)` / `Vector.tabulate(n)(f)` / … — a
+        // collection COMPANION's factory members, which are a namespace and not
+        // receiver dispatch (the companion is not a value here, so reaching this
+        // as an ordinary method call reported `empty is not a member of Null`).
+        // Each desugars to the equivalent combinator expression and is compiled
+        // as if it had been written that way.
+        if let Expr::Var(owner) = recv {
+            if let Some(desugared) = companion_factory(owner, name, args, line) {
+                return self.expr(&desugared);
+            }
+        }
         // `super.m(args)` — skip this class in the linearization and call the
         // nearest supertype that defines `m` (a static call, as the JVM's
         // `invokespecial` is).
@@ -4928,6 +4940,80 @@ const ORDERING_MEMBERS: &[&str] = &[
     "BigDecimal",
 ];
 
+/// The conversion that rebuilds a generic sequence as the collection named by
+/// `owner` — how a companion factory's result gets the companion's own kind.
+/// `None` for a companion that is not an `IterableFactory` over plain elements
+/// (`Map`, whose factory members take key/value pairs instead).
+fn factory_conversion(owner: &str) -> Option<&'static str> {
+    Some(match owner {
+        // Scala 3 `Seq` is `List`; `IndexedSeq` is `Vector`.
+        "List" | "Seq" => "toList",
+        "Vector" | "IndexedSeq" => "toVector",
+        "Set" | "HashSet" => "toSet",
+        "Array" => "toArray",
+        "Iterator" => "iterator",
+        _ => return None,
+    })
+}
+
+/// The `IterableFactory` members a collection companion answers: `List.empty`,
+/// `List.fill(n)(v)`, `Vector.tabulate(n)(f)`, `List.range(a, b[, step])`,
+/// `List.concat(xs, …)` and `List.from(xs)`. Answers the expression they are
+/// equivalent to, or `None` to leave the access on the ordinary dispatch path.
+///
+/// Each one DESUGARS to a construct this frontend already compiles rather than
+/// getting its own builtin, so it inherits the existing element-type inference,
+/// closure calling convention and per-kind builder for free, and cannot drift
+/// from the combinator it is defined in terms of. `List.fill(n)(v)` becomes
+/// `(0 until n).map(_ => v).toList`, which is not merely convenient: the fill
+/// expression is BY-NAME in Scala and re-evaluated once per element, and putting
+/// it in a lambda body is what preserves that for an effectful `v`.
+fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+    let m = |recv: Expr, name: &str, args: Vec<Expr>| Expr::Method {
+        recv: Box::new(recv),
+        name: name.to_string(),
+        args,
+        line,
+    };
+    // `X.empty` is that collection's empty literal. It is answered before the
+    // element-wise members so `Map.empty` works too, where `Map.fill` would need
+    // pairs and is left alone.
+    if name == "empty" && args.is_empty() && (factory_conversion(owner).is_some() || owner == "Map")
+    {
+        return Some(Expr::Collection {
+            ctor: owner.to_string(),
+            elems: Vec::new(),
+        });
+    }
+    let conv = factory_conversion(owner)?;
+    let rebuild = |e: Expr| m(e, conv, Vec::new());
+    // `0 until n`, the index sequence `fill`/`tabulate` are defined over.
+    let indices = |n: &Expr| m(Expr::Int(0), "until", vec![n.clone()]);
+    Some(match (name, args) {
+        ("fill", [n, v]) => {
+            // The parameter name is not a legal Scala identifier, so the fill
+            // expression cannot accidentally refer to (or be shadowed by) it.
+            let f = Expr::Lambda {
+                params: vec!["_$fill".to_string()],
+                body: Box::new(v.clone()),
+                partial: false,
+            };
+            rebuild(m(indices(n), "map", vec![f]))
+        }
+        ("tabulate", [n, f]) => rebuild(m(indices(n), "map", vec![f.clone()])),
+        ("range", [a, b]) => rebuild(m(a.clone(), "until", vec![b.clone()])),
+        ("range", [a, b, step]) => {
+            rebuild(m(m(a.clone(), "until", vec![b.clone()]), "by", vec![step.clone()]))
+        }
+        ("from", [xs]) => rebuild(xs.clone()),
+        ("concat", [first, rest @ ..]) => rebuild(
+            rest.iter()
+                .fold(first.clone(), |acc, x| m(acc, "++", vec![x.clone()])),
+        ),
+        _ => return None,
+    })
+}
+
 /// The bound named by a numeric companion object — `Int.MaxValue`,
 /// `Long.MinValue`, and the sub-`Int` widths Scala also exposes. Returns `None`
 /// for anything else, which leaves the access on the ordinary dispatch path.
@@ -5045,6 +5131,7 @@ const SEQ_CTORS: &[&str] = &[
     "ArrayBuffer",
     "Buffer",
     "Iterable",
+    "Iterator",
 ];
 
 /// Niladic methods whose result is one ELEMENT of the receiver, so they take the

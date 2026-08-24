@@ -293,3 +293,46 @@ object T extends App { def va(xs: Int*) = xs.sum; println(va(List(1, 2, 3): _*))
 object T extends App { println(math.max(1: Int, 2)) }	2\n
 object T extends App { val o = None: Option[Int]; println(o.getOrElse(4)) }	4\n
 object T extends App { println((1, 2): Tuple2[Int, Int]) }	(1,2)\n
+object T extends App { println(List(1, 2).iterator) }	<iterator>\n
+object T extends App { val it = List(1, 2, 3).iterator; println(it.next()); println(it.next()); println(it.hasNext); println(it.next()); println(it.hasNext) }	1\n2\ntrue\n3\nfalse\n
+object T extends App { val it = List(1, 2, 3).iterator; println(it.toList); println(it.toList) }	List(1, 2, 3)\nList()\n
+object T extends App { println(List(1, 2).iterator.map(_ + 1)) }	<iterator>\n
+object T extends App { println(List(1, 2).iterator.map(_ + 1).toList) }	List(2, 3)\n
+object T extends App { println(List(1, 2).reverseIterator.toList) }	List(2, 1)\n
+object T extends App { println("ab".iterator.toList) }	List(a, b)\n
+object T extends App { println("ab".iterator) }	<iterator>\n
+object T extends App { println(Map("a" -> 1).iterator.toList) }	List((a,1))\n
+object T extends App { println(Set(1, 2).iterator.toList) }	List(1, 2)\n
+object T extends App { println((1 to 3).iterator.toList) }	List(1, 2, 3)\n
+object T extends App { println(Iterator(1, 2, 3).sum) }	6\n
+object T extends App { println(Iterator.empty) }	<iterator>\n
+object T extends App { println(Some(1).iterator.toList) }	List(1)\n
+object T extends App { println(List(1, 2).iterator.mkString(",")) }	1,2\n
+object T extends App { val it = List(1, 2).iterator; println(it.isEmpty); println(it.toList) }	false\nList(1, 2)\n
+object T extends App { println(List.empty) }	List()\n
+object T extends App { println(Vector.empty) }	Vector()\n
+object T extends App { println(Map.empty) }	Map()\n
+object T extends App { println(Set.empty) }	Set()\n
+object T extends App { println(List.fill(3)(0)) }	List(0, 0, 0)\n
+object T extends App { println(List.fill(0)(1)) }	List()\n
+object T extends App { println(Vector.fill(2)("a")) }	Vector(a, a)\n
+object T extends App { var n = 0; val xs = List.fill(3)({ n += 1; n }); println(xs); println(n) }	List(1, 2, 3)\n3\n
+object T extends App { println(List.tabulate(4)(i => i * i)) }	List(0, 1, 4, 9)\n
+object T extends App { println(Vector.tabulate(3)(_ + 1)) }	Vector(1, 2, 3)\n
+object T extends App { println(List.range(0, 5)) }	List(0, 1, 2, 3, 4)\n
+object T extends App { println(List.range(0, 10, 3)) }	List(0, 3, 6, 9)\n
+object T extends App { println(List.concat(List(1), List(2))) }	List(1, 2)\n
+object T extends App { println(List.from(Vector(1, 2))) }	List(1, 2)\n
+object T extends App { println(Array.fill(3)(7).toList) }	List(7, 7, 7)\n
+object T extends App { println(Set.fill(3)(1)) }	Set(1)\n
+object T extends App { println(List.empty[Int].isEmpty) }	true\n
+object T extends App { println("before"); println(List[Int]().iterator.next()) }	before\n	java.util.NoSuchElementException: next on empty iterator
+object T extends App { println(List(1, 2, 3).grouped(2)) }	<iterator>\n
+object T extends App { println(List(1, 2, 3).sliding(2)) }	<iterator>\n
+object T extends App { println(List(1, 2, 3).grouped(2).toList) }	List(List(1, 2), List(3))\n
+object T extends App { val g = List(1, 2, 3).grouped(2); println(g.toList); println(g.toList) }	List(List(1, 2), List(3))\nList()\n
+object T extends App { println(List(1, 2, 3).grouped(2).size) }	2\n
+object T extends App { println("abcd".grouped(2).toList) }	List(ab, cd)\n
+object T extends App { println("abcd".sliding(2).toList) }	List(ab, bc, cd)\n
+object T extends App { println("abcd".grouped(2)) }	<iterator>\n
+object T extends App { println(List(1, 2, 3).sliding(2).map(_.sum).toList) }	List(3, 5)\n
