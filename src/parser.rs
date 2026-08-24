@@ -1008,7 +1008,11 @@ impl Parser {
         };
         let init = if self.is(&Tok::Assign) {
             self.advance();
-            Some(self.expression()?)
+            let line = self.line();
+            let e = self.expression()?;
+            // `val n = 3: Long` — the bare ascription form. A `:` cannot start
+            // the next statement, so it can only continue this initializer.
+            Some(self.ascription_tail(e, line)?)
         } else {
             None
         };
@@ -2276,6 +2280,24 @@ impl Parser {
         // placeholder and, if nothing encloses it, is rejected — which is what
         // Scala 3 does with it ("Unbound placeholder parameter").
         let e = wrap_arg_placeholders(self.expression()?);
+        self.ascription_tail(e, line)
+    }
+
+    /// The trailing `: T` of a type ascription, applied to an already-parsed
+    /// expression.
+    ///
+    /// Scala's grammar is `Expr1 ::= PostfixExpr Ascription`, so an ascription
+    /// is legal wherever an expression is — an argument (`f(xs: Seq[Int])`), a
+    /// `val` initializer (`val n = 3: Long`), a `println` operand — and NOT only
+    /// inside parentheses. Every one of those sites shares this tail, so the
+    /// parenthesized form and the bare form cannot drift apart.
+    ///
+    /// The annotation itself is dropped: the runtime is dynamically typed on the
+    /// fusevm value model and nothing downstream reads a declared type. The one
+    /// exception is a numeric widening, which is observable WITHOUT a type
+    /// checker — `3: Double` prints `3.0`, not `3` — so it lowers to the same
+    /// `toDouble` conversion Scala's implicit widening performs.
+    fn ascription_tail(&mut self, e: Expr, line: u32) -> Result<Expr, String> {
         if !self.is(&Tok::Colon) {
             return Ok(e);
         }
@@ -2406,8 +2428,15 @@ impl Parser {
                         }
                     }
                     None => {
+                        let line = self.line();
                         let e = wrap_arg_placeholders(self.expression()?);
-                        self.spread_or(e)?
+                        // `xs: _*` is a SPREAD, not an ascription, so it is
+                        // recognized first; any other `: T` here is the bare
+                        // ascription form (`f(xs: Seq[Int])`). Inside an
+                        // argument the only tokens that may follow an
+                        // expression are `,` and `)`, so a `:` is unambiguous.
+                        let e = self.spread_or(e)?;
+                        self.ascription_tail(e, line)?
                     }
                 };
                 args.push(a);
@@ -2430,7 +2459,9 @@ impl Parser {
         let arg = if self.is(&Tok::RParen) {
             None
         } else {
-            Some(Box::new(self.expression()?))
+            let line = self.line();
+            let e = self.expression()?;
+            Some(Box::new(self.ascription_tail(e, line)?))
         };
         self.eat(&Tok::RParen)?;
         Ok(Expr::Println { newline, arg })

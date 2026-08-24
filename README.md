@@ -252,8 +252,10 @@ Implemented and checked against the reference `scala`:
   `"""…"""` form, taken verbatim) / char / boolean / `null`
   literals and the unit literal `()`; the binary operators `+ - * / %`,
   `== != < > <= >=`, `&& ||` (short-circuiting); unary `-` and `!`;
-  parenthesised grouping and type ascription (`(e: T)`, with the numeric
-  widening `(3: Double)` actually widening); Scala's `+` string concatenation
+  parenthesised grouping and type ascription — both the parenthesised `(e: T)`
+  and the bare `e: T` Scala's grammar allows wherever an expression is
+  expected (an argument, a `val` initializer), with the numeric widening
+  `3: Double` actually widening; Scala's `+` string concatenation
   and `*` string repetition; the `java.util.Formatter` conversions behind the
   `f"…"` interpolator, `"…".format(…)`, `String.format(…)` and `x.formatted(…)`
   (`%s %d %f %e %E %x %X %o %b %c`, with the flags, width and precision, rounded

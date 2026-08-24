@@ -92,8 +92,12 @@ reported as parse/compile errors, never silently mis-run.
   uniquely renames each block-local `def` and **lambda-lifts** whatever
   enclosing-frame locals its body reads into extra trailing parameters that
   every call site passes; capture sets propagate through calls to a fixpoint.
-- **Type ascription in expression position, and the unit literal.** `(e: T)`
-  parses wherever an expression does (`(None: Option[Int])`, `(xs: Seq[Int])`).
+- **Type ascription in expression position, and the unit literal.** Both the
+  parenthesised `(e: T)` and the bare `e: T` parse wherever an expression does
+  (`(None: Option[Int])`, `f(xs: Seq[Int])`, `val n = 3: Long`), which is what
+  Scala's `Expr1 ::= PostfixExpr Ascription` allows. In an argument the spread
+  `xs: _*` is recognized first, so it stays a spread rather than becoming an
+  ascription of the type `_*`.
   The runtime is dynamically typed, so the annotation is dropped — except for a
   numeric widening, which is observable WITHOUT a type checker and so is
   performed: `(3: Double)` answers `3.0`, not `3`. `()` is the `Unit` value; it

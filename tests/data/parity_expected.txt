@@ -283,3 +283,13 @@ object T extends App { println(List(1, 2, 3) map { _ * 2 }) }	List(2, 4, 6)\n
 object T extends App { println(List(1, 2, 3).map { x => val d = x * 3; if (d > 5) d else -d }) }	List(-3, 6, 9)\n
 object T extends App { { def mk(n: Int): Int => Int = (x: Int) => x + n; println(mk(1)(2)) } }	3\n
 object T extends App { println(List(1, 2, 3).maxBy { -_ }) }	1\n
+object T extends App { println(List(1, 2, 3).sum: Int) }	6\n
+object T extends App { val n = 3: Long; println(n) }	3\n
+object T extends App { val d = 3: Double; println(d) }	3.0\n
+object T extends App { println(7: Double) }	7.0\n
+object T extends App { println(None: Option[Int]) }	None\n
+object T extends App { def f(xs: Seq[Int]) = xs.sum; println(f(List(1, 2, 3): Seq[Int])) }	6\n
+object T extends App { def va(xs: Int*) = xs.sum; println(va(List(1, 2, 3): _*)) }	6\n
+object T extends App { println(math.max(1: Int, 2)) }	2\n
+object T extends App { val o = None: Option[Int]; println(o.getOrElse(4)) }	4\n
+object T extends App { println((1, 2): Tuple2[Int, Int]) }	(1,2)\n
