@@ -131,19 +131,7 @@ impl Parser {
         loop {
             match self.peek() {
                 Tok::Ident(w) if w == "package" || w == "import" => {
-                    self.advance();
-                    // Consume to the end of the line — or to the first token
-                    // that can only start a declaration. Newline inference does
-                    // not emit a separator before `case`, so an
-                    // `import …` line followed by a `case class` would
-                    // otherwise swallow the declaration whole.
-                    while !self.is(&Tok::Newline)
-                        && !self.is(&Tok::Semi)
-                        && !self.is(&Tok::Eof)
-                        && !self.at_declaration_start()
-                    {
-                        self.advance();
-                    }
+                    self.skip_import_clause();
                     self.skip_seps();
                 }
                 _ => break,
@@ -941,6 +929,27 @@ impl Parser {
     /// Parse one statement, tagging it with the source line of its first token
     /// (the single choke point every statement — top-level or nested — flows
     /// through, so `--dap` markers land on real lines).
+    /// Consume a `package`/`import`/`export` clause, cursor on the keyword.
+    ///
+    /// It runs to the end of the line — or to the first token that can only
+    /// start a declaration, because newline inference emits no separator before
+    /// `case`, so an `import …` line followed by a `case class` would otherwise
+    /// swallow the declaration whole.
+    ///
+    /// Shared by the top-level prologue and the block-statement form so the two
+    /// cannot disagree about where a clause ends.
+    fn skip_import_clause(&mut self) {
+        self.advance(); // package/import/export
+        while !self.is(&Tok::Newline)
+            && !self.is(&Tok::Semi)
+            && !self.is(&Tok::Eof)
+            && !self.is(&Tok::RBrace)
+            && !self.at_declaration_start()
+        {
+            self.advance();
+        }
+    }
+
     fn statement(&mut self) -> Result<Stmt, String> {
         let line = self.line();
         let mut kind = self.statement_kind()?;
@@ -960,6 +969,19 @@ impl Parser {
             Tok::For => Ok(StmtKind::Expr(self.for_comprehension()?)),
             Tok::Val | Tok::Var => self.local_decl(),
             Tok::Return => self.return_stmt(),
+            // A block-local `import`/`export`. Only the top-level prologue
+            // skipped these, so one inside a method body or an `extends App`
+            // block was parsed as an EXPRESSION and reported the package as a
+            // missing member (`value collection is not a member of Null`).
+            //
+            // Imports carry no runtime meaning here: unqualified names resolve
+            // against the frontend's own tables regardless of what was imported,
+            // exactly as the top-level ones already assume. So the clause is
+            // consumed and the statement is the unit value.
+            Tok::Ident(w) if w == "import" || w == "export" => {
+                self.skip_import_clause();
+                Ok(StmtKind::Expr(Expr::Tuple(Vec::new())))
+            }
             Tok::LBrace => {
                 self.advance();
                 // A bare block is Scala's block *expression*: its value is its

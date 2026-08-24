@@ -336,3 +336,17 @@ object T extends App { println("abcd".grouped(2).toList) }	List(ab, cd)\n
 object T extends App { println("abcd".sliding(2).toList) }	List(ab, bc, cd)\n
 object T extends App { println("abcd".grouped(2)) }	<iterator>\n
 object T extends App { println(List(1, 2, 3).sliding(2).map(_.sum).toList) }	List(3, 5)\n
+object T extends App { val sb = new StringBuilder; sb ++= List('x', 'y'); println(sb) }	xy\n
+object T extends App { val sb = new StringBuilder("q"); sb.appendAll(List('x', 'y')); println(sb) }	qxy\n
+object T extends App { val sb = new StringBuilder; sb.append(List(1, 2)); println(sb) }	List(1, 2)\n
+object T extends App { val sb = new StringBuilder; sb.append(7); sb.append('c'); sb.append(1.5); sb.append(true); println(sb); println(sb.length) }	7c1.5true\n9\n
+object T extends App { import scala.collection.mutable; val b = mutable.ArrayBuffer(1, 2); println(b += 3); println(b.append(4)); println(b) }	ArrayBuffer(1, 2, 3)\nArrayBuffer(1, 2, 3, 4)\nArrayBuffer(1, 2, 3, 4)\n
+object T extends App { import scala.collection.mutable; val q = mutable.Queue(1, 2); q.enqueue(3); println(q) }	Queue(1, 2, 3)\n
+object T extends App { import scala.collection.mutable; val st = mutable.Stack(1, 2); st.push(3); println(st); st += 9; println(st) }	Stack(3, 1, 2)\nStack(3, 1, 2, 9)\n
+object T extends App { import scala.collection.mutable; val dq = mutable.ArrayDeque(1, 2); dq.append(3); dq.prepend(0); println(dq) }	ArrayDeque(0, 1, 2, 3)\n
+object T extends App { import scala.collection.mutable; val s = mutable.Set(1, 2); println(s.add(3)); println(s.add(3)) }	true\nfalse\n
+object T extends App { import scala.collection.mutable; val pq = mutable.PriorityQueue(3, 1, 4); pq += 8; println(pq) }	PriorityQueue(8, 4, 3, 1)\n
+object T extends App { val sb = new StringBuilder; var i = 0; while (i < 500) { sb.append(i % 10); i += 1 }; println(sb.length) }	500\n
+object T extends App { import scala.collection.mutable; val b = mutable.ArrayBuffer(1, 2); b += 3; println(b) }	ArrayBuffer(1, 2, 3)\n
+object T { def main(args: Array[String]): Unit = { import scala.math; println(math.abs(-3)) } }	3\n
+object T { def main(args: Array[String]): Unit = { def f(): Int = { import scala.math; math.max(3, 1) }; println(f()) } }	3\n

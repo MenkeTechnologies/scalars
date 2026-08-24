@@ -4364,10 +4364,7 @@ fn mut_seq_method(
     let strbuf = kind == SeqKind::StrBuf;
     let me = || Ok(recv.clone());
     // Whether `args[0]` is a collection of elements (`++=`) or one element.
-    let all = matches!(
-        name,
-        "++=" | "addAll" | "appendAll" | "prependAll" | "--=" | "subtractAll"
-    );
+    let all = is_add_all_form(name);
     // What a `StringBuilder` addition contributes: the characters of a `Char`
     // sequence for the `All` forms (`sb ++= List('a','b')`), and otherwise the
     // characters of the argument's `String.valueOf` — which is why
@@ -4727,6 +4724,77 @@ fn mut_map_method(
     }
 }
 
+/// The single-element APPEND mutations — `buf += x`, `buf.append(x)`,
+/// `q.enqueue(x)`, `sb.append(x)` — performed IN PLACE, answering the receiver.
+///
+/// [`seq_method`] opens by CLONING the receiver's elements, which nearly every
+/// operation needs. An append does not: it only pushes onto the end. Paying for
+/// the copy anyway, and then a second one to rebuild the vector, made appending
+/// in a loop QUADRATIC — 20_000 `StringBuilder.append`s took 11.2s and 40_000
+/// took 45.1s, the clean 4x-per-doubling of an O(n²) curve, and the 200_000 a
+/// realistic program does never finished.
+///
+/// Only the kinds whose append is a plain push are taken here; everything else
+/// falls through to the general path unchanged. A `Set` must scan for membership
+/// first, a `PriorityQueue` sifts rather than appends (and is not a buffer), and
+/// `Stack.push` PREPENDS — which is why the NAME is checked and not just the
+/// kind, since a `Stack`'s `+=` is still `Growable.addOne` and does append.
+///
+/// A `StringBuilder` given an object argument also falls through: that argument
+/// is rendered through a user `toString` override, which needs the VM this
+/// function deliberately does not take.
+fn append_in_place(recv: &Value, name: &str, args: &[Value]) -> Option<Value> {
+    if args.len() != 1 {
+        return None;
+    }
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let id = *id as usize;
+    // The kind is read under a SHORT immutable borrow: building the appended
+    // values can re-enter the heap (`str_chars` renders a collection argument),
+    // so no borrow may be held across that.
+    let kind = HEAP.with(|h| match h.borrow().get(id) {
+        Some(HeapVal::Seq(k, _)) => Some(*k),
+        _ => None,
+    })?;
+    if !kind.is_buffer() {
+        return None;
+    }
+    let appends = matches!(name, "+=" | "addOne" | "append")
+        || (name == "enqueue" && kind == SeqKind::Queue);
+    if !appends {
+        return None;
+    }
+    let adds = if kind == SeqKind::StrBuf {
+        if matches!(args[0], Value::Obj(_)) {
+            return None;
+        }
+        str_chars(&args[0])
+    } else {
+        vec![args[0].clone()]
+    };
+    HEAP.with(|h| {
+        if let Some(HeapVal::Seq(_, xs)) = h.borrow_mut().get_mut(id) {
+            xs.extend(adds);
+        }
+    });
+    Some(recv.clone())
+}
+
+/// Whether an addition/removal name takes a COLLECTION of elements (`++=`,
+/// `addAll`, `appendAll`, …) rather than one element (`+=`, `append`, …).
+///
+/// Shared by the two places that must agree about it: `mut_seq_method`, which
+/// spreads the argument, and its call site, which pre-renders a `StringBuilder`'s
+/// argument through a user `toString` and must NOT do so for these.
+fn is_add_all_form(name: &str) -> bool {
+    matches!(
+        name,
+        "++=" | "addAll" | "appendAll" | "prependAll" | "--=" | "subtractAll"
+    )
+}
+
 /// The JDK's out-of-bounds message for an indexed sequence write.
 fn index_out_of_bounds(i: i64, len: usize) -> String {
     format!(
@@ -4738,6 +4806,11 @@ fn index_out_of_bounds(i: i64, len: usize) -> String {
 /// `Seq` (`List`/`Set`/`Iterable`) methods — a faithful subset. Closure-taking
 /// ops run their function argument through [`invoke_closure`].
 fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // Appending is answered BEFORE the receiver's elements are read, because
+    // reading them is what made appending quadratic — see [`append_in_place`].
+    if let Some(me) = append_in_place(recv, name, args) {
+        return Ok(me);
+    }
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
     // A `scala.collection.Iterator` is CONSUMED by traversing it, and that is
     // the one part of its laziness a strict frontend must still reproduce: the
@@ -4787,8 +4860,16 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // `toString`. `mut_seq_method` holds no VM, so the argument is rendered
         // here — the string it becomes then appends character by character
         // exactly as a literal would.
+        //
+        // Only the ONE-element forms, though. `++=`/`appendAll` take an
+        // `IterableOnce[Char]` and contribute its ELEMENTS, and rendering the
+        // argument first destroyed that: `sb ++= List('x', 'y')` appended the
+        // eleven characters of `List(x, y)` instead of `xy`.
         let rendered: Vec<Value>;
-        let args = if kind == SeqKind::StrBuf && matches!(args.first(), Some(Value::Obj(_))) {
+        let args = if kind == SeqKind::StrBuf
+            && !is_add_all_form(name)
+            && matches!(args.first(), Some(Value::Obj(_)))
+        {
             rendered = args
                 .iter()
                 .map(|a| match a {

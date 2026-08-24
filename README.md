@@ -545,6 +545,12 @@ number in arithmetic (`'a' + 1 == 98`) and as text when printed
 `"abc".toList.map(_.toInt)` is the code points while `"abc".map(_.toUpper)` is
 still a `String`.
 
+Appending to a growable collection (`buf += x`, `sb.append(x)`, `q.enqueue(x)`)
+is amortized O(1). It reads the receiver's elements in place rather than copying
+them, which is what the general method path does and had made appending in a
+loop quadratic — 40,000 `StringBuilder.append`s took 45s, and the 200,000 a real
+program does never finished.
+
 ### Differential parity fuzzer
 
 `cargo run --bin parity-fuzz -- --count 300 --probes 40` generates

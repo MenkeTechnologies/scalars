@@ -594,9 +594,18 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **An unqualified `Set`/`Map` always means the immutable one.** `import` lines
-  are skipped, not tracked, so `import scala.collection.mutable.Set` followed by
-  a bare `Set(1, 2)` builds the immutable set. Write `mutable.Set(1, 2)`.
+- **`import` clauses are skipped, not tracked**, at the top level and, since
+  they are recognized in statement position too, inside a method body or a
+  block. Skipping them costs nothing for a *qualifying* import — `import
+  scala.collection.mutable` followed by `mutable.ArrayBuffer(…)` works, because
+  the qualified name is what resolves — but a SELECTOR import does not bring its
+  member into scope unqualified: `import scala.math.abs` followed by a bare
+  `abs(-3)` is `not found: abs`. Write `math.abs(-3)`. The collection names
+  (`ListBuffer`, `ArrayBuffer`, `Buffer`) are the exception, and only because
+  they resolve unqualified with or without the import. For the same reason an
+  unqualified `Set`/`Map` always means the IMMUTABLE one: `import
+  scala.collection.mutable.Set` followed by a bare `Set(1, 2)` builds the
+  immutable set. Write `mutable.Set(1, 2)`.
 - **`xs: _*` outside an argument position.** The spread is parsed where Scala
   allows it — as an argument — and rejected everywhere else, which is also what
   Scala does. A spread handed to a parameter that is not repeated is a compile
