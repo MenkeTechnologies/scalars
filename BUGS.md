@@ -610,6 +610,16 @@ reported as parse/compile errors, never silently mis-run.
   allows it — as an argument — and rejected everywhere else, which is also what
   Scala does. A spread handed to a parameter that is not repeated is a compile
   error on both sides.
+- **A `Map`'s and `Set`'s inserts are LINEAR, so filling one is quadratic.**
+  Both are stored as an ordered entry vector, which is what makes their
+  iteration order byte-reproducible (the CHAMP trie order, the mutable table
+  order); a lookup therefore scans, where Scala's hashes. Filling a
+  `mutable.Map` by key measured 1.27s / 5.06s / 20.41s of user time at n = 4k /
+  8k / 16k. Element WRITES on a sequence do not have this shape — an append and
+  an `a(i) = v` are both amortized O(1) (`append_in_place`). Closing this needs
+  a hash index beside the entry vector, which has to preserve that vector as the
+  order of record; it is not done, and the cost is stated here rather than
+  hidden.
 - **Lazy views.** `.view` and `LazyList`. `Iterator` itself is no longer one of
   these gaps: `.iterator`/`.reverseIterator` (and `grouped`/`sliding`) answer a
   real [`SeqKind::Iterator`], which renders `<iterator>`, answers

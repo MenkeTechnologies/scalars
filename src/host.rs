@@ -5597,11 +5597,17 @@ fn seq_product(items: &[Value]) -> Value {
 /// `Map.to*` do.
 fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let (rep, entries) = map_rep_entries(recv).unwrap_or((HashRep::Small, Vec::new()));
-    // Every closure-taking `Map` method passes one `Tuple2` argument.
-    let pairs: Vec<Value> = entries
-        .iter()
-        .map(|(k, v)| new_pair(k.clone(), v.clone()))
-        .collect();
+    // Every closure-taking `Map` method passes one `Tuple2` argument. Built on
+    // DEMAND, because materializing it allocates a fresh heap tuple PER ENTRY:
+    // the methods that never traverse the map — `apply`, `get`, `size`, and
+    // above all the `update` that fills one in a loop — were paying n
+    // allocations on every call.
+    let pairs = || -> Vec<Value> {
+        entries
+            .iter()
+            .map(|(k, v)| new_pair(k.clone(), v.clone()))
+            .collect()
+    };
     // In-place mutation, before the pure paths: on a `mutable.Map` the names
     // `+`/`-`/`++` still build a new map, but `+=`/`-=`/`update`/`put` mutate.
     if matches!(rep, HashRep::Mutable(_) | HashRep::Linked) {
@@ -5644,8 +5650,9 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // `Map` builder from the element type) and an `Iterable` otherwise.
         // `m.collect(pf)` is the same, over the entries `pf` is defined at.
         ("map" | "flatMap" | "collect", 1) => {
-            let mut out = Vec::with_capacity(pairs.len());
-            for p in &pairs {
+            let ps = pairs();
+            let mut out = Vec::with_capacity(ps.len());
+            for p in &ps {
                 if name == "collect" && !is_defined_at(vm, &args[0], p)? {
                     continue;
                 }
@@ -5682,7 +5689,8 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             let keep_if = name != "filterNot";
             let mut kept = Vec::new();
             let mut dropping = false;
-            for (p, e) in pairs.iter().zip(entries.iter()) {
+            let ps = pairs();
+            for (p, e) in ps.iter().zip(entries.iter()) {
                 let hit = truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(p))?);
                 match name {
                     "takeWhile" | "dropWhile" => {
@@ -5700,7 +5708,8 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         ("partition", 1) => {
             let mut yes = Vec::new();
             let mut no = Vec::new();
-            for (p, e) in pairs.iter().zip(entries.iter()) {
+            let ps = pairs();
+            for (p, e) in ps.iter().zip(entries.iter()) {
                 if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(p))?) {
                     yes.push(e.clone());
                 } else {
@@ -5710,10 +5719,11 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             Ok(new_pair(new_map(rep, yes), new_map(rep, no)))
         }
         ("head", 0) | ("last", 0) | ("headOption", 0) | ("lastOption", 0) => {
+            let ps = pairs();
             let pick = if name.starts_with("head") {
-                pairs.first()
+                ps.first()
             } else {
-                pairs.last()
+                ps.last()
             };
             if name.ends_with("Option") {
                 return Ok(opt(pick.cloned()));
@@ -5725,20 +5735,55 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 "scalars: java.util.NoSuchElementException: next on empty iterator".into()
             })
         }
+        // `Map.groupBy` builds sub-MAPS, not sub-sequences: `MapOps` rebuilds
+        // each group through its own `fromSpecific`, so
+        // `Map("a"->1,"b"->2,"c"->3).groupBy(_._2 % 2)` is
+        // `HashMap(0 -> Map(b -> 2), 1 -> Map(a -> 1, c -> 3))`. Delegating to
+        // the sequence implementation answered `0 -> List((b,2))` instead. The
+        // OUTER map is a `HashMap` at any size, as the sequence `groupBy`'s is.
+        ("groupBy", 1) => {
+            let mut groups: Vec<(Value, Vec<(Value, Value)>)> = Vec::new();
+            for (p, e) in pairs().iter().zip(entries.iter()) {
+                let k = invoke_closure(vm, &args[0], std::slice::from_ref(p))?;
+                match groups.iter_mut().find(|(gk, _)| value_eq(gk, &k)) {
+                    Some(slot) => slot.1.push(e.clone()),
+                    None => groups.push((k, vec![e.clone()])),
+                }
+            }
+            Ok(new_map(
+                HashRep::Hashed,
+                groups
+                    .into_iter()
+                    .map(|(k, group)| (k, new_map(rep, group)))
+                    .collect(),
+            ))
+        }
+        // `Map.mkString` renders each entry `k -> v`, not as the `Tuple2` the
+        // sequence implementation prints: `MapOps.addString` supplies its own
+        // rendering, which is the same one behind `Map.toString`'s arrows. So
+        // `Map("a"->1).mkString(";")` is `a -> 1`, not `(a,1)`.
+        ("mkString", _) => {
+            let rendered: Vec<Value> = entries
+                .iter()
+                .map(|(k, v)| Value::str(format!("{} -> {}", scala_str(k), scala_str(v))))
+                .collect();
+            let seq = new_list(rendered);
+            seq_method(vm, &seq, name, args)
+        }
         // Everything else that only reads the entries as a pair sequence is the
         // sequence implementation over `Map`'s `Tuple2` elements.
         (
             "exists" | "forall" | "count" | "find" | "collectFirst" | "foldLeft" | "foldRight"
-            | "fold" | "reduce" | "maxBy" | "minBy" | "groupBy" | "toList" | "toSeq" | "toVector"
-            | "toArray" | "toSet" | "mkString" | "sortBy" | "unzip" | "zipWithIndex" | "iterator",
+            | "fold" | "reduce" | "maxBy" | "minBy" | "toList" | "toSeq" | "toVector" | "toArray"
+            | "toSet" | "sortBy" | "unzip" | "zipWithIndex" | "iterator",
             _,
         ) => {
-            let seq = new_list(pairs);
+            let seq = new_list(pairs());
             seq_method(vm, &seq, name, args)
         }
         ("toMap", 0) => Ok(recv.clone()),
         ("foreach", 1) => {
-            for p in &pairs {
+            for p in &pairs() {
                 invoke_closure(vm, &args[0], std::slice::from_ref(p))?;
             }
             Ok(unit_value())
