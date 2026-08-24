@@ -46,11 +46,6 @@
 
 use std::process::Command;
 
-fn run(src: &str) -> (String, bool) {
-    let (out, _err, ok) = run_full(src);
-    (out, ok)
-}
-
 fn run_full(src: &str) -> (String, String, bool) {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("scalars_parity_{}.scala", fnv1a(src)));

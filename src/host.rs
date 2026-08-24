@@ -251,7 +251,7 @@ pub const MAKE_LINKEDMAP: u16 = 768;
 /// Builtin id for a `mutable.PriorityQueue(...)` literal: pops `argc` elements,
 /// appends them raw and then heapifies, which is exactly what Scala's builder
 /// does and is why the stored order is neither the input's nor sorted (see
-/// [`heapify`]).
+/// `heapify`).
 pub const MAKE_PRIORITYQUEUE: u16 = 769;
 /// Builtin id for the run-time half of `x += e` / `x -= e`: pops one value and
 /// answers whether it is a collection that mutates in place. `true` sends the
@@ -5880,6 +5880,10 @@ fn java_str_cmp(a: &str, b: &str) -> Ordering {
     a.encode_utf16().cmp(b.encode_utf16())
 }
 
+/// Key of [`METHOD_ENTRIES`]: the class name, the method name and the arity,
+/// because an overloaded method is registered once per arity.
+type MethodKey = (Arc<str>, &'static str, usize);
+
 thread_local! {
     /// `(class, method, argc) → subroutine entry`, memoized because resolving one
     /// is a LINEAR scan of the chunk's name table and a `sorted` over a
@@ -5891,7 +5895,7 @@ thread_local! {
     ///
     /// `argc` is part of the key because an OVERLOADED method is registered
     /// per-arity (`Class$m$1`), so `Class.m` is two different entries.
-    static METHOD_ENTRIES: RefCell<HashMap<(Arc<str>, &'static str, usize), Option<usize>>> =
+    static METHOD_ENTRIES: RefCell<HashMap<MethodKey, Option<usize>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -6232,7 +6236,7 @@ fn b_array_fill(vm: &mut VM, _argc: u8) -> Value {
     if n < 0 {
         return fault(
             vm,
-            &format!("scalars: java.lang.NegativeArraySizeException: {n}"),
+            format!("scalars: java.lang.NegativeArraySizeException: {n}"),
         );
     }
     let zero = match ty.as_str() {

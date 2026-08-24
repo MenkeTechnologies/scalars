@@ -1958,16 +1958,16 @@ fn g_braces(r: &mut Rng) -> String {
             "{{ val f{u}: Int => Int = _ * {k}; println(f{u}({lim})); println({xs}.map(f{u})) }}"
         ),
         // Scala's typed placeholder.
-        17 => format!("{{ val g{u} = (_: Int) + {k}; println(g{u}({lim})); println({xs}.map(g{u})) }}"),
+        17 => format!(
+            "{{ val g{u} = (_: Int) + {k}; println(g{u}({lim})); println({xs}.map(g{u})) }}"
+        ),
         // A leading statement in the brace block: it runs ONCE, when the block is
         // evaluated to produce the function — not once per element.
         18 => format!("println({xs}.map {{ println(\"once\"); _ + {k} }})"),
         // A brace lambda whose body ends in an `if`: the block's value is the
         // `if`'s, so this is not `Unit`.
         19 => format!("println({xs}.map {{ x => if (x > {lim}) \"hi\" else \"lo\" }})"),
-        20 => format!(
-            "println({xs}.map {{ x => val d = x * {k}; if (d > {lim}) d else -d }})"
-        ),
+        20 => format!("println({xs}.map {{ x => val d = x * {k}; if (d > {lim}) d else -d }})"),
         // A bare `_` as a whole ARGUMENT: the expansion belongs to the call
         // around it, not to the statement the call sits in. Bound to a `val`
         // here, which is the placement the other modes never wrote — they only

@@ -5452,7 +5452,10 @@ fn a_brace_group_is_an_argument_and_a_placeholder_inside_it_expands_there() {
          println(List(3, 1, 2).sortBy { -_ })",
     ));
     assert!(ok, "{out}");
-    assert_eq!(out, "List(2, 4, 6)\nList(2, 3)\n-6\nList(1, 2)\nList(3, 2, 1)\n");
+    assert_eq!(
+        out,
+        "List(2, 4, 6)\nList(2, 3)\n-6\nList(1, 2)\nList(3, 2, 1)\n"
+    );
 }
 
 #[test]
