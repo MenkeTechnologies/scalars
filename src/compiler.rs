@@ -5002,9 +5002,11 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
         }
         ("tabulate", [n, f]) => rebuild(m(indices(n), "map", vec![f.clone()])),
         ("range", [a, b]) => rebuild(m(a.clone(), "until", vec![b.clone()])),
-        ("range", [a, b, step]) => {
-            rebuild(m(m(a.clone(), "until", vec![b.clone()]), "by", vec![step.clone()]))
-        }
+        ("range", [a, b, step]) => rebuild(m(
+            m(a.clone(), "until", vec![b.clone()]),
+            "by",
+            vec![step.clone()],
+        )),
         ("from", [xs]) => rebuild(xs.clone()),
         ("concat", [first, rest @ ..]) => rebuild(
             rest.iter()

@@ -254,7 +254,7 @@ pub const MAKE_LINKEDMAP: u16 = 768;
 /// `heapify`).
 pub const MAKE_PRIORITYQUEUE: u16 = 769;
 /// Builtin id for an `Iterator(...)` literal: pops `argc` elements into a
-/// consumable [`SeqKind::Iterator`]. `Iterator.empty` lowers to the same builtin
+/// consumable `SeqKind::Iterator`. `Iterator.empty` lowers to the same builtin
 /// with no arguments.
 pub const MAKE_ITERATOR: u16 = 772;
 /// Builtin id for the run-time half of `x += e` / `x -= e`: pops one value and
@@ -5632,8 +5632,7 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         (
             "exists" | "forall" | "count" | "find" | "collectFirst" | "foldLeft" | "foldRight"
             | "fold" | "reduce" | "maxBy" | "minBy" | "groupBy" | "toList" | "toSeq" | "toVector"
-            | "toArray" | "toSet" | "mkString" | "sortBy" | "unzip" | "zipWithIndex"
-            | "iterator",
+            | "toArray" | "toSet" | "mkString" | "sortBy" | "unzip" | "zipWithIndex" | "iterator",
             _,
         ) => {
             let seq = new_list(pairs);
@@ -7621,8 +7620,11 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("toList", 0) => Ok(new_list(s.chars().map(make_char).collect())),
         // `StringOps.iterator` — the characters as a CONSUMABLE `Iterator`,
         // not a `List`, so it renders as `<iterator>` and a second traversal
-        // sees it exhausted (see [`SeqKind::Iterator`]).
-        ("iterator", 0) => Ok(new_seq(SeqKind::Iterator, s.chars().map(make_char).collect())),
+        // sees it exhausted (see `SeqKind::Iterator`).
+        ("iterator", 0) => Ok(new_seq(
+            SeqKind::Iterator,
+            s.chars().map(make_char).collect(),
+        )),
         // `StringOps.grouped`/`sliding` — an `Iterator` whose windows are
         // `String`s, not `List`s of `Char` (`"abcd".grouped(2).toList` is
         // `List(ab, cd)`), because `StringOps` rebuilds through its own builder.
