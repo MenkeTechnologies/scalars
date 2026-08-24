@@ -1167,6 +1167,21 @@ impl SeqKind {
         }
     }
 
+    /// The out-of-range text an indexed WRITE (`a(i) = v`) answers.
+    ///
+    /// The same as [`SeqKind::index_fault`] for every kind but `ListBuffer`,
+    /// which is the one whose read and write disagree: `apply` forwards to the
+    /// LINEAR `LinearSeqOps` and reports the bare index, while `update` runs its
+    /// own `checkIndex` and reports the legal span. Captured from Scala 3.8.4 on
+    /// JDK 26.0.2 — `mutable.ListBuffer(1,2)(4)` is `IndexOutOfBoundsException: 4`
+    /// but `lb(4) = 1` is `4 is out of bounds (min 0, max 1)`.
+    fn index_write_fault(self, i: i64, len: usize) -> String {
+        match self {
+            SeqKind::ListBuffer => index_out_of_bounds(i, len),
+            _ => self.index_fault(i, len),
+        }
+    }
+
     /// The empty-receiver text for `head`, `last`, `tail` and `init`.
     ///
     /// Same story as [`SeqKind::index_fault`]: `List` names itself
@@ -4724,13 +4739,15 @@ fn mut_map_method(
     }
 }
 
-/// The single-element APPEND mutations — `buf += x`, `buf.append(x)`,
-/// `q.enqueue(x)`, `sb.append(x)` — performed IN PLACE, answering the receiver.
+/// The element WRITES that need no copy of the receiver — the single-element
+/// appends (`buf += x`, `buf.append(x)`, `q.enqueue(x)`, `sb.append(x)`) and the
+/// indexed `a(i) = v` — performed in place.
 ///
 /// [`seq_method`] opens by CLONING the receiver's elements, which nearly every
-/// operation needs. An append does not: it only pushes onto the end. Paying for
-/// the copy anyway, and then a second one to rebuild the vector, made appending
-/// in a loop QUADRATIC — 20_000 `StringBuilder.append`s took 11.2s and 40_000
+/// operation needs. These do not: an append only pushes onto the end, and an
+/// indexed write only needs the LENGTH to bounds-check. Paying for the copy
+/// anyway, and then a second one to rebuild the vector, made both QUADRATIC in a
+/// loop — filling a 16_000-element `Array` by index took 6.8s — 20_000 `StringBuilder.append`s took 11.2s and 40_000
 /// took 45.1s, the clean 4x-per-doubling of an O(n²) curve, and the 200_000 a
 /// realistic program does never finished.
 ///
@@ -4743,22 +4760,38 @@ fn mut_map_method(
 /// A `StringBuilder` given an object argument also falls through: that argument
 /// is rendered through a user `toString` override, which needs the VM this
 /// function deliberately does not take.
-fn append_in_place(recv: &Value, name: &str, args: &[Value]) -> Option<Value> {
-    if args.len() != 1 {
-        return None;
-    }
+fn append_in_place(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let Value::Obj(id) = recv else {
         return None;
     };
     let id = *id as usize;
-    // The kind is read under a SHORT immutable borrow: building the appended
-    // values can re-enter the heap (`str_chars` renders a collection argument),
-    // so no borrow may be held across that.
-    let kind = HEAP.with(|h| match h.borrow().get(id) {
-        Some(HeapVal::Seq(k, _)) => Some(*k),
+    // The kind and length are read under a SHORT immutable borrow: building the
+    // appended values can re-enter the heap (`str_chars` renders a collection
+    // argument), so no borrow may be held across that.
+    let (kind, len) = HEAP.with(|h| match h.borrow().get(id) {
+        Some(HeapVal::Seq(k, xs)) => Some((*k, xs.len())),
         _ => None,
     })?;
-    if !kind.is_buffer() {
+
+    // `a(i) = v`, the desugar target of `Array.update`. It reads no element
+    // either — only the LENGTH, for the bounds check.
+    if (name, args.len()) == ("update", 2) {
+        if !(kind == SeqKind::Array || kind.is_buffer()) {
+            return None;
+        }
+        let i = args[0].to_int();
+        if i < 0 || i as usize >= len {
+            return Some(Err(kind.index_write_fault(i, len)));
+        }
+        HEAP.with(|h| {
+            if let Some(HeapVal::Seq(_, xs)) = h.borrow_mut().get_mut(id) {
+                xs[i as usize] = args[1].clone();
+            }
+        });
+        return Some(Ok(Value::Undef));
+    }
+
+    if args.len() != 1 || !kind.is_buffer() {
         return None;
     }
     let appends =
@@ -4779,7 +4812,7 @@ fn append_in_place(recv: &Value, name: &str, args: &[Value]) -> Option<Value> {
             xs.extend(adds);
         }
     });
-    Some(recv.clone())
+    Some(Ok(recv.clone()))
 }
 
 /// Whether an addition/removal name takes a COLLECTION of elements (`++=`,
@@ -4808,8 +4841,8 @@ fn index_out_of_bounds(i: i64, len: usize) -> String {
 fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     // Appending is answered BEFORE the receiver's elements are read, because
     // reading them is what made appending quadratic — see [`append_in_place`].
-    if let Some(me) = append_in_place(recv, name, args) {
-        return Ok(me);
+    if let Some(r) = append_in_place(recv, name, args) {
+        return r;
     }
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
     // A `scala.collection.Iterator` is CONSUMED by traversing it, and that is
@@ -4947,26 +4980,10 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         // In-place element assignment (`a(i) = v`), the desugar target of
         // `Array.update`. Only a `mutable.Seq` answers it — an `Array` or one of
-        // the growable buffers.
-        ("update", 2) => {
-            if !(kind == SeqKind::Array || kind.is_buffer()) {
-                return Err(no_such_method(recv, name));
-            }
-            // `a(i) = v` fails exactly the way `a(i)` does: an `Array` hits the
-            // JVM's array check, a buffer hits `IndexedSeqOps`' span message.
-            let i = args[0].to_int();
-            if i < 0 || i as usize >= items.len() {
-                return Err(kind.index_fault(i, items.len()));
-            }
-            if let Value::Obj(id) = recv {
-                HEAP.with(|h| {
-                    if let Some(HeapVal::Seq(_, xs)) = h.borrow_mut().get_mut(*id as usize) {
-                        xs[i as usize] = args[1].clone();
-                    }
-                });
-            }
-            Ok(Value::Undef)
-        }
+        // the growable buffers — and those are all handled by
+        // [`append_in_place`] before the elements are copied, so what reaches
+        // here is an immutable receiver, which has no `update` at all.
+        ("update", 2) => Err(no_such_method(recv, name)),
         // `max`/`min` under the implicit ordering. The explicit-`Ordering` form
         // runs a user closure when the ordering is keyed, so it is answered on
         // the VM-aware arm below.

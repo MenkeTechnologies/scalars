@@ -545,11 +545,13 @@ number in arithmetic (`'a' + 1 == 98`) and as text when printed
 `"abc".toList.map(_.toInt)` is the code points while `"abc".map(_.toUpper)` is
 still a `String`.
 
-Appending to a growable collection (`buf += x`, `sb.append(x)`, `q.enqueue(x)`)
-is amortized O(1). It reads the receiver's elements in place rather than copying
-them, which is what the general method path does and had made appending in a
-loop quadratic — 40,000 `StringBuilder.append`s took 45s, and the 200,000 a real
-program does never finished.
+Writing an element is amortized O(1) — appending to a growable collection
+(`buf += x`, `sb.append(x)`, `q.enqueue(x)`) and the indexed `a(i) = v`. Both
+write the receiver in place instead of copying its elements, which is what the
+general method path does and what had made either one quadratic in a loop:
+40,000 `StringBuilder.append`s took 45s (and the 200,000 a real program does
+never finished), and filling a 16,000-element `Array` by index took 6.8s. They
+are 0.16s, 0.79s and 0.04s.
 
 ### Differential parity fuzzer
 
