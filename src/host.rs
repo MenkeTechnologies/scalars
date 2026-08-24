@@ -4761,8 +4761,8 @@ fn append_in_place(recv: &Value, name: &str, args: &[Value]) -> Option<Value> {
     if !kind.is_buffer() {
         return None;
     }
-    let appends = matches!(name, "+=" | "addOne" | "append")
-        || (name == "enqueue" && kind == SeqKind::Queue);
+    let appends =
+        matches!(name, "+=" | "addOne" | "append") || (name == "enqueue" && kind == SeqKind::Queue);
     if !appends {
         return None;
     }
