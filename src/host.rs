@@ -368,6 +368,15 @@ pub const SF32_CLASS: u16 = 776;
 /// same reason [`SF32_CLASS`] and [`SF32_STR`] do.
 pub const SF32_HASH: u16 = 777;
 
+/// Widen the top-of-stack value to `Double` when it is a `Float`. `argc == 1`.
+///
+/// The mirror of [`SF32`]. Scala widens an argument to the declared type, and
+/// `Float` to `Double` is a real conversion here because the two are distinct
+/// runtime values: `val d: Double = 0.1f` holds `0.10000000149011612`, not the
+/// `Float` `0.1`. Anything that is not a `Float` passes through untouched, so a
+/// `Double`-declared position pays nothing for values that already are one.
+pub const SF64: u16 = 778;
+
 /// The [`SF32_ARITH`] operator codes, shared with the compiler.
 pub mod f32_op {
     pub const ADD: i64 = 0;
@@ -634,6 +643,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SF32_STR, b_f32_str);
     vm.register_builtin(SF32_CLASS, b_f32_class);
     vm.register_builtin(SF32_HASH, b_f32_hash);
+    vm.register_builtin(SF64, b_f64);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -3056,6 +3066,7 @@ fn class_of(recv: &Value) -> Result<Value, String> {
         Value::Str(_) => ("java.lang.String".to_string(), "String".to_string(), false),
         Value::Int(_) => ("int".to_string(), "int".to_string(), true),
         Value::Float(_) => ("double".to_string(), "double".to_string(), true),
+        Value::Status(_) => ("float".to_string(), "float".to_string(), true),
         Value::Bool(_) => ("boolean".to_string(), "boolean".to_string(), true),
         Value::Undef => ("void".to_string(), "void".to_string(), true),
         Value::Obj(_) if as_char(recv).is_some() => ("char".to_string(), "char".to_string(), true),
@@ -3383,6 +3394,10 @@ fn scala_hash(v: &Value) -> Option<i32> {
             long_hash(*i)
         }),
         Value::Float(f) => Some(double_hash(*f)),
+        // `Statics.anyHash` on a `Float` box folds to the SAME hash a `Double`
+        // of that value gets, which is what keeps `Set(1.0f, 1.0)` a
+        // one-element set and a `Float` key findable by its `Double` twin.
+        Value::Status(_) => f32_of(v).map(|f| double_hash(f64::from(f))),
         Value::Str(s) => Some(string_hash(s)),
         Value::Bool(b) => Some(if *b { 1231 } else { 1237 }),
         Value::Undef => Some(0),
@@ -3795,6 +3810,15 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
 fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Obj(_), Value::Obj(_)) => obj_eq(a, b),
+        // A `Float` is a distinct VARIANT, so `a == b` would answer `false` for
+        // it against the `Int` or `Double` of the same value. Scala's `==`
+        // crosses the numeric widths: `1.0f == 1` and `1.0f == 1.0` are both
+        // true, and `0.1f == 0.1` is false because the widening is what is
+        // compared, not the rendering.
+        (Value::Status(_), _) | (_, Value::Status(_)) => match (float_of(a), float_of(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => a == b,
+        },
         _ => a == b,
     }
 }
@@ -3843,6 +3867,7 @@ fn b_matcherr(vm: &mut VM, _argc: u8) -> Value {
     let class = match &v {
         Value::Int(_) => "java.lang.Integer",
         Value::Float(_) => "java.lang.Double",
+        Value::Status(_) => "java.lang.Float",
         Value::Bool(_) => "java.lang.Boolean",
         Value::Str(_) => "java.lang.String",
         _ => "scala.runtime.Null$",
@@ -3860,7 +3885,8 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
     match ty {
         "String" | "CharSequence" => matches!(v, Value::Str(_)),
         "Int" | "Integer" | "Long" | "Short" | "Byte" => matches!(v, Value::Int(_)),
-        "Double" | "Float" => matches!(v, Value::Float(_)),
+        "Double" => matches!(v, Value::Float(_)),
+        "Float" => matches!(v, Value::Status(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
         "Any" | "AnyRef" | "AnyVal" | "Object" => true,
         // The sequence shapes a sequence pattern (`case List(a, b) =>`) and the
@@ -4016,7 +4042,7 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             Ok(pad_num(digits, n < 0, left, zero, plus, space, width))
         }
         'f' | 'F' => {
-            let x = v.to_float();
+            let x = num_f64(v);
             let p = prec.unwrap_or(6);
             let digits = match nonfinite(x, conv, plus, space) {
                 Some(t) => return Ok(pad_str(t, left, width)),
@@ -4073,7 +4099,7 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
         // that division is itself inexact and moves the tie: `1234.5` at
         // `%.3e` is `1.235e+03`, not `1.234e+03`.
         'e' | 'E' => {
-            let x = v.to_float();
+            let x = num_f64(v);
             let p = prec.unwrap_or(6);
             if let Some(t) = nonfinite(x, conv, plus, space) {
                 return Ok(pad_str(t, left, width));
@@ -6422,9 +6448,13 @@ fn value_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Str(x), Value::Str(y)) => java_str_cmp(x, y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
-            double_total_cmp(a.to_float(), b.to_float())
-        }
+        (
+            Value::Int(_) | Value::Float(_) | Value::Status(_),
+            Value::Int(_) | Value::Float(_) | Value::Status(_),
+        ) => double_total_cmp(
+            float_of(a).unwrap_or(f64::NAN),
+            float_of(b).unwrap_or(f64::NAN),
+        ),
         // `Char` orders by code point, so a `Seq[Char]` sorts like the `String`
         // of the same characters does.
         (Value::Obj(_), Value::Obj(_)) if as_char(a).is_some() && as_char(b).is_some() => {
@@ -6929,7 +6959,7 @@ fn seq_sum(items: &[Value]) -> Value {
                 .fold(0i64, i64::wrapping_add),
         )
     } else {
-        Value::float(items.iter().map(|v| v.to_float()).sum())
+        Value::float(items.iter().map(num_f64).sum())
     }
 }
 
@@ -7393,15 +7423,15 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
                     .parse::<f64>()
                     .map(Value::float)
                     .map_err(|_| number_format(&s)),
-                other => Ok(Value::float(other.to_float())),
+                other => Ok(Value::float(num_f64(other))),
             }
         }
         ("java.Boolean", "parseBoolean" | "valueOf", 1) => Ok(Value::bool(
             args[0].as_str_cow().eq_ignore_ascii_case("true"),
         )),
-        ("java.Double" | "java.Float", "isNaN", 1) => Ok(Value::bool(args[0].to_float().is_nan())),
+        ("java.Double" | "java.Float", "isNaN", 1) => Ok(Value::bool(num_f64(&args[0]).is_nan())),
         ("java.Double" | "java.Float", "isInfinite", 1) => {
-            Ok(Value::bool(args[0].to_float().is_infinite()))
+            Ok(Value::bool(num_f64(&args[0]).is_infinite()))
         }
         // ── Rendering ────────────────────────────────────────────────────────
         ("java.Integer" | "java.Long", "toBinaryString", 1) => {
@@ -7435,7 +7465,7 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         // `Double.toString(d)` is the same shortest-round-trip rendering the
         // implicit `"" + d` uses, so `-0.0` keeps its sign.
         ("java.Double" | "java.Float", "toString", 1) => {
-            Ok(Value::str(format_double(args[0].to_float())))
+            Ok(Value::str(format_double(num_f64(&args[0]))))
         }
         ("java.String", "valueOf", 1) => Ok(Value::str(scala_str(&args[0]))),
         // ── Arithmetic statics ───────────────────────────────────────────────
@@ -7590,7 +7620,7 @@ fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
         None => (false, name),
     };
     let ints = args.iter().all(|a| matches!(a, Value::Int(_))) && !(java && name == "signum");
-    let f = |i: usize| args[i].to_float();
+    let f = |i: usize| num_f64(&args[i]);
     match (name, args.len()) {
         ("Pi" | "PI", 0) => Ok(Value::float(std::f64::consts::PI)),
         ("E", 0) => Ok(Value::float(std::f64::consts::E)),
@@ -8249,7 +8279,10 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     // is legal wherever the infix one is. Only the primitive receivers route here:
     // `+`/`-` on a `Set`/`Map` mean set inclusion/removal and stay with the
     // collection dispatcher below.
-    if matches!(recv, Value::Str(_) | Value::Int(_) | Value::Float(_)) {
+    if matches!(
+        recv,
+        Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::Status(_)
+    ) {
         if let Some(r) = operator_method(recv, name, args) {
             return r;
         }
@@ -8258,6 +8291,7 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         Value::Str(s) => string_method(s, name, args),
         Value::Int(n) => int_method(*n, name, args),
         Value::Float(f) => double_method(*f, name, args),
+        Value::Status(_) => float_method(f32_of(recv).unwrap_or(0.0), name, args),
         Value::Bool(b) => bool_method(*b, name, args),
         Value::Obj(_) => obj_method(recv, name, args),
         _ => Err(no_such_method(recv, name)),
@@ -8401,8 +8435,22 @@ fn num_of(v: &Value) -> Option<i64> {
 fn float_of(v: &Value) -> Option<f64> {
     match v {
         Value::Float(f) => Some(*f),
+        // A `Float` widens exactly — every `f32` is an `f64` — so the `Double`
+        // view of one is its own value, which is what makes `0.1f + 1.0` the
+        // `Double` 1.1 and `0.1f.toDouble` 0.10000000149011612.
+        Value::Status(_) => f32_of(v).map(f64::from),
         _ => num_of(v).map(|n| n as f64),
     }
+}
+
+/// A numeric operand as an `f64`, `NaN` when it is not numeric at all.
+///
+/// The difference from `Value::to_float` is a `Float`: that one reads
+/// `Value::Status`'s payload as the integer it is declared to be (a shell exit
+/// code), which for a `Float` is its BIT PATTERN — `1.0f` came out as
+/// 1065353216.0. Every arithmetic path that can see a `Float` uses this.
+fn num_f64(v: &Value) -> f64 {
+    float_of(v).unwrap_or_else(|| v.to_float())
 }
 
 /// The dotted spelling of a binary operator on a primitive receiver — `n.+(1)`,
@@ -8437,7 +8485,7 @@ fn operator_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Va
                 }
             }
             _ => {
-                let (x, y) = (recv.to_float(), b.to_float());
+                let (x, y) = (num_f64(recv), num_f64(b));
                 match name {
                     "<" => x < y,
                     ">" => x > y,
@@ -8468,11 +8516,11 @@ fn operator_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Va
                 Ok(Value::int(recv.to_int().wrapping_rem(b.to_int())))
             }
         }
-        "+" => Ok(Value::float(recv.to_float() + b.to_float())),
-        "-" => Ok(Value::float(recv.to_float() - b.to_float())),
-        "*" => Ok(Value::float(recv.to_float() * b.to_float())),
-        "/" => Ok(Value::float(recv.to_float() / b.to_float())),
-        _ => Ok(Value::float(recv.to_float() % b.to_float())),
+        "+" => Ok(Value::float(num_f64(recv) + num_f64(b))),
+        "-" => Ok(Value::float(num_f64(recv) - num_f64(b))),
+        "*" => Ok(Value::float(num_f64(recv) * num_f64(b))),
+        "/" => Ok(Value::float(num_f64(recv) / num_f64(b))),
+        _ => Ok(Value::float(num_f64(recv) % num_f64(b))),
     })
 }
 
@@ -9563,6 +9611,127 @@ fn bool_method(b: bool, name: &str, args: &[Value]) -> Result<Value, String> {
     }
 }
 
+/// `Float` methods (a faithful subset of `scala.Float` / `RichFloat`).
+///
+/// Mostly `double_method`'s surface one width down, but the differences are the
+/// point: a member that answers "the same number" answers a `Float`
+/// (`abs`, `max`, `min`), `toFloat` is the identity where `toDouble` widens,
+/// `round` answers an `Int` (the `Double` overload answers a `Long`), and
+/// `hashCode` is the 32-bit pattern rather than the folded 64-bit one.
+fn float_method(f: f32, name: &str, args: &[Value]) -> Result<Value, String> {
+    let arg = || args.first().and_then(as_f32).unwrap_or(f32::NAN);
+    match (name, args.len()) {
+        ("abs", 0) => Ok(make_f32(f.abs())),
+        ("toFloat", 0) => Ok(make_f32(f)),
+        // Widening to `Double` is exact and is how the single-precision
+        // rounding becomes visible: `0.1f.toDouble` is `0.10000000149011612`.
+        ("toDouble", 0) => Ok(Value::float(f64::from(f))),
+        // `f2i`/`f2l` saturate exactly as `d2i`/`d2l` do.
+        ("toInt", 0) => Ok(Value::int(i64::from(f as i32))),
+        ("toLong", 0) => Ok(Value::int(f as i64)),
+        ("toByte", 0) => Ok(Value::int(to_byte(i64::from(f as i32)))),
+        ("toShort", 0) => Ok(Value::int(to_short(i64::from(f as i32)))),
+        ("toChar", 0) => Ok(make_char(char_of_code(f as i64))),
+        ("isNaN", 0) => Ok(Value::bool(f.is_nan())),
+        ("isInfinity" | "isInfinite", 0) => Ok(Value::bool(f.is_infinite())),
+        // `Math.round(float)` answers an `int`, where the `double` overload
+        // answers a `long` — the two disagree at the extremes, and only the
+        // receiver's width says which one a call selected.
+        ("round", 0) => Ok(Value::int(i64::from(round_f32(f)))),
+        ("max", 1) => Ok(make_f32(java_float_max(f, arg()))),
+        ("min", 1) => Ok(make_f32(java_float_min(f, arg()))),
+        ("signum", 0) => Ok(Value::int(if f.is_nan() || f == 0.0 {
+            0
+        } else if f < 0.0 {
+            -1
+        } else {
+            1
+        })),
+        ("compareTo" | "compare", 1) => Ok(Value::int(float_total_cmp(f, arg()) as i64)),
+        ("hashCode", 0) => Ok(Value::int(i64::from(float_to_int_bits(f)))),
+        ("toString", 0) => Ok(Value::str(format_float32(f))),
+        (
+            "abs" | "toInt" | "toLong" | "toByte" | "toShort" | "toDouble" | "toFloat" | "isNaN"
+            | "isInfinity" | "isInfinite" | "round" | "max" | "min" | "signum" | "compareTo"
+            | "compare",
+            _,
+        ) => Err(format!("scalars: Float.{name}: wrong number of arguments")),
+        // `x.formatted(spec)` on `Any`. The numeric conversions receive the
+        // WIDENED value, exactly as `String.format` does — Scala promotes a
+        // `Float` argument to a `Double` for them, which is why `%.9f` of
+        // `1.0f/3.0f` is `0.333333343`.
+        ("formatted", 1) => Ok(Value::str(format_all(
+            &args[0].as_str_cow(),
+            std::slice::from_ref(&Value::float(f64::from(f))),
+            None,
+        )?)),
+        _ => Err(no_such_method(&make_f32(f), name)),
+    }
+}
+
+/// `Math.round(float)` — the `int` overload, which saturates at the `Int` range
+/// rather than the `Long` one. `Math.round(1.0e20f)` is `Integer.MAX_VALUE`,
+/// where the `double` overload's answer is `Long.MAX_VALUE`; that difference is
+/// the reason the two overloads have to be told apart at all.
+///
+/// The JDK adds a half and takes the floor, which is not the same as rounding
+/// to nearest: `0.49999997f + 0.5f` is exactly `1.0f` at single precision, so
+/// `Math.round(0.49999997f)` is 1.
+fn round_f32(f: f32) -> i32 {
+    if f.is_nan() {
+        return 0;
+    }
+    (f + 0.5f32).floor() as i32
+}
+
+/// `math.max` at 32-bit width: a `NaN` operand PROPAGATES rather than being
+/// ignored, and `-0.0` is below `0.0`.
+fn java_float_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() { b } else { a };
+    }
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// The same for `math.min`.
+fn java_float_min(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() { a } else { b };
+    }
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// `java.lang.Float.compare` — the TOTAL order, so `NaN` is above everything
+/// and `-0.0` below `0.0`. Read off the bit patterns the way the JDK does.
+fn float_total_cmp(a: f32, b: f32) -> i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    let (ab, bb) = (float_to_int_bits(a), float_to_int_bits(b));
+    match ab.cmp(&bb) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
 /// `Double` methods (a faithful subset of `scala.Double` / `RichDouble`).
 fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
     match (name, args.len()) {
@@ -9587,8 +9756,8 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("round", 0) => Ok(Value::int(java_round(f))),
         // `RichDouble`'s `max`/`min` are `math.max`/`math.min`, so they PROPAGATE
         // a NaN operand rather than ignoring it.
-        ("max", 1) => Ok(Value::float(java_double_max(f, args[0].to_float()))),
-        ("min", 1) => Ok(Value::float(java_double_min(f, args[0].to_float()))),
+        ("max", 1) => Ok(Value::float(java_double_max(f, num_f64(&args[0])))),
+        ("min", 1) => Ok(Value::float(java_double_min(f, num_f64(&args[0])))),
         // `RichDouble.signum` answers an `Int`, and `-0.0`'s is `0`.
         ("signum", 0) => Ok(Value::int(if f.is_nan() || f == 0.0 {
             0
@@ -9600,7 +9769,7 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         // `java.lang.Double.compare` — the total order, so `NaN` is above
         // everything and `-0.0` is below `0.0`.
         ("compareTo" | "compare", 1) => {
-            Ok(Value::int(double_total_cmp(f, args[0].to_float()) as i64))
+            Ok(Value::int(double_total_cmp(f, num_f64(&args[0])) as i64))
         }
         (
             "abs" | "toInt" | "toLong" | "toByte" | "toShort" | "toDouble" | "toFloat" | "isNaN"
@@ -9651,6 +9820,7 @@ fn no_such_method(recv: &Value, name: &str) -> String {
         Value::Str(_) => "String",
         Value::Int(_) => "Int",
         Value::Float(_) => "Double",
+        Value::Status(_) => "Float",
         Value::Bool(_) => "Boolean",
         Value::Undef => "Null",
         _ => "value",
@@ -9726,7 +9896,15 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
                 Value::int(x.wrapping_div(*y))
             }
         }
-        _ => Value::float(a.to_float() / b.to_float()),
+        // A `Float` on either side and no `Double` opposite it divides at 32
+        // bits, exactly as `SF32_ARITH` does for the statically-typed path.
+        // This is the same operation reached without the static type — from a
+        // lambda parameter, an erased element — and it must answer the same
+        // number: `1.0f / 3.0f` is `0.33333334`, not `0.3333333333333333`.
+        _ if f32_pair(&a, &b) => {
+            make_f32(as_f32(&a).unwrap_or(f32::NAN) / as_f32(&b).unwrap_or(f32::NAN))
+        }
+        _ => Value::float(num_f64(&a) / num_f64(&b)),
     }
 }
 
@@ -9762,7 +9940,10 @@ fn b_mod(vm: &mut VM, _argc: u8) -> Value {
                 Value::int(x.wrapping_rem(*y))
             }
         }
-        _ => Value::float(a.to_float() % b.to_float()),
+        _ if f32_pair(&a, &b) => {
+            make_f32(as_f32(&a).unwrap_or(f32::NAN) % as_f32(&b).unwrap_or(f32::NAN))
+        }
+        _ => Value::float(num_f64(&a) % num_f64(&b)),
     }
 }
 
@@ -9822,6 +10003,11 @@ pub fn scala_str(v: &Value) -> String {
     match v {
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Float(f) => format_double(*f),
+        // A `Float` renders at its OWN precision, wherever it is reached from —
+        // which is the whole point of it being a distinct runtime value:
+        // `println(List(0.1f))` is `List(0.1)` because the element says so, not
+        // because the compiler told the call site.
+        Value::Status(_) => f32_of(v).map(format_float32).unwrap_or_default(),
         Value::Undef => "null".to_string(),
         // The only arrays this frontend produces are `for … yield` results, whose
         // static type over a range generator is `IndexedSeq`/`Vector`; render them
@@ -10015,6 +10201,72 @@ fn format_double(f: f64) -> String {
     }
 }
 
+// ── scala.Float ─────────────────────────────────────────────────────────────
+//
+// A Scala `Float` is a type of its own, and the whole difficulty is that
+// `fusevm::Value` has no variant for one: `Float(f64)` is the `Double`, and a
+// `Float` sharing it is indistinguishable from the `Double` holding the same
+// bits. That is what made `println(0.1f)` right (the compiler knew the static
+// type and rendered it) while `println(List(0.1f))` was wrong (the container
+// renders its elements at run time, from values that no longer carried one).
+//
+// The representation is `Value::Status`, whose payload is exactly the 32 bits
+// an `f32` needs. Three properties fall out of that choice, and together they
+// are what make a real `Float` affordable:
+//
+// - **No allocation and no interning.** The payload IS the float, so a `Float`
+//   costs a `Value` and nothing else. Boxing one on the object arena was the
+//   alternative, and this runtime's arena never frees — a `Float` accumulation
+//   loop would have grown the heap by one entry per iteration.
+// - **Disjoint from `Double`.** `Value::Status` is not `Value::Float`, so no
+//   `Double` can be mistaken for a `Float`; `0.1f == 0.1` is `false`, the two
+//   print differently, and `getClass` answers `float` versus `double` from the
+//   value alone.
+// - **Rejected, not coerced, by native arithmetic.** fusevm's `is_native_num`
+//   admits only `Int` and `Float`, so an operand of this shape sends `Op::Add`
+//   and every comparison to the [`numeric_hook`] instead of silently reading
+//   the bit pattern as a number — which is where the single-precision rules
+//   are applied. It also keeps a `Float` out of the JIT's typed registers.
+//
+// `scala.Float` is otherwise an ordinary type here: the static [`NumTy`]
+// analysis in the compiler still drives literals and the arithmetic builtins,
+// but it is no longer what makes rendering correct.
+
+/// The `Value` carrying the `Float` `f` — its IEEE-754 bit pattern.
+///
+/// `to_bits` canonicalizes nothing, so a `NaN` keeps whichever payload the
+/// operation produced; every place that observes one ([`float_to_int_bits`],
+/// [`format_float32`]) collapses it the way the JVM does.
+pub fn make_f32(f: f32) -> Value {
+    Value::Status(f.to_bits() as i32)
+}
+
+/// `Some(the float)` when `v` is a `Float`.
+pub fn f32_of(v: &Value) -> Option<f32> {
+    match v {
+        Value::Status(bits) => Some(f32::from_bits(*bits as u32)),
+        _ => None,
+    }
+}
+
+/// Whether an operand pair is `Float` arithmetic — at least one `Float` and no
+/// `Double` opposite it, which is Scala's promotion rule (`Float` sits above
+/// both integer widths and below `Double`).
+fn f32_pair(a: &Value, b: &Value) -> bool {
+    (is_f32(a) || is_f32(b)) && !matches!(a, Value::Float(_)) && !matches!(b, Value::Float(_))
+}
+
+/// Whether `v` is a `Float`.
+fn is_f32(v: &Value) -> bool {
+    matches!(v, Value::Status(_))
+}
+
+/// `v` as an `f32` when it is a number of any width — a `Float` exactly, an
+/// `Int`/`Char`/`Double` narrowed. `None` for everything that is not numeric.
+fn as_f32(v: &Value) -> Option<f32> {
+    f32_of(v).or_else(|| float_of(v).map(|d| d as f32))
+}
+
 /// [`SF32`] — round one value to 32-bit `Float` precision.
 ///
 /// A non-numeric value passes through untouched, so the builtin is safe on a
@@ -10022,11 +10274,30 @@ fn format_double(f: f64) -> String {
 /// `Char`: the narrowing is about precision, not about coercing a type.
 fn b_f32(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.stack.pop().unwrap_or(Value::Undef);
-    match &v {
-        Value::Float(f) => Value::float(f64::from(*f as f32)),
-        Value::Int(n) => Value::float(f64::from(*n as f32)),
-        _ => v,
+    conv_elementwise(v, |x| as_f32(x).map(make_f32))
+}
+
+/// Apply a width conversion to a value, or ELEMENT-WISE to a collection's
+/// contents when it is one.
+///
+/// The compiler emits a conversion for a declared collection type as readily as
+/// for a scalar (`val xs: List[Double] = List(0.1f)`), and the elements are
+/// what carry the width there. A value the conversion does not apply to — and
+/// an element of one — passes through unchanged.
+fn conv_elementwise(v: Value, f: impl Fn(&Value) -> Option<Value> + Copy) -> Value {
+    if let Some(out) = f(&v) {
+        return out;
     }
+    let Some((kind, items)) = seq_kind_items(&v) else {
+        return v;
+    };
+    // Rebuilt rather than mutated in place: the receiver is a value here, and a
+    // conversion is not a mutation of the collection it was read from.
+    let converted: Vec<Value> = items
+        .iter()
+        .map(|x| f(x).unwrap_or_else(|| x.clone()))
+        .collect();
+    heap_push(HeapVal::Seq(kind, converted))
 }
 
 /// [`SF32_ARITH`] — one arithmetic operation at 32-bit `Float` width.
@@ -10044,7 +10315,7 @@ fn b_f32_arith(vm: &mut VM, _argc: u8) -> Value {
     if unwinding() {
         return Value::Undef;
     }
-    let (Some(x), Some(y)) = (float_of(&a), float_of(&b)) else {
+    let (Some(x), Some(y)) = (as_f32(&a), as_f32(&b)) else {
         // Not a numeric pair after all — the compiler's static type was wrong
         // about one side (an erased element, a `null`). Fall back to the
         // untyped `+`, which is what this expression would have emitted
@@ -10054,7 +10325,6 @@ fn b_f32_arith(vm: &mut VM, _argc: u8) -> Value {
             Err(e) => fault(vm, &e),
         };
     };
-    let (x, y) = (x as f32, y as f32);
     let r = match code.to_int() {
         f32_op::SUB => x - y,
         f32_op::MUL => x * y,
@@ -10062,7 +10332,13 @@ fn b_f32_arith(vm: &mut VM, _argc: u8) -> Value {
         f32_op::REM => x % y,
         _ => x + y,
     };
-    Value::float(f64::from(r))
+    make_f32(r)
+}
+
+/// [`SF64`] — widen a `Float` to `Double`, leaving everything else alone.
+fn b_f64(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    conv_elementwise(v, |x| f32_of(x).map(|f| Value::float(f64::from(f))))
 }
 
 /// [`SF32_STR`] — `Float.toString` of one value.
@@ -10072,9 +10348,15 @@ fn b_f32_arith(vm: &mut VM, _argc: u8) -> Value {
 /// still stringifies the way it otherwise would.
 fn b_f32_str(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.stack.pop().unwrap_or(Value::Undef);
-    match &v {
-        Value::Float(f) => Value::str(format_float32(*f as f32)),
-        _ => v,
+    match f32_of(&v) {
+        Some(f) => Value::str(format_float32(f)),
+        // A `Double` reaching a statically-`Float` site is the compiler having
+        // been right about the type and the value having come from somewhere
+        // that did not narrow it; render it at single precision anyway.
+        None => match &v {
+            Value::Float(d) => Value::str(format_float32(*d as f32)),
+            _ => v,
+        },
     }
 }
 
@@ -10087,7 +10369,7 @@ fn b_f32_class(vm: &mut VM, _argc: u8) -> Value {
 /// [`SF32_HASH`] — `Float.hashCode`, the 32-bit bit pattern.
 fn b_f32_hash(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.stack.pop().unwrap_or(Value::Undef);
-    Value::int(i64::from(float_to_int_bits(v.to_float() as f32)))
+    Value::int(i64::from(float_to_int_bits(as_f32(&v).unwrap_or(0.0))))
 }
 
 /// `Float.toString` — the same layout rules as [`format_double`], with the
@@ -10404,6 +10686,69 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             return char_binop(name, a, b);
         }
     }
+    // A `Float` operand. `Value::Status` is not one of fusevm's native numeric
+    // shapes, so EVERY operation touching a `Float` arrives here — which is
+    // exactly what makes single precision the runtime's business rather than
+    // the compiler's, and what closes `println(List(0.1f))`.
+    //
+    // Scala's binary numeric promotion puts `Float` above both integer widths
+    // and below `Double`: `0.1f + 1` and `0.1f + 1L` are `Float`, `0.1f + 1.0`
+    // is `Double`. So a `Double` on either side widens the pair and falls
+    // through to the arms below; anything else is computed at 32 bits.
+    if (is_f32(a) || is_f32(b)) && !matches!(a, Value::Float(_)) && !matches!(b, Value::Float(_)) {
+        if op == NumOp::Neg {
+            return Ok(make_f32(-f32_of(a).unwrap_or(0.0)));
+        }
+        // A `String` on either side is a concatenation, not arithmetic; it is
+        // answered by the general arms below, which render each side through
+        // `scala_str` — and a `Float` renders as one.
+        if !matches!(a, Value::Str(_)) && !matches!(b, Value::Str(_)) {
+            if let (Some(x), Some(y)) = (as_f32(a), as_f32(b)) {
+                return Ok(match op {
+                    NumOp::Add => make_f32(x + y),
+                    NumOp::Sub => make_f32(x - y),
+                    NumOp::Mul => make_f32(x * y),
+                    NumOp::Div => make_f32(x / y),
+                    NumOp::Mod => make_f32(x % y),
+                    NumOp::Pow => make_f32(x.powf(y)),
+                    NumOp::Lt => Value::bool(x < y),
+                    NumOp::Gt => Value::bool(x > y),
+                    NumOp::Le => Value::bool(x <= y),
+                    NumOp::Ge => Value::bool(x >= y),
+                    NumOp::Eq => Value::bool(x == y),
+                    NumOp::Ne => Value::bool(x != y),
+                    // Handled above.
+                    NumOp::Neg => make_f32(-x),
+                });
+            }
+        }
+    }
+    // A `Float` against a `Double`. Promotion widens the `Float` FIRST and the
+    // operation is then a `Double` one — which is what makes `0.1f == 0.1`
+    // FALSE (`0.1f` widens to 0.10000000149011612, not to 0.1) while
+    // `1.0f == 1.0` is true. Comparing the two renderings instead, as the
+    // general string-structural arm below would, gets both of those wrong.
+    if (is_f32(a) && matches!(b, Value::Float(_))) || (matches!(a, Value::Float(_)) && is_f32(b)) {
+        let (x, y) = (
+            float_of(a).unwrap_or(f64::NAN),
+            float_of(b).unwrap_or(f64::NAN),
+        );
+        return Ok(match op {
+            NumOp::Add => Value::float(x + y),
+            NumOp::Sub => Value::float(x - y),
+            NumOp::Mul => Value::float(x * y),
+            NumOp::Div => Value::float(x / y),
+            NumOp::Mod => Value::float(x % y),
+            NumOp::Pow => Value::float(x.powf(y)),
+            NumOp::Lt => Value::bool(x < y),
+            NumOp::Gt => Value::bool(x > y),
+            NumOp::Le => Value::bool(x <= y),
+            NumOp::Ge => Value::bool(x >= y),
+            NumOp::Eq => Value::bool(x == y),
+            NumOp::Ne => Value::bool(x != y),
+            NumOp::Neg => Value::float(-x),
+        });
+    }
     // Two integers reaching this hook means the exact result left `i64` — the VM
     // delegates an overflow here so a host with bignums can widen. Scala has no
     // bignum in its primitive tower: `Long` arithmetic WRAPS, so
@@ -10444,7 +10789,7 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         (a, b),
         (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_))
     ) {
-        let (x, y) = (a.to_float(), b.to_float());
+        let (x, y) = (num_f64(a), num_f64(b));
         let promoted = match op {
             NumOp::Add => Some(Value::float(x + y)),
             NumOp::Sub => Some(Value::float(x - y)),

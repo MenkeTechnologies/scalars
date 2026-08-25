@@ -95,8 +95,11 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   `Float.toString` picks the shortest decimal that round-trips through 32 bits
   (`0.1f` is `0.1`; the `Double` with those bits is `0.10000000149011612`). The
   constants (`Float.MaxValue` is `3.4028235E38`), `.toFloat`, `getClass`
-  (`float`) and `hashCode` follow. A `Float` inside a collection or a record
-  still renders as a `Double` — see `BUGS.md`.
+  (`float`) and `hashCode` follow. It is a distinct RUNTIME value — its 32 bits
+  ride in a `Value` variant of exactly that width — so it renders as a `Float`
+  wherever it is reached from: out of a `List`, a `case class` field, a `Map`
+  value, or an `Any`. What it costs is the JIT, which takes only the VM's two
+  native numeric shapes; see `BUGS.md`.
 - **Scala 3 entry points** — `@main def go(n: Int, s: String)` binds its
   parameters from the command line through the same reader Scala generates,
   including the wording and the exit status of a bad one (`Illegal command line

@@ -726,40 +726,29 @@ reported as parse/compile errors, never silently mis-run.
   about how a program runs and goes stale with every library release. Refusing
   it is the intended behaviour, so a program asking for it gets `value getClass
   is not a member of value` rather than a plausible-looking wrong name.
-- **A `Float` inside a collection or a record renders as a `Double`.** `Float`
-  is a real type now — single-precision literals, arithmetic, conversions,
-  constants, `toString`, `getClass` and `hashCode` all match Scala (see
-  `README.md`) — and it is a STATIC one: fusevm has a single floating
-  representation, so which of the two widths a value carries is knowable only
-  from the type the compiler inferred for the expression, exactly as `Int` and
-  `Long` share one `i64` and are told apart by the width analysis.
+- **A `Float` is not observable through a JIT-compiled loop.** `Float` is a real
+  type — single-precision literals, arithmetic, conversions, constants,
+  `toString`, `getClass` and `hashCode` all match Scala, and they match it
+  wherever the value is reached from, including out of a collection, a record
+  field, a `Map` value or an `Any`. It is a distinct RUNTIME value:
+  `Value::Status`, whose payload is exactly the 32 bits an `f32` needs (see
+  `scala.Float` in `src/host.rs`).
 
-  That is enough everywhere the type reaches the value, and it does not reach
-  the ELEMENTS of a container. `println(List(0.1f))` prints
-  `List(0.10000000149011612)` and `case class P(v: Float); println(P(0.1f))`
-  prints `P(0.10000000149011612)`, because both render their contents at run
-  time from values that no longer carry a width. The element ARITHMETIC is
-  correct — `List(0.1f, 0.2f).sum` is `0.3` and `xs.map(_ / 3.0f)` computes at
-  single precision — and so is any element pulled back out and used on its own
-  (`a(0) + a(1)`, `p.v / 3.0f`); it is only the container's own `toString` that
-  reads a `Double`. Rendering the elements from the container's static element
-  type would answer `List`/`Array`/`Vector` and still miss a record's fields, a
-  `Map`'s values, and anything erased through an `Any`, so it is not the fix
-  that closes this.
+  What that costs is the JIT. fusevm's `is_native_num` admits only `Int` and
+  `Double`, which is precisely what routes every operation on a `Float` through
+  the numeric hook instead of letting native arithmetic read the bit pattern as
+  a number — and the same test keeps a `Float` out of the JIT's typed
+  registers. So a hot `Float` loop stays interpreted where the identical loop
+  over `Int` or `Double` reaches native code, and `scala --tiers` reports that
+  honestly. The statically-typed path costs a `CallBuiltin` (`SF32_ARITH`) for
+  the same reason: rounding an `f64` result afterwards rounds twice and can
+  land a ulp from the value Scala computes (`16777217.0f * 0.2f` is
+  `3355443.2`; the double-rounded product is `3355443.3`).
 
-  Two smaller positions where the type does not reach either: a lambda parameter
-  typed only by a declared FUNCTION type (`val f: Float => Float = z => …` — a
-  parameter typed by a traversal, as in `xs.map(z => …)`, does get the element's
-  width), and a name bound by a destructuring `val (a, b) = (0.1f, 0.2f)`.
+  This is the same trade the Java frontend makes for the identical rule, and it
+  is a floor rather than a bug: single precision cannot be both exact and
+  native on a VM whose native floats are 64-bit.
 
-  A `Float` operation also leaves the JIT's reach: single precision costs a
-  `CallBuiltin` (`SF32_ARITH`), because rounding an `f64` result afterwards
-  rounds twice and can land a ulp from the value Scala computes
-  (`16777217.0f * 0.2f` is `3355443.2`, and the double-rounded product is
-  `3355443.3`). fusevm's tracer refuses to record through a builtin, so a hot
-  `Float` loop stays interpreted where the same loop over `Int` or `Double`
-  reaches native code. This is the same trade the Java frontend makes for the
-  identical rule.
 - **`given`/`using`.** A `given` declaration and a `using` parameter list are
   both parse errors.
 

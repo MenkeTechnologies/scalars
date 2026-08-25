@@ -927,16 +927,20 @@ impl Compiler {
                 // one (`val n: Long = 1`), otherwise inferred from the
                 // initializer, which is how Scala itself types a bare `val`.
                 let w = self.binding_width(ty.as_deref(), init.as_ref());
-                let is_f32 = w.num == NumTy::Float32;
                 self.widths.insert(name.clone(), w);
                 // A `var` a closure assigns lives in a heap cell, allocated here
                 // even without an initializer so the closure has something to
                 // write through (see [`boxed_vars`]).
-                // `val x: Float = 1` stores 1.0f, not the `Int` 1 — Scala widens
-                // the initializer to the declared type, and the `Float` half of
-                // that widening is a rounding this frontend has to perform. An
-                // initializer that is ALREADY a `Float` needs nothing.
-                let round = is_f32 && init.as_ref().map(|e| self.num_ty(e)) != Some(NumTy::Float32);
+                // The initializer is converted to the DECLARED type, which
+                // between the two floating widths is a real conversion: `val x:
+                // Float = 1` stores `1.0f`, and `val d: Double = 0.1f` stores
+                // `0.10000000149011612`. A value that already has the declared
+                // width needs nothing.
+                // Emitted whenever the annotation names a floating width. Both
+                // builtins pass through a value that already has it, so the
+                // only cost of not narrowing the test further is one op on a
+                // declaration that did not need one.
+                let conv = declared_conv(ty.as_deref());
                 if self.is_boxed(name) {
                     match init {
                         Some(e) => self.expr(e)?,
@@ -944,8 +948,8 @@ impl Compiler {
                             self.b.emit(Op::LoadUndef, 0);
                         }
                     }
-                    if round && init.is_some() {
-                        self.emit_f32_round(NumTy::Float32, s.line);
+                    if let (Some(id), true) = (conv, init.is_some()) {
+                        self.b.emit(Op::CallBuiltin(id, 1), s.line);
                     }
                     self.unwind_check_dropping(1);
                     self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
@@ -954,8 +958,8 @@ impl Compiler {
                 }
                 if let Some(e) = init {
                     self.expr(e)?;
-                    if round {
-                        self.emit_f32_round(NumTy::Float32, s.line);
+                    if let Some(id) = conv {
+                        self.b.emit(Op::CallBuiltin(id, 1), s.line);
                     }
                     self.unwind_check_dropping(1);
                     self.emit_store(place);
@@ -1344,12 +1348,16 @@ impl Compiler {
             Expr::Int(n) | Expr::Long(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
             }
-            // A `Float` literal loads exactly as a `Double` one does — the value
-            // model is the same `f64`, and the lexer already rounded the
-            // constant to 32-bit precision. Only the STATIC type differs, and
-            // that is read off the AST node by `num_ty`.
-            Expr::Float(f) | Expr::Float32(f) => {
+            Expr::Float(f) => {
                 let c = self.b.add_constant(Value::float(*f));
+                self.b.emit(Op::LoadConst(c), 0);
+            }
+            // A `Float` literal loads a `Float` CONSTANT — a distinct runtime
+            // value carrying its own width (see `scala.Float` in
+            // [`crate::host`]), not the `Double` holding the same bits. The
+            // lexer already rounded it to 32-bit precision.
+            Expr::Float32(f) => {
+                let c = self.b.add_constant(crate::host::make_f32(*f as f32));
                 self.b.emit(Op::LoadConst(c), 0);
             }
             Expr::Str(s) => {
@@ -2729,6 +2737,11 @@ impl Compiler {
         // `x = e`, or `x <op>= e` → the current value then the operator.
         if op == AssignOp::Assign {
             self.expr(value)?;
+            // The declared width of the TARGET, applied to whatever was
+            // assigned — the same conversion the declaration made.
+            if let Some(id) = self.widths.get(name).and_then(|w| w.conv) {
+                self.b.emit(Op::CallBuiltin(id, 1), line);
+            }
         } else {
             self.emit_load(place);
             if boxed {
@@ -4499,6 +4512,7 @@ impl Compiler {
             num,
             elem,
             cls: init.and_then(|e| self.class_of(e)),
+            conv: declared_conv(ty),
         }
     }
 
@@ -4830,14 +4844,6 @@ impl Compiler {
             .emit(Op::CallBuiltin(crate::host::SF32_ARITH, 3), line);
     }
 
-    /// Round the value on top of the stack to 32-bit `Float` precision, when its
-    /// static type says it is one. A no-op for every other type.
-    fn emit_f32_round(&mut self, w: NumTy, line: u32) {
-        if w == NumTy::Float32 {
-            self.b.emit(Op::CallBuiltin(crate::host::SF32, 1), line);
-        }
-    }
-
     /// Round every parameter declared `Float` to single precision on entry, in
     /// the slots the prologue just filled. `base` is the slot the first
     /// parameter landed in — 0 for a `def`, a constructor and an `object`
@@ -4870,13 +4876,19 @@ impl Compiler {
         }
     }
 
-    /// Round the value in `slot` when `ty` declares it a `Float`.
+    /// Convert the value in `slot` to the width `ty` declares — narrowing to
+    /// `Float`, or widening a `Float` to `Double`. Emitted for no other type.
+    ///
+    /// Both directions are real conversions, because `Float` and `Double` are
+    /// distinct runtime values: `def f(x: Float)` called `f(1)` binds `1.0f`,
+    /// and `def g(d: Double)` called `g(0.1f)` binds `0.10000000149011612`. The
+    /// callee cannot know which width the caller had, so the prologue converts
+    /// unconditionally and each builtin passes through what it does not apply
+    /// to.
     fn emit_f32_param(&mut self, ty: Option<&str>, slot: u16) {
-        if declared_width(ty.unwrap_or("")) != NumTy::Float32 {
-            return;
-        }
+        let Some(id) = declared_conv(ty) else { return };
         self.b.emit(Op::GetSlot(slot), 0);
-        self.b.emit(Op::CallBuiltin(crate::host::SF32, 1), 0);
+        self.b.emit(Op::CallBuiltin(id, 1), 0);
         self.b.emit(Op::SetSlot(slot), 0);
     }
 
@@ -5523,6 +5535,12 @@ struct Width {
     /// For an instance of a user-declared class, that class's name, which is how
     /// a field or method access on it recovers a width.
     cls: Option<String>,
+    /// The conversion a value assigned to this binding must pass through, when
+    /// it was declared at one of the two floating widths — see
+    /// [`declared_conv`]. `Float` and `Double` are distinct runtime values, so
+    /// `var d: Double = 0.0; d = 0.1f` has to widen at the assignment exactly
+    /// as the declaration did.
+    conv: Option<u16>,
 }
 
 impl Width {
@@ -5694,6 +5712,24 @@ fn declared_element_width(ty: &str) -> NumTy {
 
 /// The width a declared type name denotes, for `val x: Long = …` and a `def`
 /// parameter's mandatory annotation.
+/// The conversion builtin a declared floating type asks of a value reaching it,
+/// or `None` for every type that needs none.
+fn declared_conv(ty: Option<&str>) -> Option<u16> {
+    let ty = ty.map(|t| t.trim_start_matches("=>").trim())?;
+    // One collection layer counts: the ELEMENTS of a `List[Double]` are what
+    // carry the width, and the conversion applies to them (see
+    // `host::conv_elementwise`).
+    let inner = match (ty.find('['), ty.strip_suffix(']')) {
+        (Some(open), Some(_)) if SEQ_CTORS.contains(&&ty[..open]) => &ty[open + 1..ty.len() - 1],
+        _ => ty,
+    };
+    match inner {
+        "Float" => Some(crate::host::SF32),
+        "Double" => Some(crate::host::SF64),
+        _ => None,
+    }
+}
+
 fn declared_width(ty: &str) -> NumTy {
     // A by-name parameter is spelled `=> Int`; the arrow is part of the string.
     match ty.trim_start_matches("=>").trim() {
