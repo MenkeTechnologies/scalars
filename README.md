@@ -107,6 +107,12 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   them. A type-class instance is a singleton `object`, which already works as a
   value, so `def show[A: Sh](x: A)` resolves to the right instance from the
   argument's type. Two candidates of one type is an error, not a pick.
+- **`LazyList`** — a real lazy structure, not a materialized vector: elements
+  are produced on demand and memoised, so `LazyList.from(1)`,
+  `.iterate(seed)(f)` and `.continually(v)` are infinite and usable.
+  `map`/`filter`/`zip`/`tail`/`drop` force nothing, printing one shows only
+  what has been computed (`LazyList(1, 2, <not computed>)`), and a second
+  traversal recomputes none of it.
 - **`lazy val`** — the initializer runs at the FIRST read and at most once, and
   not at all if the binding is never read. All three are observable when it
   prints or throws, so the binding holds a thunk in a cell until the first read

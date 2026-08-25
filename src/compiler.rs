@@ -2565,6 +2565,50 @@ impl Compiler {
         })
     }
 
+    /// The `LazyList` a factory call builds, as the synthetic constructor call
+    /// [`LAZYLIST_CALL`] — `LazyList.from(1)`, `.iterate(seed)(f)`,
+    /// `.continually(v)`, `.empty`. `None` for anything else.
+    ///
+    /// The tag rides as a trailing `String` argument, which is what the builtin
+    /// reads to pick the rule.
+    fn lazylist_factory(&self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+        let mk = |tag: &str, mut a: Vec<Expr>| {
+            a.push(Expr::Str(tag.to_string()));
+            Some(Expr::Call {
+                name: LAZYLIST_CALL.to_string(),
+                args: a,
+                line,
+            })
+        };
+        // The curried second clause of `iterate`.
+        if name == "apply" && args.len() == 1 {
+            if let Expr::Method {
+                recv: inner,
+                name: m,
+                args: first,
+                ..
+            } = recv
+            {
+                if m == "iterate" && first.len() == 1 && is_lazylist_companion(inner) {
+                    return mk("iterate", vec![first[0].clone(), args[0].clone()]);
+                }
+            }
+        }
+        if !is_lazylist_companion(recv) {
+            return None;
+        }
+        match (name, args.len()) {
+            // The parser merges a curried call's clauses, so `iterate(1)(f)`
+            // arrives as one call of two arguments.
+            ("iterate", 2) => mk("iterate", vec![args[0].clone(), args[1].clone()]),
+            ("from", 1) => mk("from", vec![args[0].clone()]),
+            ("continually", 1) => mk("continually", vec![args[0].clone()]),
+            ("empty", 0) => mk("empty", Vec::new()),
+            ("apply", _) => mk("empty", args.to_vec()),
+            _ => None,
+        }
+    }
+
     /// The hoisted function an `extension` call selects, or `None` when no
     /// extension applies.
     ///
@@ -3804,6 +3848,11 @@ impl Compiler {
                 }
             }
         }
+        // `LazyList` factories. `iterate` is curried (`LazyList.iterate(1)(f)`),
+        // so its second clause arrives as an `apply` on the first.
+        if let Some(e) = self.lazylist_factory(recv, name, args, line) {
+            return self.expr(&e);
+        }
         // An `extension` method, selected on the RECEIVER's static type. A real
         // MEMBER wins — Scala warns that a colliding extension "will never be
         // selected from type C" — so a user class that responds to the name is
@@ -4579,6 +4628,30 @@ impl Compiler {
         // `summon[T]` — fetch the given of type `T`. The type arrived as the
         // one argument (see `crate::parser::SUMMON`), because it IS the
         // argument here rather than an erased annotation.
+        // `LazyList(1, 2, 3)` — the literal, which parses as a call on the
+        // companion's name.
+        if name == "LazyList" {
+            let mut a = args.to_vec();
+            a.push(Expr::Str("empty".to_string()));
+            for e in &a {
+                self.expr(e)?;
+            }
+            self.b.emit(
+                Op::CallBuiltin(crate::host::LAZYLIST_NEW, a.len() as u8),
+                line,
+            );
+            return Ok(());
+        }
+        if name == LAZYLIST_CALL {
+            for e in args {
+                self.expr(e)?;
+            }
+            self.b.emit(
+                Op::CallBuiltin(crate::host::LAZYLIST_NEW, args.len() as u8),
+                line,
+            );
+            return Ok(());
+        }
         if name == crate::parser::SUMMON {
             if let [Expr::Str(ty)] = args {
                 let found = self.resolve_implicit(ty, line)?;
@@ -6307,6 +6380,15 @@ fn push_substituted(out: &mut String, word: &str, subst: &[(String, String)]) {
 /// A declared type's base name, with type arguments dropped: `List[A]` is
 /// `List`. Extension selection compares base names, since the arguments are a
 /// typing concern this frontend does not model.
+/// The synthetic call a `LazyList` factory lowers to; its last argument is the
+/// tag naming which rule to build.
+const LAZYLIST_CALL: &str = "lazylist$";
+
+/// Whether `e` names the `LazyList` companion.
+fn is_lazylist_companion(e: &Expr) -> bool {
+    matches!(e, Expr::Var(n) if n == "LazyList")
+}
+
 fn base_type(ty: &str) -> String {
     let t = ty.trim();
     match t.find('[') {

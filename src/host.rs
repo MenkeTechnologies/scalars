@@ -390,6 +390,19 @@ pub const LAZY_NEW: u16 = 779;
 /// first read replaces it, in the cell, with the value it produced.
 pub const LAZY_FORCE: u16 = 780;
 
+/// Build a `LazyList`. Stack `[arg…, kindTag]`; the tag selects which rule.
+/// See [`lazy_new_from_tag`].
+pub const LAZYLIST_NEW: u16 = 781;
+
+/// `head #:: tail` — cons onto a `LazyList`, with the TAIL still a thunk.
+/// Stack `[head, thunk]`; `argc == 2`.
+///
+/// The tail must stay unrun for a self-referential definition to work at all:
+/// `val fibs = 0 #:: 1 #:: fibs.zip(fibs.tail)…` reads `fibs` inside its own
+/// initializer, and only a thunk defers that read until after the binding
+/// exists.
+pub const LAZY_CONS: u16 = 782;
+
 /// The [`SF32_ARITH`] operator codes, shared with the compiler.
 pub mod f32_op {
     pub const ADD: i64 = 0;
@@ -659,6 +672,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SF64, b_f64);
     vm.register_builtin(LAZY_NEW, b_lazy_new);
     vm.register_builtin(LAZY_FORCE, b_lazy_force);
+    vm.register_builtin(LAZYLIST_NEW, b_lazylist_new);
+    vm.register_builtin(LAZY_CONS, b_lazy_cons);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -1066,6 +1081,14 @@ enum HeapVal {
     /// every closure that captured it (see [`CELL_NEW`]). Never user-visible: the
     /// compiler emits a `CELL_GET`/`CELL_SET` around every access.
     Cell(Value),
+    /// A `LazyList` — the one collection whose elements are produced on demand
+    /// and remembered, so an INFINITE source is representable.
+    ///
+    /// `forced` is the prefix already computed, which is both the memo and what
+    /// the rendering shows (`LazyList(1, 2, <not computed>)`); `src` is the
+    /// rule that produces the next element. Every operation forces the minimum
+    /// prefix it needs and no more.
+    Lazy(LazyList),
     /// A `Char`. Scala's `Char` is neither an `Int` nor a `String`: it prints as
     /// one character but enters arithmetic as its 16-bit code point, and
     /// `'5'.toInt` (53) must differ from `"5".toInt` (5). A one-character
@@ -2782,6 +2805,13 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
     if let Value::Str(s) = recv {
         return string_method(s, "charAt", args);
     }
+    // `xs(i)` on a `LazyList` forces exactly the prefix it needs, so it reaches
+    // the lazy dispatcher rather than the strict sequence one.
+    if as_lazy(recv).is_some() {
+        if let Some(r) = lazy_method(vm, recv, "apply", args) {
+            return r;
+        }
+    }
     if let Value::Obj(id) = recv {
         let kind = HEAP.with(|h| {
             h.borrow().get(*id as usize).map(|o| match o {
@@ -3218,6 +3248,16 @@ fn obj_to_string(v: &Value) -> String {
             // `Iterator.toString` is a FIXED string in the standard library, not
             // the elements and not the JVM identity form — printing an iterator
             // must not consume it, so it cannot report what it holds.
+            // A `LazyList` shows what it has FORCED and says the rest is not
+            // computed — printing one must not force it, which is the whole
+            // difference between this collection and every other.
+            Some(HeapVal::Lazy(l)) => {
+                let mut parts: Vec<String> = l.forced.iter().map(scala_str).collect();
+                if !l.done {
+                    parts.push("<not computed>".to_string());
+                }
+                format!("LazyList({})", parts.join(", "))
+            }
             Some(HeapVal::Seq(SeqKind::Iterator, _)) => "<iterator>".to_string(),
             // A view does not show its contents: `List(1,2,3).view` is
             // `SeqView(<not computed>)`. An `Array`'s view is the exception and
@@ -4433,6 +4473,17 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
         }
     }
 
+    // A `LazyList` — answered before every strict dispatcher, because its
+    // combinators must NOT force and the strict ones do.
+    if as_lazy(&recv).is_some() {
+        if let Some(r) = lazy_method(vm, &recv, &name, &args) {
+            return match r {
+                Ok(v) => v,
+                Err(e) => fault(vm, e),
+            };
+        }
+    }
+
     // `Either`'s surface, same reason and same fall-through.
     if let Some(outcome) = as_either(&recv) {
         if let Some(r) = either_method(vm, &recv, outcome, &name, &args) {
@@ -4570,6 +4621,7 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 HeapVal::Char(_) => 8,
                 // Likewise an `Ordering`, which `ordering_method` answers.
                 HeapVal::Ordering { .. } => 9,
+                HeapVal::Lazy(_) => 10,
             })
         })
     } else {
@@ -10450,6 +10502,411 @@ fn cell_set(cell: &Value, v: Value) {
             }
         });
     }
+}
+
+/// [`LAZYLIST_NEW`] — build a `LazyList` from a factory tag and its arguments.
+fn b_lazylist_new(vm: &mut VM, argc: u8) -> Value {
+    let mut args = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        args.push(vm.stack.pop().unwrap_or(Value::Undef));
+    }
+    args.reverse();
+    let Some(tag) = args.pop() else {
+        return new_lazy(Vec::new(), LazySrc::End);
+    };
+    match &*tag.as_str_cow() {
+        // `LazyList.from(n)` — the integers upward.
+        "from" => new_lazy(
+            Vec::new(),
+            LazySrc::Ints {
+                next: args.first().map(Value::to_int).unwrap_or(0),
+            },
+        ),
+        // `LazyList.iterate(seed)(f)`.
+        "iterate" => new_lazy(
+            Vec::new(),
+            LazySrc::Iter {
+                next: args.first().cloned().unwrap_or(Value::Undef),
+                f: args.get(1).cloned().unwrap_or(Value::Undef),
+            },
+        ),
+        "continually" => new_lazy(
+            Vec::new(),
+            LazySrc::Rep {
+                v: args.first().cloned().unwrap_or(Value::Undef),
+            },
+        ),
+        // `LazyList(1, 2, 3)` and `LazyList.empty`. The elements are known,
+        // but a fresh literal is still UNFORCED — the reference prints
+        // `LazyList(<not computed>)` for one — so they are a rule rather than
+        // a prefix.
+        _ => new_lazy(Vec::new(), LazySrc::Elems { items: args, at: 0 }),
+    }
+}
+
+/// [`LAZY_CONS`] — `head #:: tail`, the tail left as a thunk.
+fn b_lazy_cons(vm: &mut VM, _argc: u8) -> Value {
+    let thunk = vm.stack.pop().unwrap_or(Value::Undef);
+    let head = vm.stack.pop().unwrap_or(Value::Undef);
+    new_lazy(vec![head], LazySrc::Thunk { thunk, base: 1 })
+}
+
+/// `LazyList`'s method surface.
+///
+/// Every member forces the minimum prefix it needs: `take(n).toList` forces
+/// `n`, `head` forces one, and `map`/`filter`/`zip` force NOTHING — they build
+/// a new rule over this one, which is what keeps them usable on an infinite
+/// source.
+fn lazy_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    // The lazy combinators, answered before anything forces.
+    match (name, args.len()) {
+        ("map", 1) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Map {
+                    src: recv.clone(),
+                    f: args[0].clone(),
+                },
+            )))
+        }
+        ("filter" | "withFilter", 1) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Filter {
+                    src: recv.clone(),
+                    p: args[0].clone(),
+                    at: 0,
+                },
+            )))
+        }
+        ("zip", 1) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Zip {
+                    a: recv.clone(),
+                    b: args[0].clone(),
+                },
+            )))
+        }
+        // `tail` is the same list one element along, and is itself lazy.
+        ("tail", 0) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Drop {
+                    src: recv.clone(),
+                    n: 1,
+                },
+            )))
+        }
+        ("drop", 1) => {
+            let n = args[0].to_int().max(0) as usize;
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Drop {
+                    src: recv.clone(),
+                    n,
+                },
+            )));
+        }
+        _ => {}
+    }
+    // The rest force, each only as far as it must.
+    let r = (|| -> Result<Option<Value>, String> {
+        Ok(match (name, args.len()) {
+            ("take", 1) => {
+                let n = args[0].to_int().max(0) as usize;
+                let got = lazy_force(vm, recv, n.saturating_sub(1))?;
+                let head: Vec<Value> = got.into_iter().take(n).collect();
+                Some(new_lazy(head, LazySrc::End))
+            }
+            ("head", 0) => match lazy_force(vm, recv, 0)?.first() {
+                Some(v) => Some(v.clone()),
+                None => {
+                    return Err(
+                        "scalars: java.util.NoSuchElementException: head of empty lazy list"
+                            .to_string(),
+                    )
+                }
+            },
+            ("headOption", 0) => Some(opt(lazy_force(vm, recv, 0)?.first().cloned())),
+            ("isEmpty", 0) => Some(Value::bool(lazy_force(vm, recv, 0)?.is_empty())),
+            ("nonEmpty", 0) => Some(Value::bool(!lazy_force(vm, recv, 0)?.is_empty())),
+            ("apply", 1) => {
+                let i = args[0].to_int().max(0) as usize;
+                match lazy_force(vm, recv, i)?.get(i) {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Err(format!("scalars: java.lang.IndexOutOfBoundsException: {i}"))
+                    }
+                }
+            }
+            // These need the WHOLE list, so they terminate only on a finite one.
+            ("toList", 0) => Some(new_list(lazy_all(vm, recv)?)),
+            ("toVector" | "toIndexedSeq" | "toSeq", 0) => {
+                Some(new_seq(SeqKind::Vector, lazy_all(vm, recv)?))
+            }
+            ("toArray", 0) => Some(new_seq(SeqKind::Array, lazy_all(vm, recv)?)),
+            ("length" | "size", 0) => Some(Value::int(lazy_all(vm, recv)?.len() as i64)),
+            ("sum", 0) => Some(seq_sum(&lazy_all(vm, recv)?)),
+            ("mkString", 0..=1) => {
+                let items = lazy_all(vm, recv)?;
+                let sep = args
+                    .first()
+                    .map(|a| a.as_str_cow().into_owned())
+                    .unwrap_or_default();
+                Some(Value::str(join_vm(vm, &items, &sep)))
+            }
+            ("foreach", 1) => {
+                for v in lazy_all(vm, recv)? {
+                    invoke_closure(vm, &args[0], std::slice::from_ref(&v))?;
+                }
+                Some(unit_value())
+            }
+            ("force", 0) => {
+                lazy_all(vm, recv)?;
+                Some(recv.clone())
+            }
+            _ => None,
+        })
+    })();
+    match r {
+        Ok(Some(v)) => Some(Ok(v)),
+        Ok(None) => None,
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// Force a `LazyList` to the end and answer every element. Only meaningful for
+/// a finite one; an infinite source runs out of the fuel `lazy_force` bounds it
+/// with and reports rather than hanging.
+fn lazy_all(vm: &mut VM, list: &Value) -> Result<Vec<Value>, String> {
+    let mut k = 0usize;
+    loop {
+        let got = lazy_force(vm, list, k)?;
+        if got.len() <= k {
+            return Ok(got);
+        }
+        k = got.len();
+    }
+}
+
+/// Read a `LazyList` handle's state, if `v` is one.
+fn as_lazy(v: &Value) -> Option<LazyList> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Lazy(l)) => Some(l.clone()),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Allocate a `LazyList` with the given prefix and rule.
+fn new_lazy(forced: Vec<Value>, src: LazySrc) -> Value {
+    let done = matches!(src, LazySrc::End);
+    heap_push(HeapVal::Lazy(LazyList { forced, src, done }))
+}
+
+/// Write a `LazyList` handle's state back — how memoisation is recorded.
+fn set_lazy(v: &Value, l: LazyList) {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Lazy(slot)) = h.borrow_mut().get_mut(*id as usize) {
+                *slot = l;
+            }
+        });
+    }
+}
+
+/// Force `list` until it has more than `k` elements, or is known to be
+/// finished. Answers the elements forced so far.
+///
+/// Every forced element is written back into the handle, so a second traversal
+/// recomputes nothing — which is observable by counting a `map`'s calls.
+///
+/// `fuel` bounds the scan a `filter` may do between hits, so a predicate no
+/// element satisfies stops instead of hanging: an infinite source with no
+/// matching element cannot be distinguished from a slow one, and a bound that
+/// reports is better than a loop that does not.
+fn lazy_force(vm: &mut VM, list: &Value, k: usize) -> Result<Vec<Value>, String> {
+    const FUEL: usize = 1_000_000;
+    let mut steps = 0usize;
+    loop {
+        let Some(mut l) = as_lazy(list) else {
+            return Err("scalars: value is not a LazyList".to_string());
+        };
+        if l.done || l.forced.len() > k {
+            return Ok(l.forced);
+        }
+        steps += 1;
+        if steps > FUEL {
+            return Err(format!(
+                "scalars: LazyList did not produce element {k} within {FUEL} steps"
+            ));
+        }
+        match l.src.clone() {
+            LazySrc::End => {
+                l.done = true;
+                set_lazy(list, l);
+            }
+            LazySrc::Ints { next } => {
+                l.forced.push(Value::int(next));
+                l.src = LazySrc::Ints {
+                    next: next.wrapping_add(1),
+                };
+                set_lazy(list, l);
+            }
+            LazySrc::Rep { v } => {
+                l.forced.push(v.clone());
+                set_lazy(list, l);
+            }
+            LazySrc::Iter { next, f } => {
+                l.forced.push(next.clone());
+                let after = invoke_closure(vm, &f, std::slice::from_ref(&next))?;
+                l.src = LazySrc::Iter { next: after, f };
+                set_lazy(list, l);
+            }
+            // Run the thunk ONCE, then continue from what it produced.
+            LazySrc::Thunk { thunk, base } => {
+                let cont = invoke_closure(vm, &thunk, &[])?;
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                l2.src = LazySrc::Cont { list: cont, base };
+                set_lazy(list, l2);
+            }
+            LazySrc::Cont { list: inner, base } => {
+                let want = l.forced.len() - base;
+                let got = lazy_force(vm, &inner, want)?;
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                match got.get(want) {
+                    Some(v) => l2.forced.push(v.clone()),
+                    None => l2.done = true,
+                }
+                set_lazy(list, l2);
+            }
+            LazySrc::Map { src, f } => {
+                let i = l.forced.len();
+                let got = lazy_force(vm, &src, i)?;
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                match got.get(i) {
+                    Some(v) => {
+                        let mapped = invoke_closure(vm, &f, std::slice::from_ref(v))?;
+                        let mut l3 = as_lazy(list).unwrap_or(l2);
+                        l3.forced.push(mapped);
+                        set_lazy(list, l3);
+                    }
+                    None => {
+                        l2.done = true;
+                        set_lazy(list, l2);
+                    }
+                }
+            }
+            LazySrc::Filter { src, p, at } => {
+                let got = lazy_force(vm, &src, at)?;
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                match got.get(at) {
+                    Some(v) => {
+                        let hit = invoke_closure(vm, &p, std::slice::from_ref(v))?;
+                        let keep = truthy(&hit);
+                        let mut l3 = as_lazy(list).unwrap_or(l2);
+                        if keep {
+                            l3.forced.push(v.clone());
+                        }
+                        l3.src = LazySrc::Filter { src, p, at: at + 1 };
+                        set_lazy(list, l3);
+                    }
+                    None => {
+                        l2.done = true;
+                        set_lazy(list, l2);
+                    }
+                }
+            }
+            LazySrc::Elems { items, at } => {
+                let mut l2 = l;
+                match items.get(at) {
+                    Some(v) => {
+                        l2.forced.push(v.clone());
+                        l2.src = LazySrc::Elems { items, at: at + 1 };
+                    }
+                    None => l2.done = true,
+                }
+                set_lazy(list, l2);
+            }
+            LazySrc::Drop { src, n } => {
+                let i = l.forced.len() + n;
+                let got = lazy_force(vm, &src, i)?;
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                match got.get(i) {
+                    Some(v) => l2.forced.push(v.clone()),
+                    None => l2.done = true,
+                }
+                set_lazy(list, l2);
+            }
+            LazySrc::Zip { a, b } => {
+                let i = l.forced.len();
+                let ga = lazy_force(vm, &a, i)?;
+                let gb = lazy_force(vm, &b, i)?;
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                match (ga.get(i), gb.get(i)) {
+                    (Some(x), Some(y)) => l2.forced.push(new_pair(x.clone(), y.clone())),
+                    _ => l2.done = true,
+                }
+                set_lazy(list, l2);
+            }
+        }
+    }
+}
+
+/// A `LazyList`'s memoised prefix and the rule producing the rest.
+#[derive(Clone)]
+pub struct LazyList {
+    /// Elements already computed. Never recomputed — `LazyList.from(1).map(f)`
+    /// traversed twice calls `f` once per element, which a program can count.
+    forced: Vec<Value>,
+    /// How the next element is produced.
+    src: LazySrc,
+    /// Set once the source is known to be finished, so a finite list stops
+    /// rather than re-asking a spent rule.
+    done: bool,
+}
+
+/// How a `LazyList` produces the element after its forced prefix.
+#[derive(Clone)]
+enum LazySrc {
+    /// No more elements.
+    End,
+    /// The integers from `next` upward — `LazyList.from(n)`.
+    Ints { next: i64 },
+    /// `LazyList.iterate(seed)(f)`: `next`, then `f(next)`, and so on.
+    Iter { next: Value, f: Value },
+    /// `LazyList.continually(v)` — the same element forever.
+    Rep { v: Value },
+    /// The continuation is behind a zero-argument thunk not yet run. This is
+    /// what makes `a #:: rest` lazy in `rest`, and so what lets a `LazyList`
+    /// refer to ITSELF (`val fibs = 0 #:: 1 #:: fibs.zip(fibs.tail)…`): by the
+    /// time the thunk runs, the binding it reads has been assigned.
+    Thunk { thunk: Value, base: usize },
+    /// The continuation, already forced to a `LazyList`. Element `k >= base`
+    /// of this list is element `k - base` of that one.
+    Cont { list: Value, base: usize },
+    /// `src.map(f)` — element `k` is `f` of the source's element `k`.
+    Map { src: Value, f: Value },
+    /// `src.filter(p)` — the source is scanned from `at` for the next hit.
+    Filter { src: Value, p: Value, at: usize },
+    /// `a.zip(b)` — element `k` is the pair of their `k`th elements.
+    Zip { a: Value, b: Value },
+    /// `src.drop(n)` — element `k` is the source's element `k + n`. `tail` is
+    /// this with `n = 1`.
+    Drop { src: Value, n: usize },
+    /// A literal `LazyList(1, 2, 3)`. The elements are known, but they are
+    /// still produced one at a time: Scala prints `LazyList(<not computed>)`
+    /// for a fresh one, so even a literal starts unforced.
+    Elems { items: Vec<Value>, at: usize },
 }
 
 /// The class tag of an unforced `lazy val`. Not spellable as a Scala class

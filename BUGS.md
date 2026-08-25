@@ -695,31 +695,28 @@ reported as parse/compile errors, never silently mis-run.
   MUTABLE `Map`/`Set` do not have this shape: their inserts are amortized
   `O(1)` (see the entry above), and so are the growable sequences.
 
-- **`LazyList`.** The one collection whose laziness is not just a perf idiom:
-  an INFINITE source cannot be represented by a materialized element vector,
-  and that is the whole point of it.
+- **A `LazyList` cannot be built by `#::`, and a few of its combinators are
+  missing.** The structure itself is real now: elements are produced on demand
+  and MEMOISED, so an infinite source works (`LazyList.from(1)`,
+  `.iterate(seed)(f)`, `.continually(v)`), a literal starts unforced, printing
+  one shows only what has been computed (`LazyList(1, 2, <not computed>)`), and
+  `map`/`filter`/`zip`/`tail`/`drop` force nothing at all — they build a rule
+  over the source, which is what keeps them usable on an infinite one.
+  Traversing twice recomputes nothing, which a program can count.
 
-  `.view` is no longer one of these gaps, and `lazy val` never was. A view is
-  STRICT here, exactly as `Iterator` is — its elements are materialized when it
-  is built, so a downstream combinator sees what a lazy one would have produced
-  — and the only thing that separates it from an ordinary collection is that it
-  does not show its contents: `List(1,2,3).view` renders `SeqView(<not
-  computed>)`, `Vector(1,2).view` `IndexedSeqView(<not computed>)`, and an
-  `Array`'s view `ArrayView(1, 2)`, which is the one that does show them. That
-  rendering is what the kind carries.
+  What is missing is the CONS operator: `0 #:: 1 #:: rest` does not lex, so the
+  self-referential definition that makes a `LazyList` interesting
+  (`val fibs: LazyList[Int] = 0 #:: 1 #:: fibs.zip(fibs.tail).map(…)`) cannot
+  be written. The runtime supports it — a cons node holds its tail as an unrun
+  thunk precisely so the binding can be read after it exists — and only the
+  surface syntax is absent.
 
-  `lazy val` was never one of these gaps either: its initializer runs at the
-  first read and at most once, and not at all if it is never read — the binding
-  holds a thunk in a cell until the first read replaces it with the value it
-  produced. Nor is `Iterator`: `.iterator`/`.reverseIterator` (and
-  `grouped`/`sliding`) answer a
-  real [`SeqKind::Iterator`], which renders `<iterator>`, answers
-  `hasNext`/`next()`, and is CONSUMED by traversing it — `it.toList` twice gives
-  the elements and then `List()`, and `next()` past the end throws
-  `NoSuchElementException: next on empty iterator`. Its elements are still
-  MATERIALIZED when it is built, so it is strict in the one way that stays
-  unobservable: a downstream combinator sees the same elements Scala's lazy one
-  would, but an infinite source cannot be represented.
+  A combinator that must see every element (`toList`, `sum`, `length`,
+  `mkString`, `foreach`) terminates only on a finite list, as in Scala. An
+  infinite one is bounded rather than left to hang: forcing stops after a
+  million steps and reports, since an infinite source with no matching element
+  is indistinguishable from a slow one.
+
 - **A `Char` range — `'a' to 'e'`, `'a' until 'z'`, `for (c <- 'a' to 'd')`.**
   Scala's is a `NumericRange[Char]`, which this frontend has no representation
   for: a `Char` is a heap value here, so reading the endpoints as integers built
