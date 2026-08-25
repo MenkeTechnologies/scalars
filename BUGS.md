@@ -407,6 +407,17 @@ reported as parse/compile errors, never silently mis-run.
   primitives, a user `class`/`case class`/`object` (whose JVM class takes the
   `$` suffix Scala appends to an object) and a throwable — which is the usual
   reason to call it, `e.getClass.getSimpleName`.
+
+  A primitive reached through an `Any`-typed position reports the PRIMITIVE
+  class where Scala reports the BOXED one: `val a: Any = 1; a.getClass` is
+  `int` here and `class java.lang.Integer` in Scala. Boxing is what the JVM
+  answer is about, and nothing in this runtime boxes — a value is the same
+  value whatever static type it flows through. The divergence is uniform
+  across `Int`, `Double`, `Float`, `Boolean` and `Char`, and it applies only to
+  the erased position: called directly on the value (`1.getClass`,
+  `0.1f.getClass`) all five answer the primitive name, as Scala does. Closing
+  it would mean tracking `Any` through the width analysis purely so `getClass`
+  could name a box that never exists.
 - **`f(xs: _*)` — the varargs spread.** The sequence is handed STRAIGHT to the
   repeated parameter rather than collected into a one-element `ArraySeq`, so
   `def f(xs: Int*) = xs.sum; f(List(1,2,3): _*)` is `6`. Every collection
