@@ -71,6 +71,14 @@ pub struct ClassDecl {
     /// (the runtime is dynamically typed, so the `val`/`var`/private distinction
     /// is not enforced — a documented simplification).
     pub params: Vec<String>,
+    /// The DEFAULT of each [`Self::params`] entry, same order and length;
+    /// `None` where the parameter has none.
+    ///
+    /// Kept unevaluated, because Scala evaluates a default at the CALL site and
+    /// only when the argument is omitted — splicing the expression in at the
+    /// construction is what reproduces that exactly, and it is the same thing
+    /// `Compiler::adapt_args` does for a `def`.
+    pub param_defaults: Vec<Option<Expr>>,
     /// The declared type of each [`Self::params`] entry, same order and length.
     /// Scala requires an annotation on every constructor parameter, so this is
     /// the width of every field the primary constructor contributes — which is
@@ -185,6 +193,11 @@ pub enum StmtKind {
     /// dynamically typed on the fusevm value model (see `BUGS.md`).
     Local {
         is_val: bool,
+        /// `lazy val x = e` — the initializer is not evaluated at the
+        /// declaration but at the FIRST read, and at most once. A `lazy val`
+        /// never read is never evaluated at all, which is observable whenever
+        /// the initializer prints, throws, or costs anything.
+        is_lazy: bool,
         ty: Option<String>,
         name: String,
         init: Option<Expr>,

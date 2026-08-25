@@ -112,6 +112,11 @@ struct Compiler {
     /// What each `import`'s named selectors bind — see [`Program::imports`].
     /// Consulted only where a bare name resolved to nothing else.
     imports: HashMap<String, Vec<String>>,
+    /// The `lazy val` bindings in scope. Their slot holds a CELL whose contents
+    /// start as a thunk, so a read is a force rather than a load — see
+    /// [`crate::host::LAZY_FORCE`]. Scoped like [`Self::vals`]: taken on entry
+    /// to a body and restored on the way out.
+    lazies: HashSet<String>,
     /// The packages a WILDCARD `import` opened — see
     /// [`Compiler::imported_wildcard`].
     wildcards: Vec<Vec<String>>,
@@ -259,6 +264,10 @@ struct ClassMeta {
     /// Primary-constructor arity (the `new`/`apply`/`unapply` argument count —
     /// the leading prefix of `field_names`).
     arity: usize,
+    /// Each primary-constructor parameter's DEFAULT, same order and length as
+    /// the arity prefix; `None` where it has none. Spliced at the construction
+    /// site by [`Compiler::adapt_ctor_args`], which is where Scala evaluates it.
+    param_defaults: Vec<Option<Expr>>,
     /// `case class` → structural semantics + companion `apply`/`unapply`/`copy`.
     is_case: bool,
     /// `trait` → no constructor is emitted and it cannot be instantiated.
@@ -493,6 +502,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             ClassMeta {
                 field_names,
                 arity: cd.params.len(),
+                param_defaults: cd.param_defaults.clone(),
                 is_case: cd.is_case,
                 is_trait: cd.is_trait,
                 supers: mro[1..].to_vec(),
@@ -662,6 +672,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         overloads,
         imports: prog.imports.clone(),
         wildcards: prog.import_wildcards.clone(),
+        lazies: HashSet::new(),
         has_user_tostring: classes
             .iter()
             .flat_map(|cd| cd.methods.iter())
@@ -787,6 +798,7 @@ fn builtin_case1(name: &str, field: &str) -> ClassDecl {
         super_args: Vec::new(),
         params: vec![field.to_string()],
         param_tys: vec![None],
+        param_defaults: vec![None],
         body: Vec::new(),
         field_names: vec![field.to_string()],
         methods: Vec::new(),
@@ -923,6 +935,7 @@ impl Compiler {
                 name,
                 init,
                 is_val,
+                is_lazy,
                 ty,
             } => {
                 let place = self.declare_place(name);
@@ -945,6 +958,29 @@ impl Compiler {
                 // only cost of not narrowing the test further is one op on a
                 // declaration that did not need one.
                 let conv = declared_conv(ty.as_deref());
+                // `lazy val x = e` — the initializer becomes a zero-argument
+                // thunk parked in a cell, and every read of `x` forces it once
+                // (see [`crate::host::LAZY_FORCE`]). The cell is what gives the
+                // memoization somewhere to write the forced value back to, so a
+                // lazy binding is always boxed whether or not a closure
+                // captures it.
+                if *is_lazy {
+                    self.lazies.insert(name.clone());
+                    match init {
+                        Some(e) => {
+                            self.lambda(&[], e, false)?;
+                            self.b
+                                .emit(Op::CallBuiltin(crate::host::LAZY_NEW, 1), s.line);
+                        }
+                        None => {
+                            self.b.emit(Op::LoadUndef, 0);
+                        }
+                    }
+                    self.unwind_check_dropping(1);
+                    self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
+                    self.emit_store(place);
+                    return Ok(());
+                }
                 if self.is_boxed(name) {
                     match init {
                         Some(e) => self.expr(e)?,
@@ -2324,6 +2360,18 @@ impl Compiler {
     /// class field (`this.field`) or sibling method, enclosing object `val`/method,
     /// singleton object value, zero-arg `def` (paren-less call), then global.
     fn var_ref(&mut self, name: &str) -> Result<(), String> {
+        // A `lazy val`'s place holds a CELL whose contents start as a thunk, so
+        // a read is a force rather than a load — see
+        // [`crate::host::LAZY_FORCE`]. Answered before every other shape
+        // because the binding may live in a frame slot or, at the top level of
+        // an `extends App` body, in a program global; the force is the same
+        // either way.
+        if self.lazies.contains(name) {
+            let place = self.resolve_place(name);
+            self.emit_load(place);
+            self.b.emit(Op::CallBuiltin(crate::host::LAZY_FORCE, 1), 0);
+            return Ok(());
+        }
         let is_local = self
             .scope
             .as_ref()
@@ -3098,18 +3146,77 @@ impl Compiler {
             Some(meta) => meta.arity,
             None => return Err(format!("scalars: not found: type {name} (line {line})")),
         };
+        let args = self.adapt_ctor_args(name, args, line)?;
         if args.len() != arity {
             return Err(format!(
                 "scalars: {name} takes {arity} constructor argument(s), found {} (line {line})",
                 args.len()
             ));
         }
-        for a in args {
+        for a in &args {
             self.expr(a)?;
         }
         let nidx = self.b.add_name(&ctor_name(name));
         self.b.emit(Op::Call(nidx, args.len() as u8), line);
         Ok(())
+    }
+
+    /// The same for a CONSTRUCTOR: place named arguments and splice the default
+    /// of every omitted parameter.
+    ///
+    /// A `case class P(x: Int, y: String = "d")` is constructed `P(1)`, and a
+    /// primary constructor takes named arguments as readily as `copy` does. The
+    /// defaults are held unevaluated and spliced here rather than evaluated
+    /// once at declaration, because that is where Scala evaluates them — a
+    /// default with a side effect runs per construction that omits it, and not
+    /// at all otherwise.
+    fn adapt_ctor_args(&self, name: &str, args: &[Expr], line: u32) -> Result<Vec<Expr>, String> {
+        let Some(meta) = self.classes.get(name) else {
+            return Ok(args.to_vec());
+        };
+        let named_any = args.iter().any(|a| matches!(a, Expr::NamedArg { .. }));
+        if !named_any && args.len() >= meta.arity {
+            return Ok(args.to_vec());
+        }
+        let params = &meta.field_names[..meta.arity.min(meta.field_names.len())];
+        let mut slots: Vec<Option<Expr>> = vec![None; params.len()];
+        let mut pos = 0usize;
+        for a in args {
+            match a {
+                Expr::NamedArg { name: pn, value } => {
+                    let Some(i) = params.iter().position(|p| p == pn) else {
+                        return Err(format!(
+                            "scalars: {name} has no parameter named `{pn}` (line {line})"
+                        ));
+                    };
+                    if slots[i].is_some() {
+                        return Err(format!(
+                            "scalars: parameter `{pn}` of {name} is given twice (line {line})"
+                        ));
+                    }
+                    slots[i] = Some((**value).clone());
+                }
+                _ => {
+                    if pos >= params.len() {
+                        return Err(format!(
+                            "scalars: too many arguments for {name} (line {line})"
+                        ));
+                    }
+                    slots[pos] = Some(a.clone());
+                    pos += 1;
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(params.len());
+        for (i, slot) in slots.into_iter().enumerate() {
+            match slot.or_else(|| meta.param_defaults.get(i).cloned().flatten()) {
+                Some(e) => out.push(e),
+                // Left for the arity check to report, which names the class and
+                // the counts.
+                None => return Ok(args.to_vec()),
+            }
+        }
+        Ok(out)
     }
 
     /// Rewrite a written argument list into the exact positional list the
@@ -3556,6 +3663,19 @@ impl Compiler {
         if let Expr::Var(owner) = recv {
             if let Some(desugared) = companion_factory(owner, name, args, line) {
                 return self.expr(&desugared);
+            }
+        }
+        // A `case class` companion's `unapply`, called explicitly. Scala 3
+        // derives it as a name-based extractor that answers the instance
+        // ITSELF — the pattern matcher then reads `_1`/`_2` off it — so
+        // `P.unapply(P(1, "q"))` is `P(1,q)` and not `Some((1, "q"))`. Pattern
+        // position never reaches here: `case P(a, b) =>` lowers to the field
+        // reads directly.
+        if name == "unapply" && args.len() == 1 {
+            if let Expr::Var(owner) = recv {
+                if self.classes.get(owner).is_some_and(|m| m.is_case) {
+                    return self.expr(&args[0]);
+                }
             }
         }
         // `super.m(args)` — skip this class in the linearization and call the
@@ -5457,6 +5577,24 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
         args,
         line,
     };
+    // `Either.cond(test, right, left)` — the factory that picks a side. Written
+    // out as the `if` it is defined to be, which also keeps both branches
+    // BY-NAME: only the side taken is evaluated, as in Scala.
+    if owner == "Either" && name == "cond" && args.len() == 3 {
+        return Some(Expr::If {
+            cond: Box::new(args[0].clone()),
+            then: Box::new(Expr::Call {
+                name: "Right".to_string(),
+                args: vec![args[1].clone()],
+                line,
+            }),
+            els: Some(Box::new(Expr::Call {
+                name: "Left".to_string(),
+                args: vec![args[2].clone()],
+                line,
+            })),
+        });
+    }
     // `X.empty` is that collection's empty literal. It is answered before the
     // element-wise members so `Map.empty` works too, where `Map.fill` would need
     // pairs and is left alone.

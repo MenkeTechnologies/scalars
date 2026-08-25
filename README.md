@@ -100,6 +100,10 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   wherever it is reached from: out of a `List`, a `case class` field, a `Map`
   value, or an `Any`. What it costs is the JIT, which takes only the VM's two
   native numeric shapes; see `BUGS.md`.
+- **`lazy val`** — the initializer runs at the FIRST read and at most once, and
+  not at all if the binding is never read. All three are observable when it
+  prints or throws, so the binding holds a thunk in a cell until the first read
+  replaces it with the value it produced.
 - **Scala 3 entry points** — `@main def go(n: Int, s: String)` binds its
   parameters from the command line through the same reader Scala generates,
   including the wording and the exit status of a bad one (`Illegal command line

@@ -377,6 +377,19 @@ pub const SF32_HASH: u16 = 777;
 /// `Double`-declared position pays nothing for values that already are one.
 pub const SF64: u16 = 778;
 
+/// Wrap a zero-argument thunk as the UNFORCED state of a `lazy val`.
+/// `argc == 1`; the result is stored in the binding's cell.
+pub const LAZY_NEW: u16 = 779;
+
+/// Read a `lazy val`'s cell, forcing it on the first read. Stack `[cell]`;
+/// `argc == 1`.
+///
+/// A `lazy val` evaluates its initializer at the first READ and at most once,
+/// and not at all if it is never read — all three of which are observable when
+/// the initializer prints or throws. So the binding holds a thunk until the
+/// first read replaces it, in the cell, with the value it produced.
+pub const LAZY_FORCE: u16 = 780;
+
 /// The [`SF32_ARITH`] operator codes, shared with the compiler.
 pub mod f32_op {
     pub const ADD: i64 = 0;
@@ -644,6 +657,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SF32_CLASS, b_f32_class);
     vm.register_builtin(SF32_HASH, b_f32_hash);
     vm.register_builtin(SF64, b_f64);
+    vm.register_builtin(LAZY_NEW, b_lazy_new);
+    vm.register_builtin(LAZY_FORCE, b_lazy_force);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -10360,6 +10375,69 @@ fn b_f32_arith(vm: &mut VM, _argc: u8) -> Value {
         _ => x + y,
     };
     make_f32(r)
+}
+
+/// Read a boxed `var`'s cell directly (the value half of [`CELL_GET`]).
+fn cell_get(cell: &Value) -> Value {
+    let Value::Obj(id) = cell else {
+        return Value::Undef;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::Cell(v)) => v.clone(),
+        _ => Value::Undef,
+    })
+}
+
+/// Write a boxed `var`'s cell directly (the value half of [`CELL_SET`]).
+fn cell_set(cell: &Value, v: Value) {
+    if let Value::Obj(id) = cell {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Cell(slot)) = h.borrow_mut().get_mut(*id as usize) {
+                *slot = v;
+            }
+        });
+    }
+}
+
+/// The class tag of an unforced `lazy val`. Not spellable as a Scala class
+/// name, so no user record can collide with it, and it never escapes: the only
+/// value that holds one is the binding's own cell, and every read of that
+/// binding goes through [`LAZY_FORCE`].
+const LAZY_CLASS: &str = "<lazy>";
+
+/// [`LAZY_NEW`] — park a thunk as the unforced state of a `lazy val`.
+fn b_lazy_new(vm: &mut VM, _argc: u8) -> Value {
+    let thunk = vm.stack.pop().unwrap_or(Value::Undef);
+    heap_alloc(ScalaObj {
+        class: Arc::from(LAZY_CLASS),
+        is_case: false,
+        is_object: false,
+        fields: vec![(Arc::from("t"), thunk)],
+    })
+}
+
+/// [`LAZY_FORCE`] — read a `lazy val`'s cell, forcing it once.
+fn b_lazy_force(vm: &mut VM, _argc: u8) -> Value {
+    let cell = vm.stack.pop().unwrap_or(Value::Undef);
+    let current = cell_get(&cell);
+    let Some(thunk) = with_obj(&current, |o| {
+        (&*o.class == LAZY_CLASS)
+            .then(|| o.fields.first().map(|(_, v)| v.clone()))
+            .flatten()
+    })
+    .flatten() else {
+        // Already forced — every read after the first lands here.
+        return current;
+    };
+    let forced = match invoke_closure(vm, &thunk, &[]) {
+        Ok(v) => v,
+        Err(e) => return fault(vm, e),
+    };
+    // Written back BEFORE the value is answered, so a second read finds the
+    // value rather than the thunk even when the initializer read the binding
+    // itself (Scala answers the partially-initialized value there too).
+    cell_set(&cell, forced.clone());
+    forced
 }
 
 /// [`SF64`] — widen a `Float` to `Double`, leaving everything else alone.

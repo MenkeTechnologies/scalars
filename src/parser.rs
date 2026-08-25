@@ -399,6 +399,7 @@ impl Parser {
         // Primary-constructor parameters (all become fields).
         let mut params = Vec::new();
         let mut param_tys = Vec::new();
+        let mut param_defaults: Vec<Option<Expr>> = Vec::new();
         if self.is(&Tok::LParen) {
             self.advance();
             self.skip_seps();
@@ -414,11 +415,15 @@ impl Parser {
                     pty = Some(self.type_ref()?);
                 }
                 param_tys.push(pty);
-                // A default value (`x: Int = 0`) is parsed and ignored.
+                // `x: Int = 0` — a default, kept unevaluated so the
+                // construction can splice it exactly where Scala evaluates it.
+                let mut pdefault = None;
                 if self.is(&Tok::Assign) {
                     self.advance();
-                    self.expression()?;
+                    self.skip_seps();
+                    pdefault = Some(self.expression()?);
                 }
+                param_defaults.push(pdefault);
                 params.push(pname);
                 if self.is(&Tok::Comma) {
                     self.advance();
@@ -472,6 +477,7 @@ impl Parser {
             super_args,
             params,
             param_tys,
+            param_defaults,
             body,
             field_names,
             methods,
@@ -760,6 +766,7 @@ impl Parser {
                         ty: Some("Array[String]".to_string()),
                         init: Some(Expr::MainArgv),
                         is_val: true,
+                        is_lazy: false,
                     },
                     line,
                 },
@@ -1105,6 +1112,14 @@ impl Parser {
             // for effect (its `Vector`/`Unit` value is discarded).
             Tok::For => Ok(StmtKind::Expr(self.for_comprehension()?)),
             Tok::Val | Tok::Var => self.local_decl(),
+            // `lazy val x = e` in statement position. The modifier is dropped
+            // everywhere else it may appear (it carries no runtime meaning on a
+            // `def`, whose body is already only run when called); on a `val` it
+            // is the whole point.
+            Tok::Ident(w) if w == "lazy" && matches!(self.peek_at(1), Tok::Val | Tok::Var) => {
+                self.advance();
+                self.local_decl_lazy(true)
+            }
             Tok::Return => self.return_stmt(),
             // A block-local `import`/`export`. Only the top-level prologue
             // skipped these, so one inside a method body or an `extends App`
@@ -1147,6 +1162,11 @@ impl Parser {
 
     /// A `val`/`var` binding: `val x = e`, `var y: Int = e`.
     fn local_decl(&mut self) -> Result<StmtKind, String> {
+        self.local_decl_lazy(false)
+    }
+
+    /// The same, told whether a `lazy` modifier preceded the `val`.
+    fn local_decl_lazy(&mut self, is_lazy: bool) -> Result<StmtKind, String> {
         let is_val = matches!(self.peek(), Tok::Val);
         self.advance(); // val/var
                         // A pattern definition — `val (a, b) = pair`, `val Some(x) = opt`.
@@ -1177,6 +1197,7 @@ impl Parser {
         };
         Ok(StmtKind::Local {
             is_val,
+            is_lazy,
             ty,
             name,
             init,

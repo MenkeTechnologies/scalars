@@ -669,8 +669,11 @@ reported as parse/compile errors, never silently mis-run.
   MUTABLE `Map`/`Set` do not have this shape: their inserts are amortized
   `O(1)` (see the entry above), and so are the growable sequences.
 
-- **Lazy views.** `.view` and `LazyList`. `Iterator` itself is no longer one of
-  these gaps: `.iterator`/`.reverseIterator` (and `grouped`/`sliding`) answer a
+- **Lazy views.** `.view` and `LazyList`. `lazy val` is NOT one of these gaps:
+  its initializer runs at the first read and at most once, and not at all if it
+  is never read — the binding holds a thunk in a cell until the first read
+  replaces it with the value it produced. `Iterator` is not one either:
+  `.iterator`/`.reverseIterator` (and `grouped`/`sliding`) answer a
   real [`SeqKind::Iterator`], which renders `<iterator>`, answers
   `hasNext`/`next()`, and is CONSUMED by traversing it — `it.toList` twice gives
   the elements and then `List()`, and `next()` past the end throws
