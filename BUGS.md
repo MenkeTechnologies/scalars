@@ -614,20 +614,26 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **A WILDCARD `import` brings nothing into scope.** `import scala.math._`
-  followed by a bare `sqrt(9.0)` is `not found: sqrt`; write `math.sqrt(9.0)`,
-  or import the member by name. A NAMED selector does work — `import
-  scala.math.abs`, `import scala.math.{max, min => lo}` and `import
-  scala.math.Pi` all bind the local name to the qualified path, and a definition
-  shadows the import as it does in Scala — but a wildcard names no member, so
-  there is nothing to bind it to. Resolving one would mean guessing that any
-  unresolved name is a member of some imported package and reporting a worse
-  error when it is not.
+- **A wildcard `import` binds only the members this frontend actually provides
+  for that package.** `import scala.math._` binds `sqrt`, `Pi` and the rest of
+  `scala.math`; `import scala.collection.mutable._` binds the collection
+  factories, including making a bare `Set(1, 2)` the MUTABLE one. A wildcard
+  over any other package binds nothing, and an unresolved name under any
+  wildcard is still `not found` rather than a rewritten guess.
 
-  An unqualified `mutable` package path is also still accepted without the
-  import that Scala requires for it: `mutable.Set(1, 2)` compiles here and is
-  `Not found: mutable` in Scala. That is a leniency, not a wrong answer — every
-  program the reference accepts behaves identically.
+  That gate is deliberate. A wildcard names no member, so binding one means
+  deciding that some opened package provides a name — and a blind rewrite would
+  turn every unresolved name into a member access on whichever package was
+  imported last, reporting a failure further downstream and in worse terms than
+  the honest one. The two package member lists mirror the runtime's own tables
+  (`host::math_member`, the mutable factories), so a wildcard cannot bind a name
+  the runtime then refuses.
+
+  An unqualified `mutable` package path is also accepted without the import
+  Scala requires for it: `mutable.Set(1, 2)` compiles here and is `Not found:
+  mutable` in Scala. That is a leniency, not a wrong answer — every program the
+  reference accepts behaves identically.
+
 - **`xs: _*` outside an argument position.** The spread is parsed where Scala
   allows it — as an argument — and rejected everywhere else, which is also what
   Scala does. A spread handed to a parameter that is not repeated is a compile

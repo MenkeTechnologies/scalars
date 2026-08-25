@@ -39,6 +39,15 @@ pub struct Program {
     /// import without the parser having to track scopes. A wildcard selector
     /// (`import scala.math._`) contributes nothing here — see `BUGS.md`.
     pub imports: HashMap<String, Vec<String>>,
+    /// The package paths a WILDCARD `import` opened — `import scala.math._`
+    /// records `[scala, math]`.
+    ///
+    /// A wildcard names no member, so unlike [`Self::imports`] it cannot be a
+    /// map from a local name to a path. What it can do is say which packages a
+    /// bare name may be looked for in, and the compiler asks only about the
+    /// members it actually provides for that package — so an unknown name is
+    /// still `not found` rather than a guess that fails further downstream.
+    pub import_wildcards: Vec<Vec<String>>,
 }
 
 /// A `class` / `case class` declaration. The instance is a host-heap record (an

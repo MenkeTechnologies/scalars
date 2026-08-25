@@ -34,6 +34,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         classes: Vec::new(),
         objects: Vec::new(),
         imports: HashMap::new(),
+        wildcards: Vec::new(),
     };
     let mut prog = p.program()?;
     // Block-local `def`s are still statements at this point; scope, uniquely
@@ -54,6 +55,9 @@ struct Parser {
     objects: Vec<ObjectDecl>,
     /// What each `import`'s named selectors bind — see [`Program::imports`].
     imports: HashMap<String, Vec<String>>,
+    /// The package paths a WILDCARD `import` opened — see
+    /// [`Program::import_wildcards`].
+    wildcards: Vec<Vec<String>>,
 }
 
 /// The outcome of parsing a top-level `object`: the program entry point, or a
@@ -261,6 +265,7 @@ impl Parser {
             classes: std::mem::take(&mut self.classes),
             objects: std::mem::take(&mut self.objects),
             imports: std::mem::take(&mut self.imports),
+            import_wildcards: std::mem::take(&mut self.wildcards),
         })
     }
 
@@ -983,13 +988,21 @@ impl Parser {
     /// nothing else in scope answers to them. `Set` and `Map` do, and the
     /// import is what says which one is meant.
     fn imported_mutable_ctor(&self, name: &str) -> Option<String> {
-        let path = self.imports.get(name)?;
-        let (member, prefix) = path.split_last()?;
-        if !prefix.ends_with(&["collection".to_string(), "mutable".to_string()])
-            && prefix != ["mutable"]
-        {
-            return None;
-        }
+        let member = match self.imports.get(name) {
+            Some(path) => {
+                let (member, prefix) = path.split_last()?;
+                if !is_mutable_path(prefix) {
+                    return None;
+                }
+                member.clone()
+            }
+            // A wildcard over the mutable package names every factory in it,
+            // so `import scala.collection.mutable._` makes a bare `Set(1, 2)`
+            // the mutable one exactly as the selector import does.
+            None if self.wildcards.iter().any(|w| is_mutable_path(w)) => name.to_string(),
+            None => return None,
+        };
+        let member = &member;
         Some(match member.as_str() {
             "Set" | "HashSet" => "mutable.Set".to_string(),
             "Map" | "HashMap" => "mutable.Map".to_string(),
@@ -1023,6 +1036,15 @@ impl Parser {
             i += 1;
         }
         if i >= end {
+            // `import a.b._` — a wildcard, whose last segment is the marker
+            // rather than a member. It opens the PREFIX.
+            if path.last().map(String::as_str) == Some("_") {
+                path.pop();
+                if !path.is_empty() {
+                    self.wildcards.push(path);
+                }
+                return;
+            }
             // `import a.b.c` — the last segment is the selector, and also the
             // local name.
             if path.len() >= 2 {
@@ -1054,7 +1076,9 @@ impl Parser {
                 },
                 _ => (member.clone(), i + 1),
             };
-            if !local.is_empty() && local != "_" {
+            if member == "_" {
+                self.wildcards.push(prefix.clone());
+            } else if !local.is_empty() && local != "_" {
                 let mut full = prefix.clone();
                 full.push(member);
                 self.imports.insert(local, full);
@@ -3118,6 +3142,7 @@ fn parse_fragment(src: &str) -> Result<Expr, String> {
         classes: Vec::new(),
         objects: Vec::new(),
         imports: HashMap::new(),
+        wildcards: Vec::new(),
     };
     p.skip_seps();
     // Scala's `${…}` holds a BLOCK, not just an expression, so a splice may
@@ -3418,6 +3443,18 @@ fn binop(t: &Tok) -> Option<(BinOp, u8)> {
 /// The package-path segments a `new scala.collection.mutable.X` may be spelled
 /// through. `new` takes a type name, so the prefix is consumed and discarded.
 const MUTABLE_PREFIXES: &[&str] = &["scala", "collection", "mutable"];
+
+/// Whether a dotted path names the `scala.collection.mutable` package, in any
+/// of the three spellings a program may reach it by.
+fn is_mutable_path(path: &[String]) -> bool {
+    matches!(
+        path.iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["mutable"] | ["collection", "mutable"] | ["scala", "collection", "mutable"]
+    )
+}
 
 /// Whether `e` is the `scala.collection.mutable` package path — spelled
 /// `mutable`, `collection.mutable` or `scala.collection.mutable`. The compiler's

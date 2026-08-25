@@ -112,6 +112,9 @@ struct Compiler {
     /// What each `import`'s named selectors bind — see [`Program::imports`].
     /// Consulted only where a bare name resolved to nothing else.
     imports: HashMap<String, Vec<String>>,
+    /// The packages a WILDCARD `import` opened — see
+    /// [`Compiler::imported_wildcard`].
+    wildcards: Vec<Vec<String>>,
     /// Class metadata (`name → (ordered field names, is_case)`), for
     /// construction, `copy`, method dispatch, and constructor-pattern binding.
     classes: HashMap<String, ClassMeta>,
@@ -658,6 +661,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         method_index,
         overloads,
         imports: prog.imports.clone(),
+        wildcards: prog.import_wildcards.clone(),
         has_user_tostring: classes
             .iter()
             .flat_map(|cd| cd.methods.iter())
@@ -2440,7 +2444,12 @@ impl Compiler {
     /// Consulted only AFTER every binding has been tried, which is what gives
     /// Scala's rule that a definition shadows an import.
     fn imported(&self, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
-        let path = self.imports.get(name)?;
+        let path = self
+            .imports
+            .get(name)
+            .cloned()
+            .or_else(|| self.imported_wildcard(name))?;
+        let path = &path;
         let (member, prefix) = path.split_last()?;
         let (first, rest) = prefix.split_first()?;
         let recv = rest
@@ -2456,6 +2465,37 @@ impl Compiler {
             name: member.clone(),
             args: args.to_vec(),
             line,
+        })
+    }
+
+    /// The qualified path a bare name takes through a WILDCARD `import`, or
+    /// `None` when no wildcard in scope provides that name.
+    ///
+    /// The gate is what makes this honest. A wildcard names no member, so a
+    /// blind rewrite would turn every unresolved name into a member access on
+    /// some imported package and report a worse error than `not found` when the
+    /// guess was wrong. Instead each opened package is asked whether it
+    /// actually provides the name, against the same tables the qualified
+    /// spelling resolves through — so `import scala.math._` binds `sqrt` and
+    /// leaves `nosuch` exactly as unresolved as it was.
+    fn imported_wildcard(&self, name: &str) -> Option<Vec<String>> {
+        self.wildcards.iter().find_map(|prefix| {
+            let segs: Vec<&str> = prefix.iter().map(String::as_str).collect();
+            let provides = match segs.as_slice() {
+                ["math"] | ["scala", "math"] | ["Math"] | ["java", "lang", "Math"] => {
+                    MATH_MEMBERS.contains(&name)
+                }
+                ["mutable"] | ["collection", "mutable"] | ["scala", "collection", "mutable"] => {
+                    MUTABLE_MEMBERS.contains(&name)
+                }
+                _ => false,
+            };
+            if !provides {
+                return None;
+            }
+            let mut full = prefix.clone();
+            full.push(name.to_string());
+            Some(full)
         })
     }
 
@@ -5587,6 +5627,58 @@ fn combine_all(mut widths: impl Iterator<Item = NumTy>) -> NumTy {
 
 /// The collection literals whose elements are values (as opposed to `Map`'s
 /// key/value pairs, which have two widths and no single element type).
+/// The members `scala.math` provides, which is what a wildcard over it binds.
+/// Mirrors `host::math_member`'s own match, so the two cannot drift into a
+/// wildcard that binds a name the runtime then refuses.
+const MATH_MEMBERS: &[&str] = &[
+    "Pi",
+    "PI",
+    "E",
+    "abs",
+    "signum",
+    "max",
+    "min",
+    "round",
+    "floor",
+    "ceil",
+    "rint",
+    "sqrt",
+    "cbrt",
+    "exp",
+    "log",
+    "log10",
+    "pow",
+    "hypot",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "toRadians",
+    "toDegrees",
+];
+
+/// The members `scala.collection.mutable` provides. The collection factories
+/// are what a program reaches for through a wildcard over it.
+const MUTABLE_MEMBERS: &[&str] = &[
+    "Set",
+    "HashSet",
+    "Map",
+    "HashMap",
+    "ListBuffer",
+    "ArrayBuffer",
+    "Buffer",
+    "Queue",
+    "Stack",
+    "ArrayDeque",
+    "LinkedHashSet",
+    "LinkedHashMap",
+    "StringBuilder",
+    "PriorityQueue",
+];
+
 const SEQ_CTORS: &[&str] = &[
     "List",
     "Seq",
