@@ -640,12 +640,24 @@ reported as parse/compile errors, never silently mis-run.
   error on both sides.
 - **Building an IMMUTABLE collection one element at a time is quadratic**, and
   it is the REPRESENTATION that is quadratic rather than anything specific to
-  `Map`. `m = m + (k -> v)` in a loop measures 0.24s / 1.06s / 5.27s / 24.05s at
-  n = 1k / 2k / 4k / 8k, and `v = v :+ i` on a `Vector` — which has no hashing,
-  no ordering and no key lookup, only the copy — measures 0.04s / 0.13s / 0.53s
-  / 2.10s across the same n. Both are 4x per doubling. The `Vector` figure is
-  the floor for a copying representation, and the `Map` sits about 12x above it:
-  that gap is the per-insert rehash of every key and the trie-order rebuild.
+  `Map`. Measured against a frozen binary, taking the MINIMUM of repeated runs —
+  this machine runs many builds at once, and under load a single timing is not
+  a measurement (one run of an unchanged case came back 145x its own minimum):
+
+  | n | `m = m + (k -> v)` | `v = v :+ i` |
+  | --- | --- | --- |
+  | 1000 | 0.21s | 0.03s |
+  | 2000 | 1.03s (4.9x) | 0.13s (4.3x) |
+  | 4000 | 4.22s (4.1x) | 0.44s (3.4x) |
+  | 8000 | | 1.97s (4.5x) |
+  | 16000 | | 8.86s (4.5x) |
+  | 32000 | | 35.91s (4.1x) |
+
+  Both are ~4x per doubling. The `Vector` case has no hashing, no ordering and
+  no key lookup — only the copy — so it is the FLOOR for a copying
+  representation, and it is quadratic too. The `Map` sits roughly an order of
+  magnitude above it (7x at n=1000 rising to 10x at n=4000, so the gap grows:
+  the trie-order rebuild carries a log factor the copy does not).
 
   Scala is cheap here for one reason, and it is not an index: its immutable
   `Map`/`Set`/`Vector` are PERSISTENT — a CHAMP trie and a radix-balanced
@@ -661,10 +673,13 @@ reported as parse/compile errors, never silently mis-run.
   way the mutable table's is — that one is sorted by `(bucket, hash)`, so an
   insert is a binary search, whereas CHAMP order depends on which other keys
   share a hash prefix, and adding one key can move another from a node's data
-  section into a new sub-trie. Half-measures were measured rather than assumed:
-  replacing `champ_order`'s per-node `BTreeMap` with a fixed 32-slot array —
-  a node has exactly 32 slots — took n = 8k from 28.96s to 24.05s, which is a
-  1.2x constant and leaves the growth class alone.
+  section into a new sub-trie.
+
+  What IS available without the trie is the constant. Replacing `champ_order`'s
+  per-node `BTreeMap` with a fixed 32-slot array — a node has exactly 32 slots —
+  is **1.77x**, measured by running the two binaries INTERLEAVED so both arms
+  see the same load, and identical at n=1000 and n=2000 and on both the median
+  and the minimum (1.76x-1.78x). It leaves the growth class alone.
 
   MUTABLE `Map`/`Set` do not have this shape: their inserts are amortized
   `O(1)` (see the entry above), and so are the growable sequences.
