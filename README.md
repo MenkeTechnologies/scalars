@@ -694,9 +694,9 @@ Next waves, in priority order:
 1. **Lazy views** — `.view` and `LazyList`. (`Iterator` itself is done: it is a
    real consumable iterator, not a strict `Iterable`.)
 2. **The broader standard library** — `scala.io`, `scala.util.Random`, `BigInt`
-   and `BigDecimal`, and `scala.collection.*` as a namespace. (`scala.util.Try`
-   is done, with `Either`'s right-biased surface beside it; `Either.left`'s
-   `LeftProjection` is not.)
+   and `BigDecimal`, and `scala.collection.*` as a namespace. (`scala.util.Try` is
+   done, and `Either`'s right-biased surface with `Either.left`'s
+   `LeftProjection` beside it.)
 3. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement. Both
    are refused rather than approximated: reading one by name used to answer the
    whole match and `${name}` in a replacement used to be copied through

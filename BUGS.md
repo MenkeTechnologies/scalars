@@ -483,9 +483,12 @@ reported as parse/compile errors, never silently mis-run.
   work, and the method surface operates on the `Right` while passing a `Left`
   through: `isLeft`/`isRight`, `getOrElse`, `orElse`, `map`, `flatMap`,
   `foreach`, `exists`/`forall` (vacuously true on a `Left`), `contains`, `fold`,
-  `swap`, `filterOrElse`, `toOption` and `toSeq`/`toList`. `Either.left`'s
-  `LeftProjection` is NOT modeled — it is a distinct type, not a member set —
-  so `e.left.getOrElse(…)` is refused rather than approximated.
+  `swap`, `filterOrElse`, `toOption` and `toSeq`/`toList`. `Either.left` answers
+  the `LeftProjection` that mirrors those onto the `Left` — `get` (which throws
+  `Either.left.get on Right`), `getOrElse`, `map`, `flatMap`, `foreach`,
+  `exists`/`forall`, `toOption`, `toSeq`/`toList` and `filterToOption`. It is a
+  `case class` in Scala and one here, so it renders `LeftProjection(Left(bad))`
+  and compares structurally through the ordinary case-record machinery.
 - **`scala.util.Try`.** `Try(e)` expands in the parser to
   `try Success(e) catch { case t: Throwable => Failure(t) }`, so `e` is by-name
   and evaluated inside the `try`; `Success`/`Failure` are built-in case classes
@@ -985,12 +988,17 @@ reported as parse/compile errors, never silently mis-run.
   superset, not a wrong answer — but it means the parity fuzzer's generated
   programs must emit the import, or the reference rejects the probe and the two
   sides agree on a failure that tests nothing.
-- **A parameter list's second (curried) group is flattened into the first.**
-  `def f(a: Int)(b: Int)` is callable as `f(1)(2)` only in the sense that the
-  parameters exist; the two groups are one flat list, so a partially applied
-  `f(1)` is not a function. Default values in a later group also cannot see the
-  earlier group's parameters (Scala allows that; Scala 3 forbids it *within* one
-  group, which is why call-site splicing of a default is otherwise exact).
+- **A default value in a later parameter group cannot see the earlier group's
+  parameters.** The groups are flattened into one list, and a default is
+  spliced at the call site from that flat list, so `def f(a: Int)(b: Int = a)`
+  does not resolve `a`. Scala allows it across groups; it forbids it *within*
+  one group, which is what makes call-site splicing exact everywhere else.
+
+  Partial application across the groups is NOT a gap: the flattened list keeps
+  each group's boundary, so `def add(a: Int)(b: Int)` applied to one argument
+  answers `b => add(a, b)` and `def add3(a: Int)(b: Int)(c: Int)` applied to one
+  answers a function that answers another. A call that stops INSIDE a group is
+  still a missing argument, as Scala has it.
 - **`/` is dispatched at runtime, not by static type.** Scala picks integer vs.
   floating division from the *static* operand types; there are no static types
   here, so the [`host::b_div`] builtin decides at runtime — both operands `Int`

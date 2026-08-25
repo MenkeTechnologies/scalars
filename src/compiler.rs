@@ -3080,6 +3080,65 @@ impl Compiler {
     /// Trailing parameters synthesized by [`crate::resolve`]'s nested-`def`
     /// lifting are passed through untouched: the caller already appended those
     /// arguments, and they sit AFTER the written ones.
+    /// The lambda an UNDER-applied call to `name` denotes, or `None` when the
+    /// call supplies every parameter it has to.
+    ///
+    /// Scala eta-expands a call that leaves parameters unsupplied, which is how
+    /// a curried `def add(a: Int)(b: Int)` is partially applied: the clauses are
+    /// flattened into one parameter list here, so `add(10)` arrives as a
+    /// one-argument call on a two-parameter `def` and must answer `b =>
+    /// add(10, b)`. Without this it called `add` with one argument and the
+    /// second parameter held `null`.
+    ///
+    /// Every shape the argument adaptation already handles is left to it: a
+    /// missing parameter that has a DEFAULT is filled at the call site, a
+    /// VARARG absorbs zero arguments, and a NAMED argument may supply a later
+    /// parameter than its position suggests. None of those is an under-applied
+    /// call, so all three answer `None`.
+    fn eta_partial(&self, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+        let (params, sig, captured) = self.func_sig.get(name)?;
+        let visible = params.len().checked_sub(*captured)?;
+        if args.len() >= visible || args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+            return None;
+        }
+        if sig[args.len()..visible]
+            .iter()
+            .any(|p| p.default.is_some() || p.vararg)
+        {
+            return None;
+        }
+        // Only a call that stops AT a clause boundary eta-expands. One that
+        // stops inside a clause is a missing argument, which Scala rejects and
+        // `adapt_args` reports; answering a function for it would accept a
+        // program the reference does not.
+        if !sig.get(args.len())?.clause_start {
+            return None;
+        }
+        // Exactly the NEXT clause, not every remaining parameter: `def add3(a:
+        // Int)(b: Int)(c: Int)` applied to one argument is `Int => Int => Int`,
+        // so `add3(1)` is a ONE-parameter function whose body is itself an
+        // under-applied call. That inner call eta-expands here in turn, one
+        // clause per step, which is what makes `add3(1)(2)(3)` work through the
+        // chain of `apply`s the parser builds for it. Taking all the remaining
+        // parameters at once gave a two-parameter lambda that `(2)` then called
+        // with one argument, leaving the third `null`.
+        let next = (args.len() + 1..visible)
+            .find(|&i| sig[i].clause_start)
+            .unwrap_or(visible);
+        let missing: Vec<String> = (args.len()..next).map(|i| format!("$eta{i}")).collect();
+        let mut full = args.to_vec();
+        full.extend(missing.iter().map(|p| Expr::Var(p.clone())));
+        Some(Expr::Lambda {
+            params: missing,
+            body: Box::new(Expr::Call {
+                name: name.to_string(),
+                args: full,
+                line,
+            }),
+            partial: false,
+        })
+    }
+
     fn adapt_args(&self, name: &str, args: &[Expr], line: u32) -> Result<Vec<Expr>, String> {
         let Some((params, sig, captured)) = self.func_sig.get(name) else {
             return Ok(args.to_vec());
@@ -4126,6 +4185,13 @@ impl Compiler {
         // the function's `sub_entry` frame. The callee prologue pops these args
         // into its slots (see `function_body`).
         if self.func_arity.contains_key(name) {
+            // An UNDER-applied `def` is not a call — it is the function of the
+            // parameters that were not supplied. `def add(a: Int)(b: Int)`
+            // called `add(10)` is `b => add(10, b)`, and `add(10) _` is the
+            // same thing spelled out.
+            if let Some(eta) = self.eta_partial(name, args, line) {
+                return self.expr(&eta);
+            }
             let args = self.adapt_args(name, args, line)?;
             for a in &args {
                 self.expr(a)?;

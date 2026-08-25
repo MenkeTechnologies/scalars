@@ -112,6 +112,16 @@ pub struct ParamSig {
     /// thunk and forced at EVERY use inside the body, so a by-name argument with
     /// a side effect runs once per use (and not at all if never used).
     pub by_name: bool,
+    /// `true` when this parameter opens a SECOND or later parameter clause of a
+    /// curried `def` — `def add(a: Int)(b: Int)` marks `b`.
+    ///
+    /// The clauses are flattened into one list, because a call supplying all of
+    /// them is one call. The boundary still matters in exactly one place:
+    /// Scala eta-expands a call that stops AT a clause boundary (`add(10)` is
+    /// `b => add(10, b)`) and rejects one that stops inside a clause
+    /// (`def two(a: Int, b: Int)` called `two(10)` is "missing argument for
+    /// parameter b"). Without this flag the two are indistinguishable.
+    pub clause_start: bool,
     /// The parameter's declared type, verbatim (`"Int"`, `"Long"`, `"Double"`).
     /// Scala REQUIRES a type on every `def` parameter, which makes this the one
     /// place a nested body's numeric widths are always knowable — and so the

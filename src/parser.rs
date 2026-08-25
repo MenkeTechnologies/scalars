@@ -630,9 +630,14 @@ impl Parser {
     fn param_list(&mut self) -> Result<(Vec<String>, Vec<ParamSig>), String> {
         let mut params = Vec::new();
         let mut sig = Vec::new();
+        let mut clause = 0usize;
         while self.is(&Tok::LParen) {
             self.advance();
             self.skip_seps();
+            // The first parameter of every clause AFTER the first carries the
+            // boundary — see [`ParamSig::clause_start`].
+            let mut first_of_clause = clause > 0;
+            clause += 1;
             while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
                 // `implicit`/`using` lead a parameter list, not a parameter.
                 if matches!(self.peek(), Tok::Ident(w) if w == "implicit" || w == "using")
@@ -670,6 +675,8 @@ impl Parser {
                     self.skip_seps();
                     ps.default = Some(self.expression()?);
                 }
+                ps.clause_start = first_of_clause;
+                first_of_clause = false;
                 params.push(pname);
                 sig.push(ps);
                 if self.is(&Tok::Comma) {
@@ -1946,6 +1953,24 @@ impl Parser {
                         args: vec![arg],
                         line,
                     };
+                    continue;
+                }
+                // `f _` / `add(10) _` — the explicit eta-expansion, written
+                // AFTER a complete expression. It asks for the function the
+                // expression denotes rather than its value, which is what a
+                // bare `f` and an under-applied `add(10)` already mean here
+                // (`Compiler::var_ref` eta-expands a `def` used as a value, and
+                // `Compiler::eta_partial` an under-applied call), so the marker
+                // is consumed and the expression stands.
+                //
+                // A LEADING `_` is a placeholder and unaffected: it starts an
+                // expression rather than following one. A `_` on the next line
+                // is unaffected too — newline inference puts a separator in
+                // front of it, which this never looks past.
+                if matches!(self.peek(), Tok::Ident(w) if w == "_")
+                    && matches!(e, Expr::Call { .. } | Expr::Var(_) | Expr::Method { .. })
+                {
+                    self.advance();
                     continue;
                 }
                 break;

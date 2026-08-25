@@ -4353,6 +4353,19 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
         }
     }
 
+    // The left-biased view `e.left` answers, whose members mirror the ones
+    // above onto the `Left`.
+    if let Some(either) = as_left_projection(&recv) {
+        if let Some(outcome) = as_either(&either) {
+            if let Some(r) = left_projection_method(vm, &either, outcome, &name, &args) {
+                return match r {
+                    Ok(v) => v,
+                    Err(e) => fault(vm, e),
+                };
+            }
+        }
+    }
+
     // `scala.util.Try`'s surface, for the same reason and with the same
     // fall-through: `map`/`recover`/`foreach` run a closure body.
     if let Some(outcome) = as_try(&recv) {
@@ -7899,6 +7912,82 @@ fn either_method(
             Err(e) => Err(e),
         },
         ("filterOrElse", 2, Err(_)) => Ok(recv.clone()),
+        // `e.left` — the LEFT-biased view of the same `Either`, which is how a
+        // right-biased `Either` still reaches its `Left`. It is a `case class`
+        // in Scala (`Either.LeftProjection`), so it is one here: the record
+        // renders `LeftProjection(Left(bad))` and compares structurally through
+        // the ordinary case-record machinery, with no rule of its own.
+        ("left", 0, _) => Ok(heap_alloc(ScalaObj {
+            class: Arc::from(LEFT_PROJECTION),
+            is_case: true,
+            is_object: false,
+            fields: vec![(Arc::from("e"), recv.clone())],
+        })),
+        _ => return None,
+    })
+}
+
+/// The class tag of the record `Either.left` answers.
+const LEFT_PROJECTION: &str = "LeftProjection";
+
+/// View a value as a `LeftProjection`, answering the `Either` it projects.
+fn as_left_projection(v: &Value) -> Option<Value> {
+    with_obj(v, |o| {
+        (&*o.class == LEFT_PROJECTION).then(|| o.fields.first().map(|(_, v)| v.clone()))
+    })
+    .flatten()
+    .flatten()
+}
+
+/// `Either.LeftProjection`'s method surface — the mirror image of
+/// [`either_method`]'s right-biased half, operating on the `Left` and passing a
+/// `Right` through.
+///
+/// `outcome` is the projected `Either` viewed as success-or-failure, so its
+/// `Err` side is the `Left` this projection is about; `either` is that `Either`
+/// itself, which the members that answer it unchanged return (`map` and
+/// `flatMap` on a `Right` give back the SAME instance, as Scala's do).
+fn left_projection_method(
+    vm: &mut VM,
+    either: &Value,
+    outcome: Result<Value, Value>,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    Some(match (name, args.len(), &outcome) {
+        ("get", 0, Err(v)) => Ok(v.clone()),
+        // Scala's message names the projection, not the `Either`.
+        ("get", 0, Ok(_)) => {
+            Err("scalars: java.util.NoSuchElementException: Either.left.get on Right".to_string())
+        }
+        ("getOrElse", 1, Err(v)) => Ok(v.clone()),
+        ("getOrElse", 1, Ok(_)) => Ok(args[0].clone()),
+        ("toOption", 0, _) => Ok(opt(outcome.clone().err())),
+        ("toSeq" | "toList", 0, _) => Ok(new_list(outcome.clone().err().into_iter().collect())),
+        ("map", 1, Err(v)) => match invoke_closure(vm, &args[0], std::slice::from_ref(v)) {
+            Ok(r) => Ok(make_either(false, r)),
+            Err(e) => Err(e),
+        },
+        ("flatMap", 1, Err(v)) => invoke_closure(vm, &args[0], std::slice::from_ref(v)),
+        ("foreach", 1, Err(v)) => {
+            invoke_closure(vm, &args[0], std::slice::from_ref(v)).map(|_| unit_value())
+        }
+        ("map" | "flatMap", 1, Ok(_)) => Ok(either.clone()),
+        ("foreach", 1, Ok(_)) => Ok(unit_value()),
+        ("exists" | "forall", 1, Err(v)) => invoke_closure(vm, &args[0], std::slice::from_ref(v))
+            .map(|hit| Value::bool(truthy(&hit))),
+        ("exists", 1, Ok(_)) => Ok(Value::bool(false)),
+        ("forall", 1, Ok(_)) => Ok(Value::bool(true)),
+        // `filterToOption` answers `Some(the Either)` when the `Left` passes the
+        // predicate, and `None` both when it fails and when there is no `Left`.
+        ("filterToOption", 1, Err(v)) => {
+            match invoke_closure(vm, &args[0], std::slice::from_ref(v)) {
+                Ok(hit) if truthy(&hit) => Ok(opt(Some(either.clone()))),
+                Ok(_) => Ok(opt(None)),
+                Err(e) => Err(e),
+            }
+        }
+        ("filterToOption", 1, Ok(_)) => Ok(opt(None)),
         _ => return None,
     })
 }
