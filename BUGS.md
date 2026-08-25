@@ -700,39 +700,40 @@ reported as parse/compile errors, never silently mis-run.
   about how a program runs and goes stale with every library release. Refusing
   it is the intended behaviour, so a program asking for it gets `value getClass
   is not a member of value` rather than a plausible-looking wrong name.
-- **`Float` is not a distinct type.** There is one `Double` numeric type, so the
-  FINITE `Float` constants — `Float.MaxValue`/`MinValue`/`MinPositiveValue` and
-  the `java.lang.Float` spellings of them — are not answered. The constant is the
-  visible half of it; single precision is the rest. `0.1f + 0.2f` answers
-  `0.30000000000000004` where Scala answers `0.3`, `1.0f / 3.0f` answers
-  `0.3333333333333333` where Scala answers `0.33333334`, `Int.MaxValue.toFloat`
-  answers `2.147483647E9` where Scala answers `2.1474836E9`, `0.1f.toDouble`
-  answers `0.1` where Scala answers `0.10000000149011612`, and `(1.1f).getClass`
-  is `double`, not `float`.
+- **A `Float` inside a collection or a record renders as a `Double`.** `Float`
+  is a real type now — single-precision literals, arithmetic, conversions,
+  constants, `toString`, `getClass` and `hashCode` all match Scala (see
+  `README.md`) — and it is a STATIC one: fusevm has a single floating
+  representation, so which of the two widths a value carries is knowable only
+  from the type the compiler inferred for the expression, exactly as `Int` and
+  `Long` share one `i64` and are told apart by the width analysis.
 
-  The divergence starts at the LITERAL, not just at arithmetic, which is what
-  makes a `Float`-flavoured `toString` alone insufficient: an `f` literal is
-  rounded to single precision before it is ever used, so `16777217.0f` is
-  `1.6777216E7` in Scala (the odd integer is not representable as an `f32`) and
-  `1.0e-45f` is `1.4E-45` (the smallest `f32` subnormal). Both are read at
-  double precision here and answer `1.6777217E7` and `1.0E-45`. A real `Float`
-  therefore has to round at three places — the literal, every arithmetic
-  result, and the rendering — and fixing any one alone moves the wrong answer
-  rather than removing it.
+  That is enough everywhere the type reaches the value, and it does not reach
+  the ELEMENTS of a container. `println(List(0.1f))` prints
+  `List(0.10000000149011612)` and `case class P(v: Float); println(P(0.1f))`
+  prints `P(0.10000000149011612)`, because both render their contents at run
+  time from values that no longer carry a width. The element ARITHMETIC is
+  correct — `List(0.1f, 0.2f).sum` is `0.3` and `xs.map(_ / 3.0f)` computes at
+  single precision — and so is any element pulled back out and used on its own
+  (`a(0) + a(1)`, `p.v / 3.0f`); it is only the container's own `toString` that
+  reads a `Double`. Rendering the elements from the container's static element
+  type would answer `List`/`Array`/`Vector` and still miss a record's fields, a
+  `Map`'s values, and anything erased through an `Any`, so it is not the fix
+  that closes this.
 
-  This is why the finite constants stay an ERROR rather than becoming `f32::MAX
-  as f64`: that renders `3.4028234663852886E38`, not Scala's `3.4028235E38`.
-  Storing the shortest `Float` decimal as a `Double` instead would fix the
-  printing and leave `Float.MaxValue.toDouble` wrong — a plausible-looking wrong
-  answer in place of an honest rejection. They land when `Float` becomes a real
-  value type with its own `f32` arithmetic and `Float.toString` rendering.
+  Two smaller positions where the type does not reach either: a lambda parameter
+  typed only by a declared FUNCTION type (`val f: Float => Float = z => …` — a
+  parameter typed by a traversal, as in `xs.map(z => …)`, does get the element's
+  width), and a name bound by a destructuring `val (a, b) = (0.1f, 0.2f)`.
 
-  The three NON-finite ones are answered, because they are the ones a `Double`
-  holds exactly: `Float.NaN`, `Float.PositiveInfinity` and
-  `Float.NegativeInfinity` (and `java.lang.Float`'s `NaN`/`POSITIVE_INFINITY`/
-  `NEGATIVE_INFINITY`) print `NaN`, `Infinity` and `-Infinity` at either width,
-  so no precision is claimed that the value model does not have. Every other
-  value-class companion bound is answered.
+  A `Float` operation also leaves the JIT's reach: single precision costs a
+  `CallBuiltin` (`SF32_ARITH`), because rounding an `f64` result afterwards
+  rounds twice and can land a ulp from the value Scala computes
+  (`16777217.0f * 0.2f` is `3355443.2`, and the double-rounded product is
+  `3355443.3`). fusevm's tracer refuses to record through a builtin, so a hot
+  `Float` loop stays interpreted where the same loop over `Int` or `Double`
+  reaches native code. This is the same trade the Java frontend makes for the
+  identical rule.
 - **`given`/`using`.** A `given` declaration and a `using` parameter list are
   both parse errors.
 

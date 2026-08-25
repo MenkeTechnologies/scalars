@@ -85,6 +85,18 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   the first 60000 subnormals, every power of two in the range with its odd
   multiples, and 16000 pseudo-random draws across the whole exponent span —
   agree everywhere.
+- **`Float` at single precision** — `Float` is a distinct type, told apart from
+  `Double` by the same static analysis that tells an `Int` from a `Long` (one
+  runtime representation, two widths). It rounds where Scala rounds: at the
+  LITERAL (`16777217.0f` is `1.6777216E7`, `1.0e-45f` is `1.4E-45`), at every
+  OPERATION (`1.0f / 3.0f` is `0.33333334`, and `16777217.0f * 0.2f` is
+  `3355443.2` — computing it at 64 bits and narrowing after rounds twice and
+  answers `3355443.3`), and at every crossing into a `String`, where
+  `Float.toString` picks the shortest decimal that round-trips through 32 bits
+  (`0.1f` is `0.1`; the `Double` with those bits is `0.10000000149011612`). The
+  constants (`Float.MaxValue` is `3.4028235E38`), `.toFloat`, `getClass`
+  (`float`) and `hashCode` follow. A `Float` inside a collection or a record
+  still renders as a `Double` — see `BUGS.md`.
 - **Scala 3 entry points** — `@main def go(n: Int, s: String)` binds its
   parameters from the command line through the same reader Scala generates,
   including the wording and the exit status of a bad one (`Illegal command line
@@ -503,7 +515,8 @@ Scala source → lexer → parser (AST) → lower to fusevm bytecode → fusevm 
 | --- | --- |
 | **fusevm-hosted** | No local `vm.rs` / `jit.rs`, no JVM. Scala lowers to fusevm bytecode and runs on the shared three-tier Cranelift JIT; `jit-disk-cache` persists native code across runs. |
 | **Newline inference** | The lexer emits a statement separator for a source line break only where one token can end a statement and the next can begin one (Scala's rule), so idiomatic semicolon-free source parses. |
-| **Native arithmetic** | Operators lower to native fusevm ops; the JIT traces hot integer loops. A strict numeric hook supplies Scala's `+` string concatenation for non-numeric operands, `Long` wrapping on integer overflow, and `Double` promotion for a mixed pair past 2^53; a division builtin restores `Int` truncation. |
+| **Native arithmetic** | Operators lower to native fusevm ops; the JIT traces hot integer loops. A strict numeric hook supplies Scala's `+` string concatenation for non-numeric operands, `Long` wrapping on integer overflow, and `Double` promotion for a mixed pair past 2^53; a division builtin restores `Int` truncation. `Float` is the one arithmetic that leaves the native ops: single precision has to round once, at 32 bits, so it costs a builtin. |
+| **Rotated loops** | `while` and the counted `for` are lowered body-first, with the test at the bottom, so the loop closes on a CONDITIONAL backward branch — the one shape fusevm's tracer compiles. Emitted the other way (test at the top, unconditional `Jump` back), every loop this frontend produced was recorded and then declined. `scala --tiers` reports which tier each loop actually reached. |
 | **Scala print semantics** | `println`/`print` lower to a registered builtin that formats values Scala-style (`true`/`false`, `3.0`, `null`), rather than the VM's shell-flavoured `PrintLn`. |
 
 ---

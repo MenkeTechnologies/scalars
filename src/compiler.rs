@@ -286,6 +286,12 @@ struct ObjMeta {
     is_case: bool,
     /// The linearization excluding the object itself.
     supers: Vec<String>,
+    /// The declared numeric width of each member — a `def`'s return type, a
+    /// `val`'s annotation or its literal initializer. The object counterpart of
+    /// `ClassMeta::member_widths`, and the reason `O.f(1)` is typed by `def
+    /// f(x: Float): Float` rather than left unproven. An `object`'s methods were
+    /// the one member shape in the program with no width at all.
+    member_widths: HashMap<String, NumTy>,
 }
 
 /// Scala-style linearization of `name`: the type itself, then its supertypes
@@ -509,6 +515,24 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         // The singleton's `def`s, its own plus whatever `inherit_into_objects`
         // spliced in from its supertypes.
         let methods: HashSet<String> = od.methods.iter().map(|m| m.name.clone()).collect();
+        // The same two rules `ClassMeta::member_widths` uses, over the members
+        // `inherit_into_objects` has already spliced in.
+        let mut member_widths = HashMap::new();
+        for s in &od.body {
+            if let StmtKind::Local { name, ty, init, .. } = &s.kind {
+                let w = match ty {
+                    Some(t) => declared_width(t),
+                    None => init.as_ref().map_or(NumTy::Unknown, literal_width),
+                };
+                member_widths.insert(name.clone(), w);
+            }
+        }
+        for m in &od.methods {
+            member_widths.insert(
+                m.name.clone(),
+                declared_width(m.ret_ty.as_deref().unwrap_or("")),
+            );
+        }
         obj_meta.insert(
             od.name.clone(),
             ObjMeta {
@@ -516,6 +540,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 methods,
                 is_case: od.is_case,
                 supers: lin[&od.name][1..].to_vec(),
+                member_widths,
             },
         );
     }
@@ -3214,6 +3239,20 @@ impl Compiler {
                 return Ok(());
             }
         }
+        // The arithmetic operators in their METHOD spelling — `a.+(b)`, `a / b`
+        // written as `a./(b)`. They are the same operation as the binary form
+        // and take the same 32-bit path; without this they dispatched to the
+        // host's `Double` arithmetic and rounded once too few times.
+        if args.len() == 1 {
+            if let Some(bop) = operator_binop(name) {
+                if self.num_ty(recv).combine(self.num_ty(&args[0])) == NumTy::Float32 {
+                    self.expr(recv)?;
+                    self.expr(&args[0])?;
+                    self.emit_f32_arith(bop, line);
+                    return Ok(());
+                }
+            }
+        }
         let w = self.method_width(recv, name, args);
         // A lambda argument's parameters are typed by the traversal, so the
         // widths are decided HERE — the lambda body itself is compiled much
@@ -3750,6 +3789,7 @@ impl Compiler {
         for i in (0..cd.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
+        self.emit_f32_param_tys(&cd.param_tys, 0);
         // Supertype initialization, in Scala's order: every `extends P(args)`
         // argument list is evaluated first, walking *up* the superclass chain
         // (each level's arguments are written in terms of the level below it),
@@ -3883,6 +3923,7 @@ impl Compiler {
         for i in (0..=m.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
+        self.emit_f32_params(&m.sig, 1);
         let saved_class = self.current_class.take();
         // The field set is the *flattened* one, so a method inherited into a
         // subclass and a trait method alike see every field the instance holds.
@@ -3918,6 +3959,15 @@ impl Compiler {
         for (i, p) in m.params.iter().enumerate() {
             slots.insert(p.clone(), i as u16);
             self.vals.insert(p.clone(), true);
+            // Scala requires a type on every parameter, so an object method's
+            // body knows its own widths — the same rule `function_body` and
+            // `class_method` apply. Without it an `object`'s methods were the
+            // one body shape in the program where a declared `Long`, `Int` or
+            // `Float` parameter was analysed as unproven.
+            if let Some(t) = m.sig.get(i).and_then(|s| s.ty.as_deref()) {
+                self.widths
+                    .insert(p.clone(), self.binding_width(Some(t), None));
+            }
         }
         self.scope = Some(Scope {
             slots,
@@ -3927,6 +3977,7 @@ impl Compiler {
         for i in (0..m.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
+        self.emit_f32_params(&m.sig, 0);
         let saved_obj = self.current_object.take();
         self.current_object = Some(od.name.clone());
         self.push_unwind(UnwindKind::Def);
@@ -4249,6 +4300,7 @@ impl Compiler {
         for i in (0..f.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
+        self.emit_f32_params(&f.sig, 0);
 
         self.push_unwind(UnwindKind::Def);
         self.tail(&f.body)?;
@@ -4425,7 +4477,16 @@ impl Compiler {
             // A call to a user `def` with a declared return type. This is the
             // only width a call site can know: the body is compiled separately
             // and its result is whatever the annotation promised.
-            Expr::Call { name, .. } => self.def_widths.get(name).copied().unwrap_or(NumTy::Unknown),
+            // A call to a user `def` with a declared return type, OR an indexed
+            // read of a collection BINDING — `a(0)` parses as a call on the bare
+            // name `a`, and when `a` is a binding rather than a `def` the answer
+            // is one of its elements. A `def` of the same name wins, since a
+            // call site cannot mean both.
+            Expr::Call { name, args, .. } => match self.def_widths.get(name) {
+                Some(w) => *w,
+                None if args.len() == 1 => self.widths.get(name).map_or(NumTy::Unknown, |w| w.elem),
+                None => NumTy::Unknown,
+            },
             _ => NumTy::Unknown,
         }
     }
@@ -4524,6 +4585,19 @@ impl Compiler {
         {
             return NumTy::Float32;
         }
+        // A member of a singleton `object`, read off its own declaration.
+        // `Expr::Var` is the only receiver shape that can name one: an object is
+        // reached by its name, never by a value.
+        if let Expr::Var(o) = recv {
+            if let Some(w) = self
+                .objects
+                .get(o)
+                .and_then(|m| m.member_widths.get(name))
+                .copied()
+            {
+                return w;
+            }
+        }
         // A member of a USER-DECLARED class is typed by that class's own
         // declaration, and it takes priority over every name-based rule below.
         // Without this, `case class FileRec(name: String, size: Long)` had
@@ -4556,6 +4630,13 @@ impl Compiler {
         // cannot overflow, so they type an enclosing expression without being
         // narrowed themselves.
         if args.is_empty() && ELEM_RESULT_METHODS.contains(&name) {
+            return self.elem_ty(recv);
+        }
+        // `a(i)` — an indexed read answers one ELEMENT, so it takes the
+        // receiver's element width. A receiver with no element type (a `Map`, a
+        // function value, an unproven binding) answers `Unknown` and nothing is
+        // claimed.
+        if args.len() == 1 && name == "apply" {
             return self.elem_ty(recv);
         }
         if INT_RESULT_METHODS.contains(&name) {
@@ -4642,6 +4723,48 @@ impl Compiler {
         if w == NumTy::Float32 {
             self.b.emit(Op::CallBuiltin(crate::host::SF32, 1), line);
         }
+    }
+
+    /// Round every parameter declared `Float` to single precision on entry, in
+    /// the slots the prologue just filled. `base` is the slot the first
+    /// parameter landed in — 0 for a `def`, a constructor and an `object`
+    /// method, 1 for a class method, whose slot 0 is `this`.
+    ///
+    /// Scala widens an argument to the declared parameter type, and the `Float`
+    /// half of that widening is a rounding: `def f(x: Float)` called `f(1)`
+    /// binds `1.0f`, so `println(f(1))` is `1.0` and not `1`. Doing it in the
+    /// callee's prologue rather than at the call site covers every call shape —
+    /// named arguments, defaults, a call through a method-dispatch chain —
+    /// without any of them having to know.
+    ///
+    /// A by-name parameter is skipped: its slot holds a thunk, not a number, and
+    /// each use forces it separately.
+    fn emit_f32_params(&mut self, sig: &[ParamSig], base: u16) {
+        for (i, s) in sig.iter().enumerate() {
+            if s.by_name {
+                continue;
+            }
+            self.emit_f32_param(s.ty.as_deref(), base + i as u16);
+        }
+    }
+
+    /// The same, for a primary constructor, whose parameter types are carried as
+    /// a bare list rather than as [`ParamSig`]s. A constructor parameter is a
+    /// field, so this is also what makes `class Q(var w: Float)` hold a `Float`.
+    fn emit_f32_param_tys(&mut self, tys: &[Option<String>], base: u16) {
+        for (i, t) in tys.iter().enumerate() {
+            self.emit_f32_param(t.as_deref(), base + i as u16);
+        }
+    }
+
+    /// Round the value in `slot` when `ty` declares it a `Float`.
+    fn emit_f32_param(&mut self, ty: Option<&str>, slot: u16) {
+        if declared_width(ty.unwrap_or("")) != NumTy::Float32 {
+            return;
+        }
+        self.b.emit(Op::GetSlot(slot), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SF32, 1), 0);
+        self.b.emit(Op::SetSlot(slot), 0);
     }
 
     /// Render the value on top of the stack through `Float.toString`, when its
@@ -6524,6 +6647,20 @@ fn assign_op_method(op: AssignOp) -> &'static str {
         AssignOp::Div => "/=",
         AssignOp::Mod => "%=",
         AssignOp::Assign => unreachable!("plain assign is not a compound assignment"),
+    }
+}
+
+/// The binary operator a method name spells, for the five arithmetic operators
+/// Scala also exposes as methods (`a.+(b)` is `a + b`). `None` for every other
+/// name, including the comparisons, which are not arithmetic.
+fn operator_binop(name: &str) -> Option<BinOp> {
+    match name {
+        "+" => Some(BinOp::Add),
+        "-" => Some(BinOp::Sub),
+        "*" => Some(BinOp::Mul),
+        "/" => Some(BinOp::Div),
+        "%" => Some(BinOp::Mod),
+        _ => None,
     }
 }
 
