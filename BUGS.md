@@ -611,18 +611,20 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **`import` clauses are skipped, not tracked**, at the top level and, since
-  they are recognized in statement position too, inside a method body or a
-  block. Skipping them costs nothing for a *qualifying* import — `import
-  scala.collection.mutable` followed by `mutable.ArrayBuffer(…)` works, because
-  the qualified name is what resolves — but a SELECTOR import does not bring its
-  member into scope unqualified: `import scala.math.abs` followed by a bare
-  `abs(-3)` is `not found: abs`. Write `math.abs(-3)`. The collection names
-  (`ListBuffer`, `ArrayBuffer`, `Buffer`) are the exception, and only because
-  they resolve unqualified with or without the import. For the same reason an
-  unqualified `Set`/`Map` always means the IMMUTABLE one: `import
-  scala.collection.mutable.Set` followed by a bare `Set(1, 2)` builds the
-  immutable set. Write `mutable.Set(1, 2)`.
+- **A WILDCARD `import` brings nothing into scope.** `import scala.math._`
+  followed by a bare `sqrt(9.0)` is `not found: sqrt`; write `math.sqrt(9.0)`,
+  or import the member by name. A NAMED selector does work — `import
+  scala.math.abs`, `import scala.math.{max, min => lo}` and `import
+  scala.math.Pi` all bind the local name to the qualified path, and a definition
+  shadows the import as it does in Scala — but a wildcard names no member, so
+  there is nothing to bind it to. Resolving one would mean guessing that any
+  unresolved name is a member of some imported package and reporting a worse
+  error when it is not.
+
+  An unqualified `mutable` package path is also still accepted without the
+  import that Scala requires for it: `mutable.Set(1, 2)` compiles here and is
+  `Not found: mutable` in Scala. That is a leniency, not a wrong answer — every
+  program the reference accepts behaves identically.
 - **`xs: _*` outside an argument position.** The spread is parsed where Scala
   allows it — as an argument — and rejected everywhere else, which is also what
   Scala does. A spread handed to a parameter that is not repeated is a compile

@@ -109,6 +109,9 @@ struct Compiler {
     /// unnarrowed. Global, because [`crate::resolve`] has already hoisted every
     /// nested `def` into one flat namespace by the time this is built.
     def_widths: HashMap<String, NumTy>,
+    /// What each `import`'s named selectors bind — see [`Program::imports`].
+    /// Consulted only where a bare name resolved to nothing else.
+    imports: HashMap<String, Vec<String>>,
     /// Class metadata (`name → (ordered field names, is_case)`), for
     /// construction, `copy`, method dispatch, and constructor-pattern binding.
     classes: HashMap<String, ClassMeta>,
@@ -654,6 +657,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         objects: obj_meta,
         method_index,
         overloads,
+        imports: prog.imports.clone(),
         has_user_tostring: classes
             .iter()
             .flat_map(|cd| cd.methods.iter())
@@ -2404,9 +2408,47 @@ impl Compiler {
                 .emit(Op::CallBuiltin(crate::host::MAKE_ORDERING, 0), 0);
             return Ok(());
         }
+        // An `import`'s named selector — see [`Compiler::imported`]. Placed
+        // after every binding so a definition shadows the import, and before the
+        // global fallback so an imported name is not read as an unbound one,
+        // which answers `null` rather than failing.
+        if let Some(q) = self.imported(name, &[], 0) {
+            return self.expr(&q);
+        }
         let place = self.resolve_place(name);
         self.emit_load(place);
         Ok(())
+    }
+
+    /// The qualified expression an imported bare name stands for, when the name
+    /// bound to nothing else. `import scala.math.abs` makes `abs` mean
+    /// `scala.math.abs`, and `abs(-3)` mean `scala.math.abs(-3)`.
+    ///
+    /// `args` are the call's, or empty for a bare read. The chain is built out
+    /// of ordinary member accesses, so whatever already resolves the written
+    /// form resolves this one — the import adds no new resolution rule, only a
+    /// shorter spelling.
+    ///
+    /// Consulted only AFTER every binding has been tried, which is what gives
+    /// Scala's rule that a definition shadows an import.
+    fn imported(&self, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+        let path = self.imports.get(name)?;
+        let (member, prefix) = path.split_last()?;
+        let (first, rest) = prefix.split_first()?;
+        let recv = rest
+            .iter()
+            .fold(Expr::Var(first.clone()), |recv, seg| Expr::Method {
+                recv: Box::new(recv),
+                name: seg.clone(),
+                args: Vec::new(),
+                line,
+            });
+        Some(Expr::Method {
+            recv: Box::new(recv),
+            name: member.clone(),
+            args: args.to_vec(),
+            line,
+        })
     }
 
     /// Whether an instance of `cname` responds to `method` — declared by the
@@ -4114,6 +4156,11 @@ impl Compiler {
             self.b
                 .emit(Op::CallBuiltin(crate::host::APPLY, args.len() as u8), line);
             return Ok(());
+        }
+        // An `import`'s named selector, which every binding above has now had
+        // its chance to shadow.
+        if let Some(q) = self.imported(name, args, line) {
+            return self.expr(&q);
         }
         if !self.has_ffi {
             return Err(format!("scalars: not found: {name} (line {line})"));

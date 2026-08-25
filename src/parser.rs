@@ -12,6 +12,7 @@
 
 use crate::ast::*;
 use crate::lexer::{Tok, Token};
+use std::collections::HashMap;
 
 /// The synthetic call `new Array[T](n)` desugars to; lowered by
 /// [`crate::compiler`] to the zero-filling array builtin.
@@ -32,6 +33,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         funcs: Vec::new(),
         classes: Vec::new(),
         objects: Vec::new(),
+        imports: HashMap::new(),
     };
     let mut prog = p.program()?;
     // Block-local `def`s are still statements at this point; scope, uniquely
@@ -50,6 +52,8 @@ struct Parser {
     classes: Vec<ClassDecl>,
     /// Top-level non-entry `object`/`case object` declarations.
     objects: Vec<ObjectDecl>,
+    /// What each `import`'s named selectors bind — see [`Program::imports`].
+    imports: HashMap<String, Vec<String>>,
 }
 
 /// The outcome of parsing a top-level `object`: the program entry point, or a
@@ -256,6 +260,7 @@ impl Parser {
             functions: std::mem::take(&mut self.funcs),
             classes: std::mem::take(&mut self.classes),
             objects: std::mem::take(&mut self.objects),
+            imports: std::mem::take(&mut self.imports),
         })
     }
 
@@ -943,18 +948,111 @@ impl Parser {
     /// stops the clause, which is what makes a block-local
     /// `import scala.util.{Try, Success}` end at the right token.
     fn skip_import_clause(&mut self) {
+        let importing = matches!(self.peek(), Tok::Ident(w) if w == "import");
         self.advance(); // package/import/export
+        let start = self.pos;
         let mut depth = 0u32;
         loop {
             match self.peek() {
                 Tok::LBrace => depth += 1,
-                Tok::RBrace if depth == 0 => return,
+                Tok::RBrace if depth == 0 => break,
                 Tok::RBrace => depth -= 1,
-                Tok::Newline | Tok::Semi | Tok::Eof if depth == 0 => return,
-                _ if depth == 0 && self.at_declaration_start() => return,
+                Tok::Newline | Tok::Semi | Tok::Eof if depth == 0 => break,
+                _ if depth == 0 && self.at_declaration_start() => break,
                 _ => {}
             }
             self.advance();
+        }
+        if importing {
+            self.record_import(start, self.pos);
+        }
+    }
+
+    /// The collection constructor a bare `name` selects when an `import` bound
+    /// it to a `scala.collection.mutable` factory, else `None`.
+    ///
+    /// Only the names whose meaning the import CHANGES need this: `ListBuffer`
+    /// and the rest already resolve to the mutable factory unqualified, because
+    /// nothing else in scope answers to them. `Set` and `Map` do, and the
+    /// import is what says which one is meant.
+    fn imported_mutable_ctor(&self, name: &str) -> Option<String> {
+        let path = self.imports.get(name)?;
+        let (member, prefix) = path.split_last()?;
+        if !prefix.ends_with(&["collection".to_string(), "mutable".to_string()])
+            && prefix != ["mutable"]
+        {
+            return None;
+        }
+        Some(match member.as_str() {
+            "Set" | "HashSet" => "mutable.Set".to_string(),
+            "Map" | "HashMap" => "mutable.Map".to_string(),
+            other => mutable_buffer_ctor(other)?.to_string(),
+        })
+    }
+
+    /// Record what an `import` clause's NAMED selectors bind, from the token
+    /// range the skip above consumed.
+    ///
+    /// The clause is `import a.b.c`, `import a.b.{x, y => z}`, or
+    /// `import a.b._`. Only the first two contribute: each selector maps the
+    /// local name a program may then write bare to the qualified path it stands
+    /// for. A wildcard names nothing, so it records nothing.
+    ///
+    /// Read off the tokens rather than parsed into a clause type because an
+    /// import has no runtime meaning here beyond this mapping — see
+    /// [`Program::imports`].
+    fn record_import(&mut self, start: usize, end: usize) {
+        let mut path: Vec<String> = Vec::new();
+        let mut i = start;
+        while i < end {
+            match &self.toks[i].kind {
+                Tok::Ident(w) => path.push(w.clone()),
+                Tok::Dot => {}
+                Tok::LBrace => break,
+                // `import a.b.this`, `import a.b.given` and the like name no
+                // value this frontend can reach.
+                _ => return,
+            }
+            i += 1;
+        }
+        if i >= end {
+            // `import a.b.c` — the last segment is the selector, and also the
+            // local name.
+            if path.len() >= 2 {
+                if let Some(local) = path.last().cloned() {
+                    self.imports.insert(local, path);
+                }
+            }
+            return;
+        }
+        // `import a.b.{ … }` — `path` is the prefix, and each selector extends
+        // it by one segment.
+        let prefix = path;
+        if prefix.is_empty() {
+            return;
+        }
+        let mut i = i + 1; // past `{`
+        while i < end {
+            let Tok::Ident(member) = &self.toks[i].kind else {
+                i += 1;
+                continue;
+            };
+            let member = member.clone();
+            // `x => y` renames; `x => _` HIDES the name, and hiding one that was
+            // never bound is a no-op here.
+            let (local, next) = match self.toks.get(i + 1).map(|t| &t.kind) {
+                Some(Tok::FatArrow) => match self.toks.get(i + 2).map(|t| &t.kind) {
+                    Some(Tok::Ident(alias)) => (alias.clone(), i + 3),
+                    _ => (String::new(), i + 3),
+                },
+                _ => (member.clone(), i + 1),
+            };
+            if !local.is_empty() && local != "_" {
+                let mut full = prefix.clone();
+                full.push(member);
+                self.imports.insert(local, full);
+            }
+            i = next;
         }
     }
 
@@ -2261,10 +2359,21 @@ impl Parser {
                 }
                 if self.is(&Tok::LParen) {
                     // `List(...)` / `Map(...)` / `Array(...)` collection literals.
+                    // A name an `import` selector bound to a
+                    // `scala.collection.mutable` factory means THAT factory,
+                    // even when the same name also denotes an immutable one:
+                    // `import scala.collection.mutable.Set` makes a bare
+                    // `Set(1, 2)` the mutable set. An explicit import outranks
+                    // the default scope in Scala, and this is the one place the
+                    // two disagree about a name.
+                    if let Some(ctor) = self.imported_mutable_ctor(&name) {
+                        let elems = self.arg_list()?;
+                        return Ok(eta_bare_args(Expr::Collection { ctor, elems }));
+                    }
                     // `ListBuffer`/`ArrayBuffer`/`Buffer` are the mutable names
                     // that can only mean the mutable collection, so they work
-                    // unqualified (imports are skipped, not tracked). `Set` and
-                    // `Map` stay immutable — see `BUGS.md`.
+                    // unqualified. A bare `Set`/`Map` with no import naming the
+                    // mutable one stays immutable, as in Scala.
                     if matches!(
                         name.as_str(),
                         "List"
@@ -2983,6 +3092,7 @@ fn parse_fragment(src: &str) -> Result<Expr, String> {
         funcs: Vec::new(),
         classes: Vec::new(),
         objects: Vec::new(),
+        imports: HashMap::new(),
     };
     p.skip_seps();
     // Scala's `${…}` holds a BLOCK, not just an expression, so a splice may
@@ -3277,9 +3387,9 @@ fn binop(t: &Tok) -> Option<(BinOp, u8)> {
 }
 
 /// The collection constructor an *unqualified* mutable name selects. Only the
-/// names that cannot also mean an immutable collection are listed: imports are
-/// skipped rather than tracked, so a bare `Set`/`Map` must keep meaning the
-/// immutable one (see `BUGS.md`).
+/// names that cannot also mean an immutable collection are listed: a bare
+/// `Set`/`Map` means the immutable one unless an `import` selector says
+/// otherwise (see [`Parser::imported_mutable_ctor`]).
 /// The package-path segments a `new scala.collection.mutable.X` may be spelled
 /// through. `new` takes a type name, so the prefix is consumed and discarded.
 const MUTABLE_PREFIXES: &[&str] = &["scala", "collection", "mutable"];
@@ -3316,7 +3426,7 @@ fn mutable_buffer_ctor(name: &str) -> Option<&'static str> {
         // `Queue`/`Stack`/`ArrayDeque`/`LinkedHash*` also name immutable or
         // package-qualified types, but none of them is in Scala's default scope,
         // so an unqualified use can only have come from a `scala.collection
-        // .mutable` import — which is skipped rather than tracked (see BUGS.md).
+        // .mutable` import — which is accepted with or without one.
         "Queue" => "Queue",
         "Stack" => "Stack",
         "ArrayDeque" => "ArrayDeque",

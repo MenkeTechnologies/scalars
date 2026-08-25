@@ -6,6 +6,8 @@
 //! `case class`, `object` and `trait` declarations, all of which are modeled
 //! here (see `BUGS.md` for what is not).
 
+use std::collections::HashMap;
+
 /// A parsed compilation unit: the entry object name, the body of its entry
 /// point (`main`, or the `extends App` body), and the object's other `def`s.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +29,16 @@ pub struct Program {
     /// object — singletons whose `def`s dispatch statically and whose `val`s are
     /// program-global.
     pub objects: Vec<ObjectDecl>,
+    /// What an `import`'s named selectors bind: the LOCAL name a program may
+    /// then write bare, mapped to the qualified path it stands for.
+    /// `import scala.math.abs` records `abs → [scala, math, abs]`, and
+    /// `import scala.math.{max, min => lo}` records `max` and `lo` the same way.
+    ///
+    /// Consulted by the compiler ONLY where a bare name resolved to nothing
+    /// else, which is what gives Scala's rule that a definition shadows an
+    /// import without the parser having to track scopes. A wildcard selector
+    /// (`import scala.math._`) contributes nothing here — see `BUGS.md`.
+    pub imports: HashMap<String, Vec<String>>,
 }
 
 /// A `class` / `case class` declaration. The instance is a host-heap record (an
