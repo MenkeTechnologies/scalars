@@ -755,8 +755,19 @@ reported as parse/compile errors, never silently mis-run.
   is a floor rather than a bug: single precision cannot be both exact and
   native on a VM whose native floats are 64-bit.
 
-- **`given`/`using`.** A `given` declaration and a `using` parameter list are
-  both parse errors.
+- **`given` declarations, `extension` methods, and implicit CONVERSIONS.** A
+  `given` declaration and an `extension` block are parse errors, and an
+  `implicit def` is not applied as a conversion.
+
+  An implicit PARAMETER clause is not one of these gaps: `def f(x: Int)(implicit
+  m: Int)` and the `using` spelling of it are both supplied from the implicit
+  scope, which is every `implicit val` in the program, selected by declared TYPE
+  — and a clause written explicitly at the call site still wins. What is missing
+  is the rest of the implicit machinery: a `given` as the way to introduce one,
+  an `implicit def` as a conversion, and resolution by anything richer than a
+  type-name match (no type parameters, no subtyping, no companion-object
+  search). An unresolved implicit is left as an ordinary arity error rather than
+  guessed at.
 
   By-name parameters and `@main` used to be listed here and are not gaps: `def
   f(x: => Int)` passes a thunk forced at every use (the `params` fuzz mode is

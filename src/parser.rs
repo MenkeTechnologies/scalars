@@ -35,6 +35,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         objects: Vec::new(),
         imports: HashMap::new(),
         wildcards: Vec::new(),
+        implicits: Vec::new(),
     };
     let mut prog = p.program()?;
     // Block-local `def`s are still statements at this point; scope, uniquely
@@ -58,6 +59,8 @@ struct Parser {
     /// The package paths a WILDCARD `import` opened — see
     /// [`Program::import_wildcards`].
     wildcards: Vec<Vec<String>>,
+    /// `implicit val NAME: TY` declarations — see [`Program::implicits`].
+    implicits: Vec<(String, String)>,
 }
 
 /// The outcome of parsing a top-level `object`: the program entry point, or a
@@ -266,6 +269,7 @@ impl Parser {
             objects: std::mem::take(&mut self.objects),
             imports: std::mem::take(&mut self.imports),
             import_wildcards: std::mem::take(&mut self.wildcards),
+            implicits: std::mem::take(&mut self.implicits),
         })
     }
 
@@ -649,6 +653,9 @@ impl Parser {
             // boundary — see [`ParamSig::clause_start`].
             let mut first_of_clause = clause > 0;
             clause += 1;
+            // `implicit`/`using` lead a parameter LIST, so the marker applies to
+            // every parameter in this clause.
+            let mut implicit_clause = false;
             while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
                 // `implicit`/`using` lead a parameter list, not a parameter.
                 if matches!(self.peek(), Tok::Ident(w) if w == "implicit" || w == "using")
@@ -657,6 +664,7 @@ impl Parser {
                         Some(Tok::Colon)
                     )
                 {
+                    implicit_clause = true;
                     self.advance();
                     self.skip_seps();
                     continue;
@@ -687,6 +695,7 @@ impl Parser {
                     ps.default = Some(self.expression()?);
                 }
                 ps.clause_start = first_of_clause;
+                ps.implicit_clause = implicit_clause;
                 first_of_clause = false;
                 params.push(pname);
                 sig.push(ps);
@@ -1119,6 +1128,20 @@ impl Parser {
             Tok::Ident(w) if w == "lazy" && matches!(self.peek_at(1), Tok::Val | Tok::Var) => {
                 self.advance();
                 self.local_decl_lazy(true)
+            }
+            // `implicit val n: Int = 5` — an ordinary binding that ALSO enters
+            // the implicit scope, which is what fills an `implicit` parameter
+            // clause at a call site.
+            Tok::Ident(w) if w == "implicit" && matches!(self.peek_at(1), Tok::Val | Tok::Var) => {
+                self.advance();
+                let decl = self.local_decl()?;
+                if let StmtKind::Local {
+                    name, ty: Some(ty), ..
+                } = &decl
+                {
+                    self.implicits.push((name.clone(), ty.clone()));
+                }
+                Ok(decl)
             }
             Tok::Return => self.return_stmt(),
             // A block-local `import`/`export`. Only the top-level prologue
@@ -3164,6 +3187,7 @@ fn parse_fragment(src: &str) -> Result<Expr, String> {
         objects: Vec::new(),
         imports: HashMap::new(),
         wildcards: Vec::new(),
+        implicits: Vec::new(),
     };
     p.skip_seps();
     // Scala's `${…}` holds a BLOCK, not just an expression, so a splice may

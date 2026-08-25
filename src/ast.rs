@@ -48,6 +48,14 @@ pub struct Program {
     /// members it actually provides for that package — so an unknown name is
     /// still `not found` rather than a guess that fails further downstream.
     pub import_wildcards: Vec<Vec<String>>,
+    /// `implicit val NAME: TY` declarations, as `(name, declared type)`.
+    ///
+    /// This is the implicit SCOPE, and it is resolved by declared type name: an
+    /// `implicit` / `using` parameter clause is not written at the call site, so
+    /// the compiler supplies each of its parameters from the first binding here
+    /// whose type matches. An annotation is required, because the type is the
+    /// only thing that selects one.
+    pub implicits: Vec<(String, String)>,
 }
 
 /// A `class` / `case class` declaration. The instance is a host-heap record (an
@@ -129,6 +137,13 @@ pub struct ParamSig {
     /// thunk and forced at EVERY use inside the body, so a by-name argument with
     /// a side effect runs once per use (and not at all if never used).
     pub by_name: bool,
+    /// `true` when this parameter belongs to an `implicit` / `using` clause.
+    ///
+    /// Such a clause is not written at the call site: the compiler supplies it
+    /// from the implicit scope. Without the flag an omitted one looks exactly
+    /// like a partial application, and `def f(x: Int)(implicit m: Int)` called
+    /// `f(1)` eta-expanded to a function instead of answering a number.
+    pub implicit_clause: bool,
     /// `true` when this parameter opens a SECOND or later parameter clause of a
     /// curried `def` — `def add(a: Int)(b: Int)` marks `b`.
     ///

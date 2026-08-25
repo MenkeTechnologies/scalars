@@ -5819,6 +5819,22 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     .collect(),
             ))
         }
+        // `zipAll(that, thisElem, thatElem)` — the zip that runs to the LONGER
+        // of the two, padding whichever ran out. `zip` stops at the shorter.
+        ("zipAll", 3) => {
+            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let n = items.len().max(other.len());
+            Ok(same(
+                (0..n)
+                    .map(|i| {
+                        new_pair(
+                            items.get(i).cloned().unwrap_or_else(|| args[1].clone()),
+                            other.get(i).cloned().unwrap_or_else(|| args[2].clone()),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
         ("zipWithIndex", 0) => Ok(same(
             items
                 .iter()

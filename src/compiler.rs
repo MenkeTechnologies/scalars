@@ -117,6 +117,9 @@ struct Compiler {
     /// [`crate::host::LAZY_FORCE`]. Scoped like [`Self::vals`]: taken on entry
     /// to a body and restored on the way out.
     lazies: HashSet<String>,
+    /// The implicit scope: `(name, declared type)` for every `implicit val` —
+    /// see [`Compiler::implicit_args`].
+    implicits: Vec<(String, String)>,
     /// The packages a WILDCARD `import` opened — see
     /// [`Compiler::imported_wildcard`].
     wildcards: Vec<Vec<String>>,
@@ -673,6 +676,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         imports: prog.imports.clone(),
         wildcards: prog.import_wildcards.clone(),
         lazies: HashSet::new(),
+        implicits: prog.implicits.clone(),
         has_user_tostring: classes
             .iter()
             .flat_map(|cd| cd.methods.iter())
@@ -2449,6 +2453,15 @@ impl Compiler {
                 self.b.emit(Op::Call(nidx, 0), 0);
                 return Ok(());
             }
+            // `def h(implicit m: Int)` written bare is a complete CALL, not a
+            // function value: its only clause is supplied rather than written,
+            // so there is nothing left for an eta-expansion to abstract over.
+            if self
+                .implicit_args(name, &[])
+                .is_some_and(|filled| filled.len() == arity)
+            {
+                return self.call(name, &[], 0);
+            }
             let params: Vec<String> = (0..arity).map(|i| format!("$eta{i}")).collect();
             let call = Expr::Call {
                 name: name.to_string(),
@@ -3274,6 +3287,13 @@ impl Compiler {
         if !sig.get(args.len())?.clause_start {
             return None;
         }
+        // An `implicit` / `using` clause is not written at the call site — it is
+        // SUPPLIED (see `Compiler::implicit_args`), so a call that stops in
+        // front of one is complete rather than partially applied. Without this
+        // `def f(x: Int)(implicit m: Int)` called `f(1)` answered a function.
+        if sig[args.len()].implicit_clause {
+            return None;
+        }
         // Exactly the NEXT clause, not every remaining parameter: `def add3(a:
         // Int)(b: Int)(c: Int)` applied to one argument is `Int => Int => Int`,
         // so `add3(1)` is a ONE-parameter function whose body is itself an
@@ -3299,7 +3319,33 @@ impl Compiler {
         })
     }
 
+    /// The arguments an `implicit` / `using` clause contributes to a call on
+    /// `name` that did not write them, resolved from the implicit scope by
+    /// declared TYPE — which is the only thing that selects one.
+    ///
+    /// `None` when the callee has no implicit clause, when the call already
+    /// supplied it, or when the scope holds nothing of the right type; the
+    /// last case leaves the call exactly as it was, so an unresolved implicit
+    /// is reported by the ordinary arity path rather than by a guess.
+    fn implicit_args(&self, name: &str, args: &[Expr]) -> Option<Vec<Expr>> {
+        let (params, sig, captured) = self.func_sig.get(name)?;
+        let visible = params.len().checked_sub(*captured)?;
+        let first = sig[..visible].iter().position(|p| p.implicit_clause)?;
+        if args.len() != first {
+            return None;
+        }
+        let mut out = args.to_vec();
+        for p in &sig[first..visible] {
+            let ty = p.ty.as_deref()?.trim();
+            let found = self.implicits.iter().find(|(_, t)| t.trim() == ty)?;
+            out.push(Expr::Var(found.0.clone()));
+        }
+        Some(out)
+    }
+
     fn adapt_args(&self, name: &str, args: &[Expr], line: u32) -> Result<Vec<Expr>, String> {
+        let filled = self.implicit_args(name, args);
+        let args: &[Expr] = filled.as_deref().unwrap_or(args);
         let Some((params, sig, captured)) = self.func_sig.get(name) else {
             return Ok(args.to_vec());
         };
