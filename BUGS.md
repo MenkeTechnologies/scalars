@@ -669,11 +669,24 @@ reported as parse/compile errors, never silently mis-run.
   MUTABLE `Map`/`Set` do not have this shape: their inserts are amortized
   `O(1)` (see the entry above), and so are the growable sequences.
 
-- **Lazy views.** `.view` and `LazyList`. `lazy val` is NOT one of these gaps:
-  its initializer runs at the first read and at most once, and not at all if it
-  is never read — the binding holds a thunk in a cell until the first read
-  replaces it with the value it produced. `Iterator` is not one either:
-  `.iterator`/`.reverseIterator` (and `grouped`/`sliding`) answer a
+- **`LazyList`.** The one collection whose laziness is not just a perf idiom:
+  an INFINITE source cannot be represented by a materialized element vector,
+  and that is the whole point of it.
+
+  `.view` is no longer one of these gaps, and `lazy val` never was. A view is
+  STRICT here, exactly as `Iterator` is — its elements are materialized when it
+  is built, so a downstream combinator sees what a lazy one would have produced
+  — and the only thing that separates it from an ordinary collection is that it
+  does not show its contents: `List(1,2,3).view` renders `SeqView(<not
+  computed>)`, `Vector(1,2).view` `IndexedSeqView(<not computed>)`, and an
+  `Array`'s view `ArrayView(1, 2)`, which is the one that does show them. That
+  rendering is what the kind carries.
+
+  `lazy val` was never one of these gaps either: its initializer runs at the
+  first read and at most once, and not at all if it is never read — the binding
+  holds a thunk in a cell until the first read replaces it with the value it
+  produced. Nor is `Iterator`: `.iterator`/`.reverseIterator` (and
+  `grouped`/`sliding`) answer a
   real [`SeqKind::Iterator`], which renders `<iterator>`, answers
   `hasNext`/`next()`, and is CONSUMED by traversing it — `it.toList` twice gives
   the elements and then `List()`, and `next()` past the end throws

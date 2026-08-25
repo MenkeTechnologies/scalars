@@ -1128,6 +1128,18 @@ enum SeqKind {
     /// standard library, not the JVM identity form, so unlike an `Array` it is
     /// perfectly reproducible.
     Iterator,
+    /// A `.view` — `SeqView`/`IndexedSeqView`/`ArrayView`, told apart by the
+    /// receiver it was taken of (`false` here is the `Seq` case, `true` the
+    /// indexed one; an `Array`'s view is [`SeqKind::ArrayView`]).
+    ///
+    /// Views are the one collection whose CONTENTS Scala does not show:
+    /// `List(1,2,3).view` prints `SeqView(<not computed>)`. Strict here, as
+    /// `Iterator` is — a downstream combinator sees the same elements a lazy
+    /// view would produce — so only that rendering is reproduced.
+    View(bool),
+    /// An `Array`'s `.view`, which unlike the others DOES show its elements
+    /// (`ArrayView(1, 2)`).
+    ArrayView,
     /// `scala.collection.immutable.ArraySeq` — the `IndexedSeq` a `StringOps`
     /// combinator answers when its function's result type is not `Char`
     /// (`"abc".map(_.toInt)` is an `ArraySeq`, not a `Vector`).
@@ -1204,6 +1216,9 @@ impl SeqKind {
             SeqKind::Set(HashRep::Linked) => "LinkedHashSet",
             SeqKind::Iterable => "Iterable",
             SeqKind::Iterator => "Iterator",
+            SeqKind::View(false) => "SeqView",
+            SeqKind::View(true) => "IndexedSeqView",
+            SeqKind::ArrayView => "ArrayView",
             SeqKind::ArraySeq => "ArraySeq",
             SeqKind::Array => "Array",
             SeqKind::ListBuffer => "ListBuffer",
@@ -1292,6 +1307,7 @@ impl SeqKind {
             SeqKind::List | SeqKind::Iterable | SeqKind::Iterator => {
                 Some(format!("{} of empty list", op.word()))
             }
+            SeqKind::View(_) | SeqKind::ArrayView => Some(format!("{} of empty list", op.word())),
             // `Vector`/`IndexedSeq` name the operation on an `empty` receiver —
             // and `last` reports `empty.tail`, because it is implemented as one.
             SeqKind::Vector => Some(match op {
@@ -3203,6 +3219,12 @@ fn obj_to_string(v: &Value) -> String {
             // the elements and not the JVM identity form — printing an iterator
             // must not consume it, so it cannot report what it holds.
             Some(HeapVal::Seq(SeqKind::Iterator, _)) => "<iterator>".to_string(),
+            // A view does not show its contents: `List(1,2,3).view` is
+            // `SeqView(<not computed>)`. An `Array`'s view is the exception and
+            // renders its elements, so it falls through to the general arm.
+            Some(HeapVal::Seq(k @ SeqKind::View(_), _)) => {
+                format!("{}(<not computed>)", k.label())
+            }
             Some(HeapVal::Seq(kind, items)) => {
                 let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(", ");
                 format!("{}({inner})", kind.label())
@@ -5568,6 +5590,21 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // The `Iterator` protocol itself. Guarded on the kind because Scala
         // declares neither on any other collection — `List(1).hasNext` is a
         // compile error there and stays a missing method here.
+        // `.view` is STRICT here, exactly as `.iterator` is: the elements are
+        // already materialized, so a downstream combinator sees what a lazy
+        // view would have produced. Only the view's own rendering differs from
+        // an ordinary collection's, and that is what the kind carries.
+        ("view", 0) => Ok(new_seq(
+            match kind {
+                SeqKind::Array => SeqKind::ArrayView,
+                SeqKind::Vector
+                | SeqKind::ArraySeq
+                | SeqKind::ArrayBuffer
+                | SeqKind::Range { .. } => SeqKind::View(true),
+                _ => SeqKind::View(false),
+            },
+            items.to_vec(),
+        )),
         ("hasNext", 0) if kind == SeqKind::Iterator => Ok(Value::bool(!items.is_empty())),
         ("next", 0) if kind == SeqKind::Iterator => {
             let Some(first) = items.first().cloned() else {
