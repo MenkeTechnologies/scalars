@@ -1031,20 +1031,41 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower `while (cond) { … }` **rotated**: the body comes first and the test
+    /// sits at the BOTTOM, reached on entry by one forward jump, so the loop
+    /// closes with a *conditional* backward branch (`JumpIfTrue`) rather than an
+    /// unconditional `Jump` back to a test at the top.
+    ///
+    /// That shape is what fusevm's tracing JIT requires — it closes a recorded
+    /// trace only on a conditional backward branch. Emitted the other way,
+    /// `--tiers` reported `trace-eligible=false traced=false` for every `while`
+    /// and every `for` this frontend produced, and a hot loop stayed in the
+    /// interpreter however many times it ran.
+    ///
+    /// The test is emitted ONCE, not duplicated at the top: a Scala `while`
+    /// condition may have side effects (`while ({ i += 1; i < n })`), and one
+    /// copy keeps the effect at one program point as well as keeping the
+    /// bytecode the same size. Evaluation count is unchanged either way — a
+    /// top-test loop evaluates the condition `n + 1` times for `n` iterations,
+    /// and so does this: once on the way in through the forward jump, then once
+    /// after each body run.
     fn while_stmt(&mut self, cond: &Expr, body: &[Stmt]) -> Result<(), String> {
+        let to_test = self.b.emit(Op::Jump(0), 0);
         let top = self.b.current_pos();
-        self.expr(cond)?;
-        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
         // A raise inside the body must leave the loop instead of spinning on
         // garbage; the check after the whole `while` statement continues outward.
         self.push_unwind(UnwindKind::Loop);
         for s in body {
             self.stmt(s)?;
         }
-        self.b.emit(Op::Jump(top), 0);
+        let test = self.b.current_pos();
+        self.b.patch_jump(to_test, test);
+        self.expr(cond)?;
+        self.b.emit(Op::JumpIfTrue(top), 0);
         let end = self.b.current_pos();
+        // An unwinding body jumps here, PAST the bottom test — a raise must not
+        // evaluate the condition one more time on its way out.
         self.pop_unwind_to(end);
-        self.b.patch_jump(jf, end);
         Ok(())
     }
 
@@ -1075,11 +1096,28 @@ impl Compiler {
                     self.b.emit(Op::Add, 0);
                     self.emit_store(len);
                 }
-                None => {
-                    // foreach: run for effect, discard the value.
-                    self.expr(body)?;
-                    self.b.emit(Op::Pop, 0);
-                }
+                // foreach: run for effect, discard the value.
+                //
+                // A braced body is lowered STATEMENT by statement rather than as
+                // an expression whose value is popped. The two run the same code
+                // except at the end: a block whose last statement is not an
+                // expression has no value, so `block_expr` synthesizes a `Unit`
+                // — `CallBuiltin(MAKE_TUPLE, 0)` — purely for this `Pop` to drop
+                // again. That pair is not free. fusevm's tracing JIT refuses to
+                // record through a `CallBuiltin`, so the one dead op sat in
+                // every `for (i <- a until b) { … }` body and kept the loop out
+                // of the JIT however hot it got.
+                None => match body {
+                    Expr::Block(stmts) => {
+                        for s in stmts {
+                            self.stmt(s)?;
+                        }
+                    }
+                    _ => {
+                        self.expr(body)?;
+                        self.b.emit(Op::Pop, 0);
+                    }
+                },
             }
             return Ok(());
         }
@@ -1157,7 +1195,33 @@ impl Compiler {
                     }
                     _ => None,
                 };
+                // Rotated, for the reason [`Compiler::while_stmt`] gives: the
+                // bound test sits at the BOTTOM and closes the loop with a
+                // conditional backward branch, which is the only shape fusevm's
+                // tracing JIT compiles. The test is reached on entry by this one
+                // forward jump, so a zero-iteration range still runs it first.
+                let to_test = self.b.emit(Op::Jump(0), 0);
                 let top = self.b.current_pos();
+                // As in `while_stmt`: a raise in the body exits the loop rather
+                // than iterating on garbage.
+                self.push_unwind(UnwindKind::Loop);
+                self.lower_for(enums, idx + 1, body, yield_into)?;
+                // The innermost `lower_for` ends in an *expression* (the body
+                // value), not a statement, so nothing above emitted a check for
+                // it; without this one a raise in a single-expression body would
+                // spin the loop forever.
+                self.unwind_check();
+                self.emit_load(vplace);
+                match splace {
+                    Some(sp) => self.emit_load(sp),
+                    None => {
+                        self.b.emit(Op::LoadInt(1), 0);
+                    }
+                }
+                self.b.emit(Op::Add, 0);
+                self.emit_store(vplace);
+                let test = self.b.current_pos();
+                self.b.patch_jump(to_test, test);
                 match (splace, const_step(step.as_ref())) {
                     // No `by`, or a literal `by` whose sign is known at compile
                     // time: one static bound test, exactly as before.
@@ -1187,29 +1251,9 @@ impl Compiler {
                         self.b.patch_jump(j_done, done_at);
                     }
                 }
-                let jf = self.b.emit(Op::JumpIfFalse(0), 0);
-                // As in `while_stmt`: a raise in the body exits the loop rather
-                // than iterating on garbage.
-                self.push_unwind(UnwindKind::Loop);
-                self.lower_for(enums, idx + 1, body, yield_into)?;
-                // The innermost `lower_for` ends in an *expression* (the body
-                // value), not a statement, so nothing above emitted a check for
-                // it; without this one a raise in a single-expression body would
-                // spin the loop forever.
-                self.unwind_check();
-                self.emit_load(vplace);
-                match splace {
-                    Some(sp) => self.emit_load(sp),
-                    None => {
-                        self.b.emit(Op::LoadInt(1), 0);
-                    }
-                }
-                self.b.emit(Op::Add, 0);
-                self.emit_store(vplace);
-                self.b.emit(Op::Jump(top), 0);
+                self.b.emit(Op::JumpIfTrue(top), 0);
                 let end_pos = self.b.current_pos();
                 self.pop_unwind_to(end_pos);
-                self.b.patch_jump(jf, end_pos);
                 if let Some(j) = j_zero {
                     self.b.patch_jump(j, end_pos);
                 }

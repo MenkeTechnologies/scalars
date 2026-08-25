@@ -278,23 +278,48 @@ mod tests {
         assert!(report.reaches_native(), "{report}");
     }
 
-    /// A counted loop in a function counts in frame slots, so its body holds
-    /// nothing the tiers refuse and fusevm's recorder accepts the sequence. It
-    /// still installs no trace: the loop is emitted in the unrotated shape — a
-    /// forward `JumpIfFalse` exit closed by an unconditional backward `Jump` —
-    /// which the trace compiler records and then declines. This pins the gap
-    /// the report exists to expose; if loop lowering is rotated later, this
-    /// test is the one that says so.
+    /// A `while` in a function counts in frame slots, so its body holds nothing
+    /// the tiers refuse — and since the frontend rotates loop lowering (the test
+    /// emitted once, at the BOTTOM, closing the loop with a conditional backward
+    /// branch) fusevm's recorder both accepts the sequence and installs a trace.
+    ///
+    /// This test used to assert the opposite, because the loop was emitted with
+    /// its test at the top and an unconditional `Jump` back to it, which the
+    /// trace compiler records and then declines. It is the frontend-level
+    /// counterpart of `a_rotated_slot_loop_reaches_a_compiled_trace` above: that
+    /// one builds the accepted shape by hand, this one checks the compiler
+    /// produces it.
     #[test]
-    fn a_counted_loop_is_trace_eligible_but_installs_no_trace() {
+    fn a_counted_while_reaches_a_compiled_trace() {
         let report = report(PROGRAM).expect("runs");
         let counted = report.chunks[0]
             .loops
             .iter()
             .find(|l| l.trace_eligible)
             .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
-        assert!(!counted.traced, "{report}");
+        assert!(counted.traced, "{report}");
         assert!(!counted.blacklisted, "{report}");
-        assert!(!report.reaches_native(), "{report}");
+        assert!(report.reaches_native(), "{report}");
+    }
+
+    /// The counted `for` is lowered by a different path than the `while` above
+    /// (`lower_for`, which owns the range's bound test and its step), so its
+    /// rotation is a separate claim and gets its own test.
+    ///
+    /// The accumulator deliberately stays inside 32-bit range: fusevm blacklists
+    /// a strict-mode trace that bails on overflow, which is a different
+    /// mechanism from loop shape and would mask what this test is asking about.
+    #[test]
+    fn a_counted_for_reaches_a_compiled_trace() {
+        let program = "object Main {\n def f(n: Int): Int = { var t = 0; for (i <- 0 until n) { t += 1 }; t }\n def main(a: Array[String]): Unit = println(f(200000))\n}";
+        let report = report(program).expect("runs");
+        let counted = report.chunks[0]
+            .loops
+            .iter()
+            .find(|l| l.trace_eligible)
+            .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
+        assert!(counted.traced, "{report}");
+        assert!(!counted.blacklisted, "{report}");
+        assert!(report.reaches_native(), "{report}");
     }
 }
