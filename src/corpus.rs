@@ -1823,7 +1823,7 @@ pub const CORPUS: &[Entry] = &[
     (
         "MaxValue",
         "Int Methods",
-        "A Scala value-class companion's bound: `Int`, `Long`, `Short`, `Byte`, `Char` and `Double` all answer `MaxValue`/`MinValue`, and `Double` adds `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`. These are `scala.Int`'s members, NOT `java.lang.Integer`'s — the two namespaces stay apart, so `Double.parseDouble` is an error here exactly as it is in Scala.",
+        "A Scala value-class companion's bound: `Int`, `Long`, `Short`, `Byte`, `Char`, `Double` and `Float` all answer `MaxValue`/`MinValue`, and the two floating ones add `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`. `Float`'s are rendered at single precision (`Float.MaxValue` is `3.4028235E38`). These are `scala.Int`'s members, NOT `java.lang.Integer`'s — the two namespaces stay apart, so `Double.parseDouble` is an error here exactly as it is in Scala.",
         "Int.MaxValue: Int\nprintln(Int.MaxValue)   // => 2147483647",
     ),
     (
@@ -1871,8 +1871,8 @@ pub const CORPUS: &[Entry] = &[
     (
         "toFloat",
         "Int Methods",
-        "The integer widened to floating point. There is no distinct 32-bit float, so this is `toDouble`.",
-        "n.toFloat: Double\nprintln(7.toFloat)   // => 7.0",
+        "The integer narrowed to a 32-bit `Float`, which rounds: `Int.MaxValue.toFloat` is `2.1474836E9`, not `2.147483647E9`. Distinct from `toDouble`, which is exact for every `Int`.",
+        "n.toFloat: Float\nprintln(7.toFloat)          // => 7.0\nprintln(Int.MaxValue.toFloat)   // => 2.1474836E9",
     ),
     (
         "toByte",
@@ -1968,8 +1968,8 @@ pub const CORPUS: &[Entry] = &[
     (
         "toFloat (Double)",
         "Double Methods",
-        "The receiver unchanged — there is no narrower float type here, so no precision is lost as it would be on the JVM.",
-        "d.toFloat: Double\nprintln(2.5.toFloat)   // => 2.5",
+        "The receiver rounded to 32-bit `Float` precision. The rounding is real and observable by widening it back: `0.1.toFloat.toDouble` is `0.10000000149011612`, not `0.1`. A value that fits exactly is unchanged.",
+        "d.toFloat: Float\nprintln(2.5.toFloat)              // => 2.5\nprintln(0.1.toFloat.toDouble)   // => 0.10000000149011612",
     ),
     (
         "isNaN",
@@ -2061,8 +2061,14 @@ pub const CORPUS: &[Entry] = &[
     (
         "value",
         "Tuples and Records",
-        "The payload field of a `Some`. Scala's `Option` methods — `get`, `getOrElse`, `map`, `isDefined` — are not implemented, so this field and `case Some(v)` are the two ways to open an `Option`.",
+        "The payload field of a `Some`, and of a `Left`/`Right`. It is the record's field rather than an `Option` method: `get`, `getOrElse`, `map` and `isDefined` all work too, so a field read is the low-level way to open one and `case Some(v)` the idiomatic one.",
         "some.value: A\nprintln(List(1, 2).find(_ > 1).value)   // => 2",
+    ),
+    (
+        "left",
+        "Tuples and Records",
+        "The LEFT-biased view of an `Either`. Scala's `Either` is right-biased — `map`, `getOrElse` and the rest operate on the `Right` and pass a `Left` through — so this projection is how the `Left` is reached without a `match`. It answers `get` (which throws `Either.left.get on Right`), `getOrElse`, `map`, `flatMap`, `foreach`, `exists`/`forall`, `toOption`, `toSeq`/`toList` and `filterToOption`, each the mirror of the right-biased member.",
+        "e.left: LeftProjection\nval e: Either[String, Int] = Left(\"bad\")\nprintln(e.left.getOrElse(\"none\"))   // => bad\nprintln(e.left.map(_.length))       // => Left(3)",
     ),
     (
         "toString (record)",
