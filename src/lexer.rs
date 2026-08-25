@@ -32,6 +32,20 @@ pub enum Tok {
     /// static distinction to decide whether an expression wraps at 32 bits.
     Long(i64),
     Float(f64),
+    /// An `f`/`F`-suffixed floating literal — a `Float`, not a `Double`.
+    ///
+    /// The value is ALREADY rounded to 32-bit precision here, because Scala
+    /// rounds an `f` literal at the literal: `16777217.0f` is `1.6777216E7`
+    /// (the odd integer has no `f32`) and `1.0e-45f` is `1.4E-45` (the
+    /// smallest `f32` subnormal). Reading both at `f64` and narrowing later
+    /// answers `1.6777217E7` and `1.0E-45`.
+    ///
+    /// Kept separate from [`Tok::Float`] for the same reason [`Tok::Long`] is
+    /// kept separate from [`Tok::Int`]: the two share a runtime
+    /// representation and differ only in the static type, which is what the
+    /// compiler needs to decide where arithmetic happens at 32-bit width and
+    /// where a value renders as a `Float`.
+    Float32(f64),
     Str(String),
     /// A `Char` literal (`'a'`, `'\n'`). Separate from [`Tok::Str`] because
     /// `Char` is its own Scala type: it dispatches as a *number* in arithmetic
@@ -137,6 +151,7 @@ impl Tok {
             Tok::Int(_)
                 | Tok::Long(_)
                 | Tok::Float(_)
+                | Tok::Float32(_)
                 | Tok::Str(_)
                 | Tok::Char(_)
                 | Tok::InterpStr { .. }
@@ -161,6 +176,7 @@ impl Tok {
             Tok::Int(_)
                 | Tok::Long(_)
                 | Tok::Float(_)
+                | Tok::Float32(_)
                 | Tok::Str(_)
                 | Tok::Char(_)
                 | Tok::InterpStr { .. }
@@ -381,16 +397,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
             }
-            // The float/double suffixes are accepted and dropped — they name a
-            // type the value model already has. `L` is KEPT, because `Long` and
-            // `Int` are the same runtime representation but different WIDTHS,
-            // and only the suffix says which one a literal is.
+            // Every numeric suffix is KEPT, because each names a static type
+            // the one runtime representation cannot: `Long` and `Int` are the
+            // same `i64` and differ only in WIDTH, and `Float` and `Double` are
+            // the same `f64` and differ only in PRECISION. Only the suffix says
+            // which one a literal is. `d`/`D` is the exception — it names the
+            // default, so it carries no information and is dropped.
             let mut is_long = false;
+            let mut is_f32 = false;
             if i < bytes.len() && matches!(bytes[i], b'L' | b'l' | b'f' | b'F' | b'd' | b'D') {
-                if matches!(bytes[i], b'f' | b'F' | b'd' | b'D') {
-                    is_float = true;
-                } else {
-                    is_long = true;
+                match bytes[i] {
+                    b'f' | b'F' => {
+                        is_float = true;
+                        is_f32 = true;
+                    }
+                    b'd' | b'D' => is_float = true,
+                    _ => is_long = true,
                 }
                 i += 1;
             }
@@ -399,7 +421,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 let v: f64 = text
                     .parse()
                     .map_err(|_| format!("scalars: bad float literal `{text}` on line {line}"))?;
-                push!(Tok::Float(v), line);
+                // Scala rounds an `f` literal to single precision AT the
+                // literal, before it is ever used, so the rounding belongs
+                // here rather than at the first operation.
+                if is_f32 {
+                    push!(Tok::Float32(f64::from(v as f32)), line);
+                } else {
+                    push!(Tok::Float(v), line);
+                }
             } else {
                 // `Long.MinValue` is written `-9223372036854775808L`, and the
                 // sign is a separate token — so the MAGNITUDE the lexer sees is

@@ -322,6 +322,61 @@ pub const MAIN_ARG: u16 = 755;
 /// pushes the program arguments as an `Array` of `String`. Takes no operands.
 pub const MAIN_ARGV: u16 = 756;
 
+/// Round the top-of-stack number to 32-bit `Float` precision. `argc == 1`.
+///
+/// fusevm has one floating representation, so a `Float` here is a `Double`
+/// *kept* at single precision — every place a value becomes one has to round.
+/// This is that rounding: the `f` literal suffix, `.toFloat`, and a `Float`
+/// parameter's incoming argument all go through it.
+pub const SF32: u16 = 773;
+
+/// One arithmetic operation performed at 32-bit `Float` width. Stack
+/// `[lhs, rhs, op]` (`op` on top, one of the [`f32_op`] constants); `argc == 3`.
+///
+/// Rounding an `f64` result afterwards is a DIFFERENT computation: the double
+/// rounding can land a ulp away from the single one Scala performs. `1.0f /
+/// 3.0f` is `0.33333334`, and forming the quotient at 64 bits first gives
+/// `0.3333333333333333`, whose nearest `f32` is the same — but
+/// `16777217.0f * 0.2f` is `3355443.2` in Scala and `3355443.3` if the product
+/// is formed in `f64` and narrowed after. So the operation itself is done in
+/// `f32` throughout, which is why it costs a builtin rather than a native op.
+pub const SF32_ARITH: u16 = 774;
+
+/// `Float.toString` of the top-of-stack value. `argc == 1`.
+///
+/// A `Float` and a `Double` holding the same bits print differently: Scala's
+/// shortest-round-trip decimal is computed against the TYPE's precision, so
+/// `0.1f` prints `0.1` where the `Double` with those bits prints
+/// `0.10000000149011612`. The value model cannot tell the two apart, so the
+/// compiler emits this wherever a statically-`Float` value crosses into a
+/// `String`.
+pub const SF32_STR: u16 = 775;
+
+/// `getClass` on a statically-`Float` receiver, which pops that receiver and
+/// answers the `java.lang.Class` record for `float`. `argc == 1`.
+///
+/// The runtime value cannot tell a `Float` from the `Double` holding its bits,
+/// so a `getClass` reaching the ordinary dispatch answers `double` for both.
+/// Only the compiler knows which type the receiver had.
+pub const SF32_CLASS: u16 = 776;
+
+/// `hashCode` on a statically-`Float` receiver, which pops that receiver and
+/// answers `java.lang.Float.floatToIntBits`. `argc == 1`.
+///
+/// A `Float` and the `Double` holding its bits hash differently — `3.0f` is
+/// 1077936128 and `3.0` is 1074266112 — so this needs the static type for the
+/// same reason [`SF32_CLASS`] and [`SF32_STR`] do.
+pub const SF32_HASH: u16 = 777;
+
+/// The [`SF32_ARITH`] operator codes, shared with the compiler.
+pub mod f32_op {
+    pub const ADD: i64 = 0;
+    pub const SUB: i64 = 1;
+    pub const MUL: i64 = 2;
+    pub const DIV: i64 = 3;
+    pub const REM: i64 = 4;
+}
+
 thread_local! {
     /// The program arguments after the script path, as
     /// [`crate::cli::Cli::argv`] captured them. Read by [`MAIN_ARG`] and
@@ -574,6 +629,11 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(UNAPPLY_SEQ, b_unapply_seq);
     vm.register_builtin(MAIN_ARG, b_main_arg);
     vm.register_builtin(MAIN_ARGV, b_main_argv);
+    vm.register_builtin(SF32, b_f32);
+    vm.register_builtin(SF32_ARITH, b_f32_arith);
+    vm.register_builtin(SF32_STR, b_f32_str);
+    vm.register_builtin(SF32_CLASS, b_f32_class);
+    vm.register_builtin(SF32_HASH, b_f32_hash);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -3019,16 +3079,23 @@ fn class_of(recv: &Value) -> Result<Value, String> {
         }
         _ => return Err(no_such_method(recv, "getClass")),
     };
-    Ok(heap_alloc(ScalaObj {
+    Ok(class_record(&name, &simple, primitive))
+}
+
+/// The `java.lang.Class` record `getClass` answers. The names are stored as
+/// FIELDS called `getName`/`getSimpleName` so the ordinary paren-less field read
+/// in [`obj_method`] answers them.
+fn class_record(name: &str, simple: &str, primitive: bool) -> Value {
+    heap_alloc(ScalaObj {
         class: Arc::from(CLASS_CLASS),
         is_case: false,
         is_object: false,
         fields: vec![
-            (Arc::from("getName"), Value::str(name)),
-            (Arc::from("getSimpleName"), Value::str(simple)),
+            (Arc::from("getName"), Value::str(name.to_string())),
+            (Arc::from("getSimpleName"), Value::str(simple.to_string())),
             (Arc::from("isPrimitive"), Value::bool(primitive)),
         ],
-    }))
+    })
 }
 
 /// The primary-constructor prefix of a record's fields — exactly what Scala's
@@ -6847,13 +6914,14 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         ("Double", "PositiveInfinity", 0) => Ok(Value::float(f64::INFINITY)),
         ("Double", "NegativeInfinity", 0) => Ok(Value::float(f64::NEG_INFINITY)),
         ("Double", "NaN", 0) => Ok(Value::float(f64::NAN)),
-        // `Float`'s three non-finite constants, which are the ones a `Double`
-        // holds EXACTLY — `Float.NaN` and the two infinities have a single
-        // spelling at both widths, so no precision is claimed here that the
-        // value model does not have. The finite `Float` constants
-        // (`MaxValue`/`MinValue`/`MinPositiveValue`) are deliberately absent:
-        // they round-trip through `Float.toString`, and this frontend has no
-        // single-precision value to render (see BUGS.md).
+        // `Float`'s constants are the `f32` value widened, which is exact — an
+        // `f32` is an `f64`. What makes them print as Scala's `3.4028235E38`
+        // rather than as `3.4028234663852886E38` is not the value but the
+        // RENDERING, and the compiler types these accesses `Float` so they
+        // render through `Float.toString` like any other one.
+        ("Float", "MaxValue", 0) => Ok(Value::float(f64::from(f32::MAX))),
+        ("Float", "MinValue", 0) => Ok(Value::float(f64::from(f32::MIN))),
+        ("Float", "MinPositiveValue", 0) => Ok(Value::float(f64::from(f32::from_bits(1)))),
         ("Float", "NaN", 0) => Ok(Value::float(f64::NAN)),
         ("Float", "PositiveInfinity", 0) => Ok(Value::float(f64::INFINITY)),
         ("Float", "NegativeInfinity", 0) => Ok(Value::float(f64::NEG_INFINITY)),
@@ -6871,6 +6939,12 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         ("java.Double", "NaN", 0) => Ok(Value::float(f64::NAN)),
         ("java.Double", "POSITIVE_INFINITY", 0) => Ok(Value::float(f64::INFINITY)),
         ("java.Double", "NEGATIVE_INFINITY", 0) => Ok(Value::float(f64::NEG_INFINITY)),
+        ("java.Float", "MAX_VALUE", 0) => Ok(Value::float(f64::from(f32::MAX))),
+        // `java.lang.Float.MIN_VALUE` is the smallest POSITIVE `float`, which is
+        // `scala.Float.MinPositiveValue`; the JDK boxes have no name for the
+        // most negative one. That is the same asymmetry `java.Double` carries
+        // above.
+        ("java.Float", "MIN_VALUE", 0) => Ok(Value::float(f64::from(f32::from_bits(1)))),
         ("java.Float", "NaN", 0) => Ok(Value::float(f64::NAN)),
         ("java.Float", "POSITIVE_INFINITY", 0) => Ok(Value::float(f64::INFINITY)),
         ("java.Float", "NEGATIVE_INFINITY", 0) => Ok(Value::float(f64::NEG_INFINITY)),
@@ -7746,7 +7820,8 @@ fn char_method(c: char, name: &str, args: &[Value]) -> Result<Value, String> {
         ("toInt" | "toLong", 0) => Ok(Value::int(code)),
         ("toShort", 0) => Ok(Value::int(to_short(code))),
         ("toByte", 0) => Ok(Value::int(to_byte(code))),
-        ("toDouble" | "toFloat", 0) => Ok(Value::float(code as f64)),
+        ("toDouble", 0) => Ok(Value::float(code as f64)),
+        ("toFloat", 0) => Ok(Value::float(f64::from(code as f32))),
         ("toChar", 0) => Ok(make_char(c)),
         // `Char.hashCode` is the code point (as `java.lang.Character`'s is).
         ("hashCode", 0) => Ok(Value::int(code)),
@@ -8047,9 +8122,21 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // `Double.parseDouble` DOES accept surrounding whitespace, which is the
         // asymmetry above: the same padding that makes `toInt` throw is fine
         // here.
-        ("toDouble" | "toFloat", 0) => s.trim().parse::<f64>().map(Value::float).map_err(|_| {
-            format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
-        }),
+        ("toDouble" | "toFloat", 0) => s
+            .trim()
+            .parse::<f64>()
+            .map(|v| {
+                // `"0.1".toFloat` parses AT single precision, so the parse and
+                // the rounding are one step in Scala and two here.
+                Value::float(if name == "toFloat" {
+                    f64::from(v as f32)
+                } else {
+                    v
+                })
+            })
+            .map_err(|_| {
+                format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
+            }),
         // `StringOps.toBoolean` is case-insensitive but NOT trimming, and its
         // failure is an `IllegalArgumentException` rather than the
         // `NumberFormatException` every other conversion here raises.
@@ -8920,7 +9007,8 @@ fn str_compare(a: &str, b: &str) -> i64 {
 fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
     match (name, args.len()) {
         ("abs", 0) => Ok(Value::int(n.wrapping_abs())),
-        ("toDouble" | "toFloat", 0) => Ok(Value::float(n as f64)),
+        ("toDouble", 0) => Ok(Value::float(n as f64)),
+        ("toFloat", 0) => Ok(Value::float(f64::from(n as f32))),
         ("toInt" | "toLong", 0) => Ok(Value::int(n)),
         // The narrowing conversions. `toInt` above is a no-op here because the
         // compiler already wraps an `Int`-typed result to 32 bits; these two have
@@ -8946,6 +9034,13 @@ fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         // `RichInt.signum` and `Integer.compare`, both answering an `Int`.
         ("signum", 0) => Ok(Value::int(n.signum())),
         ("compareTo" | "compare", 1) => Ok(Value::int(n.cmp(&args[0].to_int()) as i64)),
+        // `Integer.hashCode` is the value and `Long.hashCode` folds the two
+        // halves together. The value model cannot tell the two apart, and does
+        // not need to: an `Int` always fits in 32 bits, where the fold is the
+        // identity, so the `Long` rule answers both.
+        ("hashCode", 0) => Ok(Value::int(i64::from(
+            (n ^ ((n as u64) >> 32) as i64) as i32,
+        ))),
         (
             "abs" | "toDouble" | "toFloat" | "toInt" | "toLong" | "toByte" | "toShort" | "max"
             | "min" | "signum" | "compareTo" | "compare" | "toHexString" | "toBinaryString"
@@ -8995,6 +9090,8 @@ fn bool_method(b: bool, name: &str, args: &[Value]) -> Result<Value, String> {
         ("|", 1) => Ok(Value::bool(b | rhs())),
         ("^", 1) => Ok(Value::bool(b ^ rhs())),
         ("unary_!", 0) => Ok(Value::bool(!b)),
+        // `java.lang.Boolean.hashCode` — the two constants the JDK specifies.
+        ("hashCode", 0) => Ok(Value::int(if b { 1231 } else { 1237 })),
         _ => Err(no_such_method(&Value::bool(b), name)),
     }
 }
@@ -9016,7 +9113,8 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("toByte", 0) => Ok(Value::int(to_byte(i64::from(f as i32)))),
         ("toShort", 0) => Ok(Value::int(to_short(i64::from(f as i32)))),
         ("toChar", 0) => Ok(make_char(char_of_code(f as i64))),
-        ("toDouble" | "toFloat", 0) => Ok(Value::float(f)),
+        ("toDouble", 0) => Ok(Value::float(f)),
+        ("toFloat", 0) => Ok(Value::float(f64::from(f as f32))),
         ("isNaN", 0) => Ok(Value::bool(f.is_nan())),
         ("isInfinity" | "isInfinite", 0) => Ok(Value::bool(f.is_infinite())),
         ("round", 0) => Ok(Value::int(java_round(f))),
@@ -9043,6 +9141,15 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
             | "compare",
             _,
         ) => Err(format!("scalars: Double.{name}: wrong number of arguments")),
+        // `java.lang.Double.hashCode` — the two halves of the bit pattern folded
+        // together. A `Float` receiver does NOT come here: its hash is the
+        // 32-bit pattern, which is a different number for the same value
+        // (`3.0f` is 1077936128 and `3.0` is 1074266112), so the compiler routes
+        // a statically-`Float` receiver to [`SF32_HASH`] instead.
+        ("hashCode", 0) => {
+            let bits = double_to_long_bits(f);
+            Ok(Value::int(i64::from((bits ^ (bits >> 32)) as i32)))
+        }
         // `x.formatted(spec)` on `Any` — the argument is the format string.
         ("formatted", 1) => Ok(Value::str(format_all(
             &args[0].as_str_cow(),
@@ -9051,6 +9158,23 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         )?)),
         _ => Err(no_such_method(&Value::float(f), name)),
     }
+}
+
+/// `java.lang.Double.doubleToLongBits` — the raw bits, with every `NaN`
+/// collapsed to the one canonical pattern the JVM reports.
+fn double_to_long_bits(f: f64) -> i64 {
+    if f.is_nan() {
+        return 0x7ff8_0000_0000_0000u64 as i64;
+    }
+    f.to_bits() as i64
+}
+
+/// `java.lang.Float.floatToIntBits` — the same canonicalization one width down.
+fn float_to_int_bits(f: f32) -> i32 {
+    if f.is_nan() {
+        return 0x7fc0_0000u32 as i32;
+    }
+    f.to_bits() as i32
 }
 
 /// The Scala compile-error a bad member access resembles (a `value … is not a
@@ -9422,6 +9546,188 @@ fn format_double(f: f64) -> String {
     } else {
         body
     }
+}
+
+/// [`SF32`] — round one value to 32-bit `Float` precision.
+///
+/// A non-numeric value passes through untouched, so the builtin is safe on a
+/// statically-`Float` expression whose value turned out to be `null` or a
+/// `Char`: the narrowing is about precision, not about coercing a type.
+fn b_f32(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    match &v {
+        Value::Float(f) => Value::float(f64::from(*f as f32)),
+        Value::Int(n) => Value::float(f64::from(*n as f32)),
+        _ => v,
+    }
+}
+
+/// [`SF32_ARITH`] — one arithmetic operation at 32-bit `Float` width.
+///
+/// Both operands are narrowed to `f32` before the operation and the result is
+/// widened back to the one `Value::Float` representation, so the rounding
+/// happens exactly once, where Scala's does.
+fn b_f32_arith(vm: &mut VM, _argc: u8) -> Value {
+    let code = vm.stack.pop().unwrap_or(Value::Undef);
+    let b = vm.stack.pop().unwrap_or(Value::Undef);
+    let a = vm.stack.pop().unwrap_or(Value::Undef);
+    // Suppressed while unwinding, exactly as `b_div` is: the operands are the
+    // `Undef` a raise left behind, and answering `NaN` for them would displace
+    // the real exception's value with a plausible number.
+    if unwinding() {
+        return Value::Undef;
+    }
+    let (Some(x), Some(y)) = (float_of(&a), float_of(&b)) else {
+        // Not a numeric pair after all — the compiler's static type was wrong
+        // about one side (an erased element, a `null`). Fall back to the
+        // untyped `+`, which is what this expression would have emitted
+        // without the `Float` analysis.
+        return match numeric_hook(NumOp::Add, &a, &b) {
+            Ok(v) => v,
+            Err(e) => fault(vm, &e),
+        };
+    };
+    let (x, y) = (x as f32, y as f32);
+    let r = match code.to_int() {
+        f32_op::SUB => x - y,
+        f32_op::MUL => x * y,
+        f32_op::DIV => x / y,
+        f32_op::REM => x % y,
+        _ => x + y,
+    };
+    Value::float(f64::from(r))
+}
+
+/// [`SF32_STR`] — `Float.toString` of one value.
+///
+/// A non-floating value passes through unchanged rather than being rendered,
+/// so a statically-`Float` expression that turned out to hold something else
+/// still stringifies the way it otherwise would.
+fn b_f32_str(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    match &v {
+        Value::Float(f) => Value::str(format_float32(*f as f32)),
+        _ => v,
+    }
+}
+
+/// [`SF32_CLASS`] — the `java.lang.Class` record for `float`.
+fn b_f32_class(vm: &mut VM, _argc: u8) -> Value {
+    vm.stack.pop();
+    class_record("float", "float", true)
+}
+
+/// [`SF32_HASH`] — `Float.hashCode`, the 32-bit bit pattern.
+fn b_f32_hash(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    Value::int(i64::from(float_to_int_bits(v.to_float() as f32)))
+}
+
+/// `Float.toString` — the same layout rules as [`format_double`], with the
+/// shortest decimal computed against **32-bit** precision.
+///
+/// That is the whole difference between the two. The `f64` nearest `0.1f`
+/// prints `0.10000000149011612` as a `Double` and `0.1` as a `Float`, because
+/// only 24 bits of significand have to round-trip. The plain-vs-`E` threshold
+/// (`1e-3 <= |x| < 1e7`) and the mandatory fractional digit are identical, so
+/// only the digit selection is duplicated.
+fn format_float32(f: f32) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    let neg = f < 0.0;
+    let (digits, exp) = java_decimal_f32(f.abs());
+    let body = if (-3..=6).contains(&exp) {
+        render_plain(&digits, exp)
+    } else {
+        render_scientific(&digits, exp)
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// [`java_decimal`]'s three steps, applied at `f32` precision.
+///
+/// The specification `Float.toString` follows is `Double.toString`'s with the
+/// type changed, so the steps are the same: the shortest round-tripping form,
+/// a two-digit floor when that form is one digit, and an exact tie broken
+/// toward the even last digit. What differs is the precision every one of them
+/// is measured at — `Float.MinPositiveValue` is `1.4E-45` for the same reason
+/// `Double.MinPositiveValue` is `4.9E-324`, and only an `f32` round-trip test
+/// can tell that.
+fn java_decimal_f32(m: f32) -> (String, i32) {
+    let sci = format!("{m:e}");
+    let (mant, exp_str) = sci.split_once('e').expect("`{:e}` always contains `e`");
+    let mut exp: i32 = exp_str.parse().expect("`{:e}` exponent is an integer");
+    let mut digits: String = mant.chars().filter(|c| *c != '.').collect();
+    if digits.len() == 1 {
+        let two = format!("{m:.1e}");
+        let (m2, e2) = two.split_once('e').expect("`{:e}` always contains `e`");
+        digits = m2.chars().filter(|c| *c != '.').collect();
+        exp = e2.parse().expect("`{:e}` exponent is an integer");
+    }
+    if let Some((d, e)) = break_tie_to_even_f32(m, &digits, exp) {
+        digits = d;
+        exp = e;
+    }
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    (digits, exp)
+}
+
+/// [`break_tie_to_even`] at `f32` precision.
+///
+/// The exact expansion is read off the `f64` widening of `m`, which is exact —
+/// every `f32` is an `f64` — so the tie test itself is the same arithmetic.
+/// Only the round-trip test changes: a candidate counts when it parses back to
+/// the same **`f32`**, which is what keeps the tie-break ranging over the
+/// decimals that actually name this `Float`.
+fn break_tie_to_even_f32(m: f32, digits: &str, exp: i32) -> Option<(String, i32)> {
+    let n = digits.len();
+    let wide = f64::from(m);
+    let probe = format!("{wide:.*e}", n);
+    let (pm, pe) = probe.split_once('e')?;
+    if pe.parse::<i32>().ok()? != exp || !pm.ends_with('5') {
+        return None;
+    }
+    let exact = format!("{wide:.1099e}");
+    let (em, ee) = exact.split_once('e')?;
+    if ee.parse::<i32>().ok()? != exp {
+        return None;
+    }
+    let ed: Vec<u8> = em.bytes().filter(|b| *b != b'.').collect();
+    if ed.len() <= n || ed[n] != b'5' || ed[n + 1..].iter().any(|b| *b != b'0') {
+        return None;
+    }
+    let low = String::from_utf8(ed[..n].to_vec()).ok()?;
+    let (high, high_exp) = increment_last_digit(&low, exp);
+    if !round_trips_f32(&low, exp, m) || !round_trips_f32(&high, high_exp, m) {
+        return None;
+    }
+    if (low.as_bytes()[n - 1] - b'0') % 2 == 0 {
+        Some((low, exp))
+    } else {
+        Some((high, high_exp))
+    }
+}
+
+/// Whether the decimal `d.ddd × 10^exp` rounds back to exactly the `f32` `m`.
+fn round_trips_f32(digits: &str, exp: i32, m: f32) -> bool {
+    let (head, rest) = digits.split_at(1);
+    let rest = if rest.is_empty() { "0" } else { rest };
+    format!("{head}.{rest}e{exp}")
+        .parse::<f32>()
+        .is_ok_and(|v| v == m)
 }
 
 /// The decimal Java renders for a positive finite `m`, as `(digits, exp)` — the

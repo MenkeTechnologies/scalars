@@ -1590,6 +1590,7 @@ impl Parser {
                 Tok::Int(_)
                     | Tok::Long(_)
                     | Tok::Float(_)
+                    | Tok::Float32(_)
                     | Tok::Str(_)
                     | Tok::Char(_)
                     | Tok::InterpStr { .. }
@@ -1764,6 +1765,13 @@ impl Parser {
                     Tok::Float(f) => {
                         self.advance();
                         Some(Expr::Float(-f))
+                    }
+                    // `-1.5f` is one `Float` literal, not a negation applied
+                    // to one — the fold keeps the static type as well as the
+                    // value, so the result still lowers as a `Float`.
+                    Tok::Float32(f) => {
+                        self.advance();
+                        Some(Expr::Float32(-f))
                     }
                     _ => None,
                 };
@@ -2003,6 +2011,10 @@ impl Parser {
             Tok::Float(f) => {
                 self.advance();
                 Ok(Expr::Float(f))
+            }
+            Tok::Float32(f) => {
+                self.advance();
+                Ok(Expr::Float32(f))
             }
             Tok::Str(s) => {
                 self.advance();
@@ -2770,7 +2782,11 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::Literal(Expr::Int(n)))
             }
-            Tok::Float(f) => {
+            // A `Float` literal in PATTERN position is only ever compared
+            // for equality against a value the analysis already narrowed, so
+            // it keeps the `Double` node — the same reason a `Long` pattern
+            // does.
+            Tok::Float(f) | Tok::Float32(f) => {
                 self.advance();
                 Ok(Pattern::Literal(Expr::Float(f)))
             }
@@ -2799,7 +2815,7 @@ impl Parser {
                 self.advance();
                 match self.advance() {
                     Tok::Int(n) | Tok::Long(n) => Ok(Pattern::Literal(Expr::Int(n.wrapping_neg()))),
-                    Tok::Float(f) => Ok(Pattern::Literal(Expr::Float(-f))),
+                    Tok::Float(f) | Tok::Float32(f) => Ok(Pattern::Literal(Expr::Float(-f))),
                     other => Err(format!(
                         "scalars: expected a numeric literal after `-` in a pattern, found {other} (line {})",
                         self.line()

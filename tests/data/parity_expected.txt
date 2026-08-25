@@ -413,3 +413,25 @@ object T extends App { println(f"${ val d = 1.5; d }%.2f") }	1.50\n
 object T extends App { println(s"${ def f(x: Int) = x * 3; f(2) }") }	6\n
 object T extends App { println(s"outer ${ s"inner ${1 + 1}" } end") }	outer inner 2 end\n
 object T extends App { val n = 7; println(s"${n + 1}"); println(s"$n + 1") }	8\n7 + 1\n
+object T extends App { println(1.0f / 3.0f); println(0.1f + 0.2f); println(1.0f - 0.9f); println(0.1f * 3.0f) }	0.33333334\n0.3\n0.100000024\n0.3\n
+object T extends App { println(16777217.0f); println(1.0e-45f); println(16777217.0f * 0.2f); println(1.0e10f) }	1.6777216E7\n1.4E-45\n3355443.2\n1.0E10\n
+object T extends App { println(Float.MaxValue); println(Float.MinValue); println(Float.MinPositiveValue); println(Float.NaN) }	3.4028235E38\n-3.4028235E38\n1.4E-45\nNaN\n
+object T extends App { println(Float.PositiveInfinity); println(Float.NegativeInfinity); println(1.0f / 0.0f); println(0.0f / 0.0f) }	Infinity\n-Infinity\nInfinity\nNaN\n
+object T extends App { println(java.lang.Float.MAX_VALUE); println(java.lang.Float.MIN_VALUE); println(java.lang.Float.NaN) }	3.4028235E38\n1.4E-45\nNaN\n
+object T extends App { println(Int.MaxValue.toFloat); println(0.1f.toDouble); println(1.0f.toInt); println(2.7f.toInt) }	2.1474836E9\n0.10000000149011612\n1\n2\n
+object T extends App { println(0.1.toFloat); println("0.1".toFloat); println(3.toFloat); println(1234567890123L.toFloat) }	0.1\n0.1\n3.0\n1.234568E12\n
+object T extends App { var s: Float = 0.0f; var i = 0; while (i < 10) { s += 0.1f; i += 1 }; println(s) }	1.0000001\n
+object T extends App { var s: Float = 0.0f; for (i <- 0 until 100) s += 0.01f; println(s) }	0.99999934\n
+object T extends App { var f: Float = 10.0f; f /= 3.0f; println(f); f *= 3.0f; println(f); f -= 1.0f; println(f); f %= 2.0f; println(f) }	3.3333333\n10.0\n9.0\n1.0\n
+object T extends App { def half(a: Float): Float = a / 2.0f; println(half(1.0f)); println(half(1.0f) + 1.0f); println(half(7.0f)) }	0.5\n1.5\n3.5\n
+object T extends App { val x: Float = 1; println(x); val y: Float = 2.5f; println("y is " + y); println(s"y=$y") }	1.0\ny is 2.5\ny=2.5\n
+object T extends App { println(1.0f + 1.0); println(1.0f * 2); println(1.0f / 3); println(2 / 4.0f); println(1.0f + 1L) }	2.0\n2.0\n0.33333334\n0.5\n2.0\n
+object T extends App { println((1.1f).getClass); println(1.0f.toString); println(0.1f.hashCode); println(3.0f.hashCode) }	float\n1.0\n1036831949\n1077936128\n
+object T extends App { println(1.5.hashCode); println(3.hashCode); println(5000000000L.hashCode); println(true.hashCode); println(false.hashCode) }	1073217536\n3\n705032705\n1231\n1237\n
+object T extends App { println(0.1f == 0.1); println(0.1f < 0.1); println(1.0f == 1.0); println(-0.0f == 0.0f) }	false\nfalse\ntrue\ntrue\n
+object T extends App { println(math.abs(-1.5f)); println(3.0f max 2.0f); println(3.0f min 2.0f); println(-2.5f) }	1.5\n3.0\n2.0\n-2.5\n
+object T extends App { println(100000000.0f); println(0.0001f); println(0.001f); println(1234567.0f); println(12345678.0f) }	1.0E8\n1.0E-4\n0.001\n1234567.0\n1.2345678E7\n
+object T extends App { println(1.0f.isNaN); println(Float.NaN.isNaN); println((1.0f/0.0f).isInfinite); println(Float.NaN.hashCode) }	false\ntrue\ntrue\n2143289344\n
+object T extends App { val a: Float = 1.0f; val b: Float = 3.0f; println(a / b); println(a + b); println(a - b); println(a * b) }	0.33333334\n4.0\n-2.0\n3.0\n
+object T extends App { println(0.0f); println(-0.0f); println(1.0f); println(-1.0f); println(0.5f) }	0.0\n-0.0\n1.0\n-1.0\n0.5\n
+object T extends App { println(f"${1.0f/3.0f}%.9f"); println(f"${0.1f}%s"); println("" + (1.0f/3.0f)) }	0.333333343\n0.1\n0.33333334\n

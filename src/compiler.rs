@@ -898,16 +898,25 @@ impl Compiler {
                 // one (`val n: Long = 1`), otherwise inferred from the
                 // initializer, which is how Scala itself types a bare `val`.
                 let w = self.binding_width(ty.as_deref(), init.as_ref());
+                let is_f32 = w.num == NumTy::Float32;
                 self.widths.insert(name.clone(), w);
                 // A `var` a closure assigns lives in a heap cell, allocated here
                 // even without an initializer so the closure has something to
                 // write through (see [`boxed_vars`]).
+                // `val x: Float = 1` stores 1.0f, not the `Int` 1 — Scala widens
+                // the initializer to the declared type, and the `Float` half of
+                // that widening is a rounding this frontend has to perform. An
+                // initializer that is ALREADY a `Float` needs nothing.
+                let round = is_f32 && init.as_ref().map(|e| self.num_ty(e)) != Some(NumTy::Float32);
                 if self.is_boxed(name) {
                     match init {
                         Some(e) => self.expr(e)?,
                         None => {
                             self.b.emit(Op::LoadUndef, 0);
                         }
+                    }
+                    if round && init.is_some() {
+                        self.emit_f32_round(NumTy::Float32, s.line);
                     }
                     self.unwind_check_dropping(1);
                     self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
@@ -916,6 +925,9 @@ impl Compiler {
                 }
                 if let Some(e) = init {
                     self.expr(e)?;
+                    if round {
+                        self.emit_f32_round(NumTy::Float32, s.line);
+                    }
                     self.unwind_check_dropping(1);
                     self.emit_store(place);
                 }
@@ -1277,6 +1289,11 @@ impl Compiler {
         let n = match arg {
             Some(e) => {
                 self.expr(e)?;
+                // `println(0.1f)` prints `0.1`; the `Double` holding those bits
+                // prints `0.10000000149011612`. Rendering here rather than in
+                // the print builtin is what lets the one value model carry both
+                // — only the compiler knows which type this expression had.
+                self.emit_f32_str(self.num_ty(e), 0);
                 1
             }
             None => 0,
@@ -1298,7 +1315,11 @@ impl Compiler {
             Expr::Int(n) | Expr::Long(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
             }
-            Expr::Float(f) => {
+            // A `Float` literal loads exactly as a `Double` one does — the value
+            // model is the same `f64`, and the lexer already rounded the
+            // constant to 32-bit precision. Only the STATIC type differs, and
+            // that is read off the AST node by `num_ty`.
+            Expr::Float(f) | Expr::Float32(f) => {
                 let c = self.b.add_constant(Value::float(*f));
                 self.b.emit(Op::LoadConst(c), 0);
             }
@@ -1402,6 +1423,15 @@ impl Compiler {
             }
             Expr::Format { value, spec, line } => {
                 self.expr(value)?;
+                // `%s` of a `Float` is its `Float.toString`, so it renders here
+                // like any other crossing into a `String`. The NUMERIC
+                // conversions must NOT: Scala widens a `Float` argument to a
+                // `Double` for them, which is why `f"${1.0f/3.0f}%.9f"` is
+                // `0.333333343` — nine digits the single-precision decimal does
+                // not have.
+                if spec.ends_with('s') {
+                    self.emit_f32_str(self.num_ty(value), *line);
+                }
                 let c = self.b.add_constant(Value::str(spec.clone()));
                 self.b.emit(Op::LoadConst(c), *line);
                 self.b.emit(Op::CallBuiltin(crate::host::SFORMAT, 2), *line);
@@ -2443,6 +2473,18 @@ impl Compiler {
     /// Scala expands this to.
     fn compound_tail(&mut self, op: AssignOp, value: &Expr, target: NumTy) -> Result<(), String> {
         let w = target.combine(self.num_ty(value));
+        // `f += x` on a `Float` is ONE 32-bit operation, not a 64-bit one
+        // narrowed afterwards — the same reason the binary path routes through
+        // the host. A `Float` target is also proof the receiver is not a
+        // growable collection, so the `+=` member test below is skipped with it.
+        if w == NumTy::Float32 {
+            if let Some(bop) = compound_binop(op) {
+                self.expr(value)?;
+                self.emit_f32_arith(bop, 0);
+                self.assign_result_is_unit();
+                return Ok(());
+            }
+        }
         if !matches!(op, AssignOp::Add | AssignOp::Sub) {
             self.expr(value)?;
             match op {
@@ -3152,6 +3194,25 @@ impl Compiler {
         // `use(3)(g)` / `use(3) { g }` — one clause of a curried `def`.
         if let Some(call) = self.uncurry(recv, name, args, line) {
             return self.expr(&call);
+        }
+        // The three methods that observe a receiver's TYPE rather than its
+        // value, on a receiver the analysis proved is a `Float`. All three would
+        // otherwise read the one runtime representation and answer for a
+        // `Double`: `0.1f.toString` is `0.1` (not `0.10000000149011612`),
+        // `(1.1f).getClass` is `float` (not `double`), and `3.0f.hashCode` is
+        // 1077936128 (not 1074266112).
+        if args.is_empty() && self.num_ty(recv) == NumTy::Float32 {
+            let id = match name {
+                "toString" => Some(crate::host::SF32_STR),
+                "getClass" => Some(crate::host::SF32_CLASS),
+                "hashCode" => Some(crate::host::SF32_HASH),
+                _ => None,
+            };
+            if let Some(id) = id {
+                self.expr(recv)?;
+                self.b.emit(Op::CallBuiltin(id, 1), line);
+                return Ok(());
+            }
         }
         let w = self.method_width(recv, name, args);
         // A lambda argument's parameters are typed by the traversal, so the
@@ -4343,6 +4404,7 @@ impl Compiler {
         match e {
             Expr::Int(_) => NumTy::Int,
             Expr::Long(_) => NumTy::Long,
+            Expr::Float32(_) => NumTy::Float32,
             // A `Char` widens to `Int` the moment it enters arithmetic: `'a' + 1`
             // is the `Int` 98, and `Char` itself has no arithmetic of its own.
             Expr::Char(_) => NumTy::Int,
@@ -4403,6 +4465,7 @@ impl Compiler {
             Expr::Int(_)
             | Expr::Long(_)
             | Expr::Float(_)
+            | Expr::Float32(_)
             | Expr::Str(_)
             | Expr::Char(_)
             | Expr::Bool(_)
@@ -4447,6 +4510,19 @@ impl Compiler {
         }
         if name == "toLong" {
             return NumTy::Long;
+        }
+        // `.toFloat` is Scala's narrowing conversion TO single precision, so its
+        // result is a `Float` whatever the receiver was.
+        if name == "toFloat" {
+            return NumTy::Float32;
+        }
+        // `Float.MaxValue` / `MinValue` / `MinPositiveValue` / `NaN` / the two
+        // infinities, in either the Scala or the `java.lang.Float` spelling.
+        // The integer companions are handled by `companion_bound` above, which
+        // answers a bound and so cannot name a floating one.
+        if args.is_empty() && boxed_module(recv).is_some_and(|m| m == "Float" || m == "java.Float")
+        {
+            return NumTy::Float32;
         }
         // A member of a USER-DECLARED class is typed by that class's own
         // declaration, and it takes priority over every name-based rule below.
@@ -4532,11 +4608,52 @@ impl Compiler {
     }
 
     /// Wrap only when the result is provably a 32-bit `Int`. A `Long` result
-    /// must keep its full width, and an unproven one might be a `Double` or a
-    /// `String`, which the shift pair would destroy — so both are left alone.
+    /// must keep its full width, a `Float` is not an integer at all, and an
+    /// unproven one might be a `Double` or a `String`, which the shift pair
+    /// would destroy — so all three are left alone.
     fn narrow(&mut self, w: NumTy, line: u32) {
         if w == NumTy::Int {
             self.emit_wrap32(line);
+        }
+    }
+
+    /// Emit one arithmetic operation at 32-bit `Float` width, with both operands
+    /// already on the stack.
+    ///
+    /// A comparison never reaches here: the caller gates on the result type
+    /// being [`NumTy::Float32`], which only the five arithmetic operators
+    /// produce. `::` cannot either — its result is a `List`.
+    fn emit_f32_arith(&mut self, op: BinOp, line: u32) {
+        let code = match op {
+            BinOp::Sub => crate::host::f32_op::SUB,
+            BinOp::Mul => crate::host::f32_op::MUL,
+            BinOp::Div => crate::host::f32_op::DIV,
+            BinOp::Mod => crate::host::f32_op::REM,
+            _ => crate::host::f32_op::ADD,
+        };
+        self.b.emit(Op::LoadInt(code), line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::SF32_ARITH, 3), line);
+    }
+
+    /// Round the value on top of the stack to 32-bit `Float` precision, when its
+    /// static type says it is one. A no-op for every other type.
+    fn emit_f32_round(&mut self, w: NumTy, line: u32) {
+        if w == NumTy::Float32 {
+            self.b.emit(Op::CallBuiltin(crate::host::SF32, 1), line);
+        }
+    }
+
+    /// Render the value on top of the stack through `Float.toString`, when its
+    /// static type says it is a `Float`. A no-op for every other type.
+    ///
+    /// A `Float` and the `Double` holding its bits print differently — `0.1f` is
+    /// `0.1` and the `Double` is `0.10000000149011612` — and the value model
+    /// cannot tell them apart, so this is emitted at every point a
+    /// statically-`Float` value crosses into a `String`.
+    fn emit_f32_str(&mut self, w: NumTy, line: u32) {
+        if w == NumTy::Float32 {
+            self.b.emit(Op::CallBuiltin(crate::host::SF32_STR, 1), line);
         }
     }
 
@@ -4583,8 +4700,30 @@ impl Compiler {
         } else {
             NumTy::Unknown
         };
+        // A `Float` operation is performed at 32-bit width THROUGHOUT, not
+        // computed at 64 and narrowed after: the double rounding can land a ulp
+        // away from the single one Scala performs. So it leaves the native ops
+        // entirely — see [`crate::host::SF32_ARITH`]. A `String` concatenation
+        // is not arithmetic and never reaches here (`w` is `Unknown` for one),
+        // and neither is a comparison.
+        if w == NumTy::Float32 {
+            self.expr(lhs)?;
+            self.expr(rhs)?;
+            self.emit_f32_arith(op, 0);
+            return Ok(());
+        }
+        // `"" + f` and `s"$f"` must render `f` as a `Float`, not as the `Double`
+        // holding its bits. Only a `+` whose FAR side is a `String` is a
+        // concatenation, so that is what gates the conversion; an arithmetic `+`
+        // took the branch above and never reaches here.
         self.expr(lhs)?;
+        if op == BinOp::Add && yields_strings(rhs) {
+            self.emit_f32_str(self.num_ty(lhs), 0);
+        }
         self.expr(rhs)?;
+        if op == BinOp::Add && yields_strings(lhs) {
+            self.emit_f32_str(self.num_ty(rhs), 0);
+        }
         // `"s" + p` renders `p` through its `toString`, and so does `s"$p"` —
         // the parser desugars an interpolation to exactly this, `"" + p + ""`.
         // Both reach fusevm's `Op::Add`, whose numeric hook is a plain
@@ -4758,6 +4897,7 @@ fn expr_any(e: &Expr, pred: &impl Fn(&Expr) -> bool) -> bool {
         Expr::Int(_)
         | Expr::Long(_)
         | Expr::Float(_)
+        | Expr::Float32(_)
         | Expr::Str(_)
         | Expr::Char(_)
         | Expr::Bool(_)
@@ -5112,6 +5252,17 @@ enum NumTy {
     Int,
     /// Provably a 64-bit `Long`: arithmetic on it does not wrap.
     Long,
+    /// Provably a 32-bit `Float`: arithmetic on it is performed at single
+    /// precision and it renders through `Float.toString`.
+    ///
+    /// fusevm has one floating representation, so a `Float` is a `Double` KEPT
+    /// at 32-bit precision — and keeping it there is a static obligation, not a
+    /// runtime property. Every value that becomes one is rounded where it
+    /// becomes one (the `f` literal, `.toFloat`, a `Float` parameter's incoming
+    /// argument), every operation on one is performed at 32 bits, and every
+    /// crossing into a `String` renders at 32 bits. This variant is what says
+    /// where all three happen.
+    Float32,
     /// A `Double`, a `String`, a collection, or a value whose type this frontend
     /// cannot recover. Never narrowed.
     #[default]
@@ -5154,10 +5305,17 @@ impl NumTy {
     /// expression to `Long` (so `2147483647 + 1L` is 2147483648, not a wrap).
     /// Anything unproven poisons the result, because a `Double` or `String`
     /// operand means this was never integer arithmetic at all.
+    /// `Float` sits above both integer widths and below `Double`: `1.5f + 1` and
+    /// `1.5f + 1L` are `Float`, and `1.5f + 1.0` is `Double`. The `Double` half
+    /// needs no rule of its own — a `Double` is [`NumTy::Unknown`] here, and an
+    /// unproven operand already poisons the result, which for a `Float` operand
+    /// means falling back to the 64-bit arithmetic that is exactly right.
     fn combine(self, other: NumTy) -> NumTy {
         match (self, other) {
             (NumTy::Int, NumTy::Int) => NumTy::Int,
             (NumTy::Long, NumTy::Int | NumTy::Long) | (NumTy::Int, NumTy::Long) => NumTy::Long,
+            (NumTy::Float32, NumTy::Float32 | NumTy::Int | NumTy::Long)
+            | (NumTy::Int | NumTy::Long, NumTy::Float32) => NumTy::Float32,
             _ => NumTy::Unknown,
         }
     }
@@ -5204,6 +5362,7 @@ fn literal_width(e: &Expr) -> NumTy {
     match e {
         Expr::Int(_) | Expr::Char(_) => NumTy::Int,
         Expr::Long(_) => NumTy::Long,
+        Expr::Float32(_) => NumTy::Float32,
         Expr::Unary {
             op: UnOp::Neg | UnOp::Complement,
             rhs,
@@ -5304,6 +5463,7 @@ fn declared_width(ty: &str) -> NumTy {
     match ty.trim_start_matches("=>").trim() {
         "Int" | "Short" | "Byte" | "Integer" => NumTy::Int,
         "Long" => NumTy::Long,
+        "Float" => NumTy::Float32,
         _ => NumTy::Unknown,
     }
 }
@@ -6087,6 +6247,7 @@ impl<'a> BoxScan<'a> {
             Expr::Int(_)
             | Expr::Long(_)
             | Expr::Float(_)
+            | Expr::Float32(_)
             | Expr::Str(_)
             | Expr::Char(_)
             | Expr::Bool(_)
@@ -6310,6 +6471,7 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
         Expr::Int(_)
         | Expr::Long(_)
         | Expr::Float(_)
+        | Expr::Float32(_)
         | Expr::Str(_)
         | Expr::Char(_)
         | Expr::Bool(_)
@@ -6362,6 +6524,20 @@ fn assign_op_method(op: AssignOp) -> &'static str {
         AssignOp::Div => "/=",
         AssignOp::Mod => "%=",
         AssignOp::Assign => unreachable!("plain assign is not a compound assignment"),
+    }
+}
+
+/// The binary operator a compound assignment expands to, for the paths that
+/// lower `x op= e` as `x op e` rather than through [`compound_op`]. `None` for
+/// the plain `=`, which is not a compound assignment at all.
+fn compound_binop(op: AssignOp) -> Option<BinOp> {
+    match op {
+        AssignOp::Add => Some(BinOp::Add),
+        AssignOp::Sub => Some(BinOp::Sub),
+        AssignOp::Mul => Some(BinOp::Mul),
+        AssignOp::Div => Some(BinOp::Div),
+        AssignOp::Mod => Some(BinOp::Mod),
+        AssignOp::Assign => None,
     }
 }
 

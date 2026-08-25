@@ -269,6 +269,16 @@ pub enum Expr {
     /// expression written without the suffix wraps to `-2147483648`.
     Long(i64),
     Float(f64),
+    /// An `f`-suffixed floating literal (`1.5f`, `0.1F`) — a `Float`.
+    ///
+    /// The value it carries is ALREADY rounded to 32-bit precision (the lexer
+    /// does it), so it compiles to the same `LoadFloat` constant an
+    /// [`Expr::Float`] does. The variant exists so the compiler can tell a
+    /// `Float` from a `Double` STATICALLY, which is what routes its arithmetic
+    /// through the 32-bit operation and its rendering through
+    /// `Float.toString` — the same reason [`Expr::Long`] is separate from
+    /// [`Expr::Int`].
+    Float32(f64),
     Str(String),
     /// A `Char` literal. Distinct from [`Expr::Str`]: a `Char` is its own type,
     /// so it answers `Char`'s methods (`toInt` is the code point, not a parse)
