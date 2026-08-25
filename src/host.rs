@@ -25,7 +25,7 @@ use fusevm::{Frame, NumOp, VMResult, Value, VM};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -3681,19 +3681,46 @@ fn champ_order(hashes: &[u32]) -> Vec<usize> {
             out.extend_from_slice(idxs);
             return;
         }
-        let mut slots: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        // A node has exactly 32 slots, so they are a fixed array rather than a
+        // `BTreeMap` — which allocated a map plus a `Vec` per slot at every
+        // level of every walk, and this walk runs once per rebuild of an
+        // immutable `Map`/`Set`.
+        let mut counts = [0u32; 32];
         for &i in idxs {
-            slots.entry((hashes[i] >> shift) & 31).or_default().push(i);
+            counts[((hashes[i] >> shift) & 31) as usize] += 1;
         }
-        for group in slots.values() {
-            if group.len() == 1 {
-                out.push(group[0]);
+        // The data payloads: slots holding exactly ONE element, emitted in
+        // ascending SLOT order (not the order the elements arrived in) and
+        // before any sub-trie. That is the shape that makes the order
+        // canonical, so both halves of it are load-bearing.
+        let mut single = [usize::MAX; 32];
+        for &i in idxs {
+            let slot = ((hashes[i] >> shift) & 31) as usize;
+            if counts[slot] == 1 {
+                single[slot] = i;
             }
         }
-        for group in slots.values() {
-            if group.len() > 1 {
-                walk(group, hashes, shift + 5, out);
+        for &i in single.iter() {
+            if i != usize::MAX {
+                out.push(i);
             }
+        }
+        // Then the sub-tries, also in ascending slot order. A node whose
+        // children are all singletons allocates nothing here.
+        if !counts.iter().any(|&c| c > 1) {
+            return;
+        }
+        for slot in 0..32u32 {
+            if counts[slot as usize] <= 1 {
+                continue;
+            }
+            let mut group = Vec::with_capacity(counts[slot as usize] as usize);
+            for &i in idxs {
+                if (hashes[i] >> shift) & 31 == slot {
+                    group.push(i);
+                }
+            }
+            walk(&group, hashes, shift + 5, out);
         }
     }
     let mut out = Vec::with_capacity(hashes.len());
