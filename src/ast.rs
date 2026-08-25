@@ -172,6 +172,12 @@ pub struct Func {
     pub params: Vec<String>,
     /// One entry per [`Self::params`] entry, same order and length.
     pub sig: Vec<ParamSig>,
+    /// The `def`'s type-parameter NAMES (`[A, B]` answers `["A", "B"]`).
+    ///
+    /// Kept because implicit resolution substitutes them: a `using` parameter
+    /// of type `Sh[A]` names no given until `A` is known, and what makes it
+    /// known is the argument passed for the value parameter declared `A`.
+    pub type_params: Vec<String>,
     /// The declared return type, verbatim (`Some("Int")` for `def f(): Int`).
     /// Scala infers a return type when it is omitted, which this frontend cannot
     /// do, so an unannotated `def` answers `None` and its calls stay unnarrowed.

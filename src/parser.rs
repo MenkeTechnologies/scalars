@@ -36,6 +36,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         imports: HashMap::new(),
         wildcards: Vec::new(),
         implicits: Vec::new(),
+        givens: 0,
     };
     let mut prog = p.program()?;
     // Block-local `def`s are still statements at this point; scope, uniquely
@@ -61,6 +62,10 @@ struct Parser {
     wildcards: Vec<Vec<String>>,
     /// `implicit val NAME: TY` declarations — see [`Program::implicits`].
     implicits: Vec<(String, String)>,
+    /// How many anonymous `given`s have been named so far. A `given` need not
+    /// be named by the program (`given Int = 5`), but it still has to be a
+    /// binding for a call site to reference, so one is synthesized.
+    givens: usize,
 }
 
 /// The outcome of parsing a top-level `object`: the program entry point, or a
@@ -577,26 +582,56 @@ impl Parser {
     /// Parse a non-`main` `def name[(...)]: T = body` into a [`Func`]. The cursor
     /// is on `def`. Type parameters and parameter/return types are consumed but
     /// only parameter *names* are kept (the runtime is dynamically typed).
-    fn parse_def(&mut self) -> Result<Func, String> {
-        self.eat(&Tok::Def)?;
-        let name = self.ident()?;
-        // Optional `[T, U]` type-parameter clause — skip the whole bracket group.
-        if self.is(&Tok::LBracket) {
-            let mut depth = 0;
-            loop {
-                match self.advance() {
-                    Tok::LBracket => depth += 1,
-                    Tok::RBracket => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
+    /// The `[…]` clause of a `def`: its type-parameter names, and the context
+    /// bounds written on them as `(type param, bounding type)` pairs.
+    ///
+    /// `[A]` answers `(["A"], [])`; `[A: Sh]` answers `(["A"], [("A", "Sh")])`,
+    /// which the caller turns into a `using` parameter of type `Sh[A]`.
+    fn type_param_clause(&mut self) -> Result<TypeParams, String> {
+        let mut names = Vec::new();
+        let mut bounds = Vec::new();
+        if !self.is(&Tok::LBracket) {
+            return Ok((names, bounds));
+        }
+        self.advance();
+        let mut depth = 1u32;
+        while depth > 0 && !self.is(&Tok::Eof) {
+            match self.peek().clone() {
+                Tok::LBracket => {
+                    depth += 1;
+                    self.advance();
+                }
+                Tok::RBracket => {
+                    depth -= 1;
+                    self.advance();
+                }
+                // A name at the TOP level of the clause is a type parameter;
+                // one nested inside a bound's own arguments is not.
+                Tok::Ident(w) if depth == 1 => {
+                    self.advance();
+                    if self.is(&Tok::Colon) {
+                        self.advance();
+                        let b = self.type_ref()?;
+                        bounds.push((w.clone(), b));
                     }
-                    Tok::Eof => break,
-                    _ => {}
+                    names.push(w);
+                }
+                _ => {
+                    self.advance();
                 }
             }
         }
+        Ok((names, bounds))
+    }
+
+    fn parse_def(&mut self) -> Result<Func, String> {
+        self.eat(&Tok::Def)?;
+        let name = self.ident()?;
+        // `[T, U]` / `[A: Ord]` — the type-parameter clause. The NAMES are kept
+        // (implicit resolution substitutes them at a call site) and so are the
+        // CONTEXT BOUNDS, which are a `using` parameter in disguise: `[A: Sh]`
+        // declares an unnamed `using` parameter of type `Sh[A]`.
+        let (type_params, bounds) = self.type_param_clause()?;
         // Parameter list. Scala allows a parameterless `def name = …`, so the
         // `(` is optional.
         let (params, sig) = self.param_list()?;
@@ -612,10 +647,25 @@ impl Parser {
                 name,
                 params,
                 sig,
+                type_params,
                 ret_ty,
                 captured: 0,
                 body: Vec::new(),
                 is_abstract: true,
+            });
+        }
+        // A context bound is a `using` parameter with no name of its own, so
+        // one is synthesized. It goes LAST, after every written clause, which
+        // is where Scala puts it.
+        let mut params = params;
+        let mut sig = sig;
+        for (i, (tp, bound)) in bounds.iter().enumerate() {
+            params.push(format!("evidence${}", i + 1));
+            sig.push(ParamSig {
+                ty: Some(format!("{bound}[{tp}]")),
+                implicit_clause: true,
+                clause_start: i == 0,
+                ..ParamSig::default()
             });
         }
         self.eat(&Tok::Assign)?;
@@ -630,6 +680,7 @@ impl Parser {
             name,
             params,
             sig,
+            type_params,
             ret_ty,
             captured: 0,
             body,
@@ -1132,6 +1183,10 @@ impl Parser {
             // `implicit val n: Int = 5` — an ordinary binding that ALSO enters
             // the implicit scope, which is what fills an `implicit` parameter
             // clause at a call site.
+            // `given` in its four shapes — named or anonymous, by value or by
+            // body. Each is an ordinary binding that ALSO enters the implicit
+            // scope; see [`Parser::given_decl`].
+            Tok::Ident(w) if w == "given" && self.starts_given() => self.given_decl(),
             Tok::Ident(w) if w == "implicit" && matches!(self.peek_at(1), Tok::Val | Tok::Var) => {
                 self.advance();
                 let decl = self.local_decl()?;
@@ -1184,6 +1239,91 @@ impl Parser {
     }
 
     /// A `val`/`var` binding: `val x = e`, `var y: Int = e`.
+    /// Whether the `given` at the cursor opens a DECLARATION rather than being
+    /// an ordinary identifier. `given` is a soft keyword, so a program may use
+    /// it as a name; a declaration is followed by a name, a type, or `(`.
+    fn starts_given(&self) -> bool {
+        matches!(self.peek_at(1), Tok::Ident(_) | Tok::LParen | Tok::LBracket)
+    }
+
+    /// A `given` declaration, in the four shapes Scala 3 writes it:
+    ///
+    /// ```text
+    /// given Int = 5                      anonymous, by value
+    /// given named: Double = 2.5          named, by value
+    /// given Sh[Int] with { def … }       anonymous, by body
+    /// given named: Sh[Int] with { def … } named, by body
+    /// ```
+    ///
+    /// All four are one thing here: a binding of the declared TYPE, plus an
+    /// entry in the implicit scope keyed by that type. The by-body form is a
+    /// singleton `object` — the members it declares are exactly an object's,
+    /// and an object already works as a value (`use(Inst)` dispatches its
+    /// methods), which is what a type-class instance needs to be.
+    ///
+    /// An anonymous `given` still gets a name, because a call site fills a
+    /// `using` clause by referencing one.
+    fn given_decl(&mut self) -> Result<StmtKind, String> {
+        self.advance(); // `given`
+                        // `given name: Ty` vs `given Ty` — only a `:` after the first
+                        // identifier makes it a name.
+        let named = matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Colon);
+        let name = if named {
+            let n = self.ident()?;
+            self.eat(&Tok::Colon)?;
+            n
+        } else {
+            self.givens += 1;
+            format!("given${}", self.givens)
+        };
+        let ty = self.type_ref_stop_with()?;
+        // `with { … }` — a type-class instance, whose body is an object's.
+        if matches!(self.peek(), Tok::Ident(w) if w == "with") {
+            self.advance();
+            let (body, methods) = self.given_body()?;
+            self.objects.push(ObjectDecl {
+                name: name.clone(),
+                is_case: false,
+                parents: vec![base_type_name(&ty)],
+                body,
+                methods,
+            });
+            self.implicits.push((name, ty));
+            // The object is a declaration, not a statement.
+            return Ok(StmtKind::Expr(Expr::Tuple(Vec::new())));
+        }
+        self.eat(&Tok::Assign)?;
+        self.skip_seps();
+        let init = self.expression()?;
+        self.implicits.push((name.clone(), ty.clone()));
+        Ok(StmtKind::Local {
+            is_val: true,
+            is_lazy: false,
+            ty: Some(ty),
+            name,
+            init: Some(init),
+        })
+    }
+
+    /// The `{ … }` body of a `given … with`, read as an object's members.
+    fn given_body(&mut self) -> Result<(Vec<Stmt>, Vec<Func>), String> {
+        let mut body = Vec::new();
+        let mut methods = Vec::new();
+        self.eat(&Tok::LBrace)?;
+        self.skip_seps();
+        while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+            self.skip_member_modifiers();
+            if self.is(&Tok::Def) {
+                methods.push(self.parse_def()?);
+            } else {
+                body.push(self.statement()?);
+            }
+            self.skip_seps();
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok((body, methods))
+    }
+
     fn local_decl(&mut self) -> Result<StmtKind, String> {
         self.local_decl_lazy(false)
     }
@@ -1249,19 +1389,28 @@ impl Parser {
     /// Used everywhere a `=>` after the type is unambiguously part of the type
     /// (`val`/`def`/parameter/lambda-parameter annotations).
     fn type_ref(&mut self) -> Result<String, String> {
-        self.type_ref_inner(true)
+        self.type_ref_inner(true, false)
+    }
+
+    /// A type reference that STOPS at a following `with`, for `given Ty with
+    /// { … }`. `with` is an identifier to the lexer, so the ordinary reader
+    /// appends it to the type and `given Sh[Int] with` became the type
+    /// `Sh[Int]with`.
+    fn type_ref_stop_with(&mut self) -> Result<String, String> {
+        self.type_ref_inner(true, true)
     }
 
     /// A type reference in a context where a following `=>` is NOT part of the
     /// type (a `case name: Type =>` pattern, where `=>` is the arm separator).
     fn type_ref_no_arrow(&mut self) -> Result<String, String> {
-        self.type_ref_inner(false)
+        self.type_ref_inner(false, false)
     }
 
-    fn type_ref_inner(&mut self, allow_arrow: bool) -> Result<String, String> {
+    fn type_ref_inner(&mut self, allow_arrow: bool, stop_with: bool) -> Result<String, String> {
         let mut s = String::new();
         loop {
             match self.peek().clone() {
+                Tok::Ident(w) if stop_with && !s.is_empty() && w == "with" => break,
                 Tok::Ident(w) => {
                     s.push_str(&w);
                     self.advance();
@@ -2446,6 +2595,19 @@ impl Parser {
                 }
                 let line = self.line();
                 self.advance();
+                // `summon[T]` — the one place a type application is not erased,
+                // because the type IS the argument: it names which given to
+                // fetch from the implicit scope.
+                if name == "summon" && self.is(&Tok::LBracket) {
+                    self.advance();
+                    let ty = self.type_ref()?;
+                    self.eat(&Tok::RBracket)?;
+                    return self.postfix_from(Expr::Call {
+                        name: SUMMON.to_string(),
+                        args: vec![Expr::Str(ty)],
+                        line,
+                    });
+                }
                 // Optional generic type arguments (`List[Int](…)`, `foo[T](…)`).
                 if self.is(&Tok::LBracket) {
                     self.skip_bracket_group();
@@ -2674,6 +2836,13 @@ impl Parser {
 
     fn arg_list(&mut self) -> Result<Vec<Expr>, String> {
         self.eat(&Tok::LParen)?;
+        // `f(1)(using 100)` — an explicitly supplied `using` clause. The
+        // keyword only marks which clause this is; the arguments after it are
+        // ordinary positional ones, and supplying them is what makes the
+        // explicit form outrank the implicit scope.
+        if matches!(self.peek(), Tok::Ident(w) if w == "using") {
+            self.advance();
+        }
         let mut args = Vec::new();
         if !self.is(&Tok::RParen) {
             loop {
@@ -3188,6 +3357,7 @@ fn parse_fragment(src: &str) -> Result<Expr, String> {
         imports: HashMap::new(),
         wildcards: Vec::new(),
         implicits: Vec::new(),
+        givens: 0,
     };
     p.skip_seps();
     // Scala's `${…}` holds a BLOCK, not just an expression, so a splice may
@@ -3491,6 +3661,26 @@ const MUTABLE_PREFIXES: &[&str] = &["scala", "collection", "mutable"];
 
 /// Whether a dotted path names the `scala.collection.mutable` package, in any
 /// of the three spellings a program may reach it by.
+/// A declared type's BASE name, with any type arguments dropped — `Sh[Int]`
+/// answers `Sh`. A `given … with` mixes in the base type, since that is the
+/// trait whose members it implements; the arguments are a typing concern this
+/// frontend does not model.
+/// A `def`'s type-parameter names, and the context bounds written on them as
+/// `(type param, bounding type)` pairs — what [`Parser::type_param_clause`]
+/// reads out of a `[…]` clause.
+type TypeParams = (Vec<String>, Vec<(String, String)>);
+
+/// The synthetic call `summon[T]` parses to: one argument, the type's name,
+/// resolved against the implicit scope by [`crate::compiler`].
+pub const SUMMON: &str = "summon$";
+
+fn base_type_name(ty: &str) -> String {
+    match ty.find('[') {
+        Some(i) => ty[..i].trim().to_string(),
+        None => ty.trim().to_string(),
+    }
+}
+
 fn is_mutable_path(path: &[String]) -> bool {
     matches!(
         path.iter()

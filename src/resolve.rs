@@ -116,6 +116,9 @@ struct Lifted {
     /// The declared return type, carried through the lift so a hoisted nested
     /// `def` keeps the annotation its call sites' width analysis reads.
     ret_ty: Option<String>,
+    /// The `def`'s own type-parameter names, carried through the lift because
+    /// implicit resolution substitutes them at every call site.
+    type_params: Vec<String>,
     body: Vec<Stmt>,
     /// Enclosing-frame locals the body reads, in discovery order.
     captures: Vec<String>,
@@ -139,6 +142,7 @@ impl Lifted {
             name,
             params: self.params,
             sig: self.sig,
+            type_params: self.type_params,
             ret_ty: self.ret_ty,
             captured,
             body: self.body,
@@ -384,6 +388,7 @@ impl Resolver {
                     params: f.params.clone(),
                     sig: f.sig.clone(),
                     ret_ty: f.ret_ty.clone(),
+                    type_params: f.type_params.clone(),
                     body: Vec::new(),
                     captures: Vec::new(),
                     scope_base: 0,

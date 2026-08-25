@@ -120,6 +120,9 @@ struct Compiler {
     /// The implicit scope: `(name, declared type)` for every `implicit val` —
     /// see [`Compiler::implicit_args`].
     implicits: Vec<(String, String)>,
+    /// Each user `def`'s type-parameter names, for the substitution
+    /// [`Compiler::infer_type_args`] makes.
+    func_type_params: HashMap<String, Vec<String>>,
     /// The packages a WILDCARD `import` opened — see
     /// [`Compiler::imported_wildcard`].
     wildcards: Vec<Vec<String>>,
@@ -677,6 +680,11 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         wildcards: prog.import_wildcards.clone(),
         lazies: HashSet::new(),
         implicits: prog.implicits.clone(),
+        func_type_params: prog
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.type_params.clone()))
+            .collect(),
         has_user_tostring: classes
             .iter()
             .flat_map(|cd| cd.methods.iter())
@@ -2453,6 +2461,9 @@ impl Compiler {
                 self.b.emit(Op::Call(nidx, 0), 0);
                 return Ok(());
             }
+            if let Some(e) = self.implicit_ambiguity(name, &[], 0) {
+                return Err(e);
+            }
             // `def h(implicit m: Int)` written bare is a complete CALL, not a
             // function value: its only clause is supplied rather than written,
             // so there is nothing left for an eta-expansion to abstract over.
@@ -3327,6 +3338,118 @@ impl Compiler {
     /// supplied it, or when the scope holds nothing of the right type; the
     /// last case leaves the call exactly as it was, so an unresolved implicit
     /// is reported by the ordinary arity path rather than by a guess.
+    /// The binding that satisfies an implicit of declared type `ty`, or an
+    /// error naming why not.
+    ///
+    /// Resolution here is a match on the declared type's TEXT, which is what
+    /// this frontend can do without a type system: `Int` finds `given Int`, and
+    /// `Sh[Int]` finds `given Sh[Int]`. Two candidates of one type is an ERROR
+    /// rather than a silent pick, because that is what Scala reports and the
+    /// alternative is a program whose behaviour depends on declaration order.
+    fn resolve_implicit(&self, ty: &str, line: u32) -> Result<Expr, String> {
+        let ty = normalize_type(ty);
+        let hits: Vec<&(String, String)> = self
+            .implicits
+            .iter()
+            .filter(|(_, t)| normalize_type(t) == ty)
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok(Expr::Var(one.0.clone())),
+            [] => Err(format!(
+                "scalars: no given instance of type {ty} was found (line {line})"
+            )),
+            many => Err(format!(
+                "scalars: ambiguous given instances: {} both match type {ty} (line {line})",
+                many.iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )),
+        }
+    }
+
+    /// What the callee's type parameters are bound to at this call site, as
+    /// `(type param, concrete type)`.
+    ///
+    /// The rule is bounded and deliberately simple: a type parameter is
+    /// inferred from a VALUE parameter declared to be exactly that parameter.
+    /// `def show[A](x: A)(using Sh[A])` called `show(1)` binds `A` to the
+    /// static type of `1`. Inference through a constructed type (`xs: List[A]`)
+    /// or through a return position is NOT attempted — that needs a real type
+    /// system, and guessing there would resolve to the wrong given rather than
+    /// report that it could not.
+    fn infer_type_args(&self, name: &str, args: &[Expr]) -> Vec<(String, String)> {
+        let Some(f) = self.func_type_params.get(name) else {
+            return Vec::new();
+        };
+        let Some((params, sig, _)) = self.func_sig.get(name) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for tp in f {
+            for (i, p) in sig.iter().enumerate().take(params.len().min(args.len())) {
+                if p.ty.as_deref().map(str::trim) == Some(tp.as_str()) {
+                    if let Some(t) = self.static_type_name(&args[i]) {
+                        out.push((tp.clone(), t));
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The name of an expression's static type, for the shapes this frontend
+    /// can name one for. `None` where it cannot — which stops inference rather
+    /// than guessing.
+    fn static_type_name(&self, e: &Expr) -> Option<String> {
+        if let Some(cls) = self.class_of(e) {
+            return Some(cls);
+        }
+        Some(
+            match e {
+                Expr::Str(_) => "String",
+                Expr::Bool(_) => "Boolean",
+                Expr::Char(_) => "Char",
+                Expr::Float(_) => "Double",
+                Expr::Float32(_) => "Float",
+                Expr::Long(_) => "Long",
+                _ => match self.num_ty(e) {
+                    NumTy::Int => "Int",
+                    NumTy::Long => "Long",
+                    NumTy::Float32 => "Float",
+                    NumTy::Unknown => return None,
+                },
+            }
+            .to_string(),
+        )
+    }
+
+    /// Whether any implicit this call needs is AMBIGUOUS, and its message.
+    ///
+    /// Separated from [`Compiler::implicit_args`] because the two failures are
+    /// not alike: nothing found is recoverable — the call may simply not have
+    /// been an implicit one — while two candidates is a program error Scala
+    /// reports, and silently falling back would pick one by declaration order.
+    fn implicit_ambiguity(&self, name: &str, args: &[Expr], line: u32) -> Option<String> {
+        let (params, sig, captured) = self.func_sig.get(name)?;
+        let visible = params.len().checked_sub(*captured)?;
+        let first = sig[..visible].iter().position(|p| p.implicit_clause)?;
+        if args.len() != first {
+            return None;
+        }
+        let subst = self.infer_type_args(name, args);
+        for p in &sig[first..visible] {
+            let ty = substitute_type(p.ty.as_deref()?, &subst);
+            if let Err(e) = self.resolve_implicit(&ty, line) {
+                if e.contains("ambiguous") {
+                    return Some(e);
+                }
+            }
+        }
+        None
+    }
+
     fn implicit_args(&self, name: &str, args: &[Expr]) -> Option<Vec<Expr>> {
         let (params, sig, captured) = self.func_sig.get(name)?;
         let visible = params.len().checked_sub(*captured)?;
@@ -3334,11 +3457,14 @@ impl Compiler {
         if args.len() != first {
             return None;
         }
+        let subst = self.infer_type_args(name, args);
         let mut out = args.to_vec();
         for p in &sig[first..visible] {
-            let ty = p.ty.as_deref()?.trim();
-            let found = self.implicits.iter().find(|(_, t)| t.trim() == ty)?;
-            out.push(Expr::Var(found.0.clone()));
+            let ty = substitute_type(p.ty.as_deref()?, &subst);
+            // A clause this frontend cannot resolve is left for the ordinary
+            // arity path to report, so an unresolved implicit never becomes a
+            // guess. An AMBIGUOUS one is different and is raised by the caller.
+            out.push(self.resolve_implicit(&ty, 0).ok()?);
         }
         Some(out)
     }
@@ -4323,6 +4449,15 @@ impl Compiler {
     ///   dispatch by name through the FFI-call builtin. Without any FFI block, an
     ///   unknown call is a compile-time error, preserving the normal diagnostic.
     fn call(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        // `summon[T]` — fetch the given of type `T`. The type arrived as the
+        // one argument (see `crate::parser::SUMMON`), because it IS the
+        // argument here rather than an erased annotation.
+        if name == crate::parser::SUMMON {
+            if let [Expr::Str(ty)] = args {
+                let found = self.resolve_implicit(ty, line)?;
+                return self.expr(&found);
+            }
+        }
         // A synthetic range-materialization call emitted by `desugar_for` for a
         // range generator appearing in a collection comprehension.
         if name == RANGE_LIST_CALL {
@@ -4404,6 +4539,9 @@ impl Compiler {
         // the function's `sub_entry` frame. The callee prologue pops these args
         // into its slots (see `function_body`).
         if self.func_arity.contains_key(name) {
+            if let Some(e) = self.implicit_ambiguity(name, args, line) {
+                return Err(e);
+            }
             // An UNDER-applied `def` is not a call — it is the function of the
             // parameters that were not supplied. `def add(a: Int)(b: Int)`
             // called `add(10)` is `b => add(10, b)`, and `add(10) _` is the
@@ -4633,6 +4771,12 @@ impl Compiler {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
         self.emit_f32_params(&f.sig, 0);
+        // A `using` parameter IS a given inside the body: `def show2[A: Sh](x:
+        // A) = summon[Sh[A]].sh(x)` resolves `Sh[A]` to the evidence parameter
+        // it was handed, not to anything in the enclosing scope — where `A` is
+        // not even known. Scoped like `widths`: pushed here, restored on exit.
+        let saved_implicits = self.implicits.clone();
+        self.push_implicit_params(&f.params, &f.sig, f.captured);
 
         self.push_unwind(UnwindKind::Def);
         self.tail(&f.body)?;
@@ -4645,7 +4789,20 @@ impl Compiler {
         self.vals = saved_vals;
         self.widths = saved_widths;
         self.by_name = saved_by_name;
+        self.implicits = saved_implicits;
         Ok(())
+    }
+
+    /// Add a body's own `using` parameters to the implicit scope.
+    fn push_implicit_params(&mut self, params: &[String], sig: &[ParamSig], captured: usize) {
+        let visible = params.len().saturating_sub(captured);
+        for i in 0..visible {
+            if sig[i].implicit_clause {
+                if let Some(ty) = sig[i].ty.as_deref() {
+                    self.implicits.push((params[i].clone(), ty.to_string()));
+                }
+            }
+        }
     }
 
     /// Compile a statement list in tail position: every leading statement is a
@@ -5990,6 +6147,43 @@ fn declared_element_width(ty: &str) -> NumTy {
 /// parameter's mandatory annotation.
 /// The conversion builtin a declared floating type asks of a value reaching it,
 /// or `None` for every type that needs none.
+/// A declared type reduced to the form implicit resolution compares: no
+/// by-name arrow, no surrounding space, and no space inside a type-argument
+/// list, so `Sh[ Int ]` and `Sh[Int]` are one type.
+/// Replace each type parameter in `ty` with what it was inferred to be.
+/// `Sh[A]` with `A = Int` becomes `Sh[Int]`; a parameter with no binding is
+/// left alone, and the resolution that follows then reports it unresolved.
+fn substitute_type(ty: &str, subst: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(ty.len());
+    let mut word = String::new();
+    for ch in ty.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            word.push(ch);
+            continue;
+        }
+        push_substituted(&mut out, &word, subst);
+        word.clear();
+        out.push(ch);
+    }
+    push_substituted(&mut out, &word, subst);
+    out
+}
+
+/// Append `word`, replaced by its binding when it is a bound type parameter.
+fn push_substituted(out: &mut String, word: &str, subst: &[(String, String)]) {
+    match subst.iter().find(|(p, _)| p == word) {
+        Some((_, t)) => out.push_str(t),
+        None => out.push_str(word),
+    }
+}
+
+fn normalize_type(ty: &str) -> String {
+    ty.trim_start_matches("=>")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
 fn declared_conv(ty: Option<&str>) -> Option<u16> {
     let ty = ty.map(|t| t.trim_start_matches("=>").trim())?;
     // One collection layer counts: the ELEMENTS of a `List[Double]` are what
