@@ -2258,6 +2258,13 @@ impl Compiler {
         vplace: Place,
         fail_jumps: &mut Vec<usize>,
     ) -> Result<(), String> {
+        // A USER extractor — an `object` declaring `unapply` or `unapplySeq`.
+        // Answered before the regex path, which is what the builtin below
+        // handles, because the two are told apart by the extractor's
+        // DECLARATION rather than by its runtime value.
+        if let Some(m) = self.user_extractor(name) {
+            return self.match_user_extractor(name, &m, elems, vplace, fail_jumps);
+        }
         self.var_ref(name)?;
         self.emit_load(vplace);
         self.b.emit(Op::LoadInt(elems.len() as i64), 0);
@@ -2282,6 +2289,90 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
             self.obj_counter += 1;
             let ep = self.declare_place(&format!(" unappel_{}", self.obj_counter));
+            self.emit_store(ep);
+            self.match_pattern(elem, ep, fail_jumps)?;
+        }
+        Ok(())
+    }
+
+    /// The extractor method an `object` named `name` declares, if any.
+    /// `unapplySeq` is preferred, as Scala prefers it, so an object declaring
+    /// both binds a variable-length pattern.
+    fn user_extractor(&self, name: &str) -> Option<String> {
+        let meta = self.objects.get(name)?;
+        for m in ["unapplySeq", "unapply"] {
+            if meta.methods.contains(m) {
+                return Some(m.to_string());
+            }
+        }
+        None
+    }
+
+    /// `case Name(a, b) =>` where `Name` is an `object` declaring `unapply` or
+    /// `unapplySeq`.
+    ///
+    /// The extractor is CALLED with the scrutinee and answers an `Option`. A
+    /// `None` fails the pattern; a `Some` is opened and its payload bound —
+    /// positionally out of the tuple for a multi-binding `unapply`, and out of
+    /// the sequence for `unapplySeq`, which additionally has to check the
+    /// LENGTH, since a fixed-arity pattern only matches a sequence of exactly
+    /// that many elements.
+    fn match_user_extractor(
+        &mut self,
+        name: &str,
+        method: &str,
+        elems: &[Pattern],
+        vplace: Place,
+        fail_jumps: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        let seq = method == "unapplySeq";
+        // `Name.unapply(scrutinee)`.
+        self.emit_load(vplace);
+        let sub = self.sub_name(name, method, 1)?;
+        let nidx = self.b.add_name(&sub);
+        self.b.emit(Op::Call(nidx, 1), 0);
+        self.obj_counter += 1;
+        let opt = self.declare_place(&format!(" unopt_{}", self.obj_counter));
+        self.emit_store(opt);
+        // A `None` fails the pattern.
+        self.emit_load(opt);
+        let dc = self.b.add_constant(Value::str("isDefined".to_string()));
+        self.b.emit(Op::LoadConst(dc), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+        fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+        // The payload.
+        self.emit_load(opt);
+        let gc = self.b.add_constant(Value::str("get".to_string()));
+        self.b.emit(Op::LoadConst(gc), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+        self.obj_counter += 1;
+        let got = self.declare_place(&format!(" ungot_{}", self.obj_counter));
+        self.emit_store(got);
+        // `unapplySeq` binds out of a sequence, whose LENGTH has to match the
+        // pattern's arity — `case P(x, y)` must not match three elements.
+        if seq {
+            self.emit_load(got);
+            let lc = self.b.add_constant(Value::str("length".to_string()));
+            self.b.emit(Op::LoadConst(lc), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+            self.b.emit(Op::LoadInt(elems.len() as i64), 0);
+            self.b.emit(Op::NumEq, 0);
+            fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+        }
+        // A single binding takes the payload itself; several read it
+        // positionally — by index for a sequence, by `_1`.. for a tuple.
+        for (i, elem) in elems.iter().enumerate() {
+            self.emit_load(got);
+            if seq {
+                self.b.emit(Op::LoadInt(i as i64), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::APPLY, 1), 0);
+            } else if elems.len() > 1 {
+                let acc = self.b.add_constant(Value::str(format!("_{}", i + 1)));
+                self.b.emit(Op::LoadConst(acc), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+            }
+            self.obj_counter += 1;
+            let ep = self.declare_place(&format!(" unuel_{}", self.obj_counter));
             self.emit_store(ep);
             self.match_pattern(elem, ep, fail_jumps)?;
         }

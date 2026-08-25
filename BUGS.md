@@ -695,6 +695,20 @@ reported as parse/compile errors, never silently mis-run.
   MUTABLE `Map`/`Set` do not have this shape: their inserts are amortized
   `O(1)` (see the entry above), and so are the growable sequences.
 
+- **`Future`/`ExecutionContext`, and a string-interpolator PATTERN.** `Future {
+  … }` with `Await.result` is not modeled — there is no scheduler here, and a
+  synchronous stand-in would answer correctly for the programs that only await
+  and wrongly for every program that observes concurrency, which is the whole
+  reason to reach for one. `case s"x${n}y" =>` — matching by taking a string
+  interpolation apart — is a parse error; the ordinary `Regex` extractor
+  (`case r(a, b) =>`) works and is the spelling to use.
+
+  Not gaps: `unapply` and `unapplySeq` on a user `object` both bind, including
+  the length check that keeps `case P(x, y)` from matching three elements;
+  union and intersection types (`Int | String`, `A & B`) parse and are erased,
+  which is what the `match` a program writes against them already checks;
+  `opaque type`, `type` aliases and `inline def` behave as the reference does.
+
 - **A `LazyList` combinator that must see every element terminates only on a
   finite list**, as in Scala — `toList`, `sum`, `length`, `mkString`,
   `foreach`. An infinite one is BOUNDED rather than left to hang: forcing gives

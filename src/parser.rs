@@ -1510,6 +1510,16 @@ impl Parser {
         loop {
             match self.peek().clone() {
                 Tok::Ident(w) if stop_with && !s.is_empty() && w == "with" => break,
+                // A UNION or INTERSECTION type — `Int | String`, `A & B`. Both
+                // are kept verbatim: the runtime is dynamically typed, so what
+                // they constrain is checked by the `match` a program writes
+                // against them, and the annotation itself is diagnostic. Only
+                // accepted mid-type, so a `|` that starts one is still an
+                // operator.
+                Tok::Op(o) if !s.is_empty() && (o == "|" || o == "&") => {
+                    s.push_str(&o);
+                    self.advance();
+                }
                 Tok::Ident(w) => {
                     s.push_str(&w);
                     self.advance();
