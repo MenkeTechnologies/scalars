@@ -36,6 +36,8 @@ pub fn parse(src: &str) -> Result<Program, String> {
         imports: HashMap::new(),
         wildcards: Vec::new(),
         implicits: Vec::new(),
+        extensions: Vec::new(),
+        conversions: Vec::new(),
         givens: 0,
     };
     let mut prog = p.program()?;
@@ -62,6 +64,10 @@ struct Parser {
     wildcards: Vec<Vec<String>>,
     /// `implicit val NAME: TY` declarations — see [`Program::implicits`].
     implicits: Vec<(String, String)>,
+    /// `extension` declarations — see [`Program::extensions`].
+    extensions: Vec<(String, String, String)>,
+    /// Implicit conversions — see [`Program::conversions`].
+    conversions: Vec<Conversion>,
     /// How many anonymous `given`s have been named so far. A `given` need not
     /// be named by the program (`given Int = 5`), but it still has to be a
     /// binding for a call site to reference, so one is synthesized.
@@ -275,6 +281,8 @@ impl Parser {
             imports: std::mem::take(&mut self.imports),
             import_wildcards: std::mem::take(&mut self.wildcards),
             implicits: std::mem::take(&mut self.implicits),
+            extensions: std::mem::take(&mut self.extensions),
+            conversions: std::mem::take(&mut self.conversions),
         })
     }
 
@@ -1187,6 +1195,32 @@ impl Parser {
             // body. Each is an ordinary binding that ALSO enters the implicit
             // scope; see [`Parser::given_decl`].
             Tok::Ident(w) if w == "given" && self.starts_given() => self.given_decl(),
+            // `extension (x: T) def m(…) = …`, and the braced form declaring
+            // several methods on one receiver.
+            Tok::Ident(w)
+                if w == "extension" && matches!(self.peek_at(1), Tok::LParen | Tok::LBracket) =>
+            {
+                self.extension_decl()
+            }
+            // `implicit def i2s(i: Int): String = …` — an ordinary `def` that
+            // ALSO registers a conversion from its parameter type to its
+            // return type.
+            Tok::Ident(w) if w == "implicit" && matches!(self.peek_at(1), Tok::Def) => {
+                self.advance();
+                let f = self.parse_def()?;
+                if let (Some(from), Some(to)) =
+                    (f.sig.first().and_then(|p| p.ty.clone()), f.ret_ty.clone())
+                {
+                    self.conversions.push(Conversion {
+                        from,
+                        to,
+                        via: f.name.clone(),
+                        is_value: false,
+                    });
+                }
+                self.funcs.push(f);
+                Ok(StmtKind::Expr(Expr::Tuple(Vec::new())))
+            }
             Tok::Ident(w) if w == "implicit" && matches!(self.peek_at(1), Tok::Val | Tok::Var) => {
                 self.advance();
                 let decl = self.local_decl()?;
@@ -1295,6 +1329,16 @@ impl Parser {
         self.eat(&Tok::Assign)?;
         self.skip_seps();
         let init = self.expression()?;
+        // `given Conversion[A, B] = …` is a conversion as well as a given; it
+        // is applied through the instance's `apply`.
+        if let Some((from, to)) = conversion_args(&ty) {
+            self.conversions.push(Conversion {
+                from,
+                to,
+                via: name.clone(),
+                is_value: true,
+            });
+        }
         self.implicits.push((name.clone(), ty.clone()));
         Ok(StmtKind::Local {
             is_val: true,
@@ -1322,6 +1366,61 @@ impl Parser {
         }
         self.eat(&Tok::RBrace)?;
         Ok((body, methods))
+    }
+
+    /// An `extension (x: T) def m(…) = …` block.
+    ///
+    /// Each method becomes an ordinary top-level `def` whose FIRST parameter is
+    /// the receiver, and an entry recording which receiver type and method name
+    /// select it. `extension (x: Int) def dbl = x * 2` is
+    /// `def extension$Int$dbl(x: Int) = x * 2`, and `3.dbl` compiles to a call
+    /// of it — so an extension costs nothing a normal call does not, and needs
+    /// no dispatch at run time.
+    fn extension_decl(&mut self) -> Result<StmtKind, String> {
+        self.advance(); // `extension`
+                        // An extension may itself be generic (`extension [A](xs: List[A])`).
+        let _ = self.type_param_clause()?;
+        self.eat(&Tok::LParen)?;
+        let recv_name = self.ident()?;
+        self.eat(&Tok::Colon)?;
+        let recv_ty = self.type_ref()?;
+        self.eat(&Tok::RParen)?;
+        let braced = self.is(&Tok::LBrace);
+        if braced {
+            self.advance();
+            self.skip_seps();
+        }
+        loop {
+            self.skip_member_modifiers();
+            if !self.is(&Tok::Def) {
+                break;
+            }
+            let mut f = self.parse_def()?;
+            let hoisted = format!("extension${}${}", base_type_name(&recv_ty), f.name);
+            self.extensions
+                .push((recv_ty.clone(), f.name.clone(), hoisted.clone()));
+            // The receiver is prepended as the first parameter, so the body's
+            // reference to it resolves like any other.
+            f.params.insert(0, recv_name.clone());
+            f.sig.insert(
+                0,
+                ParamSig {
+                    ty: Some(recv_ty.clone()),
+                    ..ParamSig::default()
+                },
+            );
+            f.name = hoisted;
+            self.funcs.push(f);
+            if !braced {
+                break;
+            }
+            self.skip_seps();
+        }
+        if braced {
+            self.eat(&Tok::RBrace)?;
+        }
+        // A declaration, not a statement.
+        Ok(StmtKind::Expr(Expr::Tuple(Vec::new())))
     }
 
     fn local_decl(&mut self) -> Result<StmtKind, String> {
@@ -3357,6 +3456,8 @@ fn parse_fragment(src: &str) -> Result<Expr, String> {
         imports: HashMap::new(),
         wildcards: Vec::new(),
         implicits: Vec::new(),
+        extensions: Vec::new(),
+        conversions: Vec::new(),
         givens: 0,
     };
     p.skip_seps();
@@ -3669,6 +3770,29 @@ const MUTABLE_PREFIXES: &[&str] = &["scala", "collection", "mutable"];
 /// `(type param, bounding type)` pairs — what [`Parser::type_param_clause`]
 /// reads out of a `[…]` clause.
 type TypeParams = (Vec<String>, Vec<(String, String)>);
+
+/// The two type arguments of a `Conversion[A, B]`, or `None` for any other
+/// type. Split at the TOP-level comma, so `Conversion[List[A], B]` reads
+/// correctly.
+fn conversion_args(ty: &str) -> Option<(String, String)> {
+    let inner = ty.trim().strip_prefix("Conversion")?.trim();
+    let inner = inner.strip_prefix('[')?.strip_suffix(']')?;
+    let mut depth = 0i32;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ',' if depth == 0 => {
+                return Some((
+                    inner[..i].trim().to_string(),
+                    inner[i + 1..].trim().to_string(),
+                ))
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// The synthetic call `summon[T]` parses to: one argument, the type's name,
 /// resolved against the implicit scope by [`crate::compiler`].

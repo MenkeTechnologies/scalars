@@ -794,24 +794,33 @@ reported as parse/compile errors, never silently mis-run.
   is a floor rather than a bug: single precision cannot be both exact and
   native on a VM whose native floats are 64-bit.
 
-- **`given` declarations, `extension` methods, and implicit CONVERSIONS.** A
-  `given` declaration and an `extension` block are parse errors, and an
-  `implicit def` is not applied as a conversion.
+- **Implicit resolution is a match on the declared type's TEXT.** `given`,
+  `using`, `summon`, context bounds, `extension` methods and implicit
+  conversions all work (see `README.md`), and what bounds them is how a
+  candidate is selected: `Sh[Int]` finds `given Sh[Int]` by comparing type
+  names, with a call site's type parameters substituted first.
 
-  An implicit PARAMETER clause is not one of these gaps: `def f(x: Int)(implicit
-  m: Int)` and the `using` spelling of it are both supplied from the implicit
-  scope, which is every `implicit val` in the program, selected by declared TYPE
-  — and a clause written explicitly at the call site still wins. What is missing
-  is the rest of the implicit machinery: a `given` as the way to introduce one,
-  an `implicit def` as a conversion, and resolution by anything richer than a
-  type-name match (no type parameters, no subtyping, no companion-object
-  search). An unresolved implicit is left as an ordinary arity error rather than
-  guessed at.
+  Substitution is driven by a value parameter declared to BE the type
+  parameter, so `def show[A](x: A)(using Sh[A])` called `show(1)` binds
+  `A = Int`. Inference through a CONSTRUCTED type (`xs: List[A]`) or from a
+  return position is not attempted: that needs a real type system, and a guess
+  there resolves to the wrong given rather than reporting that it could not. An
+  implicit that cannot be resolved stays an ordinary arity error, and an
+  AMBIGUOUS one is an error, as in Scala.
 
-  By-name parameters and `@main` used to be listed here and are not gaps: `def
-  f(x: => Int)` passes a thunk forced at every use (the `params` fuzz mode is
-  built on it), and `@main def` is an entry point (see below). The line outlived
-  both.
+  What follows from text-matching: no subtyping (a `given Animal` does not
+  satisfy a `using Dog`, nor the reverse), no variance, no implicit priority
+  ordering beyond "exactly one candidate or it is ambiguous", and no
+  companion-object search — a given must be in the program's own scope.
+
+  An `extension` whose name collides with a real STDLIB method on a primitive
+  receiver wins, where Scala keeps the member and warns that the extension
+  "will never be selected". The member-wins rule IS enforced for a user class,
+  which is the case the reference demonstrates; the stdlib is dispatched at run
+  time here, so there is no compile-time list of its names to consult.
+
+  `given` as an implicit CLASS or with an `inline` body is not modeled.
+
 - **A repeated `@main` parameter, and two `@main` methods in one file.**
   `@main def go(first: Int, rest: String*)` is refused rather than collecting
   the remainder, and a file declaring two `@main` methods is refused rather than

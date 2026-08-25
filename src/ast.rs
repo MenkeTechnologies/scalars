@@ -8,6 +8,19 @@
 
 use std::collections::HashMap;
 
+/// One implicit conversion: the type it converts FROM, the type it converts TO,
+/// and the name that performs it — a plain function for `implicit def`, or a
+/// `Conversion` instance whose `apply` is called.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Conversion {
+    pub from: String,
+    pub to: String,
+    pub via: String,
+    /// `true` when `via` names a `Conversion` VALUE, so applying it is
+    /// `via.apply(x)` rather than `via(x)`.
+    pub is_value: bool,
+}
+
 /// A parsed compilation unit: the entry object name, the body of its entry
 /// point (`main`, or the `extends App` body), and the object's other `def`s.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +61,24 @@ pub struct Program {
     /// members it actually provides for that package — so an unknown name is
     /// still `not found` rather than a guess that fails further downstream.
     pub import_wildcards: Vec<Vec<String>>,
+    /// `extension (x: T) def m(…)` declarations, as
+    /// `(receiver type, method name, hoisted function name)`.
+    ///
+    /// An extension is dispatched on the RECEIVER's type: `3.name` and
+    /// `"q".name` select different bodies, and a real MEMBER of the receiver
+    /// wins over an extension of the same name. The compiler therefore consults
+    /// this only after every member and stdlib rule has missed, and only with a
+    /// receiver whose static type it can name.
+    pub extensions: Vec<(String, String, String)>,
+    /// Implicit CONVERSIONS, as `(from type, to type, how to apply it)`.
+    ///
+    /// Both spellings land here: `implicit def i2s(i: Int): String` records the
+    /// function's name, and `given Conversion[Int, Boolean] = …` records the
+    /// given's, applied through its `apply`. A conversion is inserted at the
+    /// two points Scala inserts one — a value assigned to a declared type, and
+    /// an argument passed to a parameter of one — and only when the value's
+    /// static type is known and is not already the target.
+    pub conversions: Vec<Conversion>,
     /// `implicit val NAME: TY` declarations, as `(name, declared type)`.
     ///
     /// This is the implicit SCOPE, and it is resolved by declared type name: an

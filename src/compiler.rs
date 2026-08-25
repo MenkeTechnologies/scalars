@@ -123,6 +123,15 @@ struct Compiler {
     /// Each user `def`'s type-parameter names, for the substitution
     /// [`Compiler::infer_type_args`] makes.
     func_type_params: HashMap<String, Vec<String>>,
+    /// `extension` declarations — see [`Program::extensions`].
+    extensions: Vec<(String, String, String)>,
+    /// Implicit conversions — see [`Program::conversions`].
+    conversions: Vec<Conversion>,
+    /// Each user `def`'s declared return TYPE NAME, where it has one. Distinct
+    /// from `def_widths`, which keeps only the numeric width and so cannot say
+    /// `String`; naming the type is what lets one extension call chain into
+    /// another (`5.sq.dbl`).
+    func_ret_ty: HashMap<String, String>,
     /// The packages a WILDCARD `import` opened — see
     /// [`Compiler::imported_wildcard`].
     wildcards: Vec<Vec<String>>,
@@ -680,6 +689,13 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         wildcards: prog.import_wildcards.clone(),
         lazies: HashSet::new(),
         implicits: prog.implicits.clone(),
+        extensions: prog.extensions.clone(),
+        conversions: prog.conversions.clone(),
+        func_ret_ty: prog
+            .functions
+            .iter()
+            .filter_map(|f| f.ret_ty.clone().map(|t| (f.name.clone(), t)))
+            .collect(),
         func_type_params: prog
             .functions
             .iter()
@@ -970,6 +986,14 @@ impl Compiler {
                 // only cost of not narrowing the test further is one op on a
                 // declaration that did not need one.
                 let conv = declared_conv(ty.as_deref());
+                // An implicit conversion, when the initializer needs one to
+                // reach the declared type. Rewritten before lowering, so what
+                // is compiled is an ordinary call.
+                let converted_init = init.as_ref().and_then(|e| self.converted(e, ty.as_deref()));
+                let init = &match converted_init {
+                    Some(c) => Some(c),
+                    None => init.clone(),
+                };
                 // `lazy val x = e` — the initializer becomes a zero-argument
                 // thunk parked in a cell, and every read of `x` forces it once
                 // (see [`crate::host::LAZY_FORCE`]). The cell is what gives the
@@ -2504,6 +2528,74 @@ impl Compiler {
         Ok(())
     }
 
+    /// `e` with an implicit conversion applied, when one is needed to reach the
+    /// declared type `to`.
+    ///
+    /// Needed means all of: the target type is known, the value's static type
+    /// is known and is NOT already the target, and a conversion between exactly
+    /// those two is in scope. Every one of those is required — an unknown
+    /// static type must not be converted, because a wrong conversion is a wrong
+    /// VALUE rather than an error.
+    fn converted(&self, e: &Expr, to: Option<&str>) -> Option<Expr> {
+        if self.conversions.is_empty() {
+            return None;
+        }
+        let to = base_type(to?);
+        let from = self.static_type_name(e)?;
+        if from == to {
+            return None;
+        }
+        let c = self
+            .conversions
+            .iter()
+            .find(|c| base_type(&c.from) == from && base_type(&c.to) == to)?;
+        Some(if c.is_value {
+            Expr::Method {
+                recv: Box::new(Expr::Var(c.via.clone())),
+                name: "apply".to_string(),
+                args: vec![e.clone()],
+                line: 0,
+            }
+        } else {
+            Expr::Call {
+                name: c.via.clone(),
+                args: vec![e.clone()],
+                line: 0,
+            }
+        })
+    }
+
+    /// The hoisted function an `extension` call selects, or `None` when no
+    /// extension applies.
+    ///
+    /// Selection is by the receiver's STATIC type — `3.name` and `"q".name`
+    /// choose different bodies — so a receiver this frontend cannot name a type
+    /// for selects nothing, and the call takes its ordinary path.
+    ///
+    /// A user class that declares the name keeps it: the reference warns that
+    /// such an extension is never selected. The same rule for a PRIMITIVE
+    /// receiver whose name collides with a real stdlib method is not enforced
+    /// — the stdlib is dispatched at run time here, so there is no compile-time
+    /// list to consult, and an extension that shadows one wins where Scala
+    /// would have ignored it (see `BUGS.md`).
+    fn extension_for(&self, recv: &Expr, name: &str) -> Option<String> {
+        if self.extensions.is_empty() {
+            return None;
+        }
+        let ty = self.static_type_name(recv)?;
+        if self
+            .classes
+            .get(&ty)
+            .is_some_and(|m| m.responds.contains(name))
+        {
+            return None;
+        }
+        self.extensions
+            .iter()
+            .find(|(rt, m, _)| m == name && base_type(rt) == ty)
+            .map(|(_, _, f)| f.clone())
+    }
+
     /// The qualified expression an imported bare name stands for, when the name
     /// bound to nothing else. `import scala.math.abs` makes `abs` mean
     /// `scala.math.abs`, and `abs(-3)` mean `scala.math.abs(-3)`.
@@ -3406,6 +3498,19 @@ impl Compiler {
         if let Some(cls) = self.class_of(e) {
             return Some(cls);
         }
+        // A call to a user `def` — including the hoisted body of an
+        // `extension` — is typed by its declared return type. This is what lets
+        // one extension chain into another (`5.sq.dbl`).
+        let called: Option<String> = match e {
+            Expr::Call { name, .. } => self.func_ret_ty.get(name).cloned(),
+            Expr::Method { recv, name, .. } => self
+                .extension_for(recv, name)
+                .and_then(|f| self.func_ret_ty.get(&f).cloned()),
+            _ => None,
+        };
+        if let Some(t) = called {
+            return Some(base_type(&t));
+        }
         Some(
             match e {
                 Expr::Str(_) => "String",
@@ -3475,6 +3580,19 @@ impl Compiler {
         let Some((params, sig, captured)) = self.func_sig.get(name) else {
             return Ok(args.to_vec());
         };
+        // An argument reaching a parameter of a declared type is one of the two
+        // points Scala inserts an implicit conversion. Applied HERE, before the
+        // plain-signature shortcut below returns, and positionally — a named
+        // argument is placed later and converted with the rest.
+        let converted: Vec<Expr> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| match sig.get(i) {
+                Some(p) if !p.vararg => self.converted(a, p.ty.as_deref()).unwrap_or(a.clone()),
+                _ => a.clone(),
+            })
+            .collect();
+        let args: &[Expr] = &converted;
         let plain = sig
             .iter()
             .all(|p| p.default.is_none() && !p.vararg && !p.by_name);
@@ -3685,6 +3803,15 @@ impl Compiler {
                     return Ok(());
                 }
             }
+        }
+        // An `extension` method, selected on the RECEIVER's static type. A real
+        // MEMBER wins — Scala warns that a colliding extension "will never be
+        // selected from type C" — so a user class that responds to the name is
+        // left to its own dispatch.
+        if let Some(f) = self.extension_for(recv, name) {
+            let mut full = vec![recv.clone()];
+            full.extend_from_slice(args);
+            return self.call(&f, &full, line);
         }
         let w = self.method_width(recv, name, args);
         // A lambda argument's parameters are typed by the traversal, so the
@@ -6174,6 +6301,17 @@ fn push_substituted(out: &mut String, word: &str, subst: &[(String, String)]) {
     match subst.iter().find(|(p, _)| p == word) {
         Some((_, t)) => out.push_str(t),
         None => out.push_str(word),
+    }
+}
+
+/// A declared type's base name, with type arguments dropped: `List[A]` is
+/// `List`. Extension selection compares base names, since the arguments are a
+/// typing concern this frontend does not model.
+fn base_type(ty: &str) -> String {
+    let t = ty.trim();
+    match t.find('[') {
+        Some(i) => t[..i].trim().to_string(),
+        None => t.to_string(),
     }
 }
 

@@ -100,6 +100,13 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   wherever it is reached from: out of a `List`, a `case class` field, a `Map`
   value, or an `Any`. What it costs is the JIT, which takes only the VM's two
   native numeric shapes; see `BUGS.md`.
+- **Scala 3 implicits** — `given` in all four shapes (named or anonymous, by
+  value or by `with { … }` body), `using` clauses written or supplied,
+  `summon[T]`, context bounds (`[A: Sh]`), `extension` methods dispatched on
+  the receiver's type, and implicit conversions applied where Scala applies
+  them. A type-class instance is a singleton `object`, which already works as a
+  value, so `def show[A: Sh](x: A)` resolves to the right instance from the
+  argument's type. Two candidates of one type is an error, not a pick.
 - **`lazy val`** — the initializer runs at the FIRST read and at most once, and
   not at all if the binding is never read. All three are observable when it
   prints or throws, so the binding holds a thunk in a cell until the first read
