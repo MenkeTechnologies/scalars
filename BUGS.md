@@ -627,19 +627,40 @@ reported as parse/compile errors, never silently mis-run.
   allows it — as an argument — and rejected everywhere else, which is also what
   Scala does. A spread handed to a parameter that is not repeated is a compile
   error on both sides.
-- **A `Map`'s and `Set`'s inserts are LINEAR, so filling one is quadratic.**
-  Both are stored as an ordered entry vector, which is what makes their
-  iteration order byte-reproducible (the CHAMP trie order, the mutable table
-  order); a lookup therefore scans, where Scala's hashes. Filling a
-  `mutable.Map` by key measured 1.27s / 5.06s / 20.41s of user time at n = 4k /
-  8k / 16k — 4x per doubling, the growth class rather than a constant factor.
-  Element WRITES on a sequence do NOT have this shape: `ListBuffer`/`ArrayBuffer`
-  `+=`, `Queue.enqueue`, `StringBuilder.append` and `a(i) = v` all measure
-  0.01-0.02 / 0.02-0.03 / 0.04-0.06s across the same n, which is 2x per doubling
-  (`append_in_place`). Closing this needs
-  a hash index beside the entry vector, which has to preserve that vector as the
-  order of record; it is not done, and the cost is stated here rather than
-  hidden.
+- **Building an IMMUTABLE `Map`/`Set` one entry at a time is quadratic.**
+  `m = m + (k -> v)` in a loop measured 2.5s / 12.4s / 34.6s at n = 2k / 4k / 8k
+  — 4x per doubling, the growth class rather than a constant factor. Scala's
+  immutable `Map` is a persistent CHAMP trie: `+` shares all but one path with
+  the map it came from, so it is `O(log n)`. Here the entries are one ordered
+  vector — which is what makes the trie's iteration order byte-reproducible —
+  and `+` copies it, so each step is `O(n)`. Closing this needs a persistent
+  structure, not an index: the cost is the COPY that `+` is defined to make, and
+  no lookup accelerator removes it. The MUTABLE collections do not have this
+  shape (see below), and `.toMap` / `Map(pairs: _*)` from an existing sequence
+  builds in one pass.
+
+  The mutable ones were quadratic for a different and removable reason, and are
+  not any more. A `mutable.Map`/`Set` is stored in the table's iteration order,
+  and every add used to copy the whole collection, re-sort it into that order,
+  and scan it linearly for the key — three `O(n)` steps per insert. An add now
+  binary-searches the vector it is already sorted by (`mut_find_slot`) and
+  splices in place, and the reads (`apply`, `get`, `contains`) answer from the
+  same search without copying anything (`mut_map_fast` / `mut_set_fast`). The
+  full rebuild is still what runs when the table GROWS, which re-buckets every
+  entry — that is the real `O(n)` step, and the doubling amortizes it to `O(1)`
+  per insert. Filling by key went from 4.13s / 5.30s / 24.76s at n = 4k / 8k /
+  16k to 0.03s / 0.06s / 0.11s, and holds 2x per doubling out to n = 64k
+  (0.41s); a `Set` went from 1.24s / 5.42s / 19.57s to 0.02s / 0.04s / 0.09s,
+  and 0.28s at 64k. Sequence writes have the same amortized-`O(1)` shape for the
+  same reason (`append_in_place`): `ListBuffer`/`ArrayBuffer` `+=`,
+  `Queue.enqueue`, `StringBuilder.append` and `a(i) = v`.
+
+  The fast path is skipped, leaving the rebuild, whenever the collection's
+  stored order is not the table's — which happens when a key does not hash, so
+  `mut_ordered` could not produce that order. An `Array` key, a plain
+  (non-`case`) instance and a function value are the shapes that do not: their
+  JVM hash is an identity no reimplementation can reproduce, so such a
+  collection's iteration order is unreproducible anyway.
 - **Lazy views.** `.view` and `LazyList`. `Iterator` itself is no longer one of
   these gaps: `.iterator`/`.reverseIterator` (and `grouped`/`sliding`) answer a
   real [`SeqKind::Iterator`], which renders `<iterator>`, answers

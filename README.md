@@ -569,6 +569,19 @@ general method path does and what had made either one quadratic in a loop:
 never finished), and filling a 16,000-element `Array` by index took 6.8s. They
 are 0.16s, 0.79s and 0.04s.
 
+A `mutable.Map`/`Set` insert is amortized O(1) for the same reason plus one
+more. Its entries are stored in the hash table's own iteration order, which is
+what makes printing one byte-identical to `scala`; an add used to copy the
+collection, re-sort it into that order, and scan it for the key. It now
+binary-searches the order it is already sorted by and splices in place, and
+`apply`/`get`/`contains` answer from the same search without copying. The
+re-sort still runs when the table GROWS and re-buckets everything — the
+doubling amortizes it. Filling a `mutable.Map` by key across n = 4k / 8k / 16k
+went from 4.13s / 5.30s / 24.76s to 0.03s / 0.06s / 0.11s, and stays at 2x per
+doubling out to n = 64k; a `mutable.Set` went from 1.24s / 5.42s / 19.57s to
+0.02s / 0.04s / 0.09s. Building an IMMUTABLE map one `+` at a time is still
+quadratic — see `BUGS.md`.
+
 ### Differential parity fuzzer
 
 `cargo run --bin parity-fuzz -- --count 300 --probes 40` generates

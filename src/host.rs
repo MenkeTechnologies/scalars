@@ -1522,6 +1522,9 @@ pub fn reset_heap() {
     // compiles its own, so a stale hit would jump into unrelated bytecode.
     METHOD_ENTRIES.with(|t| t.borrow_mut().clear());
     USER_TOSTRING.with(|t| t.set(None));
+    // The table-order ledger is keyed by arena index, which the clear above
+    // invalidates; a stale id would claim a fresh collection is already sorted.
+    MUT_SORTED.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -3537,6 +3540,99 @@ fn known_size(v: &Value) -> Option<usize> {
     as_map(v).map(|m| m.len())
 }
 
+thread_local! {
+    /// Heap ids of mutable hash collections whose stored `Vec` is KNOWN to be in
+    /// the table's iteration order.
+    ///
+    /// [`mut_ordered`] answers `None` when any key is unhashable, and the caller
+    /// then stores insertion order instead — a documented fallback for a
+    /// collection whose real order is a JVM identity hash and unreproducible
+    /// anyway. The incremental insert below binary-searches, which is only valid
+    /// on a sorted vector, so it needs to tell the two apart. Membership is
+    /// therefore recorded at the one place the order is established, and an
+    /// absent id simply takes the full-rebuild path — the ledger can only make
+    /// the fast path unavailable, never wrong.
+    ///
+    /// Ids are arena indices, which [`reset_heap`] invalidates, so it clears
+    /// this too.
+    static MUT_SORTED: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Record whether the vector just stored for `recv` is in table order.
+fn mut_note_sorted(recv: &Value, sorted: bool) {
+    if let Value::Obj(id) = recv {
+        MUT_SORTED.with(|s| {
+            let mut s = s.borrow_mut();
+            if sorted {
+                s.insert(*id);
+            } else {
+                s.remove(id);
+            }
+        });
+    }
+}
+
+/// Whether `recv`'s stored vector is known to be in table order.
+fn mut_is_sorted(recv: &Value) -> bool {
+    match recv {
+        Value::Obj(id) => MUT_SORTED.with(|s| s.borrow().contains(id)),
+        _ => false,
+    }
+}
+
+/// The position a mutable hash table's iteration order sorts a key by: its
+/// bucket index, then its improved hash. `None` for an unhashable key — an
+/// `Array`, a plain (non-`case`) instance, a function value — whose JVM hash is
+/// an identity no reimplementation can reproduce.
+fn mut_slot(v: &Value, len: usize) -> Option<(usize, i32)> {
+    let h = mut_improve(scala_hash(v)?);
+    Some(((h as u32 as usize) & (len - 1), h))
+}
+
+/// Where a key belongs in a vector already held in the table order for `len`,
+/// as `(insert_at, found)`: the index of the first entry ordered AFTER the key,
+/// and the index of an entry equal to it when the table already holds one.
+///
+/// This is what makes an insert cost `O(log n)` hashes instead of the `O(n)`
+/// [`mut_ordered`] rebuild. The vector is sorted by `(bucket, improved hash)`
+/// with ties in insertion order, so the run of entries sharing the key's slot
+/// is a contiguous range found by two binary searches; equality is then tested
+/// only inside that run, and a genuinely new key lands at its END, which is
+/// where a stable sort by insertion index would have put it.
+///
+/// `None` when the key does not hash, or when a probe lands on an entry that
+/// does not — the caller falls back to the full rebuild.
+fn mut_find_slot<T>(
+    items: &[T],
+    len: usize,
+    k: &Value,
+    key: impl Fn(&T) -> Value,
+) -> Option<(usize, Option<usize>)> {
+    let slot = mut_slot(k, len)?;
+    // `partition_point` needs a monotone predicate, which holds because the
+    // vector is sorted by exactly this key. An unhashable entry would break
+    // that, so it aborts the whole search rather than answering from it.
+    let broke = std::cell::Cell::new(false);
+    let probe = |x: &T| match mut_slot(&key(x), len) {
+        Some(s) => s,
+        None => {
+            broke.set(true);
+            (usize::MAX, i32::MAX)
+        }
+    };
+    let start = items.partition_point(|x| probe(x) < slot);
+    let end = start + items[start..].partition_point(|x| probe(x) == slot);
+    if broke.get() {
+        return None;
+    }
+    let found = items[start..end]
+        .iter()
+        .position(|x| value_eq(&key(x), k))
+        .map(|i| start + i);
+    Some((end, found))
+}
+
 /// The order a mutable hash table iterates `items`: bucket index ascending,
 /// then improved hash ascending, ties keeping their current order. `None` when
 /// any key is unhashable, which leaves the caller's insertion order alone.
@@ -4410,6 +4506,10 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
 
 /// Replace the contents (and kind) of the mutable sequence `recv` points at.
 fn set_seq_items(recv: &Value, kind: SeqKind, items: Vec<Value>) {
+    // Any wholesale replacement forfeits the table-order claim; the one caller
+    // that establishes the order re-asserts it right after. Fail-safe: a lost
+    // claim costs a rebuild, a wrong one would misplace an element.
+    mut_note_sorted(recv, false);
     if let Value::Obj(id) = recv {
         HEAP.with(|h| {
             if let Some(HeapVal::Seq(k, xs)) = h.borrow_mut().get_mut(*id as usize) {
@@ -4440,6 +4540,21 @@ fn new_pair_of((k, v): (Value, Value)) -> Value {
 /// Add `adds` to the `mutable.HashSet` behind `recv`, replaying the table growth
 /// `add` would have done and re-sorting into the table's iteration order.
 fn mut_set_add(recv: &Value, len: usize, items: &[Value], adds: &[Value], hint: Option<usize>) {
+    // The fast path: the table does not grow, its stored vector is already in
+    // table order, and every added element hashes. Then each add is a binary
+    // search and a splice, with no copy of the collection and no re-sort — which
+    // is what keeps filling a set linear instead of quadratic.
+    // `mut_grown` is asked with every add counted as NEW — the worst case for
+    // growth. If the table does not grow even then, it cannot grow for the adds
+    // that turn out to be repeats either, and the fast path applies.
+    let worst = vec![true; adds.len()];
+    if mut_grown(mut_size_hint(len, hint), items.len(), &worst) == len
+        && mut_is_sorted(recv)
+        && adds.iter().all(|a| mut_slot(a, len).is_some())
+    {
+        mut_set_splice(recv, len, adds);
+        return;
+    }
     let mut cur = items.to_vec();
     let mut flags = Vec::with_capacity(adds.len());
     for a in adds {
@@ -4450,8 +4565,182 @@ fn mut_set_add(recv: &Value, len: usize, items: &[Value], adds: &[Value], hint: 
         }
     }
     let len = mut_grown(mut_size_hint(len, hint), items.len(), &flags);
-    let ordered = mut_ordered(&cur, len, Clone::clone).unwrap_or(cur);
-    set_seq_items(recv, SeqKind::Set(HashRep::Mutable(len as u32)), ordered);
+    let ordered = mut_ordered(&cur, len, Clone::clone);
+    let sorted = ordered.is_some();
+    set_seq_items(
+        recv,
+        SeqKind::Set(HashRep::Mutable(len as u32)),
+        ordered.unwrap_or(cur),
+    );
+    mut_note_sorted(recv, sorted);
+}
+
+/// Splice `adds` into the mutable-SET vector behind `recv`, in place and in
+/// table order, without copying the collection.
+///
+/// The caller has already established the two preconditions — the collection's
+/// stored order is the table's, and every added element hashes — so no element
+/// here can fail to be placed. That is why this returns nothing to check: a
+/// partial splice would leave the collection in an order neither path produces.
+///
+/// Positions are computed under a SHARED borrow that is released before the
+/// write: hashing a `Value::Obj` key reads the arena itself, so the lookup
+/// cannot run inside a `borrow_mut`, and it nests a second shared borrow inside
+/// this one. Each add is located and then applied, one at a time, so a repeat
+/// within one `++=` sees what the earlier ones added.
+fn mut_set_splice(recv: &Value, len: usize, adds: &[Value]) {
+    let Value::Obj(id) = recv else { return };
+    let id = *id as usize;
+    for a in adds {
+        // A SHARED borrow, which the hashing inside the lookup may nest another
+        // of (a `Value::Obj` key's hash reads the arena). It is dropped before
+        // the write below, which needs the exclusive one.
+        let Some((at, found)) = HEAP.with(|h| {
+            let hb = h.borrow();
+            match hb.get(id) {
+                Some(HeapVal::Seq(_, xs)) => mut_find_slot(xs, len, a, Clone::clone),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        if found.is_some() {
+            continue;
+        }
+        HEAP.with(|h| {
+            if let Some(HeapVal::Seq(_, xs)) = h.borrow_mut().get_mut(id) {
+                xs.insert(at, a.clone());
+            }
+        });
+    }
+}
+
+/// A `Map` handle's representation and entry COUNT, without copying it.
+///
+/// [`map_rep_entries`] clones the whole entry list, which every `Map` method
+/// used to pay before it knew whether it needed one — including the `update`
+/// that fills a map in a loop, making that loop quadratic on the copy alone.
+fn map_rep_len(v: &Value) -> Option<(HashRep, usize)> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Map(rep, m)) => Some((*rep, m.len())),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// The `mutable.Map` operations that can be answered in place, with no copy of
+/// the map and no rebuild of its order. `None` means the name is not one of
+/// them, or its preconditions do not hold, and the caller takes the ordinary
+/// path — which is exactly what it did before this existed.
+///
+/// The preconditions are the two [`mut_map_splice`] needs (the stored order is
+/// the table's, and the key hashes) plus, for a write, that the table does not
+/// grow. A growth re-buckets every entry, so it goes through the full rebuild
+/// and pays its `O(n)` there — amortized to `O(1)` per insert by the doubling.
+fn mut_map_fast(
+    recv: &Value,
+    rep: HashRep,
+    n: usize,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let HashRep::Mutable(len) = rep else {
+        return None;
+    };
+    let len = len as usize;
+    if !mut_is_sorted(recv) {
+        return None;
+    }
+    // The key each supported name reads or writes at.
+    let (k, v) = match (name, args.len()) {
+        ("apply" | "get" | "contains" | "isDefinedAt", 1) => (&args[0], None),
+        ("update" | "put" | "getOrElseUpdate", 2) => (&args[0], Some(&args[1])),
+        _ => return None,
+    };
+    mut_slot(k, len)?;
+    let (_, found) = HEAP.with(|h| {
+        let hb = h.borrow();
+        match hb.get(as_obj_id(recv)?) {
+            Some(HeapVal::Map(_, m)) => mut_find_slot(m, len, k, |(ek, _)| ek.clone()),
+            _ => None,
+        }
+    })?;
+    let existing = found.and_then(|i| {
+        HEAP.with(|h| match h.borrow().get(as_obj_id(recv)?) {
+            Some(HeapVal::Map(_, m)) => Some(m[i].1.clone()),
+            _ => None,
+        })
+    });
+    match name {
+        "apply" => {
+            return Some(match existing {
+                Some(v) => Ok(v),
+                None => Err(format!(
+                    "scalars: java.util.NoSuchElementException: key not found: {}",
+                    scala_str(k)
+                )),
+            })
+        }
+        "get" => return Some(Ok(opt(existing))),
+        "contains" | "isDefinedAt" => return Some(Ok(Value::bool(existing.is_some()))),
+        "getOrElseUpdate" if existing.is_some() => return Some(Ok(existing.expect("just tested"))),
+        _ => {}
+    }
+    let v = v.expect("the write names all carry a value");
+    // A new key grows the table one insertion earlier than a repeat does, so the
+    // growth question is asked with the answer the lookup already found.
+    if mut_grown(len, n, &[found.is_none()]) != len {
+        return None;
+    }
+    let displaced = mut_map_splice(recv, len, &[(k.clone(), v.clone())]);
+    Some(Ok(match name {
+        "put" => opt(displaced),
+        "getOrElseUpdate" => v.clone(),
+        _ => Value::Undef,
+    }))
+}
+
+/// A heap handle's arena index.
+fn as_obj_id(v: &Value) -> Option<usize> {
+    match v {
+        Value::Obj(id) => Some(*id as usize),
+        _ => None,
+    }
+}
+
+/// The same for a mutable MAP: a new key is spliced in at its table position, a
+/// repeated one keeps its position and takes the new value (`put0`'s rule).
+/// Answers the value a repeated key displaced, for `put`.
+fn mut_map_splice(recv: &Value, len: usize, adds: &[(Value, Value)]) -> Option<Value> {
+    let Value::Obj(id) = recv else { return None };
+    let id = *id as usize;
+    let mut displaced = None;
+    for (k, v) in adds {
+        let Some((at, found)) = HEAP.with(|h| {
+            let hb = h.borrow();
+            match hb.get(id) {
+                Some(HeapVal::Map(_, m)) => mut_find_slot(m, len, k, |(ek, _)| ek.clone()),
+                _ => None,
+            }
+        }) else {
+            return displaced;
+        };
+        HEAP.with(|h| {
+            if let Some(HeapVal::Map(_, m)) = h.borrow_mut().get_mut(id) {
+                match found {
+                    Some(i) => {
+                        displaced = Some(m[i].1.clone());
+                        m[i].1 = v.clone();
+                    }
+                    None => m.insert(at, (k.clone(), v.clone())),
+                }
+            }
+        });
+    }
+    displaced
 }
 
 /// In-place mutation of a mutable sequence (`Array`, `ListBuffer`,
@@ -4681,11 +4970,12 @@ fn mut_seq_method(
 /// entries are stored exactly as given; a `HashMap` is re-sorted into the
 /// iteration order a table of `len` buckets produces.
 fn set_map_entries(recv: &Value, into: HashRep, entries: Vec<(Value, Value)>) {
-    let ordered = match into {
-        HashRep::Mutable(len) => {
-            mut_ordered(&entries, len as usize, |(k, _)| k.clone()).unwrap_or(entries)
-        }
-        _ => entries,
+    let (ordered, sorted) = match into {
+        HashRep::Mutable(len) => match mut_ordered(&entries, len as usize, |(k, _)| k.clone()) {
+            Some(o) => (o, true),
+            None => (entries, false),
+        },
+        _ => (entries, false),
     };
     if let Value::Obj(id) = recv {
         HEAP.with(|h| {
@@ -4695,6 +4985,10 @@ fn set_map_entries(recv: &Value, into: HashRep, entries: Vec<(Value, Value)>) {
             }
         });
     }
+    // Recorded AFTER the write, so the claim describes what is now stored. A
+    // representation with no table order (`Small`, `Hashed`, `Linked`) never
+    // claims one — the incremental insert is a mutable-table optimization.
+    mut_note_sorted(recv, sorted);
 }
 
 /// Put `adds` into the mutable map behind `recv`. On a `HashMap` this replays
@@ -4708,6 +5002,20 @@ fn mut_map_put(
     adds: &[(Value, Value)],
     hint: Option<usize>,
 ) -> Option<Value> {
+    // The fast path, as in `mut_set_add`: the table cannot grow even with every
+    // add counted as new, the stored entries are already in table order, and
+    // every added key hashes. Then each add is a binary search and a splice —
+    // no copy of the map, no re-sort — which is what keeps filling one linear.
+    if let HashRep::Mutable(len) = rep {
+        let len = len as usize;
+        let worst = vec![true; adds.len()];
+        if mut_grown(mut_size_hint(len, hint), entries.len(), &worst) == len
+            && mut_is_sorted(recv)
+            && adds.iter().all(|(k, _)| mut_slot(k, len).is_some())
+        {
+            return mut_map_splice(recv, len, adds);
+        }
+    }
     let mut cur = entries.to_vec();
     let mut flags = Vec::with_capacity(adds.len());
     let mut displaced = None;
@@ -4857,6 +5165,53 @@ fn mut_map_method(
 /// A `StringBuilder` given an object argument also falls through: that argument
 /// is rendered through a user `toString` override, which needs the VM this
 /// function deliberately does not take.
+/// The `mutable.Set` operations that can be answered in place, with no copy of
+/// the set and no rebuild of its order — the `Set` counterpart of
+/// [`mut_map_fast`], and quadratic for the same reason without it.
+fn mut_set_fast(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    if args.len() != 1 || !matches!(name, "+=" | "add" | "addOne" | "contains" | "apply") {
+        return None;
+    }
+    let id = as_obj_id(recv)?;
+    let (len, n) = HEAP.with(|h| match h.borrow().get(id) {
+        Some(HeapVal::Seq(SeqKind::Set(HashRep::Mutable(len)), xs)) => {
+            Some((*len as usize, xs.len()))
+        }
+        _ => None,
+    })?;
+    if !mut_is_sorted(recv) {
+        return None;
+    }
+    let k = &args[0];
+    mut_slot(k, len)?;
+    let (at, found) = HEAP.with(|h| {
+        let hb = h.borrow();
+        match hb.get(id) {
+            Some(HeapVal::Seq(_, xs)) => mut_find_slot(xs, len, k, Clone::clone),
+            _ => None,
+        }
+    })?;
+    if matches!(name, "contains" | "apply") {
+        return Some(Ok(Value::bool(found.is_some())));
+    }
+    // A growth re-buckets every element, so it takes the full rebuild and pays
+    // its `O(n)` there — amortized to `O(1)` per add by the doubling.
+    if mut_grown(len, n, &[found.is_none()]) != len {
+        return None;
+    }
+    if found.is_none() {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Seq(_, xs)) = h.borrow_mut().get_mut(id) {
+                xs.insert(at, k.clone());
+            }
+        });
+    }
+    Some(Ok(match name {
+        "add" => Value::bool(found.is_none()),
+        _ => recv.clone(),
+    }))
+}
+
 fn append_in_place(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let Value::Obj(id) = recv else {
         return None;
@@ -4939,6 +5294,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // Appending is answered BEFORE the receiver's elements are read, because
     // reading them is what made appending quadratic — see [`append_in_place`].
     if let Some(r) = append_in_place(recv, name, args) {
+        return r;
+    }
+    // Same reasoning for a `mutable.Set`, whose adds and lookups need neither a
+    // copy nor a re-sort.
+    if let Some(r) = mut_set_fast(recv, name, args) {
         return r;
     }
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
@@ -5693,6 +6053,14 @@ fn seq_product(items: &[Value]) -> Value {
 /// survive); one that answers a bare sequence answers a `List`, as Scala's
 /// `Map.to*` do.
 fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // Asked BEFORE the entries are copied: the in-place reads and writes need
+    // neither a copy nor a rebuild, and paying for one on every `m(k) = v` is
+    // what made filling a map quadratic.
+    if let Some((rep, n)) = map_rep_len(recv) {
+        if let Some(r) = mut_map_fast(recv, rep, n, name, args) {
+            return r;
+        }
+    }
     let (rep, entries) = map_rep_entries(recv).unwrap_or((HashRep::Small, Vec::new()));
     // Every closure-taking `Map` method passes one `Tuple2` argument. Built on
     // DEMAND, because materializing it allocates a fresh heap tuple PER ENTRY:
@@ -7312,9 +7680,14 @@ fn mut_set_from(len: usize, items: Vec<Value>) -> Value {
         }
     }
     let len = mut_grown(len, 0, &adds);
-    heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Mutable(len as u32)), {
-        mut_ordered(&uniq, len, Clone::clone).unwrap_or(uniq)
-    }))
+    let ordered = mut_ordered(&uniq, len, Clone::clone);
+    let sorted = ordered.is_some();
+    let v = heap_push(HeapVal::Seq(
+        SeqKind::Set(HashRep::Mutable(len as u32)),
+        ordered.unwrap_or(uniq),
+    ));
+    mut_note_sorted(&v, sorted);
+    v
 }
 
 /// Build a `mutable.HashMap` the same way, keyed by each entry's key. A repeated
@@ -7331,9 +7704,14 @@ fn mut_map_from(len: usize, entries: Vec<(Value, Value)>) -> Value {
         }
     }
     let len = mut_grown(len, 0, &adds);
-    heap_push(HeapVal::Map(HashRep::Mutable(len as u32), {
-        mut_ordered(&uniq, len, |(k, _)| k.clone()).unwrap_or(uniq)
-    }))
+    let ordered = mut_ordered(&uniq, len, |(k, _)| k.clone());
+    let sorted = ordered.is_some();
+    let v = heap_push(HeapVal::Map(
+        HashRep::Mutable(len as u32),
+        ordered.unwrap_or(uniq),
+    ));
+    mut_note_sorted(&v, sorted);
+    v
 }
 
 /// Build an immutable `Map` from already-deduplicated `entries` — the `Set`
