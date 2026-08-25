@@ -107,6 +107,10 @@ pub enum Tok {
     RArrow,
     /// `::` — list cons.
     ColonColon,
+    /// `#::` — `LazyList`'s cons. Distinct from [`Tok::ColonColon`] because its
+    /// right operand is BY-NAME: that is what lets a `LazyList` be defined in
+    /// terms of itself.
+    HashColonColon,
     /// `@` — the pattern binder (`case n @ Some(v) =>`).
     At,
     /// A symbolic method operator with no dedicated token: `++`, `--`, `:+`, `+:`.
@@ -548,6 +552,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             "++=" | "--=" => (Tok::OpAssign(three.to_string()), 3),
             // `>>>` — the logical right shift, longest match before `>>`.
             ">>>" => (Tok::Op(three.to_string()), 3),
+            // `#::` — `LazyList`'s cons. Matched at three characters, before
+            // the `::` below could take the last two and leave a stray `#`.
+            "#::" => (Tok::HashColonColon, 3),
             _ => match two {
                 "<-" => (Tok::LArrow, 2),
                 "=>" => (Tok::FatArrow, 2),

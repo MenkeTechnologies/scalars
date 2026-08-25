@@ -651,4 +651,8 @@ pub enum BinOp {
     Or,
     /// `::` — list cons (right-associative; prepends the left operand).
     Cons,
+    /// `#::` — `LazyList`'s cons. Its right operand is BY-NAME: the compiler
+    /// wraps it in a thunk, which is what lets a `LazyList` be defined in terms
+    /// of itself (`val fibs = 0 #:: 1 #:: fibs.zip(fibs.tail)…`).
+    LazyCons,
 }

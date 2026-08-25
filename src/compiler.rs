@@ -5526,6 +5526,16 @@ impl Compiler {
         // `"" + f` and `s"$f"` must render `f` as a `Float`, not as the `Double`
         // holding its bits. Only a `+` whose FAR side is a `String` is a
         // concatenation, so that is what gates the conversion; an arithmetic `+`
+        // `#::` — the tail is BY-NAME, so it becomes a zero-argument thunk
+        // instead of being evaluated here. That is the whole difference from
+        // `::`, and it is what lets a `LazyList` be defined in terms of itself:
+        // by the time the thunk runs, the binding it reads has been assigned.
+        if let BinOp::LazyCons = op {
+            self.expr(lhs)?;
+            self.lambda(&[], rhs, false)?;
+            self.b.emit(Op::CallBuiltin(crate::host::LAZY_CONS, 2), 0);
+            return Ok(());
+        }
         // took the branch above and never reaches here.
         self.expr(lhs)?;
         if op == BinOp::Add && yields_strings(rhs) {
@@ -5583,6 +5593,7 @@ impl Compiler {
             BinOp::Mul => Op::Mul,
             BinOp::Div => unreachable!("division routed through the SDIV builtin above"),
             BinOp::Cons => unreachable!("cons routed through the LIST_CONS builtin above"),
+            BinOp::LazyCons => unreachable!("`#::` routed through the LAZY_CONS builtin above"),
             BinOp::Mod => unreachable!("remainder routed through the SMOD builtin above"),
             BinOp::Eq => Op::NumEq,
             BinOp::Ne => Op::NumNe,

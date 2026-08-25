@@ -695,27 +695,21 @@ reported as parse/compile errors, never silently mis-run.
   MUTABLE `Map`/`Set` do not have this shape: their inserts are amortized
   `O(1)` (see the entry above), and so are the growable sequences.
 
-- **A `LazyList` cannot be built by `#::`, and a few of its combinators are
-  missing.** The structure itself is real now: elements are produced on demand
-  and MEMOISED, so an infinite source works (`LazyList.from(1)`,
-  `.iterate(seed)(f)`, `.continually(v)`), a literal starts unforced, printing
-  one shows only what has been computed (`LazyList(1, 2, <not computed>)`), and
-  `map`/`filter`/`zip`/`tail`/`drop` force nothing at all — they build a rule
-  over the source, which is what keeps them usable on an infinite one.
-  Traversing twice recomputes nothing, which a program can count.
+- **A `LazyList` combinator that must see every element terminates only on a
+  finite list**, as in Scala — `toList`, `sum`, `length`, `mkString`,
+  `foreach`. An infinite one is BOUNDED rather than left to hang: forcing gives
+  up after a million steps and reports, because an infinite source with no
+  element matching a `filter` cannot be told from a slow one.
 
-  What is missing is the CONS operator: `0 #:: 1 #:: rest` does not lex, so the
-  self-referential definition that makes a `LazyList` interesting
-  (`val fibs: LazyList[Int] = 0 #:: 1 #:: fibs.zip(fibs.tail).map(…)`) cannot
-  be written. The runtime supports it — a cons node holds its tail as an unrun
-  thunk precisely so the binding can be read after it exists — and only the
-  surface syntax is absent.
-
-  A combinator that must see every element (`toList`, `sum`, `length`,
-  `mkString`, `foreach`) terminates only on a finite list, as in Scala. An
-  infinite one is bounded rather than left to hang: forcing stops after a
-  million steps and reports, since an infinite source with no matching element
-  is indistinguishable from a slow one.
+  The structure itself is complete. Elements are produced on demand and
+  MEMOISED, so the infinite factories work (`LazyList.from(1)`,
+  `.iterate(seed)(f)`, `.continually(v)`), `#::` conses with a BY-NAME tail —
+  which is what makes a list definable in terms of itself
+  (`val fibs: LazyList[Int] = 0 #:: 1 #:: fibs.zip(fibs.tail).map(…)`) —
+  `map`/`filter`/`zip`/`tail`/`drop` force nothing, a literal starts unforced,
+  and printing shows only what has been computed
+  (`LazyList(1, 2, <not computed>)`). Traversing twice recomputes nothing,
+  which a program can count.
 
 - **A `Char` range — `'a' to 'e'`, `'a' until 'z'`, `for (c <- 'a' to 'd')`.**
   Scala's is a `NumericRange[Char]`, which this frontend has no representation

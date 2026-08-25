@@ -112,7 +112,9 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   `.iterate(seed)(f)` and `.continually(v)` are infinite and usable.
   `map`/`filter`/`zip`/`tail`/`drop` force nothing, printing one shows only
   what has been computed (`LazyList(1, 2, <not computed>)`), and a second
-  traversal recomputes none of it.
+  traversal recomputes none of it. `#::` conses with a BY-NAME tail, so a list
+  can be defined in terms of itself:
+  `val fibs: LazyList[Int] = 0 #:: 1 #:: fibs.zip(fibs.tail).map(_ + _)`.
 - **`lazy val`** — the initializer runs at the FIRST read and at most once, and
   not at all if the binding is never read. All three are observable when it
   prints or throws, so the binding holds a thunk in a cell until the first read

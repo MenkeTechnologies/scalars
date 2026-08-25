@@ -2122,9 +2122,11 @@ impl Parser {
                     break;
                 }
                 self.advance();
-                // `::` (cons) is right-associative: `1 :: 2 :: Nil` is
-                // `1 :: (2 :: Nil)`.
-                let rhs = if op == BinOp::Cons {
+                // The cons operators are right-associative: `1 :: 2 :: Nil`
+                // is `1 :: (2 :: Nil)`, and `0 #:: 1 #:: rest` likewise. Read
+                // the other way, the HEAD of `1 #:: 2 #:: a` becomes the list
+                // `1 #:: 2`.
+                let rhs = if matches!(op, BinOp::Cons | BinOp::LazyCons) {
                     self.binary(bp)?
                 } else {
                     self.binary(bp + 1)?
@@ -3743,6 +3745,8 @@ fn binop(t: &Tok) -> Option<(BinOp, u8)> {
         // `::` (cons) — Scala's `:`-family precedence sits just below `+`/`-`
         // and is right-associative (handled in `binary`).
         Tok::ColonColon => (BinOp::Cons, 6),
+        // `#::` shares `::`'s precedence and right-associativity.
+        Tok::HashColonColon => (BinOp::LazyCons, 6),
         Tok::Plus => (BinOp::Add, 7),
         Tok::Minus => (BinOp::Sub, 7),
         Tok::Star => (BinOp::Mul, 8),
