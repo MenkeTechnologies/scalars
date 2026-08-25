@@ -33,7 +33,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/scalars" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">scalars v0.1.1 · Scala on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no bespoke VM, no JVM · MIT · in active development</p>
+          <p class="docs-build-line">scalars v0.1.2 · Scala on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no bespoke VM, no JVM · MIT · in active development</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -2011,7 +2011,7 @@ println(-3.abs)   // =&gt; 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-int-methods-2">
           <h3><a class="doc-anchor" href="#doc-int-methods-2">#</a> <code>MaxValue</code></h3>
-          <p>A Scala value-class companion's bound: `Int`, `Long`, `Short`, `Byte`, `Char` and `Double` all answer `MaxValue`/`MinValue`, and `Double` adds `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`. These are `scala.Int`'s members, NOT `java.lang.Integer`'s — the two namespaces stay apart, so `Double.parseDouble` is an error here exactly as it is in Scala.</p>
+          <p>A Scala value-class companion's bound: `Int`, `Long`, `Short`, `Byte`, `Char`, `Double` and `Float` all answer `MaxValue`/`MinValue`, and the two floating ones add `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`. `Float`'s are rendered at single precision (`Float.MaxValue` is `3.4028235E38`). These are `scala.Int`'s members, NOT `java.lang.Integer`'s — the two namespaces stay apart, so `Double.parseDouble` is an error here exactly as it is in Scala.</p>
           <pre><code class="lang-scala">Int.MaxValue: Int
 println(Int.MaxValue)   // =&gt; 2147483647</code></pre>
         </article>
@@ -2060,9 +2060,10 @@ println(7.toDouble)   // =&gt; 7.0</code></pre>
         </article>
         <article class="doc-entry" id="doc-int-methods-10">
           <h3><a class="doc-anchor" href="#doc-int-methods-10">#</a> <code>toFloat</code></h3>
-          <p>The integer widened to floating point. There is no distinct 32-bit float, so this is `toDouble`.</p>
-          <pre><code class="lang-scala">n.toFloat: Double
-println(7.toFloat)   // =&gt; 7.0</code></pre>
+          <p>The integer narrowed to a 32-bit `Float`, which rounds: `Int.MaxValue.toFloat` is `2.1474836E9`, not `2.147483647E9`. Distinct from `toDouble`, which is exact for every `Int`.</p>
+          <pre><code class="lang-scala">n.toFloat: Float
+println(7.toFloat)          // =&gt; 7.0
+println(Int.MaxValue.toFloat)   // =&gt; 2.1474836E9</code></pre>
         </article>
         <article class="doc-entry" id="doc-int-methods-11">
           <h3><a class="doc-anchor" href="#doc-int-methods-11">#</a> <code>toByte</code></h3>
@@ -2163,9 +2164,10 @@ println(2.5.toDouble)   // =&gt; 2.5</code></pre>
         </article>
         <article class="doc-entry" id="doc-double-methods-5">
           <h3><a class="doc-anchor" href="#doc-double-methods-5">#</a> <code>toFloat (Double)</code></h3>
-          <p>The receiver unchanged — there is no narrower float type here, so no precision is lost as it would be on the JVM.</p>
-          <pre><code class="lang-scala">d.toFloat: Double
-println(2.5.toFloat)   // =&gt; 2.5</code></pre>
+          <p>The receiver rounded to 32-bit `Float` precision. The rounding is real and observable by widening it back: `0.1.toFloat.toDouble` is `0.10000000149011612`, not `0.1`. A value that fits exactly is unchanged.</p>
+          <pre><code class="lang-scala">d.toFloat: Float
+println(2.5.toFloat)              // =&gt; 2.5
+println(0.1.toFloat.toDouble)   // =&gt; 0.10000000149011612</code></pre>
         </article>
         <article class="doc-entry" id="doc-double-methods-6">
           <h3><a class="doc-anchor" href="#doc-double-methods-6">#</a> <code>isNaN</code></h3>
@@ -2263,26 +2265,34 @@ println(new Box(3).n)   // =&gt; 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-tuples-and-records-7">
           <h3><a class="doc-anchor" href="#doc-tuples-and-records-7">#</a> <code>value</code></h3>
-          <p>The payload field of a `Some`. Scala's `Option` methods — `get`, `getOrElse`, `map`, `isDefined` — are not implemented, so this field and `case Some(v)` are the two ways to open an `Option`.</p>
+          <p>The payload field of a `Some`, and of a `Left`/`Right`. It is the record's field rather than an `Option` method: `get`, `getOrElse`, `map` and `isDefined` all work too, so a field read is the low-level way to open one and `case Some(v)` the idiomatic one.</p>
           <pre><code class="lang-scala">some.value: A
 println(List(1, 2).find(_ &gt; 1).value)   // =&gt; 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-tuples-and-records-8">
-          <h3><a class="doc-anchor" href="#doc-tuples-and-records-8">#</a> <code>toString (record)</code></h3>
+          <h3><a class="doc-anchor" href="#doc-tuples-and-records-8">#</a> <code>left</code></h3>
+          <p>The LEFT-biased view of an `Either`. Scala's `Either` is right-biased — `map`, `getOrElse` and the rest operate on the `Right` and pass a `Left` through — so this projection is how the `Left` is reached without a `match`. It answers `get` (which throws `Either.left.get on Right`), `getOrElse`, `map`, `flatMap`, `foreach`, `exists`/`forall`, `toOption`, `toSeq`/`toList` and `filterToOption`, each the mirror of the right-biased member.</p>
+          <pre><code class="lang-scala">e.left: LeftProjection
+val e: Either[String, Int] = Left("bad")
+println(e.left.getOrElse("none"))   // =&gt; bad
+println(e.left.map(_.length))       // =&gt; Left(3)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-tuples-and-records-9">
+          <h3><a class="doc-anchor" href="#doc-tuples-and-records-9">#</a> <code>toString (record)</code></h3>
           <p>A `case class` renders `Name(f0,f1)` over its primary-constructor parameters only, comma-joined with no space; a plain class renders `Name@&lt;hex&gt;` from its heap handle rather than a JVM identity hash.</p>
           <pre><code class="lang-scala">c.toString: String
 case class P(x: Int, y: Int)
 println(P(1, 2))   // =&gt; P(1,2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-tuples-and-records-9">
-          <h3><a class="doc-anchor" href="#doc-tuples-and-records-9">#</a> <code>equals (record)</code></h3>
+        <article class="doc-entry" id="doc-tuples-and-records-10">
+          <h3><a class="doc-anchor" href="#doc-tuples-and-records-10">#</a> <code>equals (record)</code></h3>
           <p>A `case class` compares structurally, field by field. A plain class compares by identity, so two separately constructed instances are never equal.</p>
           <pre><code class="lang-scala">c.equals(other: Any): Boolean
 case class P(x: Int)
 println(P(1) == P(1))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-tuples-and-records-10">
-          <h3><a class="doc-anchor" href="#doc-tuples-and-records-10">#</a> <code>hashCode (record)</code></h3>
+        <article class="doc-entry" id="doc-tuples-and-records-11">
+          <h3><a class="doc-anchor" href="#doc-tuples-and-records-11">#</a> <code>hashCode (record)</code></h3>
           <p>A `case class` and a tuple both use the MurmurHash3 product hash, so equal values hash equally and reproduce Scala's own numbers. A plain class uses its heap handle.</p>
           <pre><code class="lang-scala">c.hashCode: Int
 case class P(x: Int)
