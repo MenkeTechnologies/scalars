@@ -391,7 +391,7 @@ pub const LAZY_NEW: u16 = 779;
 pub const LAZY_FORCE: u16 = 780;
 
 /// Build a `LazyList`. Stack `[arg…, kindTag]`; the tag selects which rule.
-/// See [`lazy_new_from_tag`].
+/// See `b_lazylist_new`, which reads the tag off the stack.
 pub const LAZYLIST_NEW: u16 = 781;
 
 /// `head #:: tail` — cons onto a `LazyList`, with the TAIL still a thunk.
@@ -10382,8 +10382,8 @@ fn format_double(f: f64) -> String {
 /// The `Value` carrying the `Float` `f` — its IEEE-754 bit pattern.
 ///
 /// `to_bits` canonicalizes nothing, so a `NaN` keeps whichever payload the
-/// operation produced; every place that observes one ([`float_to_int_bits`],
-/// [`format_float32`]) collapses it the way the JVM does.
+/// operation produced; every place that observes one (`float_to_int_bits`,
+/// `format_float32`) collapses it the way the JVM does.
 pub fn make_f32(f: f32) -> Value {
     Value::Status(f.to_bits() as i32)
 }
