@@ -1,6 +1,6 @@
 [package]
 name = "scala-rs"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.80"
 description = "Scala as a fusevm frontend: lexer, parser, and compiler to fusevm::Chunk, run on the shared three-tier Cranelift JIT — no bespoke VM or JVM"
@@ -70,7 +70,7 @@ path = "src/bin/parity_fuzz.rs"
 # block in Scala source is scanned/rewritten by `fusevm::RustSugar`
 # (src/rust_ffi.rs), compiled to a cdylib, and its exports are called by name
 # (the `__rust_compile` / by-name-call dispatch into `fusevm::ffi`).
-fusevm = { version = "0.25.0", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
+fusevm = { version = "0.26.0", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 thiserror = "2.0"
 
