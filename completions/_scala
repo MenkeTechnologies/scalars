@@ -8,6 +8,9 @@ _scala() {
     '--dump-tokens[print the lexer token stream and exit]' \
     '--dump-ast[print the parsed AST and exit]' \
     '--disasm[print the lowered fusevm bytecode and exit]' \
+    '--tiers[run the script, then report which fusevm tiers took its chunks]' \
+    '--lsp[speak the Language Server Protocol over stdio]' \
+    '--dap[speak the Debug Adapter Protocol over stdio]' \
     '*:scala file:_files -g "*.scala"'
 }
 
