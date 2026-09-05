@@ -711,6 +711,69 @@ separator and `toUpperCase` results come from it. A re-capture under `de_DE`
 would freeze `0,13` for `0.13` with nothing about it looking wrong, so the
 locale is now a hard gate beside the version.
 
+**The fuzzer compared stdout and nothing else.** `differs` scored "both sides
+exited non-zero" as agreement, so a program that died with
+`NoSuchElementException: head of empty list` on the reference and
+`IndexOutOfBoundsException: 0` here was a match — and the exception messages are
+the part of this frontend that is hand-written rather than derived, which is why
+the frozen corpus grew an expected-failure half in the first place.
+`tests/parity.rs` has compared them since; the live harness, the thing that
+explores programs nobody wrote down, was blind to the whole surface. It now
+extracts the reference's throwable line (the innermost `Caused by:`, or the
+`Exception in thread` line — an `extends App` body wraps whatever it raises in
+an `ExceptionInInitializerError`) and requires our stderr to carry it, the same
+containment rule the frozen replay applies. An oracle abort with no throwable is
+a compile error and is not compared: the program never ran.
+
+**The run banner named the wrong version.** `scala --version` prints the
+scala-cli launcher's release first and the Scala version second, and the banner
+printed the first — so every recorded session named a number that could not
+reproduce it, and the compiler moving under the corpus (3.8.4 → 3.9.0, which
+happened here between rounds) was invisible in the output. The banner names the
+absolutized oracle path and its compiler now, and a launcher that cannot name
+its compiler is refused.
+
+**`scripts/capture-parity.sh` and `scripts/reverify-parity.sh`** are the mint and
+audit sides of the frozen corpus, sharing one oracle gate
+(`scripts/parity-oracle.zsh`). `tests/parity.rs` replays the corpus without a
+Scala toolchain, which is what lets CI check parity with nothing installed — and
+is also why it cannot tell a captured expectation from an invented one: a line
+written from memory passes there forever, and the only way to make it pass is to
+break the frontend to match. `reverify-parity.sh` re-mints every record from the
+live reference and diffs it byte for byte, batch-compiling each record in its own
+package and running each entry class straight through `java` (~0.2s against the
+launcher's ~6s), then re-capturing anything it flags alone in the default package
+so a package prefix cannot be mistaken for a bad pin.
+
+The gate is a hard error on three axes, because a contaminated oracle is a
+configuration error rather than a warning: the JVM (`Double.toString` was
+reimplemented in JDK 19 and the `String` index faults moved onto `Preconditions`
+in 21, so the floor is 21), the default locale, and whether the launcher can name
+its compiler at all. The JVM axis is live, not theoretical — `scala` is a
+launcher that reads `JAVA_HOME` first, an ambient `jenv` shim points it at
+Corretto 17, and *unsetting* `JAVA_HOME` does not fix it: the launcher then
+resolves through `/usr/libexec/java_home`, which registers no JDK 19+ on this
+machine, and the run dies starting its compilation server.
+
+Probing the collection and `String` surfaces against that oracle closed a cluster
+of members the reference answers and this frontend refused: `sliding(size, step)`
+on sequences and on `String`, `tails`, `inits`, `padTo`, and
+`toIntOption`/`toLongOption`/`toDoubleOption`. `grouped`/`sliding` are now one
+walk rather than three special cases, because the trailing-window rule is subtle
+enough to be worth writing once and wrong to guess at:
+
+```text
+  List(1,2,3).sliding(2)       List(List(1, 2), List(2, 3))
+  List(1,2,3).sliding(2, 2)    List(List(1, 2), List(3))
+  List(1,2,3,4).sliding(3, 2)  List(List(1, 2, 3), List(3, 4))
+  List(1,2,3).sliding(5, 2)    List(List(1, 2, 3))
+```
+
+The first drops its trailing `List(3)` and the second keeps it, for the same
+receiver and the same window size. The rewrite also fixed an empty receiver
+answering one empty window where the reference answers none — invisible in
+`println` (`List("")` and `List()` both print `List()`) and visible in `.size`.
+
 Next waves, in priority order:
 
 1. **Lazy views** — `.view` and `LazyList`. (`Iterator` itself is done: it is a

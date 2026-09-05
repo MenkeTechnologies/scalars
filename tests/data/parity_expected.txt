@@ -522,3 +522,21 @@ object Even { def unapply(i: Int): Option[Int] = if (i % 2 == 0) Some(i / 2) els
 object Pair { def unapplySeq(s: String): Option[Seq[String]] = Some(s.split(",").toSeq) }; object T extends App { "a,b,c" match { case Pair(x, y, z) => println(x+y+z); case _ => println("no") }; "a,b" match { case Pair(x, y, z) => println("three"); case _ => println("not three") }; List(1,2,3) match { case List(a, _*) => println(a); case _ => println("no") } }	abc\nnot three\n1\n
 trait A { def a: Int = 1 }; trait B { def b: Int = 2 }; class C extends A with B; object T extends App { def f(x: Int | String): String = x match { case i: Int => "i"+i; case s: String => "s"+s }; println(f(1)); println(f("a")); def g(x: A & B): Int = x.a + x.b; println(g(new C)); val u: Int | String = 7; println(u) }	i1\nsa\n3\n7\n
 object T extends App { val r = "(\\d+)-(\\d+)".r; "12-34" match { case r(a,b) => println(a+"/"+b); case _ => println("no") }; opaque type Meters = Int; def m(i: Int): Meters = i; println(m(5)); inline def sq(x: Int): Int = x * x; println(sq(4)) }	12/34\n5\n16\n
+object T extends App { println(List(1,2,3).sliding(2, 2).toList); println(List(1,2,3).sliding(2).toList) }	List(List(1, 2), List(3))\nList(List(1, 2), List(2, 3))\n
+object T extends App { println(List(1,2,3,4,5).sliding(2, 3).toList); println(List(1,2,3,4).sliding(3, 2).toList) }	List(List(1, 2), List(4, 5))\nList(List(1, 2, 3), List(3, 4))\n
+object T extends App { println(List(1,2,3).sliding(5, 2).toList); println(List(1,2,3).sliding(1, 2).toList) }	List(List(1, 2, 3))\nList(List(1), List(3))\n
+object T extends App { println(List(1,2,3,4,5,6).sliding(2, 4).toList); println(Vector(1,2,3,4).sliding(2, 2).toList) }	List(List(1, 2), List(5, 6))\nList(Vector(1, 2), Vector(3, 4))\n
+object T extends App { println(List[Int]().sliding(2, 2).toList); println(List[Int]().sliding(2).size); println(List(1,2,3).sliding(2).size) }	List()\n0\n2\n
+object T extends App { println(List(1,2,3).tails.toList); println(List(1,2,3).inits.toList) }	List(List(1, 2, 3), List(2, 3), List(3), List())\nList(List(1, 2, 3), List(1, 2), List(1), List())\n
+object T extends App { println(List[Int]().tails.toList); println(List[Int]().inits.toList); println(List(1,2,3).tails.size) }	List(List())\nList(List())\n4\n
+object T extends App { println(Vector(1,2,3).tails.toList); println(List(1).tails.toList) }	List(Vector(1, 2, 3), Vector(2, 3), Vector(3), Vector())\nList(List(1), List())\n
+object T extends App { println("hello".sliding(2, 3).toList); println("hello".grouped(2).toList) }	List(he, lo)\nList(he, ll, o)\n
+object T extends App { println("".grouped(2).size); println("".sliding(2).size); println("hello".grouped(9).toList) }	0\n0\nList(hello)\n
+object T extends App { println("ab".padTo(5, '.')); println("ab".padTo(1, '.')); println("".padTo(3, 'x')); println("abc".padTo(5, ' ') + "|") }	ab...\nab\nxxx\nabc  |\n
+object T extends App { println("12".toIntOption); println("x".toIntOption); println("".toIntOption); println(" 12 ".toIntOption) }	Some(12)\nNone\nNone\nNone\n
+object T extends App { println("2147483648".toIntOption); println("-2147483648".toIntOption); println("99999999999999999999".toIntOption) }	None\nSome(-2147483648)\nNone\n
+object T extends App { println("12".toLongOption); println("9223372036854775808".toLongOption) }	Some(12)\nNone\n
+object T extends App { println("1.5".toDoubleOption); println("x".toDoubleOption); println("1e3".toDoubleOption); println(" 1.5 ".toDoubleOption) }	Some(1.5)\nNone\nSome(1000.0)\nSome(1.5)\n
+object T extends App { println(List(1,2,3).sliding(0, 1).toList) }		java.lang.IllegalArgumentException: requirement failed: size=0 and step=1, but both must be positive
+object T extends App { println(List(1,2,3).sliding(2, 0).toList) }		java.lang.IllegalArgumentException: requirement failed: size=2 and step=0, but both must be positive
+object T extends App { println(List(1,2,3).grouped(0).toList) }		java.lang.IllegalArgumentException: requirement failed: size=0 and step=0, but both must be positive

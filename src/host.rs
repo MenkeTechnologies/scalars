@@ -5952,40 +5952,53 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 same(items[at..].to_vec()),
             ))
         }
-        // `grouped`/`sliding` answer an `Iterator` in Scala; here they answer the
-        // materialized `List` of windows (see `BUGS.md`), so the usual
-        // `.toList`/`.foreach` consumption matches.
-        ("grouped" | "sliding", 1) => {
+        // `grouped`/`sliding` — all three spellings are ONE walk (see
+        // [`window_starts`]): `grouped(n)` is `sliding(n, n)` and `sliding(n)` is
+        // `sliding(n, 1)`, which is what `GroupedIterator` does underneath. They
+        // used to be three special cases — `chunks`, `windows`, and a receiver
+        // shorter than the window — and the two-argument form was missing, so
+        // `xs.sliding(2, 2)` was refused outright.
+        ("grouped" | "sliding", 1) | ("sliding", 2) => {
             let n = args[0].to_int();
-            if n < 1 {
+            let step = match (name, args.len()) {
+                (_, 2) => args[1].to_int(),
+                ("grouped", _) => n,
+                _ => 1,
+            };
+            if n < 1 || step < 1 {
                 // Both are `iterateUntilEmpty(size, step)` underneath, and its
-                // `require` reports BOTH numbers. `grouped(n)` passes `n` as the
-                // step; `sliding(n)` leaves the step at 1 — which is why the two
-                // print different text for the same argument.
-                let step = if name == "grouped" { n } else { 1 };
+                // `require` reports BOTH numbers — which is why `grouped(0)` and
+                // `sliding(0)` print different text for the same argument.
                 return Err(format!(
                     "scalars: java.lang.IllegalArgumentException: requirement failed: \
                      size={n} and step={step}, but both must be positive"
                 ));
             }
-            let n = n as usize;
-            let mut out = Vec::new();
-            if name == "grouped" {
-                for chunk in items.chunks(n) {
-                    out.push(same(chunk.to_vec()));
-                }
-            } else if items.len() < n {
-                out.push(same(items.clone()));
-            } else {
-                for w in items.windows(n) {
-                    out.push(same(w.to_vec()));
-                }
-            }
+            let out = window_starts(items.len(), n as usize, step as usize)
+                .map(|(a, b)| same(items[a..b].to_vec()))
+                .collect();
             // Both answer an `Iterator` of windows, not a `List` of them, so the
             // un-consumed result prints `<iterator>` and a second traversal
             // sees it exhausted.
             Ok(new_seq(SeqKind::Iterator, out))
         }
+        // `tails`/`inits` — every suffix and every prefix, longest first, both
+        // ending in the empty one. An empty receiver still answers ONE window
+        // (itself), never none, which is the opposite of `sliding`'s answer for
+        // the same receiver. Iterators, like the two above.
+        ("tails", 0) => Ok(new_seq(
+            SeqKind::Iterator,
+            (0..=items.len())
+                .map(|i| same(items[i..].to_vec()))
+                .collect(),
+        )),
+        ("inits", 0) => Ok(new_seq(
+            SeqKind::Iterator,
+            (0..=items.len())
+                .rev()
+                .map(|i| same(items[..i].to_vec()))
+                .collect(),
+        )),
         ("toSet", 0) => Ok(new_set(HashRep::Small, items)),
         ("toSeq" | "toIterable", 0) => Ok(new_list(items)),
         ("toMap", 0) => {
@@ -8674,6 +8687,43 @@ fn operator_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Va
 /// `String` methods (a faithful subset of `java.lang.String` / Scala
 /// `StringOps`). Lengths/indices are in `char`s — matching Scala for the BMP
 /// text this frontend handles.
+/// The `[start, end)` windows `sliding(size, step)` yields over `len` elements,
+/// which is also what `grouped(n)` (step `n`) and `sliding(n)` (step 1) yield.
+///
+/// The rule is not "every `step`-th window" and not "full windows only" —
+/// `GroupedIterator` refills from the UNDERLYING iterator between windows, so it
+/// stops as soon as the window it just produced reached the end of the input,
+/// and a short final window is emitted only when it began past where the previous
+/// one ended. That single condition is `start + size >= len`, and it is what
+/// makes these disagree, all measured against reference Scala 3.9.0:
+///
+/// ```text
+///   List(1,2,3).sliding(2)        List(List(1, 2), List(2, 3))
+///   List(1,2,3).sliding(2, 2)     List(List(1, 2), List(3))
+///   List(1,2,3,4).sliding(3, 2)   List(List(1, 2, 3), List(3, 4))
+///   List(1,2,3).sliding(5, 2)     List(List(1, 2, 3))
+/// ```
+///
+/// The first drops its trailing `List(3)` and the second keeps it, for the same
+/// receiver and the same window size. An EMPTY receiver yields nothing at all —
+/// the old code answered one empty window instead, which printed identically for
+/// a `String` (`List("")` and `List()` are both `List()` on the page) and
+/// differed only in `size`.
+fn window_starts(len: usize, size: usize, step: usize) -> impl Iterator<Item = (usize, usize)> {
+    let mut start = 0usize;
+    let mut done = len == 0;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let end = (start + size).min(len);
+        done = start + size >= len;
+        let w = (start, end);
+        start += step;
+        Some(w)
+    })
+}
+
 fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
     // Every `String` method that accepts a `Char` (`indexOf`, `contains`,
     // `split`, `replace`, …) uses it as text, and Scala overloads them for both,
@@ -8741,26 +8791,37 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // `StringOps.grouped`/`sliding` — an `Iterator` whose windows are
         // `String`s, not `List`s of `Char` (`"abcd".grouped(2).toList` is
         // `List(ab, cd)`), because `StringOps` rebuilds through its own builder.
-        ("grouped" | "sliding", 1) => {
+        ("grouped" | "sliding", 1) | ("sliding", 2) => {
             let n = args[0].to_int();
-            if n < 1 {
-                let step = if name == "grouped" { n } else { 1 };
+            let step = match (name, args.len()) {
+                (_, 2) => args[1].to_int(),
+                ("grouped", _) => n,
+                _ => 1,
+            };
+            if n < 1 || step < 1 {
                 return Err(format!(
                     "scalars: java.lang.IllegalArgumentException: requirement failed: \
                      size={n} and step={step}, but both must be positive"
                 ));
             }
             let chars: Vec<char> = s.chars().collect();
-            let n = n as usize;
-            let window = |w: &[char]| Value::str(w.iter().collect::<String>());
-            let out: Vec<Value> = if name == "grouped" {
-                chars.chunks(n).map(window).collect()
-            } else if chars.len() < n {
-                vec![window(&chars)]
-            } else {
-                chars.windows(n).map(window).collect()
-            };
+            let out: Vec<Value> = window_starts(chars.len(), n as usize, step as usize)
+                .map(|(a, b)| Value::str(chars[a..b].iter().collect::<String>()))
+                .collect();
             Ok(new_seq(SeqKind::Iterator, out))
+        }
+        // `StringOps.padTo` answers a STRING (not a `Seq[Char]`), and a length at
+        // or below the current one leaves it untouched.
+        ("padTo", 2) => {
+            let want = args[0].to_int().max(0) as usize;
+            let fill = as_char(&args[1])
+                .or_else(|| one_char(&args[1].as_str_cow()))
+                .unwrap_or(' ');
+            let mut out = s.to_string();
+            for _ in s.chars().count()..want {
+                out.push(fill);
+            }
+            Ok(Value::str(out))
         }
         // `"abc".toSeq` is a `WrappedString` — a VIEW of the same characters,
         // which prints as the string itself (`abc`, not `List(a, b, c)`) and
@@ -8775,6 +8836,19 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // narrowing conversions add the box's own range check on top.
         ("toInt", 0) => java_parse_int(s, 10).map(Value::int),
         ("toLong", 0) => java_parse_long(s, 10).map(Value::int),
+        // The `…Option` forms are the same parses with the throw turned into a
+        // `None`, which is exactly what makes them worth having separately: they
+        // reject what a "parse and swallow the error" version would accept.
+        // Measured against reference Scala 3.9.0, `" 12 ".toIntOption` is `None`
+        // (the JDK integer parses do not trim, as the comment above says) and
+        // `"99999999999999999999".toIntOption` is `None` for being out of an
+        // `Int`'s range rather than for being unparseable.
+        ("toIntOption", 0) => {
+            Ok(java_parse_int(s, 10).map_or_else(|_| make_none(), |n| make_some(Value::int(n))))
+        }
+        ("toLongOption", 0) => {
+            Ok(java_parse_long(s, 10).map_or_else(|_| make_none(), |n| make_some(Value::int(n))))
+        }
         ("toByte", 0) => {
             java_parse_narrow(s, 10, i64::from(i8::MIN), i64::from(i8::MAX)).map(Value::int)
         }
@@ -8799,6 +8873,16 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             .map_err(|_| {
                 format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
             }),
+        ("toDoubleOption" | "toFloatOption", 0) => Ok(s.trim().parse::<f64>().map_or_else(
+            |_| make_none(),
+            |v| {
+                make_some(Value::float(if name == "toFloatOption" {
+                    f64::from(v as f32)
+                } else {
+                    v
+                }))
+            },
+        )),
         // `StringOps.toBoolean` is case-insensitive but NOT trimming, and its
         // failure is an `IllegalArgumentException` rather than the
         // `NumberFormatException` every other conversion here raises.
