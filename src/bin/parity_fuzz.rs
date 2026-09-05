@@ -3066,13 +3066,23 @@ fn build_program(probes: &[String], entry: Entry) -> String {
 
 struct RunOut {
     stdout: Vec<u8>,
+    /// Kept, not discarded. It was drained only to stop a chatty compiler
+    /// deadlocking on a full pipe, and thrown away — so [`differs`] could see
+    /// only "both sides exited non-zero" and every program that aborted for
+    /// DIFFERENT REASONS on the two sides scored as a match. Exception messages
+    /// are hand-written strings in this frontend and are the surface most likely
+    /// to be wrong; `tests/data/parity_expected.txt` carries a whole
+    /// expected-failure half for exactly that reason, and the live fuzzer was
+    /// blind to it.
+    stderr: Vec<u8>,
     exit: i32,
     timed_out: bool,
 }
 
 static TMP_CTR: AtomicU64 = AtomicU64::new(0);
 
-/// Run `<prog> <tempfile.scala>` under a wall-clock timeout, capturing stdout.
+/// Run `<prog> <tempfile.scala>` under a wall-clock timeout, capturing both
+/// streams.
 fn run_prog(prog: &Path, src: &str, timeout: Duration) -> RunOut {
     let id = TMP_CTR.fetch_add(1, Ordering::Relaxed);
     let path =
@@ -3080,6 +3090,7 @@ fn run_prog(prog: &Path, src: &str, timeout: Duration) -> RunOut {
     if std::fs::write(&path, src).is_err() {
         return RunOut {
             stdout: Vec::new(),
+            stderr: Vec::new(),
             exit: -1,
             timed_out: false,
         };
@@ -3096,6 +3107,7 @@ fn run_prog(prog: &Path, src: &str, timeout: Duration) -> RunOut {
             let _ = std::fs::remove_file(&path);
             return RunOut {
                 stdout: Vec::new(),
+                stderr: Vec::new(),
                 exit: -1,
                 timed_out: false,
             };
@@ -3145,20 +3157,128 @@ fn run_prog(prog: &Path, src: &str, timeout: Duration) -> RunOut {
     }
 
     let stdout = out_h.take().and_then(|h| h.join().ok()).unwrap_or_default();
-    let _ = err_h.take().and_then(|h| h.join().ok());
+    let stderr = err_h.take().and_then(|h| h.join().ok()).unwrap_or_default();
     let _ = std::fs::remove_file(&path);
     RunOut {
         stdout,
+        stderr,
         exit,
         timed_out,
     }
 }
 
 /// A parity gap: stdout bytes differ, OR one side accepted the program (exit 0)
-/// while the other rejected it. Exact exit codes are not compared — a
-/// from-scratch frontend is free to pick its own non-zero code.
+/// while the other rejected it, OR both aborted but not with the same
+/// exception. Exact exit codes are not compared — a from-scratch frontend is
+/// free to pick its own non-zero code.
+///
+/// The third clause is what the old two-clause version could not see. "Both
+/// sides exited non-zero" was scored as agreement, so a program that dies with
+/// `NoSuchElementException: head of empty list` on the reference and
+/// `IndexOutOfBoundsException: 0` here was a match — and the exception messages
+/// are precisely the part of this frontend that is hand-written rather than
+/// derived, which is why the frozen corpus grew an expected-failure half.
+/// `tests/parity.rs` has compared them since; the LIVE fuzzer, the thing that
+/// explores programs nobody wrote down, did not.
+///
+/// The comparison is the same containment rule `tests/parity.rs` applies, and
+/// for the same reason: the reference's throwable LINE is the only comparable
+/// part of its stderr (the rest is ANSI build chatter and stack frames naming a
+/// temp file), and our stderr carries it behind a `scalars: ` prefix.
+///
+/// An oracle abort whose stderr holds no throwable at all is NOT compared: that
+/// is a compile error, the program never ran, and there is no exception to
+/// disagree about.
 fn differs(oracle: &RunOut, ours: &RunOut) -> bool {
-    (oracle.exit == 0) != (ours.exit == 0) || oracle.stdout != ours.stdout
+    if (oracle.exit == 0) != (ours.exit == 0) || oracle.stdout != ours.stdout {
+        return true;
+    }
+    if oracle.exit != 0 {
+        if let Some(t) = oracle_throwable(&oracle.stderr) {
+            return !String::from_utf8_lossy(&ours.stderr).contains(&t);
+        }
+    }
+    false
+}
+
+/// The throwable LINE a failing reference run reports, or `None` when it did not
+/// throw (a compile error, or a non-zero exit with no trace).
+///
+/// A failing `scala` run writes ANSI build chatter, then a stack trace whose
+/// frames name a temp file, and wraps anything raised from an `extends App` body
+/// in an `ExceptionInInitializerError` — so what is comparable is the INNERMOST
+/// `Caused by:` when there is one and the `Exception in thread "…"` line
+/// otherwise. This is the Rust twin of `parity_throwable` in
+/// `scripts/parity-oracle.zsh`, which extracts the same line when a record is
+/// minted; the two must agree or a program the fuzzer passes could still be
+/// frozen wrong.
+fn oracle_throwable(err: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(err);
+    let mut caused: Option<String> = None;
+    let mut thread: Option<String> = None;
+    for line in text.lines() {
+        let line = strip_ansi(line);
+        let line = line.trim_end();
+        if let Some(rest) = line.strip_prefix("Caused by: ") {
+            caused = Some(rest.trim().to_string());
+        } else if thread.is_none() {
+            if let Some(rest) = line.strip_prefix("Exception in thread ") {
+                // `Exception in thread "main" java.lang.Foo: msg`
+                if let Some((_, tail)) = rest.split_once("\" ") {
+                    thread = Some(tail.trim().to_string());
+                }
+            }
+        }
+    }
+    caused.or(thread).filter(|t| !t.is_empty())
+}
+
+/// The `  !! <throwable>` suffix a divergence record carries for one side, or
+/// empty for a run that did not abort.
+///
+/// A record that printed only stdout could not explain a divergence decided on
+/// the exception axis: both sides would show the same output bytes and the same
+/// non-zero exit, and the reader would have no way to see what disagreed. For
+/// the reference this is the extracted throwable line; for our own side, which
+/// writes one `scalars: <fault>` line and no trace, it is the last non-empty
+/// line of stderr.
+fn throwable_note(r: &RunOut) -> String {
+    if r.exit == 0 {
+        return String::new();
+    }
+    let t = oracle_throwable(&r.stderr).or_else(|| {
+        String::from_utf8_lossy(&r.stderr)
+            .lines()
+            .rev()
+            .map(|l| strip_ansi(l).trim().to_string())
+            .find(|l| !l.is_empty())
+    });
+    match t {
+        Some(t) => format!("  !! {t}"),
+        None => String::new(),
+    }
+}
+
+/// Drop CSI SGR sequences. The launcher colours its build chatter, and a colour
+/// reset landing inside a `Caused by:` line would otherwise become part of the
+/// extracted throwable and never match anything.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' {
+            if it.next() == Some('[') {
+                for c in it.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn render(bytes: &[u8]) -> String {
@@ -3274,6 +3394,21 @@ fn ours_bin() -> PathBuf {
 /// own build output, and it must look like a real Scala (`--version` mentions
 /// "Scala"). A misconfigured oracle is a HARD error — silently comparing against
 /// the wrong thing answers a different question.
+/// An absolute path for a candidate oracle: taken as-is when it already has a
+/// separator, looked up across `PATH` when it is a bare name. `None` when a bare
+/// name is on no `PATH` entry.
+fn absolutize(c: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(c);
+    if p.components().count() > 1 {
+        return Some(p);
+    }
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|d| d.join(&p))
+            .find(|f| f.is_file())
+    })
+}
+
 fn resolve_oracle(ours: &Path) -> PathBuf {
     let candidates: Vec<String> = if let Ok(p) = std::env::var("SCALARS_FUZZ_SCALA") {
         vec![p]
@@ -3286,11 +3421,29 @@ fn resolve_oracle(ours: &Path) -> PathBuf {
         ]
     };
     for c in &candidates {
-        let cp = PathBuf::from(c);
+        // ABSOLUTE, ALWAYS. A bare `scala` (the last candidate, and whatever a
+        // caller may pass in SCALARS_FUZZ_SCALA) is resolved through PATH here
+        // rather than left for the OS to resolve at spawn time, so the run
+        // banner names the file that actually answered and a session can be
+        // reproduced from its own output. A relative name in the report is not
+        // a reference — it is whatever that shell's PATH meant that day.
+        let Some(cp) = absolutize(c) else { continue };
         if cp.canonicalize().ok() == ours.canonicalize().ok() {
             continue; // never the frontend under test
         }
         if scala_version(&cp).is_some() {
+            // A launcher that cannot name its COMPILER is not a reference: the
+            // language version is the axis the frozen corpus is minted against,
+            // and an oracle whose banner we cannot parse is one whose
+            // disagreements cannot be attributed to a release.
+            if scala_compiler_version(&cp).is_none() {
+                eprintln!(
+                    "parity-fuzz: {} answers `-version` but names no `Scala version (default):`, \
+                     so the compiler it would compare against cannot be identified",
+                    cp.display()
+                );
+                std::process::exit(2);
+            }
             check_oracle_jvm(&cp);
             check_oracle_locale(&cp);
             return cp;
@@ -3464,6 +3617,32 @@ fn scala_version(prog: &Path) -> Option<String> {
     }
 }
 
+/// The SCALA LANGUAGE version the oracle compiles with, which is not the first
+/// line of its `--version` banner.
+///
+/// `scala` on this machine is the scala-cli launcher, and it answers
+///
+///   Scala code runner version: 1.16.0
+///   Scala version (default): 3.9.0
+///
+/// The first line is the launcher's own release and says nothing about what a
+/// program means; the second is the compiler that decides it. The run banner
+/// used to print line one, so every recorded fuzz session named a number that
+/// could not be used to reproduce it — and the compiler moving under the corpus
+/// (3.8.4 to 3.9.0 happened here between rounds) was invisible in the output.
+///
+/// Returned separately from [`scala_version`] rather than replacing it because
+/// the candidate scan uses the whole banner only to answer "is this a scala at
+/// all", while the report needs the one field that identifies the reference.
+fn scala_compiler_version(prog: &Path) -> Option<String> {
+    let banner = scala_version(prog)?;
+    banner.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("Scala version (default):")
+            .map(|v| v.trim().to_string())
+    })
+}
+
 // ───────────────────────── CLI + driver ────────────────────────────────────
 
 struct Args {
@@ -3562,11 +3741,24 @@ fn main() {
             mo.exit, mo.timed_out
         );
         println!("{}", render(&mo.stdout));
+        if let Some(t) = oracle_throwable(&mo.stderr) {
+            println!("(throwable) {t}");
+        }
         println!(
             "--- scalars    exit={} timeout={} ---",
             mr.exit, mr.timed_out
         );
         println!("{}", render(&mr.stdout));
+        // Ours verbatim: it is what the containment check in `differs` searched,
+        // so a report that showed only stdout could not explain a divergence
+        // that was decided on this stream.
+        if mr.exit != 0 {
+            let e = String::from_utf8_lossy(&mr.stderr);
+            let e = e.trim_end();
+            if !e.is_empty() {
+                println!("(stderr) {e}");
+            }
+        }
         // Either side failing to start is not a match — nothing was compared —
         // so it gets its own status rather than passing as green.
         if harness_failed(&mo) || harness_failed(&mr) {
@@ -3602,13 +3794,9 @@ fn main() {
     let start = Instant::now();
 
     eprintln!(
-        "oracle : {}",
-        scala_version(&oracle)
-            .unwrap_or_default()
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
+        "oracle : {} — Scala {}",
+        oracle.display(),
+        scala_compiler_version(&oracle).unwrap_or_else(|| "unknown".into())
     );
     eprintln!("ours   : {}", ours.display());
     eprintln!(
@@ -3660,13 +3848,15 @@ fn main() {
                     let rec = format!(
                         "==== seed {seed} ====\n\
                          probe   : {}\n\
-                         scala   : exit={} {}\n\
-                         scalars : exit={} {}\n",
+                         scala   : exit={} {}{}\n\
+                         scalars : exit={} {}{}\n",
                         minimal.join(" ; "),
                         mo.exit,
                         render(&mo.stdout).replace('\n', " | "),
+                        throwable_note(&mo),
                         mr.exit,
                         render(&mr.stdout).replace('\n', " | "),
+                        throwable_note(&mr),
                     );
                     let mut d = divergences.lock().unwrap();
                     d.push((seed, rec));
@@ -3759,4 +3949,111 @@ fn main() {
         "no divergences — scalars matches reference scala across all probes ✓ \
          ({signal}/{checked} programs carried signal)"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The throwable extractor is the whole of the new comparison axis: if it
+    /// answers `None` where the reference threw, [`differs`] silently stops
+    /// comparing exceptions and every mismatched abort scores as a match again —
+    /// a vacuous pass that looks exactly like a working check. The inputs here
+    /// are verbatim `scala` stderr captured on this machine (Scala 3.9.0 /
+    /// JVM 26.0.2.1), ANSI build chatter and stack frames included.
+    #[test]
+    fn the_reference_throwable_is_the_innermost_cause_not_the_wrapper() {
+        // An `extends App` body wraps whatever it raises in an
+        // `ExceptionInInitializerError`, so the FIRST throwable line names the
+        // wrapper and only the `Caused by:` names what actually went wrong.
+        let err = "\u{1b}[90mCompiling project (Scala 3.9.0, JVM (26))\u{1b}[0m\n\
+                   Warning: there was 1 deprecation warning; re-run with -deprecation for details\n\
+                   \u{1b}[90mCompiled project (Scala 3.9.0, JVM (26))\u{1b}[0m\n\
+                   Exception in thread \"main\" java.lang.ExceptionInInitializerError\n\
+                   \tat T.main(failprobe.scala)\n\
+                   Caused by: java.lang.ArithmeticException: / by zero\n\
+                   \tat T$.<clinit>(failprobe.scala:1)\n\
+                   \t... 1 more\n";
+        assert_eq!(
+            oracle_throwable(err.as_bytes()).as_deref(),
+            Some("java.lang.ArithmeticException: / by zero")
+        );
+
+        // A `@main` or `def main` entry raises directly, with no cause to unwrap.
+        let plain =
+            "Exception in thread \"main\" java.util.NoSuchElementException: head of empty list\n\
+                     \tat scala.collection.immutable.Nil$.head(List.scala:663)\n";
+        assert_eq!(
+            oracle_throwable(plain.as_bytes()).as_deref(),
+            Some("java.util.NoSuchElementException: head of empty list")
+        );
+
+        // A throwable with no message keeps its bare class name.
+        let bare =
+            "Exception in thread \"main\" java.lang.StackOverflowError\n\tat T$.go(t.scala:1)\n";
+        assert_eq!(
+            oracle_throwable(bare.as_bytes()).as_deref(),
+            Some("java.lang.StackOverflowError")
+        );
+
+        // Nested causes: the INNERMOST one is the comparable fault.
+        let nested = "Exception in thread \"main\" java.lang.ExceptionInInitializerError\n\
+                      Caused by: java.lang.RuntimeException: outer\n\
+                      Caused by: java.lang.IllegalStateException: boom\n\
+                      \t... 3 more\n";
+        assert_eq!(
+            oracle_throwable(nested.as_bytes()).as_deref(),
+            Some("java.lang.IllegalStateException: boom")
+        );
+
+        // A COMPILE error is not a throwable. The program never ran, there is no
+        // exception to disagree about, and reporting one would make `differs`
+        // flag every program the reference refuses.
+        let compile = "\u{1b}[90mCompiling project (Scala 3.9.0, JVM (26))\u{1b}[0m\n\
+                       [error] ./T.scala:1:32\n\
+                       [error] value +++ is not a member of Int\n\
+                       Error: Compilation failed\n";
+        assert_eq!(oracle_throwable(compile.as_bytes()), None);
+        assert_eq!(oracle_throwable(b""), None);
+    }
+
+    /// `differs` must see an abort that carries a DIFFERENT exception, and must
+    /// not invent one where the reference only failed to compile.
+    #[test]
+    fn two_aborts_with_different_exceptions_are_a_divergence() {
+        let out = |exit: i32, stdout: &str, stderr: &str| RunOut {
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+            exit,
+            timed_out: false,
+        };
+        let oracle = out(
+            1,
+            "a\n",
+            "Exception in thread \"main\" java.util.NoSuchElementException: head of empty list\n",
+        );
+        // Same stdout, same non-zero exit, different fault — the case the old
+        // two-clause `differs` scored as agreement.
+        assert!(differs(
+            &oracle,
+            &out(
+                1,
+                "a\n",
+                "scalars: java.lang.IndexOutOfBoundsException: 0\n"
+            )
+        ));
+        // Our stderr CONTAINS the reference's line (behind our own prefix).
+        assert!(!differs(
+            &oracle,
+            &out(
+                1,
+                "a\n",
+                "scalars: java.util.NoSuchElementException: head of empty list\n"
+            )
+        ));
+        // A reference that never ran carries no throwable, so nothing on that
+        // axis is compared and only the stdout/exit clauses decide.
+        let rejected = out(1, "", "[error] value +++ is not a member of Int\n");
+        assert!(!differs(&rejected, &out(2, "", "scalars: parse error\n")));
+    }
 }
