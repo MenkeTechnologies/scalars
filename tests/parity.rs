@@ -105,8 +105,12 @@ fn frozen_corpus_matches_reference_scala() {
             }
             Some(exc) => {
                 assert!(
-                    !exc.is_empty(),
-                    "record {rec}: an expected-failure record needs a non-empty exception field"
+                    well_formed_exception(exc),
+                    "record {rec}: the exception field must be a qualified JDK throwable line \
+                     (`java.…Exception`/`scala.…Error`, optionally followed by `: message`), \
+                     got {exc:?}. A non-empty check is not enough: `err.contains(\" \")` is true \
+                     of almost any stderr, so a degenerate field would let the record assert \
+                     nothing while still counting toward the expected-failure floor below."
                 );
                 failing += 1;
                 assert!(
@@ -129,11 +133,88 @@ fn frozen_corpus_matches_reference_scala() {
         }
         n += 1;
     }
-    assert!(n >= 15, "expected a non-trivial corpus, got {n} records");
+    // The floors are the counts the file ACTUALLY holds, not a token minimum.
+    // `n >= 15` against a 542-record corpus is not a floor: 527 records could be
+    // deleted — every Double-notation pin, the whole exception surface, all of
+    // it — and this test would still pass, reporting that parity is locked. A
+    // frozen corpus's only defence against silent shrinkage is a number that
+    // moves with it, so raise both whenever the corpus grows.
+    assert!(
+        n >= 542,
+        "the frozen corpus has shrunk: {n} records, expected at least 542"
+    );
     // Without this the three-field form could be dropped from the data and the
     // whole failure axis would stop being exercised with the test still green.
     assert!(
-        failing >= 20,
+        failing >= 37,
         "the expected-FAILURE half of the corpus has thinned out: {failing} records"
     );
+}
+
+/// Whether an expected-failure record's third field is a real JDK throwable
+/// line: a dotted, `java.`/`scala.`-rooted class whose last segment ends in
+/// `Exception` or `Error`, optionally followed by `: <message>`.
+///
+/// The check exists because `err.contains(exc)` is only as strong as `exc`: a
+/// field of `" "`, or `"Exception"`, or a stray word is non-empty — which is all
+/// the record format used to require — matches nearly any stderr, and would let
+/// a record report a PASS while asserting nothing about which exception stopped
+/// the program. That is the "frozen failure read as a pass" shape, and it counts
+/// toward the expected-failure floor while doing so.
+fn well_formed_exception(exc: &str) -> bool {
+    let head = exc.split_once(": ").map_or(exc, |(h, _)| h);
+    let Some(last) = head.rsplit('.').next() else {
+        return false;
+    };
+    head.split('.').count() >= 2
+        && (head.starts_with("java.") || head.starts_with("scala."))
+        && (last.ends_with("Exception") || last.ends_with("Error"))
+        && last.len() > "Exception".len()
+}
+
+/// The record-format guard has to REJECT the shapes it exists to reject.
+///
+/// A validator is itself a place a vacuous pass hides: one written so that
+/// everything satisfies it reads exactly like a working check, and the only way
+/// to tell is to hand it the degenerate inputs. Each rejected string below is one
+/// that satisfied the old `!exc.is_empty()` test and then made
+/// `err.contains(exc)` true against essentially any stderr.
+#[test]
+fn the_expected_failure_record_format_rejects_a_field_that_asserts_nothing() {
+    for bad in [
+        "",
+        " ",
+        "\t",
+        "boom",
+        "Exception",
+        "Error",
+        "java.lang.Exception",
+        "java.lang.Error",
+        ": / by zero",
+        "/ by zero",
+        "ArithmeticException: / by zero",
+        "com.example.MyException: x",
+        "java.lang.Thing: x",
+        "javaException",
+    ] {
+        assert!(
+            !well_formed_exception(bad),
+            "the record-format guard accepted {bad:?}, which asserts nothing about which \
+             exception stopped the program"
+        );
+    }
+    // …and it must keep accepting every shape the frozen corpus actually uses.
+    for good in [
+        "java.lang.ArithmeticException: / by zero",
+        "java.util.NoSuchElementException: head of empty list",
+        "scala.MatchError: 5 (of class java.lang.Integer)",
+        "java.lang.StackOverflowError",
+        "java.util.regex.PatternSyntaxException: Unclosed character class near index 0",
+        "java.util.IllegalFormatConversionException: d != java.lang.String",
+    ] {
+        assert!(
+            well_formed_exception(good),
+            "the record-format guard rejected {good:?}, a real JDK throwable line"
+        );
+    }
 }
