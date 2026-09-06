@@ -6149,6 +6149,36 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     .collect(),
             ))
         }
+        // `xs.corresponds(that)(p)` — the two run in lockstep and `p` must hold
+        // for every aligned pair, which is FALSE the moment the lengths differ:
+        // it is `zip`-and-`forall` only when they are equal. Short-circuits, so
+        // a predicate with a side effect stops at the first failure, as Scala's
+        // does.
+        ("corresponds", 2) => {
+            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            if items.len() != other.len() {
+                return Ok(Value::bool(false));
+            }
+            for (a, b) in items.iter().zip(other) {
+                if !invoke_closure(vm, &args[1], &[a.clone(), b])?.is_truthy() {
+                    return Ok(Value::bool(false));
+                }
+            }
+            Ok(Value::bool(true))
+        }
+        // `xs.aggregate(z)(seqop, combop)` — on a sequential collection the
+        // combiner is never called and the result is exactly `foldLeft(z)(seqop)`
+        // (`IterableOnceOps.aggregate` is defined as that fold). Reproduced as
+        // the fold rather than as a split-and-combine, so a `combop` that is not
+        // associative cannot change the answer here when it cannot change it
+        // there.
+        ("aggregate", 3) => {
+            let mut acc = args[0].clone();
+            for it in &items {
+                acc = invoke_closure(vm, &args[1], &[acc, it.clone()])?;
+            }
+            Ok(acc)
+        }
         ("zipWithIndex", 0) => Ok(same(
             items
                 .iter()
@@ -9948,21 +9978,30 @@ fn string_fn_method(
         "flatten",
         "lastIndexWhere",
         "segmentLength",
+        "corresponds",
+        "aggregate",
     ];
     if ALWAYS_STRING.contains(&name)
         || REBUILDS_STRING.contains(&name)
         || PASSES_THROUGH.contains(&name)
     {
         let seq = new_seq(SeqKind::Vector, chars.clone());
-        // `zip`'s operand is itself iterated, so a `String` there is its
-        // characters (`"abc".zip("xy")`). Everywhere else a `String` argument is
+        // A `zip`/`corresponds` operand is itself iterated, so a `String` there
+        // is its characters (`"abc".zip("xy")`). Everywhere else a `String` argument is
         // an ordinary value — `foldRight("")` seeds the fold with the empty
         // string — so this coercion is confined to the collection-taking ops.
-        let zipped;
+        // Only the FIRST argument is the operand; whatever follows it is kept as
+        // written. `corresponds` carries a predicate after it, and rebuilding the
+        // argument list as just the coerced operand dropped that predicate — the
+        // call then matched no arity at all.
+        let coerced;
         let args = match (name, args.first()) {
-            ("zip", Some(Value::Str(t))) => {
-                zipped = [new_seq(SeqKind::Vector, t.chars().map(make_char).collect())];
-                &zipped[..]
+            ("zip" | "corresponds", Some(Value::Str(t))) => {
+                coerced =
+                    std::iter::once(new_seq(SeqKind::Vector, t.chars().map(make_char).collect()))
+                        .chain(args[1..].iter().cloned())
+                        .collect::<Vec<_>>();
+                &coerced[..]
             }
             _ => args,
         };

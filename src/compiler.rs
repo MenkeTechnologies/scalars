@@ -6182,11 +6182,22 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
     // `X.empty` is that collection's empty literal. It is answered before the
     // element-wise members so `Map.empty` works too, where `Map.fill` would need
     // pairs and is left alone.
-    if name == "empty" && args.is_empty() && (factory_conversion(owner).is_some() || owner == "Map")
-    {
-        return Some(Expr::Collection {
+    if name == "empty" && (factory_conversion(owner).is_some() || owner == "Map") {
+        let empty = Expr::Collection {
             ctor: owner.to_string(),
             elems: Vec::new(),
+        };
+        // `List.empty[Int](0)` is an APPLICATION of the empty list, not a
+        // factory taking arguments: the type argument is absorbed and the
+        // parenthesised list that follows is `apply`'s. Requiring an empty
+        // argument list here left the whole shape unresolved — `List.empty[Int](0)`
+        // reported `empty is not a member` where the reference raises
+        // `IndexOutOfBoundsException: 0`, and `Map.empty[String,Int]("k")` hid
+        // `NoSuchElementException: key not found: k` the same way.
+        return Some(if args.is_empty() {
+            empty
+        } else {
+            m(empty, "apply", args.to_vec())
         });
     }
     let conv = factory_conversion(owner)?;
