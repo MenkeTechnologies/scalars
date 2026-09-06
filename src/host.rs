@@ -1920,8 +1920,20 @@ fn as_seq(v: &Value) -> Option<Vec<Value>> {
 }
 
 /// A `Seq` handle's kind, if `v` is one.
+///
+/// Reads the kind and NOTHING else. Routing it through [`seq_kind_items`] made
+/// asking "what kind is this?" copy every element of the receiver and then drop
+/// the copy — a `Vec` clone and a `Vec` drop per call, which measured as 90% of
+/// an indexed loop's time once `apply` started asking.
 fn seq_kind(v: &Value) -> Option<SeqKind> {
-    seq_kind_items(v).map(|(k, _)| k)
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Seq(k, _)) => Some(*k),
+            _ => None,
+        })
+    } else {
+        None
+    }
 }
 
 /// Clone a `Seq` handle's kind and elements, if `v` is one.
@@ -2823,20 +2835,43 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
         });
         match kind {
             Some(0) | Some(1) => {
-                let items = as_seq_or_tuple(recv).unwrap_or_default();
+                // A `Set`'s `apply` is `contains`, not an index: `val s =
+                // Set(1,2,3); s(2)` is `true`. It has to be answered here as
+                // well as in `seq_method`, because a BOUND set reaches this
+                // universal dispatch rather than the named-method path.
+                if matches!(seq_kind(recv), Some(SeqKind::Set(_))) {
+                    let items = as_seq_or_tuple(recv).unwrap_or_default();
+                    let key = args.first().cloned().unwrap_or(Value::Undef);
+                    return Ok(Value::bool(items.iter().any(|x| value_eq(x, &key))));
+                }
                 let i = args.first().map(|a| a.to_int()).unwrap_or(0);
+                // ONE element, read under a single borrow. Copying the whole
+                // receiver to answer one index is what made an indexed loop
+                // quadratic — `while (i < n) s += v(i)` over a 20 000-element
+                // `Vector` moved 400 million values to read 20 000 of them.
+                //
                 // Applying a BOUND sequence (`val b = …; b(5)`) must fail the
                 // same way `Seq(…)(5)` does, so it reads the receiver's kind
                 // rather than defaulting to `List`'s bare-index message. A
                 // `Tuple` has no kind and keeps that bare index, which is what
                 // `Tuple.productElement` raises.
-                return match usize::try_from(i).ok().and_then(|u| items.get(u)) {
-                    Some(v) => Ok(v.clone()),
-                    None => Err(match seq_kind_items(recv) {
-                        Some((k, _)) => k.index_fault(i, items.len()),
-                        None => format!("scalars: java.lang.IndexOutOfBoundsException: {i}"),
-                    }),
-                };
+                return HEAP.with(|h| {
+                    let heap = h.borrow();
+                    let (kind, items) = match heap.get(*id as usize) {
+                        Some(HeapVal::Seq(k, items)) => (Some(*k), &items[..]),
+                        Some(HeapVal::Tuple(items)) => (None, &items[..]),
+                        _ => (None, &[][..]),
+                    };
+                    match usize::try_from(i).ok().and_then(|u| items.get(u)) {
+                        Some(v) => Ok(v.clone()),
+                        None => Err(match kind {
+                            Some(k) => k.index_fault(i, items.len()),
+                            None => {
+                                format!("scalars: java.lang.IndexOutOfBoundsException: {i}")
+                            }
+                        }),
+                    }
+                });
             }
             Some(2) => {
                 let m = as_map(recv).unwrap_or_default();
@@ -5435,12 +5470,113 @@ fn is_add_all_form(name: &str) -> bool {
     )
 }
 
+/// The O(1) READS, answered off the heap without copying the receiver.
+///
+/// [`seq_kind_items`] CLONES every element of the receiver, and `seq_method`
+/// calls it once per dispatch — so `v.length` inside a loop over a 20 000-element
+/// `Vector` copied 20 000 values to answer a number it already knew, and the
+/// loop as a whole moved 400 million of them. That is the same shape
+/// [`append_in_place`] exists to avoid on the write side, and this is its read
+/// side: `length`, `size`, `isEmpty`, `nonEmpty`, `head`, `last` and a
+/// positional `apply` all read ONE fact out of the vector and need no copy of
+/// it at all.
+///
+/// `None` leaves the call on the ordinary path, which is where every kind whose
+/// answer is not the plain positional one goes:
+///
+/// * `Iterator`, because traversing it CONSUMES it — the drain in `seq_method`
+///   is part of the answer, not an optimization to skip.
+/// * `PriorityQueue`, whose `head` is the heap's root rather than the backing
+///   array's first slot.
+/// * a `Set` asked for `apply`, which is `contains` and not an index.
+///
+/// The bodies below are the same expressions the corresponding `seq_method`
+/// arms evaluate, including the per-kind [`SeqKind::empty_fault`] and
+/// [`SeqKind::index_fault`] messages: this is a shortcut to the same answer,
+/// never a second definition of it.
+fn seq_read_fast(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    if !matches!(
+        (name, args.len()),
+        ("length", 0)
+            | ("size", 0)
+            | ("isEmpty", 0)
+            | ("nonEmpty", 0)
+            | ("head", 0)
+            | ("last", 0)
+            | ("apply", 1)
+    ) {
+        return None;
+    }
+    let Value::Obj(id) = recv else { return None };
+    HEAP.with(|h| {
+        let heap = h.borrow();
+        let Some(HeapVal::Seq(kind, items)) = heap.get(*id as usize) else {
+            return None;
+        };
+        let kind = *kind;
+        if matches!(kind, SeqKind::Iterator | SeqKind::PriorityQueue)
+            || (name == "apply" && matches!(kind, SeqKind::Set(_)))
+        {
+            return None;
+        }
+        Some(match name {
+            "length" | "size" => Ok(Value::int(items.len() as i64)),
+            "isEmpty" => Ok(Value::bool(items.is_empty())),
+            "nonEmpty" => Ok(Value::bool(!items.is_empty())),
+            "head" => items
+                .first()
+                .cloned()
+                .ok_or_else(|| kind.empty_fault(EmptyOp::Head)),
+            "last" => items
+                .last()
+                .cloned()
+                .ok_or_else(|| kind.empty_fault(EmptyOp::Last)),
+            _ => {
+                let i = args[0].to_int();
+                match usize::try_from(i).ok().and_then(|u| items.get(u)) {
+                    Some(v) => Ok(v.clone()),
+                    None => Err(kind.index_fault(i, items.len())),
+                }
+            }
+        })
+    })
+}
+
 /// The JDK's out-of-bounds message for an indexed sequence write.
+///
+/// The maximum is `len - 1` computed as a SIGNED number, so an empty receiver
+/// reports `max -1`. Saturating it at zero was wrong and was invisible until an
+/// `updated` on an empty sequence reached this: the reference reports
+/// `0 is out of bounds (min 0, max -1)` and this answered `max 0`, naming an
+/// index that is not legal either.
 fn index_out_of_bounds(i: i64, len: usize) -> String {
     format!(
         "scalars: java.lang.IndexOutOfBoundsException: {i} is out of bounds (min 0, max {})",
-        len.saturating_sub(1)
+        len as i64 - 1
     )
+}
+
+/// The out-of-range text `updated(i, v)` answers, which is NOT the one `apply`
+/// answers on the same receiver: `updated` runs `IndexedSeqOps`' bounds check on
+/// every collection that has one, so `List(1,2).updated(9, 0)` reports the legal
+/// span where `List(1,2)(9)` reports the bare index. Measured against Scala
+/// 3.9.0 on JDK 26.0.2.1.
+///
+/// Two cases are their own. Every MUTABLE sequence — `ListBuffer`,
+/// `ArrayBuffer`, `Queue`, `Stack`, `ArrayDeque` — reports the BARE index, all
+/// measured; and an EMPTY `Vector` has its own sentence, because the persistent
+/// vector's check names the emptiness instead of a span it cannot state.
+fn updated_fault(kind: SeqKind, i: i64, len: usize) -> String {
+    match kind {
+        // An `Array` is mutable but is NOT one of them: `ArrayOps.updated`
+        // builds a fresh array through the indexed check, and reports the span.
+        SeqKind::Array => index_out_of_bounds(i, len),
+        k if k.is_mutable() => format!("scalars: java.lang.IndexOutOfBoundsException: {i}"),
+        SeqKind::Vector if len == 0 => format!(
+            "scalars: java.lang.IndexOutOfBoundsException: {i} is out of bounds (empty vector)"
+        ),
+        _ => index_out_of_bounds(i, len),
+    }
 }
 
 /// `Seq` (`List`/`Set`/`Iterable`) methods — a faithful subset. Closure-taking
@@ -5454,6 +5590,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // Same reasoning for a `mutable.Set`, whose adds and lookups need neither a
     // copy nor a re-sort.
     if let Some(r) = mut_set_fast(recv, name, args) {
+        return r;
+    }
+    // The O(1) reads, likewise before the receiver is copied — see
+    // [`seq_read_fast`].
+    if let Some(r) = seq_read_fast(recv, name, args) {
         return r;
     }
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
@@ -5630,6 +5771,41 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         ("toArray", 0) => Ok(new_seq(SeqKind::Array, items)),
         ("toVector", 0) => Ok(new_seq(SeqKind::Vector, items)),
+        // `toIndexedSeq` is `Vector` for every collection EXCEPT an `Array`,
+        // whose `IndexedSeq` is the `ArraySeq` that wraps it in place —
+        // `Array(1,2).toIndexedSeq` prints `ArraySeq(1, 2)` where
+        // `List(1,2).toIndexedSeq` prints `Vector(1, 2)`.
+        ("toIndexedSeq", 0) => Ok(new_seq(
+            if kind == SeqKind::Array {
+                SeqKind::ArraySeq
+            } else {
+                SeqKind::Vector
+            },
+            items,
+        )),
+        // `startsWith(that[, offset])` / `endsWith(that)` — prefix and suffix
+        // tests against ANOTHER SEQUENCE (`String`'s same-named methods take a
+        // string and live in [`string_method`]). An argument longer than what
+        // remains is `false`, and an empty one is `true` at any legal offset.
+        ("startsWith", 1) | ("startsWith", 2) | ("endsWith", 1) => {
+            let that = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let from = if args.len() == 2 {
+                args[1].to_int()
+            } else if name == "endsWith" {
+                items.len() as i64 - that.len() as i64
+            } else {
+                0
+            };
+            if from < 0 || from as usize + that.len() > items.len() {
+                return Ok(Value::bool(false));
+            }
+            let at = from as usize;
+            Ok(Value::bool(
+                that.iter()
+                    .enumerate()
+                    .all(|(i, e)| scala_eq(&items[at + i], e)),
+            ))
+        }
         // `iterator`/`reverseIterator` materialize their elements — this
         // frontend is strict — but answer an `Iterator`, not an `Iterable`, so
         // the two behaviors that ARE observable without laziness hold: it
@@ -5703,6 +5879,13 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             Ok(Value::str(join_vm(vm, &items, &sep)))
         }
         ("contains", 1) => Ok(Value::bool(items.iter().any(|x| value_eq(x, &args[0])))),
+        // A `Set`'s `apply` is `contains`, not an index: `Set(1,2,3)(2)` is
+        // `true` and `Set(1,2,3)(9)` is `false`. Reading it positionally
+        // answered the ELEMENT (`3`) and threw an `IndexOutOfBoundsException`
+        // for a member that is simply absent.
+        ("apply", 1) if matches!(kind, SeqKind::Set(_)) => {
+            Ok(Value::bool(items.iter().any(|x| value_eq(x, &args[0]))))
+        }
         ("apply", 1) => {
             let i = args[0].to_int();
             match usize::try_from(i).ok().and_then(|u| items.get(u)) {
@@ -5999,8 +6182,59 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 .map(|i| same(items[..i].to_vec()))
                 .collect(),
         )),
+        // `updated(i, v)` — the copy with one element replaced. Bounds-checked
+        // against the same message `apply` reports, because it is the same
+        // `IndexOutOfBoundsException` the standard library raises.
+        ("updated", 2) => {
+            let i = args[0].to_int();
+            if i < 0 || i as usize >= items.len() {
+                return Err(updated_fault(kind, i, items.len()));
+            }
+            let mut out = items;
+            out[i as usize] = args[1].clone();
+            Ok(same(out))
+        }
+        // `permutations`/`combinations(n)` — the DISTINCT arrangements and
+        // sub-multisets, in the order [`first_occurrence_order`] explains. Both
+        // answer an `Iterator` (so an un-consumed one prints `<iterator>` and a
+        // second traversal sees it exhausted) whose windows keep the receiver's
+        // own kind, exactly as `grouped`/`sliding` do.
+        ("permutations", 0) => Ok(new_seq(
+            SeqKind::Iterator,
+            permutations_of(&items).into_iter().map(same).collect(),
+        )),
+        ("combinations", 1) => Ok(new_seq(
+            SeqKind::Iterator,
+            combinations_of(&items, args[0].to_int())
+                .into_iter()
+                .map(same)
+                .collect(),
+        )),
         ("toSet", 0) => Ok(new_set(HashRep::Small, items)),
-        ("toSeq" | "toIterable", 0) => Ok(new_list(items)),
+        // `toIterable` is `Iterable.toIterable`, defined as `this`: it changes
+        // nothing at all. A `Vector` stays a `Vector`, a `Set` stays a `Set`, a
+        // `ListBuffer` stays a `ListBuffer` and a `Range` stays a `Range`.
+        // Answering `List(…)` for all of them — which is what this did — was
+        // wrong for every receiver except a `List`.
+        //
+        // An `Array` is the exception, because it is not an `Iterable` at all:
+        // `ArrayOps.toIterable` wraps it in the `immutable.ArraySeq` that is its
+        // `IndexedSeq` view.
+        ("toIterable", 0) if kind == SeqKind::Array => Ok(new_seq(SeqKind::ArraySeq, items)),
+        ("toIterable", 0) => Ok(recv.clone()),
+        // `toSeq` answers an IMMUTABLE `Seq`, so it is `this` only when the
+        // receiver already is one — `Vector(1,2).toSeq` is that same `Vector`
+        // and `(1 to 3).toSeq` is that same `Range`. A `Set`, a `Map`, an
+        // `Iterator` and every MUTABLE sequence must be copied out, and their
+        // builder is `List`'s: `ListBuffer(1,2).toSeq` is `List(1, 2)`, not a
+        // `ListBuffer`. An `Array`'s is `ArraySeq`, as above.
+        ("toSeq", 0) => match kind {
+            SeqKind::List | SeqKind::Vector | SeqKind::ArraySeq | SeqKind::Range { .. } => {
+                Ok(recv.clone())
+            }
+            SeqKind::Array => Ok(new_seq(SeqKind::ArraySeq, items)),
+            _ => Ok(new_list(items)),
+        },
         ("toMap", 0) => {
             let mut entries: Vec<(Value, Value)> = Vec::with_capacity(items.len());
             for it in &items {
@@ -6280,6 +6514,8 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
     }
     match (name, args.len()) {
+        // `Iterable.toIterable` is `this`: a `Map` stays a `Map`.
+        ("toIterable", 0) => Ok(recv.clone()),
         ("updated", 2) | ("+", 1) => {
             let mut out = entries.clone();
             match (name, as_seq_or_tuple(&args[0])) {
@@ -8724,6 +8960,111 @@ fn window_starts(len: usize, size: usize, step: usize) -> impl Iterator<Item = (
     })
 }
 
+/// The receiver reordered the way `SeqOps.permutations` and
+/// `SeqOps.combinations` both start from, as `(ranks, elements)`.
+///
+/// Scala's `PermutationsItr`/`CombinationsItr` do not sort the receiver and do
+/// not take it as written. Both begin by numbering each element with the
+/// position at which its VALUE first appeared and then stably sorting by that
+/// number, which groups duplicates together while leaving distinct elements in
+/// first-appearance order. That is why the enumeration is not lexicographic in
+/// the elements — `List(3,2,1).permutations` leads with `List(3, 2, 1)` and
+/// `List(2,1,1).combinations(2)` answers `List(2, 1)` before `List(1, 1)` —
+/// and why duplicates are never repeated: with equal elements adjacent, the
+/// enumerations below skip a repeat by advancing past a run.
+///
+/// The ranks are returned alongside because they, not the values, are what the
+/// two walks compare: `Value` has no total order here, but the ranks do.
+fn first_occurrence_order(items: &[Value]) -> (Vec<usize>, Vec<Value>) {
+    let mut distinct: Vec<&Value> = Vec::new();
+    let mut ranked: Vec<(usize, &Value)> = Vec::with_capacity(items.len());
+    for it in items {
+        let rank = match distinct.iter().position(|d| scala_eq(d, it)) {
+            Some(r) => r,
+            None => {
+                distinct.push(it);
+                distinct.len() - 1
+            }
+        };
+        ranked.push((rank, it));
+    }
+    ranked.sort_by_key(|(r, _)| *r);
+    ranked
+        .into_iter()
+        .map(|(r, v)| (r, v.clone()))
+        .unzip::<usize, Value, Vec<usize>, Vec<Value>>()
+}
+
+/// Advance `ranks` (and `elems` in lockstep) to the next permutation in
+/// ascending rank order — the textbook next-permutation step, which is exactly
+/// what `PermutationsItr` performs. `false` once the last one has been reached.
+fn next_permutation(ranks: &mut [usize], elems: &mut [Value]) -> bool {
+    let n = ranks.len();
+    if n < 2 {
+        return false;
+    }
+    let Some(i) = (0..n - 1).rev().find(|&i| ranks[i] < ranks[i + 1]) else {
+        return false;
+    };
+    let j = (i + 1..n)
+        .rev()
+        .find(|&j| ranks[j] > ranks[i])
+        .expect("ranks[i] < ranks[i+1] guarantees one");
+    ranks.swap(i, j);
+    elems.swap(i, j);
+    ranks[i + 1..].reverse();
+    elems[i + 1..].reverse();
+    true
+}
+
+/// Every DISTINCT permutation of `items`, in `SeqOps.permutations` order.
+fn permutations_of(items: &[Value]) -> Vec<Vec<Value>> {
+    let (mut ranks, mut elems) = first_occurrence_order(items);
+    let mut out = vec![elems.clone()];
+    while next_permutation(&mut ranks, &mut elems) {
+        out.push(elems.clone());
+    }
+    out
+}
+
+/// Every DISTINCT `n`-element sub-multiset of `items`, in
+/// `SeqOps.combinations(n)` order. Empty for a negative `n` or one larger than
+/// the receiver; a single empty combination for `n == 0`, whatever the receiver.
+fn combinations_of(items: &[Value], n: i64) -> Vec<Vec<Value>> {
+    let mut out = Vec::new();
+    if n < 0 || n as usize > items.len() {
+        return out;
+    }
+    let (ranks, elems) = first_occurrence_order(items);
+    let n = n as usize;
+    let mut cur: Vec<Value> = Vec::with_capacity(n);
+    // Iterative depth-first walk over start positions. `stack[d]` is the index
+    // the depth-`d` element was taken from, so backtracking resumes past the
+    // whole RUN of that element's rank — which is what makes each sub-multiset
+    // appear once rather than once per arrangement of its equal elements.
+    let mut stack: Vec<usize> = Vec::with_capacity(n);
+    let mut i = 0usize;
+    loop {
+        if cur.len() == n {
+            out.push(cur.clone());
+        } else if i < elems.len() && elems.len() - i >= n - cur.len() {
+            cur.push(elems[i].clone());
+            stack.push(i);
+            i += 1;
+            continue;
+        }
+        // Backtrack: undo the last take and resume past its run of equals.
+        let Some(taken) = stack.pop() else {
+            return out;
+        };
+        cur.pop();
+        i = taken + 1;
+        while i < ranks.len() && ranks[i] == ranks[taken] {
+            i += 1;
+        }
+    }
+}
+
 fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
     // Every `String` method that accepts a `Char` (`indexOf`, `contains`,
     // `split`, `replace`, …) uses it as text, and Scala overloads them for both,
@@ -8788,6 +9129,49 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             SeqKind::Iterator,
             s.chars().map(make_char).collect(),
         )),
+        // `StringOps.updated(i, c)` — the string with one character replaced.
+        // Its bounds fault is `String`'s, not a collection's: the JDK's
+        // `charAt` wording, which names the length rather than the max index.
+        ("updated", 2) => {
+            let i = args[0].to_int();
+            let chars: Vec<char> = s.chars().collect();
+            if i < 0 || i as usize >= chars.len() {
+                return Err(format!(
+                    "scalars: java.lang.StringIndexOutOfBoundsException: \
+                     Index {i} out of bounds for length {}",
+                    chars.len()
+                ));
+            }
+            let c = as_char(&args[1])
+                .or_else(|| one_char(&args[1].as_str_cow()))
+                .unwrap_or('\u{0}');
+            Ok(Value::str(
+                chars
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &ch)| if j == i as usize { c } else { ch })
+                    .collect::<String>(),
+            ))
+        }
+        // `StringOps.permutations`/`combinations` — same enumeration as a
+        // sequence's, but rebuilt through `StringOps`'s own builder, so the
+        // windows are `String`s (`"abc".combinations(2).toList` is
+        // `List(ab, ac, bc)`, not lists of `Char`).
+        ("permutations", 0) | ("combinations", 1) => {
+            let chars: Vec<Value> = s.chars().map(make_char).collect();
+            let groups = if name == "permutations" {
+                permutations_of(&chars)
+            } else {
+                combinations_of(&chars, args[0].to_int())
+            };
+            Ok(new_seq(
+                SeqKind::Iterator,
+                groups
+                    .into_iter()
+                    .map(|g| Value::str(g.iter().filter_map(as_char).collect::<String>()))
+                    .collect(),
+            ))
+        }
         // `StringOps.grouped`/`sliding` — an `Iterator` whose windows are
         // `String`s, not `List`s of `Char` (`"abcd".grouped(2).toList` is
         // `List(ab, cd)`), because `StringOps` rebuilds through its own builder.
@@ -8827,7 +9211,8 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // which prints as the string itself (`abc`, not `List(a, b, c)`) and
         // answers every `Seq` operation through `StringOps`. The string is
         // exactly that view here.
-        ("toSeq", 0) => Ok(Value::str(s)),
+        // `toIterable` is the same view under its `Iterable` name.
+        ("toSeq" | "toIterable", 0) => Ok(Value::str(s)),
         ("reverse", 0) => Ok(Value::str(s.chars().rev().collect::<String>())),
         // `StringOps.toInt` IS `Integer.parseInt`, and the JDK's integer parses
         // do not trim: `" 42".toInt` throws where `" 42".trim.toInt` answers 42,
@@ -9056,6 +9441,9 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 .join(&args[1].as_str_cow()),
             args[2].as_str_cow()
         ))),
+        // `StringOps.toIndexedSeq` is a `WrappedString`, which renders as the
+        // string itself rather than as a sequence of `Char`s.
+        ("toIndexedSeq", 0) => Ok(Value::str(s)),
         ("toCharArray", 0) => Ok(new_seq(SeqKind::Array, s.chars().map(make_char).collect())),
         // `StringOps.zipWithIndex` answers an `IndexedSeq`, printed `Vector(…)`.
         ("zipWithIndex", 0) => Ok(new_seq(
