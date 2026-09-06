@@ -2325,6 +2325,135 @@ fn g_lazyval(r: &mut Rng) -> String {
     }
 }
 
+/// Block-scope SHADOWING: an inner binding that reuses an outer binding's name,
+/// and a read of the outer one after the inner block closes.
+///
+/// Chosen by counting, like the modes before it. No program anywhere in this
+/// generator declared one name twice in nested scopes — `grep -c 'val a = 5; {'`
+/// answered 0 — so nothing here could say whether the outer binding survived.
+/// It did not: the frontend keys storage by NAME within a frame, so the inner
+/// declaration landed on the outer one's slot (or, at the top level, its global)
+/// and every arm below answered the INNER value twice.
+///
+/// Every arm reads the outer binding AFTER the inner scope closes, because that
+/// read is the entire question. An arm that only printed inside the inner block
+/// would agree with a frontend that had no scoping at all.
+///
+/// The inner binding is never a plain re-`val` in the SAME block: Scala's block
+/// scope runs over the whole block, so `val a = 5; { val a = a + 1 }` is a
+/// recursive value the reference REJECTS at compile time rather than a shadow.
+/// Only nested scopes are generated.
+fn g_shadow(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let s = pick(r, STRS);
+    match r.below(19) {
+        // The plain shape: a brace block, and the outer binding after it.
+        0 => format!("{{ val v{u} = {a}; {{ val v{u} = {b}; println(v{u}) }}; println(v{u}) }}"),
+        // A `var` shadowed by a `val`, then ASSIGNED after the inner block — the
+        // write has to reach the outer binding, not the departed inner one.
+        1 => format!(
+            "{{ var v{u} = {a}; {{ val v{u} = {b}; println(v{u}) }}; v{u} = {b}; println(v{u}) }}"
+        ),
+        // An `if` branch is a scope.
+        2 => format!(
+            "{{ val v{u} = {a}; if ({a} == {a}) {{ val v{u} = {b}; println(v{u}) }}; println(v{u}) }}"
+        ),
+        // A loop BODY is a scope, and it re-enters: the inner binding is fresh
+        // each iteration and the outer one is untouched by all of them.
+        3 => format!(
+            "{{ val v{u} = {a}; for (i{u} <- 1 to 3) {{ val v{u} = i{u} * 10; println(v{u}) }}; \
+             println(v{u}) }}"
+        ),
+        // The same through a `while`, whose counter is the only thing that may
+        // escape the body.
+        4 => format!(
+            "{{ var n{u} = 0; val v{u} = {a}; while (n{u} < 2) {{ val v{u} = {b}; println(v{u}); \
+             n{u} += 1 }}; println(v{u}) }}"
+        ),
+        // Three levels: each block restores the one outside it, so the tail
+        // prints three DIFFERENT values on the way out.
+        5 => format!(
+            "{{ val v{u} = {a}; {{ val v{u} = {b}; {{ val v{u} = {a} + {b}; println(v{u}) }}; \
+             println(v{u}) }}; println(v{u}) }}"
+        ),
+        // The inner binding has a different TYPE. A frontend that shares the
+        // storage does not just answer the wrong value, it answers the wrong
+        // shape — and the trailing read is an arithmetic one to prove the outer
+        // binding is still a number.
+        6 => format!(
+            "{{ val v{u} = {a}; {{ val v{u} = {s}; println(v{u}.length) }}; println(v{u} + 1) }}"
+        ),
+        // A match arm's pattern BINDER is a declaration, and its scope is the arm.
+        7 => format!(
+            "{{ val v{u} = {a}; Some({b}) match {{ case Some(v{u}) => println(v{u}); \
+             case None => println(0) }}; println(v{u}) }}"
+        ),
+        // …including under a guard, which is evaluated in the arm's scope too.
+        8 => format!(
+            "{{ val v{u} = {a}; List({a}, {b}).foreach {{ x{u} => x{u} match {{ \
+             case v{u} if v{u} > 0 => println(\"p\" + v{u}); case v{u} => println(\"n\" + v{u}) }} }}; \
+             println(v{u}) }}"
+        ),
+        // A `catch` arm's binder, whose scope is the handler. Left unscoped it
+        // leaked the THROWABLE into the outer name.
+        9 => format!(
+            "{{ val v{u} = {a}; try {{ throw new RuntimeException(\"boom\") }} \
+             catch {{ case v{u}: Exception => println(v{u}.getMessage) }}; println(v{u}) }}"
+        ),
+        // A `for` GENERATOR variable shadows, and its scope ends with the loop.
+        10 => format!("{{ val v{u} = {a}; for (v{u} <- 1 to 2) println(v{u}); println(v{u}) }}"),
+        // A for-comprehension's own `val` clause is a binding in the
+        // comprehension's scope, not the enclosing one.
+        11 => format!(
+            "{{ val v{u} = {a}; val r{u} = for (i{u} <- 1 to 2; v{u} = i{u} * 10) yield v{u}; \
+             println(r{u}); println(v{u}) }}"
+        ),
+        // A destructuring `val` binds several names at once; each is a shadow.
+        12 => format!(
+            "{{ val v{u} = {a}; val w{u} = {b}; {{ val (v{u}, w{u}) = ({b}, {a}); \
+             println(v{u} + \",\" + w{u}) }}; println(v{u} + \",\" + w{u}) }}"
+        ),
+        // Inside a LAMBDA body, where the outer binding is a CAPTURE rather than
+        // a local: the capture is bound into the closure's own frame under its
+        // own name, so an inner declaration collides there just the same.
+        13 => format!(
+            "{{ val v{u} = {a}; List({a}, {b}).foreach {{ x{u} => \
+             {{ val v{u} = x{u} * 10; println(v{u}) }}; println(v{u}) }}; println(v{u}) }}"
+        ),
+        // Inside a `def`, shadowing a PARAMETER — the parameter is still the
+        // parameter after the block, and the caller's argument still decides it.
+        14 => format!(
+            "{{ def f{u}(v{u}: Int): Int = {{ {{ val v{u} = {b}; println(v{u}) }}; v{u} }}; \
+             println(f{u}({a})); println(f{u}({b})) }}"
+        ),
+        // Inside a METHOD, shadowing a class FIELD. The field is reached as
+        // `this.field`, so the block's local must not displace it.
+        15 => format!(
+            "{{ class C{u}(val v{u}: Int) {{ def m(): Int = {{ {{ val v{u} = {b}; println(v{u}) }}; \
+             v{u} }} }}; println(new C{u}({a}).m()) }}"
+        ),
+        // A `lazy val` shadowed by an eager one: the inner read is a plain load
+        // and the outer binding is still a thunk that has never run.
+        16 => format!(
+            "{{ lazy val v{u} = {{ println(\"init\"); {a} }}; {{ val v{u} = {b}; println(v{u}) }}; \
+             println(v{u}); println(v{u}) }}"
+        ),
+        // A nested `def` reads the INNER binding, which is what it captures.
+        17 => format!(
+            "{{ val v{u} = {a}; {{ val v{u} = {b}; def g{u}(): Int = v{u} * 10; println(g{u}()) }}; \
+             println(v{u}) }}"
+        ),
+        // Two SIBLING blocks shadow the same outer name in turn. Neither may see
+        // the other's binding, and the outer one outlives both.
+        _ => format!(
+            "{{ val v{u} = {a}; {{ val v{u} = {b}; println(v{u}) }}; \
+             {{ val v{u} = {a} + {b}; println(v{u}) }}; println(v{u}) }}"
+        ),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     All,
@@ -2377,6 +2506,7 @@ enum Mode {
     Braces,
     Interp,
     LazyVal,
+    Shadow,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -2431,6 +2561,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::SeqMore => "seqmore",
         Mode::Interp => "interp",
         Mode::LazyVal => "lazyval",
+        Mode::Shadow => "shadow",
     }
 }
 
@@ -2486,6 +2617,7 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "seqmore" => Mode::SeqMore,
         "interp" => Mode::Interp,
         "lazyval" => Mode::LazyVal,
+        "shadow" => Mode::Shadow,
         _ => return None,
     })
 }
@@ -2540,6 +2672,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Braces,
     Mode::Interp,
     Mode::LazyVal,
+    Mode::Shadow,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -2899,6 +3032,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::SeqMore => g_seqmore(r),
         Mode::Interp => g_interp(r),
         Mode::LazyVal => g_lazyval(r),
+        Mode::Shadow => g_shadow(r),
         Mode::All => unreachable!(),
     }
 }
