@@ -134,19 +134,19 @@ fn frozen_corpus_matches_reference_scala() {
         n += 1;
     }
     // The floors are the counts the file ACTUALLY holds, not a token minimum.
-    // `n >= 15` against a 542-record corpus is not a floor: 527 records could be
+    // `n >= 15` against a 603-record corpus is not a floor: 588 records could be
     // deleted — every Double-notation pin, the whole exception surface, all of
     // it — and this test would still pass, reporting that parity is locked. A
     // frozen corpus's only defence against silent shrinkage is a number that
     // moves with it, so raise both whenever the corpus grows.
     assert!(
-        n >= 573,
-        "the frozen corpus has shrunk: {n} records, expected at least 573"
+        n >= 603,
+        "the frozen corpus has shrunk: {n} records, expected at least 603"
     );
     // Without this the three-field form could be dropped from the data and the
     // whole failure axis would stop being exercised with the test still green.
     assert!(
-        failing >= 43,
+        failing >= 46,
         "the expected-FAILURE half of the corpus has thinned out: {failing} records"
     );
 }

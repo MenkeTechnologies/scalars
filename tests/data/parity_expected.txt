@@ -571,3 +571,33 @@ object T extends App { println(List(1,2,3).toIndexedSeq); println(Array(1,2).toI
 object T extends App { println(List(1,2,3).startsWith(List(1,2))); println(List(1,2,3).startsWith(List(2))); println(List(1,2,3).startsWith(List())) }	true\nfalse\ntrue\n
 object T extends App { println(List(1,2,3).startsWith(List(2,3), 1)); println(List(1,2,3).startsWith(List(1,2,3,4))); println(Vector(1,2,3).startsWith(Vector(1))) }	true\nfalse\ntrue\n
 object T extends App { println(List(1,2,3).endsWith(List(2,3))); println(List(1,2,3).endsWith(List(3,2))); println(List(1,2).endsWith(List(0,1,2))) }	true\nfalse\nfalse\n
+object T extends App { val s = "café"; println(s"""$s"q"$s"""); println(s"""a"""""".length); println(raw"""r\td $s""".length) }	café"q"café\n4\n9\n
+object T extends App { val s = "x"; println(s"""multi\nline $s""") }	multi\nline x\n
+object T extends App { println(f"""${3}%05d|${"a"}%-4s|""") }	00003|a   |\n
+object T extends App { println(raw"\d+"); println(raw"a\tb".length); println(raw"$$"); println(s"$$") }	\d+\n4\n$\n$\n
+object T extends App { println(f"${1234567}%,d"); println(f"${-1234567}%,d"); println(f"${12}%,d"); println(f"${1000}%,d") }	1,234,567\n-1,234,567\n12\n1,000\n
+object T extends App { println(f"${1234567}%,012d"); println(f"${1234567}%,015d"); println(f"${-1234}%,08d"); println(f"${1234}%,-12d") }	0001,234,567\n0000001,234,567\n-001,234\n1,234       \n
+object T extends App { println(f"${1234567.891}%,.2f"); println(f"${1234567.5}%,015.2f"); println(f"${-1234567.5}%,+15.2f"); println(f"${0.5}%,.3f") }	1,234,567.89\n0001,234,567.50\n  -1,234,567.50\n0.500\n
+object T extends App { println(String.format("%,d", java.lang.Long.valueOf(1234567890123L))); println("%,d".format(1000000000)); println("%,.3f".format(9876543.21)) }	1,234,567,890,123\n1,000,000,000\n9,876,543.210\n
+object T extends App { println(f"${1234.5}%,e") }		java.util.FormatFlagsConversionMismatchException: Conversion = e, Flags = ,
+object T extends App { lazy val a = { println("init"); 5 }; def f(a: Int = 1, b: Int = 2): Int = a * 10 + b; println(f(b = 9)); println(f(7)); println(a); println(f()) }	19\n72\ninit\n5\n12\n
+object T extends App { lazy val v = -7; class C(v: Int) { def q = v * 2 }; println(new C(9).q); println(v) }	18\n-7\n
+object T extends App { lazy val v = 3; val f = (v: Int) => v + 1; println(f(10)); println(v) }	11\n3\n
+object T extends App { lazy val v = { println("init"); 4 }; println("before"); println(v); println(v); println(v + 1) }	before\ninit\n4\n4\n5\n
+object T extends App { lazy val v = { println("init"); 4 }; println("done") }	done\n
+object T extends App { lazy val p = { println("p"); 2 }; lazy val q = { println("q"); p + 3 }; println("go"); println(q); println(q); println(p) }	go\nq\np\n5\n5\n2\n
+object T extends App { lazy val v = { println("try"); 42 / 0 }; try { println(v) } catch { case e: ArithmeticException => println("c1") }; try { println(v) } catch { case e: ArithmeticException => println("c2") } }	try\nc1\ntry\nc2\n
+object T extends App { lazy val v = { println("init"); 5 }; def g(): Int = v + 1; println("before"); println(g()); println(g()) }	before\ninit\n6\n6\n
+object T extends App { lazy val v = { println("init"); List(1, 2) }; println(v.sum); println(v.length); println(v) }	init\n3\n2\nList(1, 2)\n
+object T extends App { lazy val v = { println("init"); 6 }; println(List(1, 2).map(x => x + v)) }	init\nList(7, 8)\n
+object T extends App { val l = List(1,2,3,4); println(l.corresponds(List(2,3,4,5))(_ < _)); println(l.corresponds(List(2,3))(_ < _)); println(l.corresponds(List(2,3,4,0))(_ < _)) }	true\nfalse\nfalse\n
+object T extends App { println(List[Int]().corresponds(List[Int]())((a,b) => a < b)); println("abc".corresponds("abd")(_ <= _)); println(Vector('a','b').corresponds(Vector('a','c'))(_ <= _)) }	true\ntrue\ntrue\n
+object T extends App { val l = List(1,2,3,4); println(l.aggregate(0)(_ + _, _ + _)); println(l.aggregate("")((s,i) => s + i, _ + _)); println(Vector(1,2).aggregate(10)(_ - _, _ + _)) }	10\n1234\n7\n
+object T extends App { println(Set(1,2,3).aggregate(0)(_ + _, _ + _)); println("abc".aggregate(0)((s,c) => s + c.toInt, _ + _)); println(List[Int]().aggregate(9)(_ + _, _ + _)) }	6\n294\n9\n
+object T extends App { println(List.empty[Int](0)) }		java.lang.IndexOutOfBoundsException: 0
+object T extends App { println(Map.empty[String,Int]("k")) }		java.util.NoSuchElementException: key not found: k
+object T extends App { println(List.empty[Int]); println(Vector.empty[Int].size); println(Set.empty[Int] + 1); println(Map.empty[String,Int]) }	List()\n0\nSet(1)\nMap()\n
+object T extends App { println(List(1,2,3).zipAll(List(9), 0, 0)); println(List(1).zipAll(List(8,9), -1, -1)); println(List(1,2).segmentLength(_ < 2)) }	List((1,9), (2,0), (3,0))\nList((1,8), (-1,9))\n1\n
+object T extends App { println(List(1,2,3).combinations(2).toList); println(List(1,2,3).permutations.size); println(List(1,2,3).scanRight(0)(_ + _)) }	List(List(1, 2), List(1, 3), List(2, 3))\n6\nList(6, 5, 3, 0)\n
+object T extends App { val s = "hi"; println(s"${s.length}$s"); println(s"$s${s}$s"); println(f"$s%5s|") }	2hi\nhihihi\n   hi|\n
+object T extends App { val s = "hi"; println(s"""a\tb $s""".length); println(s"""a\tb $s""".map(_.toInt).mkString(",")); println("""q\tw""".length); println("""q\tw""".map(_.toInt).mkString(",")) }	6\n97,9,98,32,104,105\n4\n113,92,116,119\n
