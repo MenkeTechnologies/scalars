@@ -601,3 +601,49 @@ object T extends App { println(List(1,2,3).zipAll(List(9), 0, 0)); println(List(
 object T extends App { println(List(1,2,3).combinations(2).toList); println(List(1,2,3).permutations.size); println(List(1,2,3).scanRight(0)(_ + _)) }	List(List(1, 2), List(1, 3), List(2, 3))\n6\nList(6, 5, 3, 0)\n
 object T extends App { val s = "hi"; println(s"${s.length}$s"); println(s"$s${s}$s"); println(f"$s%5s|") }	2hi\nhihihi\n   hi|\n
 object T extends App { val s = "hi"; println(s"""a\tb $s""".length); println(s"""a\tb $s""".map(_.toInt).mkString(",")); println("""q\tw""".length); println("""q\tw""".map(_.toInt).mkString(",")) }	6\n97,9,98,32,104,105\n4\n113,92,116,119\n
+object T extends App { val a = 5; { val a = 100; println(a) }; println(a) }	100\n5\n
+object T extends App { def f(): Unit = { val a = 5; { val a = 100; println(a) }; println(a) }; f() }	100\n5\n
+object T extends App { val a = 5; if (true) { val a = 100; println(a) }; println(a) }	100\n5\n
+object T extends App { val a = 5; for (i <- 1 to 2) { val a = i * 10; println(a) }; println(a) }	10\n20\n5\n
+object T extends App { var a = 5; { var a = 100; a += 1; println(a) }; println(a) }	101\n5\n
+object T extends App { val a = "s"; { val a = 100; println(a) }; println(a) }	100\ns\n
+object T extends App { val a = 5; List(1,2).foreach { x => val a = x; println(a) }; println(a) }	1\n2\n5\n
+object T extends App { val a = 5; { { val a = 1; println(a) }; println(a) }; println(a) }	1\n5\n5\n
+object T extends App { val a = 5; List(1).foreach { a => println(a) }; println(a) }	1\n5\n
+object T extends App { val a = 5; def g(a: Int) = a * 2; println(g(3)); println(a) }	6\n5\n
+object T extends App { val a = 5; val r = List(1,2).map { case x => val a = x + 100; a }; println(r); println(a) }	List(101, 102)\n5\n
+object T extends App { val a = 5; Some(7) match { case Some(a) => println(a); case None => () }; println(a) }	7\n5\n
+object T extends App { val a = 5; try { val a = 9; println(a) } catch { case e: Exception => () }; println(a) }	9\n5\n
+object T extends App { val a = 5; try { throw new RuntimeException("x") } catch { case a: Exception => println(a.getMessage) }; println(a) }	x\n5\n
+object T extends App { val a = 5; { lazy val a = 100; println(a) }; println(a) }	100\n5\n
+object T extends App { val a = 5; { val a = 100; { val a = 200; println(a) }; println(a) }; println(a) }	200\n100\n5\n
+object T extends App { val a = 5; { val a = 100; println(s"$a") }; println(s"$a") }	100\n5\n
+object T extends App { var n = 0; val a = 5; while (n < 2) { val a = 7; println(a); n += 1 }; println(a) }	7\n7\n5\n
+object T extends App { val a = 1; val b = { val a = 2; a * 10 }; println(b); println(a) }	20\n1\n
+object T extends App { def f(x: Int): Int = { { val x = 9; println(x) }; x }; println(f(3)) }	9\n3\n
+object T extends App { val a = 5; List(1,2).foreach { x => { val a = x * 10; println(a) }; println(a) }; println(a) }	10\n5\n20\n5\n5\n
+object T extends App { val a = 5; val r = for (i <- 1 to 2; a = i * 10) yield a; println(r); println(a) }	Vector(10, 20)\n5\n
+object T extends App { val a = 5; { val (a, b) = (1, 2); println(a + b) }; println(a) }	3\n5\n
+object T extends App { val a = 5; def g(): Int = a * 2; { val a = 100; println(g()); println(a) }; println(a) }	10\n100\n5\n
+object T extends App { var a = 5; { val a = 100; println(a) }; a = 7; println(a) }	100\n7\n
+object T extends App { val a = 5; { val a = 100; def h(): Int = a + 1; println(h()) }; println(a) }	101\n5\n
+object T extends App { val a = 5; { val a = "str"; println(a.length) }; println(a + 1) }	3\n6\n
+object T extends App { val xs = List(1,2,3); val n = 9; val r = xs.map { n => n * 2 }; println(r); println(n) }	List(2, 4, 6)\n9\n
+object T extends App { val a = 5; { val a = 100; { val a = 200; { val a = 300; println(a) }; println(a) }; println(a) }; println(a) }	300\n200\n100\n5\n
+object T extends App { val a = 5; List((1,2)).foreach { case (a, b) => println(a + b) }; println(a) }	3\n5\n
+object T extends App { val a = 5; { lazy val a = { println("init"); 100 }; println(a); println(a) }; println(a) }	init\n100\n100\n5\n
+object T extends App { val a = 5; for (a <- 1 to 2) println(a); println(a) }	1\n2\n5\n
+object T extends App { val a = 5; { var a = 1; for (i <- 1 to 3) a += i; println(a) }; println(a) }	7\n5\n
+object T extends App { val opt = Some(3); val a = 5; opt match { case Some(a) if a > 1 => println(a * 2); case _ => println(0) }; println(a) }	6\n5\n
+object T extends App { val a = 5; val f = (a: Int) => { { val a = 99; println(a) }; a }; println(f(7)); println(a) }	99\n7\n5\n
+object T extends App { val a = 5; { val a = 100; println(a) }; { val a = 200; println(a) }; println(a) }	100\n200\n5\n
+object T extends App { lazy val a = { println("init"); 5 }; { val a = 100; println(a) }; println(a); println(a) }	100\ninit\n5\n5\n
+object T extends App { var a = 5; { var a = 1; a += 10; println(a) }; a += 2; println(a) }	11\n7\n
+object T extends App { val a = 5; List(1,-2).foreach { x => x match { case a if a > 0 => println("p" + a); case a => println("n" + a) } }; println(a) }	p1\nn-2\n5\n
+object T extends App { val a = 5; val b = 6; { val (a, b) = (1, 2); println(a + "," + b) }; println(a + "," + b) }	1,2\n5,6\n
+object T extends App { val a = 5; def g(): Int = a * 2; { val a = 100; println(g()) }; println(g()); println(a) }	10\n10\n5\n
+object T extends App { val a = 5; if (a > 0) { val a = 1 } else { val a = 2 }; println(a) }	5\n
+object T extends App { val a = 5; { val a = List(1,2,3); println(a.sum) }; println(a * 2) }	6\n10\n
+object T extends App { def f(x: Int): Int = { { val x = 9; println(x) }; x }; println(f(3)); println(f(4)) }	9\n3\n9\n4\n
+object T extends App { val a = 5; val r = List(1,2).map { x => { val a = x + 1; a * 10 } }; println(r); println(a) }	List(20, 30)\n5\n
+class C(val a: Int) { def m(): Int = { { val a = 9; println(a) }; a } }; object T extends App { println(new C(5).m()) }	9\n5\n
