@@ -141,8 +141,9 @@ bindings (with `val` immutability enforced), arithmetic, `if`/`while`, the Scala
 range `for` (with a `by` step), `try`/`catch`/`finally`/`throw`, and
 `println`/`print`. User-defined `def`s — parameters, recursion,
 mutual recursion, `return`, a tail `if`/`else` result, and true block-local
-scoping (an inner `def` shadows an outer one; enclosing locals are lambda-lifted
-into parameters) — compile to fusevm's native call frames, and postfix `.`
+scoping (an inner `def` or `val` shadows an outer one of the same name and the
+outer binding survives the block; enclosing locals are lambda-lifted into
+parameters) — compile to fusevm's native call frames, and postfix `.`
 dispatch wires a core `String`/`Int`/`Double` method slice. A host-side object
 model (`class`/`object`/`case class`, `trait`, `extends`/`with`, `override`,
 `super`, virtual dispatch, `new`, fields, `this`, structural
@@ -271,6 +272,13 @@ Implemented and checked against the reference `scala`:
   two blocks may each declare `def f`, an inner one shadows an outer one, and
   the enclosing-frame locals a local `def` reads are lambda-lifted into extra
   parameters every call site passes (`src/resolve.rs`).
+- **Block-scoped values** — a `val`/`var`, a pattern binder (`case Some(a)`, a
+  `catch` arm, a destructuring `val (a, b)`) or a `for` generator that reuses an
+  enclosing name shadows it for its own scope only, and the outer binding is
+  unchanged after that scope closes — including when the outer one is a method
+  parameter, a class field, a captured local or a top-level binding. The
+  compiler underneath keys storage by name within a frame, so each shadowing
+  declaration is alpha-renamed in `src/resolve.rs` before it gets there.
 - **Parameter lists** — default values (`def f(x: Int, y: Int = 10)`, evaluated
   at the call site and only when the argument is omitted), named arguments in
   any order (`f(y = 1, x = 2)`), repeated parameters (`def f(xs: Int*)`, which
@@ -626,7 +634,7 @@ probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
 `nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, `breaks`,
 `params`, `fmt`, `apply`, `narrow`, `braces`, `arrange`, `seqmore`, `interp`,
-`lazyval`, …). It needs a real `scala` on
+`lazyval`, `shadow`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -823,10 +831,32 @@ of seven alternating pairs:
 The indexed loop was quadratic and is now linear (0.00s / 0.01s / 0.03s at
 n = 2000 / 4000 / 8000, against 0.14s / 0.53s / 2.08s).
 
-Two more modes were added the same way, by counting what the generator had never
-written rather than by picking a topic. `interp` covers the string
-interpolators; `lazyval` covers `lazy val`. Both counted ZERO across the whole
-generator, and both found real gaps on their first run.
+Profiling again found the read side of the same copy on `Map`. `map_rep_entries`
+clones every entry before the dispatch knows whether it needs one, so `m.size`
+inside a loop over a 3000-entry `Map` copied 3000 pairs to answer a number the
+heap already held. The three COUNT reads — `size`, `isEmpty`, `nonEmpty` — are
+now answered off the entry count `map_rep_len` already reads without a copy:
+0.35s -> 0.06s on a 3000-iteration `m.size` loop, against a 0.01s A/A spread and
++0.00s on an unrelated arithmetic control. Quadratic before (0.04s / 0.15s /
+0.63s at n = 1000 / 2000 / 4000), linear after (0.01s / 0.03s / 0.10s, the
+remaining growth being the map CONSTRUCTION, not the loop).
+
+The KEYED reads deliberately stayed on the ordinary path. `apply`, `get`,
+`contains` and `getOrElse` pay the same copy, but skipping it would not make them
+cheaper: the lookup behind them is a linear scan, so they are `O(n)` either way,
+and that scan compares keys with a comparison that re-enters the heap for an
+object key — a shortcut would have to hold the heap borrow across it. Making
+those `O(1)` needs an index beside the entries, which is a representation change
+rather than a shorter path to the same scan, and the entry ORDER is load-bearing
+(it is what reproduces Scala's iteration order). Building an immutable `Map` a
+key at a time is quadratic for the same representational reason and is likewise
+left alone.
+
+Three more modes were added the same way, by counting what the generator had
+never written rather than by picking a topic. `interp` covers the string
+interpolators, `lazyval` covers `lazy val`, and `shadow` covers a binding that
+reuses an enclosing name. All three counted ZERO across the whole generator, and
+all three found real gaps on their first run.
 
 `interp` crosses the three prefixes with both delimiters. The triple-quoted
 INTERPOLATED form — `s"""…"""`, which is how a Scala program writes a multi-line
@@ -867,6 +897,32 @@ group only the integer part; `,` on a conversion that has no grouped decimal
 form — `%,e`, `%,s` — is a `FormatFlagsConversionMismatchException`, not a
 silent pass. The pools now carry magnitudes that can show a separator, on both
 signs and past `Int`.
+
+A third mode was counted out the same way and found the largest gap of the three
+releases. No program anywhere in the generator had ever declared one name twice
+in nested scopes — `val a = 5; {` counted ZERO — so nothing could say whether an
+outer binding survived an inner one. It did not. The compiler keys storage by
+name within a frame, and at the top level by name outright, so the inner
+declaration landed on the outer binding's slot or global and stayed there:
+`val a = 5; { val a = 100; println(a) }; println(a)` answered `100` twice where
+the reference answers `100` then `5`. Every shape carried it — an `if` branch, a
+loop body, a `match` or `catch` arm binder, a `for` generator, a destructuring
+`val`, a lambda body, a `def` body over a parameter, a method body over a class
+field — and the failures were not only wrong VALUES: an inner `val` shadowing an
+outer `var` made a later assignment to the `var` a spurious
+`reassignment to val` error, a `catch` binder leaked the THROWABLE into the outer
+name, and an inner binding of another type made the outer read change shape
+(`str1` for what the reference prints as `6`). A local `def` reading the outer
+binding read the inner one instead, answering `200` where the reference answers
+`10`.
+
+The fix is in `src/resolve.rs`, which already renamed block-local `def`s for the
+identical reason: a shadowing value binding is now alpha-renamed too, and every
+read of it rewritten to match. Only a binding an enclosing scope already holds is
+renamed, so a program that shadows nothing compiles to exactly the bytecode it
+did before. A class BODY is the one place the rule is suppressed — its `val`s are
+field declarations, not locals shadowing the frame — and 46 records freeze the
+result.
 
 Three further gaps closed alongside them. `corresponds` and `aggregate` were
 missing from every sequence; the `String` delegation that reaches the sequence
