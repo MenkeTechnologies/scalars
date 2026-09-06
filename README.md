@@ -381,11 +381,15 @@ Implemented and checked against the reference `scala`:
   (`take`/`drop`/`slice`/`splitAt`/`span`/`partition`/`takeWhile`/`dropWhile`/
   `init`/`tail`/`headOption`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
   `grouped`/`sliding`), arrangement (`permutations`/`combinations`/`updated`),
-  prefix tests (`startsWith`/`endsWith`), `groupBy`, `mkString`, the `to*`
+  lockstep comparison (`corresponds`), the sequential `aggregate(z)(seqop,
+  combop)`, prefix tests (`startsWith`/`endsWith`), `groupBy`, `mkString`, the `to*`
   conversions, the set
   algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`), and
   `Map`'s `apply`/`get`/`getOrElse`/`keys`/`values`/`updated`, and the
-  companions' `IterableFactory` members — `List.empty`, `List.fill(n)(v)` (whose
+  companions' `IterableFactory` members — `List.empty` (including the applied
+  `List.empty[Int](0)` and `Map.empty[String, Int]("k")`, which are an
+  application of the empty collection rather than a factory taking arguments),
+  `List.fill(n)(v)` (whose
   fill expression is by-name and re-evaluated per element),
   `Vector.tabulate(n)(f)`, `List.range(a, b[, step])`, `List.concat(…)`,
   `List.from(xs)` and the `Range` companion (`Range(a, b[, step])`,
@@ -621,7 +625,8 @@ probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
 `nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, `breaks`,
-`params`, `fmt`, `apply`, `narrow`, `braces`, `arrange`, `seqmore`, …). It needs a real `scala` on
+`params`, `fmt`, `apply`, `narrow`, `braces`, `arrange`, `seqmore`, `interp`,
+`lazyval`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -817,6 +822,61 @@ of seven alternating pairs:
 
 The indexed loop was quadratic and is now linear (0.00s / 0.01s / 0.03s at
 n = 2000 / 4000 / 8000, against 0.14s / 0.53s / 2.08s).
+
+Two more modes were added the same way, by counting what the generator had never
+written rather than by picking a topic. `interp` covers the string
+interpolators; `lazyval` covers `lazy val`. Both counted ZERO across the whole
+generator, and both found real gaps on their first run.
+
+`interp` crosses the three prefixes with both delimiters. The triple-quoted
+INTERPOLATED form — `s"""…"""`, which is how a Scala program writes a multi-line
+message — did not parse at all: the prefix was recognised and the third quote
+was not, so `s"""x $v"""` lexed as an empty interpolation followed by a stray
+plain literal and the parser rejected the program at it. The triple-quoted form
+is the same interpolator, not the verbatim literal the unprefixed `"""…"""` is:
+measured against the reference, `s"""a\tb"""` has length 6 with the `\t`
+decoded, where `"""q\tw"""` has length 4 with it kept, and `raw"""r\td"""`
+keeps its backslash exactly as `raw"r\td"` does. Only the delimiter changes —
+a bare `"` inside is content, and the literal closes at the LAST of a run of
+quotes, so `s"""a"""""` is `a""`.
+
+`lazyval` found two. A `lazy val` is compiled as a read barrier keyed on the
+NAME, and nothing displaced that name when an inner binding reused it: after
+`lazy val a = 5`, the parameter in `def f(a: Int = 1) = a * 10` was forced as
+though it were the cell, and the body multiplied `null`. A class field was the
+same shape one level further in — `lazy val v = -7; class C(v: Int) { def q = v
+* 2 }` answered -14 for `new C(9).q` where the reference answers 18, because a
+bare name in a method body resolves to `this.field` before anything outside the
+class. The second gap is memoization: an initializer that RAISES has produced no
+value to memoize, and Scala re-runs it on the next read. The raise arrives as a
+pending exception rather than an error return — an arithmetic fault is not
+checked until the next statement boundary — so a successful-looking return was
+not evidence the thunk had succeeded, and whatever the faulting expression left
+behind was written into the cell. A `lazy val v = 1 / 0` read inside two
+successive `try`s threw once and then answered `0` silently.
+
+The `fmt` mode turned out to have a blind spot of the opposite shape: the
+conversion was there and no value could exercise it. `%,d` has been in that
+mode's conversion pool for as long as the mode has existed, but the shared
+integer pool tops out at 42 — every value in it below the first grouping
+boundary — so the grouping flag went entirely unimplemented underneath a
+conversion the fuzzer emitted on every run, and no run could tell. `%,d` on
+1234567 answered `1234567`. Java groups the digits BEFORE padding, which is what
+makes `%,012d` `0001,234,567` (the pad zeros themselves ungrouped) and `%,.2f`
+group only the integer part; `,` on a conversion that has no grouped decimal
+form — `%,e`, `%,s` — is a `FormatFlagsConversionMismatchException`, not a
+silent pass. The pools now carry magnitudes that can show a separator, on both
+signs and past `Int`.
+
+Three further gaps closed alongside them. `corresponds` and `aggregate` were
+missing from every sequence; the `String` delegation that reaches the sequence
+implementation over a receiver's characters rebuilt the argument list as just
+the coerced operand, which dropped the predicate `corresponds` carries after it.
+And `X.empty` was answered only with an EMPTY argument list, so
+`List.empty[Int](0)` — an application of the empty list, not a factory taking
+arguments — reported `empty is not a member` where the reference raises
+`IndexOutOfBoundsException: 0`, and `Map.empty[String, Int]("k")` hid
+`NoSuchElementException: key not found: k` the same way.
 
 Next waves, in priority order:
 
