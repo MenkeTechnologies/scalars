@@ -1986,6 +1986,179 @@ fn g_braces(r: &mut Rng) -> String {
     }
 }
 
+/// `permutations` / `combinations(n)` / `updated(i, v)` and the `Range`
+/// companion's factories — the arrangement surface.
+///
+/// Its own mode rather than more arms in `coll` because the axis it explores is
+/// not "does this combinator answer the right elements" but ORDER and
+/// DUPLICATES. Scala's `permutations`/`combinations` do not enumerate the
+/// receiver as written and do not sort it: both renumber the elements by the
+/// position their VALUE first appeared and enumerate over that, so
+/// `List(3,2,1).permutations` leads with `List(3, 2, 1)` and a receiver with
+/// repeats yields each arrangement once. An implementation that sorts, or that
+/// enumerates positions instead of values, agrees with the reference on every
+/// distinct-and-ascending receiver and diverges on every other — so the element
+/// lists here are deliberately unsorted and deliberately repetitive.
+///
+/// `updated` is here for its index fault, which is a `Seq`'s
+/// `IndexOutOfBoundsException` on a collection and a `String`'s
+/// `StringIndexOutOfBoundsException` on a string, worded differently; the
+/// generated index runs past both ends.
+fn g_arrange(r: &mut Rng) -> String {
+    let ctor = *pick(r, &["List", "Vector", "Seq"]);
+    // Small, unsorted, with repeats — see above.
+    let pool = *pick(
+        r,
+        &[
+            "3, 2, 1",
+            "2, 1, 1",
+            "1, 1, 2, 2",
+            "5, 1, 5",
+            "4, 4, 4",
+            "9, 2, 7",
+            "1",
+            "",
+        ],
+    );
+    // See `g_seqmore`: an untyped empty literal is a compile error, not a probe.
+    let xs = if pool.is_empty() {
+        format!("{ctor}.empty[Int]")
+    } else {
+        format!("{ctor}({pool})")
+    };
+    let s = *pick(r, &["\"cba\"", "\"aab\"", "\"abc\"", "\"zz\"", "\"\""]);
+    let k = r.below(5) as i64 - 1;
+    let i = r.below(6) as i64 - 1;
+    let v = pick(r, INTS);
+    let lo = r.below(8) as i64;
+    let hi = r.below(12) as i64;
+    let step = *pick(r, &["1", "2", "3", "-1", "-2", "4"]);
+    let one = |e: String| println_all(&[e]);
+    let two = |a: String, b: String| println_all(&[a, b]);
+    match r.below(12) {
+        0 => one(format!("{xs}.permutations.toList")),
+        1 => one(format!("{xs}.combinations({k}).toList")),
+        2 => two(
+            format!("{xs}.permutations.size"),
+            format!("{xs}.combinations({k}).size"),
+        ),
+        3 => one(format!("{s}.permutations.toList")),
+        4 => one(format!("{s}.combinations({k}).toList")),
+        // An `Iterator` is CONSUMED: the second traversal must see it exhausted.
+        5 => format!("{{ val it = {xs}.permutations; println(it.toList); println(it.toList) }}"),
+        6 => one(format!("{xs}.updated({i}, {v})")),
+        7 => one(format!("{s}.updated({i}, 'Q')")),
+        8 => two(
+            format!("Range({lo}, {hi})"),
+            format!("Range({lo}, {hi}).toList"),
+        ),
+        9 => two(
+            format!("Range({lo}, {hi}, {step})"),
+            format!("Range({lo}, {hi}, {step}).toList"),
+        ),
+        10 => two(
+            format!("Range.inclusive({lo}, {hi})"),
+            format!("Range.inclusive({lo}, {hi}, {step}).toList"),
+        ),
+        // The qualified spellings of names this frontend answers unqualified.
+        _ => two(
+            format!("scala.util.Try({lo} / {})", hi - hi),
+            format!("scala.collection.immutable.{xs}"),
+        ),
+    }
+}
+
+/// The `Seq`/`String`/`Map` members that every other mode happened to miss.
+///
+/// Chosen by counting, not by taste: each name below appears ZERO times in both
+/// `tests/data/parity_expected.txt` and the rest of this generator, so nothing
+/// in the harness could have told whether it worked. `scanLeft`/`scanRight`
+/// carry the seed into the result (and differ in which end it lands on),
+/// `reduceLeft`/`reduceRight` throw on an empty receiver where the folds do
+/// not, `startsWith`/`endsWith` are overloaded for a sequence and a string,
+/// `keySet` and `values` have their own iteration order, `orNull` crosses into
+/// `null`, and the three `strip*` members differ from `trim` on Unicode
+/// whitespace.
+fn g_seqmore(r: &mut Rng) -> String {
+    let ctor = *pick(r, &["List", "Vector", "Seq"]);
+    let n = r.below(4) as usize;
+    // An untyped `List()` is not a program: Scala cannot infer its element type
+    // and REJECTS it, which reads as a divergence against a frontend that
+    // accepts it — noise, not signal. The empty receiver is worth generating
+    // (`reduceLeft` throws on it where `foldLeft` does not), so it is spelled
+    // the way a Scala program would have to spell it.
+    let xs = if n == 0 {
+        format!("{ctor}.empty[Int]")
+    } else {
+        format!("{ctor}({})", int_elems(r, n))
+    };
+    let wn = 1 + r.below(3) as usize;
+    let ws = format!("List({})", str_elems(r, wn));
+    let s = *pick(r, &["\"abcd\"", "\"  pad  \"", "\"\"", "\"aXbXc\""]);
+    let z = pick(r, INTS);
+    let one = |e: String| println_all(&[e]);
+    let two = |a: String, b: String| println_all(&[a, b]);
+    match r.below(11) {
+        0 => two(
+            format!("{xs}.scanLeft({z})(_ + _)"),
+            format!("{xs}.scanRight({z})(_ + _)"),
+        ),
+        1 => two(
+            format!("{xs}.reduceLeft(_ - _)"),
+            format!("{xs}.reduceRight(_ - _)"),
+        ),
+        2 => two(
+            format!("{xs}.startsWith(List({z}))"),
+            format!("{xs}.endsWith(List({z}))"),
+        ),
+        3 => two(
+            format!("{s}.startsWith(\"a\")"),
+            format!("{s}.endsWith(\"d\")"),
+        ),
+        4 => two(
+            format!("{xs}.toArray.mkString(\",\")"),
+            format!("{xs}.toIndexedSeq"),
+        ),
+        5 => two(
+            format!("{xs}.lastOption"),
+            format!("{xs}.headOption.orNull"),
+        ),
+        6 => {
+            let mn = 1 + r.below(3) as usize;
+            let m = format!("Map({})", pair_elems(r, mn));
+            two(format!("{m}.keySet"), format!("{m}.values.toList"))
+        }
+        7 => one(format!("{xs}.withFilter(_ > 0).map(_ * 2)")),
+        8 => two(
+            format!("{s}.strip"),
+            format!("{s}.stripLeading + \"|\" + {s}.stripTrailing"),
+        ),
+        9 => two(format!("{ws}.toArray.length"), format!("{ws}.toIndexedSeq")),
+        _ => two(
+            format!("{xs}.toIterable"),
+            format!("{xs}.iterator.toArray.mkString(\"/\")"),
+        ),
+    }
+}
+
+/// `n` distinct `k -> v` pairs for a `Map` literal.
+fn pair_elems(r: &mut Rng, n: usize) -> String {
+    let mut pool: Vec<(&str, i64)> = vec![
+        ("a", 1),
+        ("b", -2),
+        ("cc", 30),
+        ("dd", 0),
+        ("eee", 7),
+        ("f", -11),
+    ];
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n.min(pool.len()) {
+        let (k, v) = pool.swap_remove(r.below(pool.len() as u64) as usize);
+        out.push(format!("\"{k}\" -> {v}"));
+    }
+    out.join(", ")
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     All,
@@ -2033,6 +2206,8 @@ enum Mode {
     AssignExpr,
     AppMember,
     Narrow,
+    Arrange,
+    SeqMore,
     Braces,
 }
 
@@ -2084,6 +2259,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::AppMember => "appmember",
         Mode::Narrow => "narrow",
         Mode::Braces => "braces",
+        Mode::Arrange => "arrange",
+        Mode::SeqMore => "seqmore",
     }
 }
 
@@ -2135,6 +2312,8 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "appmember" => Mode::AppMember,
         "narrow" => Mode::Narrow,
         "braces" => Mode::Braces,
+        "arrange" => Mode::Arrange,
+        "seqmore" => Mode::SeqMore,
         _ => return None,
     })
 }
@@ -2184,6 +2363,8 @@ const CONCRETE: &[Mode] = &[
     Mode::AssignExpr,
     Mode::AppMember,
     Mode::Narrow,
+    Mode::Arrange,
+    Mode::SeqMore,
     Mode::Braces,
 ];
 
@@ -2513,6 +2694,8 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::AppMember => g_appmember(r),
         Mode::Narrow => g_narrow(r),
         Mode::Braces => g_braces(r),
+        Mode::Arrange => g_arrange(r),
+        Mode::SeqMore => g_seqmore(r),
         Mode::All => unreachable!(),
     }
 }
