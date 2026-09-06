@@ -1790,6 +1790,7 @@ impl Compiler {
             boxed,
         });
         let saved_vals = std::mem::take(&mut self.vals);
+        let saved_lazies = self.shadow_lazies(&pc.params);
         // The enclosing scope's widths travel into the body, so a captured
         // `var n = 0` is still known to be an `Int` here.
         let saved_widths = std::mem::replace(&mut self.widths, pc.widths);
@@ -1836,6 +1837,7 @@ impl Compiler {
 
         self.scope = saved_scope;
         self.vals = saved_vals;
+        self.lazies = saved_lazies;
         self.widths = saved_widths;
         self.current_class = saved_class;
         self.current_object = saved_object;
@@ -4485,6 +4487,13 @@ impl Compiler {
 
         let mut slots = HashMap::new();
         let saved_vals = std::mem::take(&mut self.vals);
+        let saved_lazies = self.shadow_lazies(
+            &cd.params
+                .iter()
+                .chain(&cd.field_names)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         // The class's own fields are in scope by bare name for the whole
         // constructor, so a later field's initializer (`val d = n * 2`) is typed
         // by the parameter it reads.
@@ -4559,6 +4568,7 @@ impl Compiler {
 
         self.scope = None;
         self.vals = saved_vals;
+        self.lazies = saved_lazies;
         self.widths = saved_widths;
         Ok(())
     }
@@ -4606,6 +4616,20 @@ impl Compiler {
         let mut slots = HashMap::new();
         slots.insert("this".to_string(), 0u16);
         let saved_vals = std::mem::take(&mut self.vals);
+        // A bare name in a method body resolves to `this.field` before anything
+        // outside the class, so the class's own fields shadow an enclosing
+        // `lazy val` exactly as the method's parameters do — and a constructor
+        // parameter IS a field. Without the field names here,
+        // `lazy val v = -7; class C(v: Int) { def q = v * 2 }` read the outer
+        // cell and `new C(9).q` answered -14 where the reference answers 18.
+        let shadowed: Vec<String> = m
+            .params
+            .iter()
+            .chain(&cd.params)
+            .chain(&cd.field_names)
+            .cloned()
+            .collect();
+        let saved_lazies = self.shadow_lazies(&shadowed);
         // A bare field reference inside a method resolves to `this.field`, so the
         // field widths are the method body's starting widths — that is what makes
         // `def twice: Int = n * 2` wrap when `n: Int`.
@@ -4654,6 +4678,7 @@ impl Compiler {
 
         self.scope = None;
         self.vals = saved_vals;
+        self.lazies = saved_lazies;
         self.widths = saved_widths;
         Ok(())
     }
@@ -4668,6 +4693,7 @@ impl Compiler {
 
         let mut slots = HashMap::new();
         let saved_vals = std::mem::take(&mut self.vals);
+        let saved_lazies = self.shadow_lazies(&m.params);
         let saved_widths = std::mem::take(&mut self.widths);
         for (i, p) in m.params.iter().enumerate() {
             slots.insert(p.clone(), i as u16);
@@ -4701,6 +4727,7 @@ impl Compiler {
 
         self.scope = None;
         self.vals = saved_vals;
+        self.lazies = saved_lazies;
         self.widths = saved_widths;
         Ok(())
     }
@@ -4938,6 +4965,13 @@ impl Compiler {
     /// matching slice-1's flat, no-block-scope model); at top level it is a
     /// global.
     fn declare_place(&mut self, name: &str) -> Place {
+        // A new binding SHADOWS an enclosing `lazy val` of the same name, and a
+        // read of the shadowing binding is an ordinary load rather than a force.
+        // [`Compiler::var_ref`] answers `lazies` before it looks at anything
+        // else, so the name has to leave that set the moment something else
+        // claims it; the `lazy val` arm of [`Compiler::stmt`] re-inserts after
+        // its own `declare_place`, so a lazy binding still registers itself.
+        self.lazies.remove(name);
         if let Some(scope) = &mut self.scope {
             if let Some(&slot) = scope.slots.get(name) {
                 return Place::Slot(slot);
@@ -5040,6 +5074,7 @@ impl Compiler {
         // clear `vals` so val-immutability is tracked per function body.
         let mut slots = HashMap::new();
         let saved_vals = std::mem::take(&mut self.vals);
+        let saved_lazies = self.shadow_lazies(&f.params);
         let saved_widths = std::mem::take(&mut self.widths);
         for (i, p) in f.params.iter().enumerate() {
             slots.insert(p.clone(), i as u16);
@@ -5090,10 +5125,32 @@ impl Compiler {
 
         self.scope = None;
         self.vals = saved_vals;
+        self.lazies = saved_lazies;
         self.widths = saved_widths;
         self.by_name = saved_by_name;
         self.implicits = saved_implicits;
         Ok(())
+    }
+
+    /// Take [`Self::lazies`] into a body whose parameters may SHADOW an
+    /// enclosing `lazy val`, returning the set to restore on the way out.
+    ///
+    /// The set cannot simply be cleared on entry: a lambda body legitimately
+    /// reads an enclosing `lazy val`, and clearing would load its cell instead
+    /// of forcing it. Only the names this body rebinds are removed.
+    ///
+    /// Without this, `lazy val a = 5` followed by `def f(a: Int = 1) = a * 10`
+    /// compiled the parameter read as a force of a cell that was never there
+    /// and the body multiplied `null`.
+    fn shadow_lazies(&mut self, params: &[String]) -> HashSet<String> {
+        if self.lazies.is_empty() {
+            return HashSet::new();
+        }
+        let saved = self.lazies.clone();
+        for p in params {
+            self.lazies.remove(p);
+        }
+        saved
     }
 
     /// Add a body's own `using` parameters to the implicit scope.

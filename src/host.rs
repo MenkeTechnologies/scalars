@@ -11415,6 +11415,17 @@ fn b_lazy_force(vm: &mut VM, _argc: u8) -> Value {
         Ok(v) => v,
         Err(e) => return fault(vm, e),
     };
+    // An initializer that RAISED produced no value to memoize: Scala leaves the
+    // binding uninitialized and RE-RUNS the initializer on the next read, so a
+    // `lazy val v = 1 / 0` read twice inside two `try`s runs its side effects
+    // twice and throws twice. The raise here is a pending exception rather than
+    // an `Err` — an arithmetic fault is not checked until the next statement
+    // boundary — so `Ok` is not on its own evidence that the thunk succeeded,
+    // and writing back regardless memoized whatever the faulting expression had
+    // left on the stack. The second read then answered that value silently.
+    if unwinding() {
+        return forced;
+    }
     // Written back BEFORE the value is answered, so a second read finds the
     // value rather than the thunk even when the initializer read the binding
     // itself (Scala answers the partially-initialized value there too).
