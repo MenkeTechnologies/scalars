@@ -4130,7 +4130,7 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
     let conv = sb[sb.len() - 1] as char;
     let mid = &sb[1..sb.len() - 1];
 
-    let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+    let (mut left, mut zero, mut plus, mut space, mut group) = (false, false, false, false, false);
     let mut j = 0;
     while j < mid.len() && matches!(mid[j], b'-' | b'0' | b'+' | b' ' | b'#' | b',') {
         match mid[j] {
@@ -4138,6 +4138,7 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             b'0' => zero = true,
             b'+' => plus = true,
             b' ' => space = true,
+            b',' => group = true,
             _ => {}
         }
         j += 1;
@@ -4156,6 +4157,15 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             j += 1;
         }
         prec = Some(p);
+    }
+
+    // Java accepts `,` only on the conversions that HAVE a grouped decimal form
+    // — `d`, `f` and the general `g` — and raises on the rest rather than
+    // ignoring it, so `%,e` and `%,s` are errors, not silent passes.
+    if group && !matches!(conv, 'd' | 'f' | 'F') {
+        return Err(format!(
+            "scalars: java.util.FormatFlagsConversionMismatchException: Conversion = {conv}, Flags = ,"
+        ));
     }
 
     match conv {
@@ -4177,16 +4187,30 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
         }
         'd' => {
             let n = v.to_int();
-            let digits = (n as i128).unsigned_abs().to_string();
+            let mut digits = (n as i128).unsigned_abs().to_string();
+            if group {
+                digits = group_digits(&digits);
+            }
             Ok(pad_num(digits, n < 0, left, zero, plus, space, width))
         }
         'f' | 'F' => {
             let x = num_f64(v);
             let p = prec.unwrap_or(6);
-            let digits = match nonfinite(x, conv, plus, space) {
+            let mut digits = match nonfinite(x, conv, plus, space) {
                 Some(t) => return Ok(pad_str(t, left, width)),
                 None => round_half_up(x.abs(), p),
             };
+            if group {
+                // Only the INTEGER part is grouped; the fraction keeps its
+                // digits contiguous (`%,.2f` of 1234567.5 is `1,234,567.50`).
+                let (int, frac) = digits.split_once('.').unwrap_or((digits.as_str(), ""));
+                let mut g = group_digits(int);
+                if !frac.is_empty() {
+                    g.push('.');
+                    g.push_str(frac);
+                }
+                digits = g;
+            }
             Ok(pad_num(
                 digits,
                 x.is_sign_negative(),
@@ -4384,6 +4408,24 @@ fn pad_str(s: String, left: bool, width: usize) -> String {
     } else {
         format!("{}{s}", " ".repeat(padn))
     }
+}
+
+/// Insert Java's locale grouping separator every three digits from the right.
+///
+/// Applied to the digit string BEFORE any padding, which is what reproduces
+/// Java's zero-pad interaction: `%,012d` of 1234567 is `0001,234,567` — the
+/// grouped `1,234,567` zero-padded out to twelve characters, with the pad zeros
+/// themselves left ungrouped.
+fn group_digits(digits: &str) -> String {
+    let b = digits.as_bytes();
+    let mut out = String::with_capacity(b.len() + b.len() / 3);
+    for (i, c) in b.iter().enumerate() {
+        if i > 0 && (b.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*c as char);
+    }
+    out
 }
 
 /// Pad a numeric body (`digits`, already sign-stripped) to `width`, applying the
