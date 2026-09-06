@@ -656,11 +656,25 @@ fn keyword_or_ident(word: &str) -> Tok {
     }
 }
 
-/// Lex an interpolated string `s"…"` / `f"…"` / `raw"…"`. `i` points at the
-/// opening `"`; returns the [`Tok::InterpStr`] token, the index past the closing
-/// `"`, and the updated line. Splits the body into literal `parts` and `$id` /
-/// `${expr}` splices; for `f`, captures each splice's trailing `%…` format spec.
+/// Lex an interpolated string `s"…"` / `f"…"` / `raw"…"`, in either the
+/// single-quoted or the TRIPLE-quoted form. `i` points at the first `"`; returns
+/// the [`Tok::InterpStr`] token, the index past the closing delimiter, and the
+/// updated line. Splits the body into literal `parts` and `$id` / `${expr}`
+/// splices; for `f`, captures each splice's trailing `%…` format spec.
 /// `raw` keeps backslash escapes literal (`raw"\n"` is a backslash then `n`).
+///
+/// The triple-quoted form is the SAME interpolator, not the verbatim literal the
+/// unprefixed `"""…"""` is. Measured against the reference: `s"""a\tb"""` has
+/// length 6 (the `\t` decoded) where `"""q\tw"""` has length 4 (kept literal),
+/// and `raw"""r\td"""` keeps its backslash exactly as `raw"r\td"` does. What the
+/// third quote changes is only the delimiter — a bare `"` inside is literal, a
+/// newline inside is literal, and the string closes at the LAST of a run of
+/// quotes, so `s"""a"""""` is `a""`.
+///
+/// Without this arm the prefix was recognised and the body was not: `s"""x $v"""`
+/// lexed as an EMPTY interpolation (`s""`) immediately followed by a plain
+/// `"x $v"` literal, and the parser then rejected the program at the stray
+/// string. Every multi-line interpolated string was unparseable.
 fn lex_interp(
     prefix: &str,
     bytes: &[u8],
@@ -671,13 +685,14 @@ fn lex_interp(
     let raw = prefix == "raw";
     let is_f = prefix == "f";
     let start_line = line;
-    i += 1; // opening quote
+    let triple = src[i..].starts_with("\"\"\"");
+    i += if triple { 3 } else { 1 }; // opening delimiter
     let mut parts: Vec<String> = Vec::new();
     let mut exprs: Vec<String> = Vec::new();
     let mut fmts: Vec<Option<String>> = Vec::new();
     let mut cur = String::new();
 
-    while i < bytes.len() && bytes[i] != b'"' {
+    while i < bytes.len() && !at_close(src, i, triple) {
         let c = bytes[i] as char;
         // Escapes: raw keeps them verbatim, others decode.
         if c == '\\' && i + 1 < bytes.len() {
@@ -780,7 +795,17 @@ fn lex_interp(
             "scalars: unterminated interpolated string on line {start_line}"
         ));
     }
-    i += 1; // closing quote
+    if triple {
+        // Scala closes at the LAST of a run of quotes, so the extra ones belong
+        // to the string: `s"""a"""""` is `a""`.
+        while src[i..].starts_with("\"\"\"\"") {
+            cur.push('"');
+            i += 1;
+        }
+        i += 3;
+    } else {
+        i += 1;
+    }
     parts.push(cur);
     Ok((
         Tok::InterpStr {
@@ -793,6 +818,15 @@ fn lex_interp(
         i,
         line,
     ))
+}
+
+/// Whether the closing delimiter of an interpolated string starts at `i`.
+fn at_close(src: &str, i: usize, triple: bool) -> bool {
+    if triple {
+        src[i..].starts_with("\"\"\"")
+    } else {
+        src.as_bytes()[i] == b'"'
+    }
 }
 
 /// Read an `f`-interpolator format spec `%[flags][width][.precision]conv`
