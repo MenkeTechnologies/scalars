@@ -1,23 +1,34 @@
-//! Lexical scoping for block-local `def`s: unique renaming + lambda lifting.
+//! Lexical scoping: unique renaming of `def`s and shadowed bindings, plus
+//! lambda lifting.
 //!
-//! The compiler consumes a *flat* function namespace ([`Program::functions`]) —
-//! every `def` is a global subroutine reached by name. Scala, however, scopes a
-//! `def` to the block that declares it, so two blocks may each declare `def f`
-//! and an inner `f` must shadow an outer one. Hoisting them all into one table
-//! keyed by the source name silently drops every definition but the first, which
-//! is a wrong-answer bug rather than a diagnostic.
+//! Scala scopes a definition to the block that writes it. The compiler behind
+//! this pass has no block scopes at all — it resolves a `def` against a FLAT
+//! function namespace ([`Program::functions`]) and a value against one flat
+//! per-frame slot table keyed by name (or, at the top level, one namespace of
+//! program globals). Two definitions of one name therefore land on one storage
+//! location, and the inner one silently overwrites the outer. This pass sits
+//! between the parser and the compiler and makes each definition its own name
+//! before the compiler ever sees them.
 //!
-//! This pass sits between the parser and the compiler and closes that gap in two
-//! steps:
+//! 1. **Unique renaming.** The AST is walked with a scope stack.
 //!
-//! 1. **Unique renaming.** The AST is walked with a scope stack. Each block
-//!    pre-binds its own [`StmtKind::DefDecl`]s (so mutually recursive local
-//!    `def`s and forward references inside one block resolve, as Scala's block
-//!    scoping requires), and every `Var`/`Call` reference is rewritten to the
-//!    globally unique name of whichever `def` it actually resolves to. A `val`
-//!    or parameter shadows an outer `def` of the same name from its declaration
-//!    onward. The first claimant of a name keeps it verbatim, so a program with
-//!    no collisions compiles to exactly the bytecode it did before.
+//!    *`def`s.* Each block pre-binds its own [`StmtKind::DefDecl`]s (so
+//!    mutually recursive local `def`s and forward references inside one block
+//!    resolve, as Scala's block scoping requires), and every `Var`/`Call`
+//!    reference is rewritten to the globally unique name of whichever `def` it
+//!    actually resolves to. Hoisting them all into one table keyed by the source
+//!    name would drop every definition but the first.
+//!
+//!    *Values.* A `val`/`var`/pattern binder/generator that shadows a binding
+//!    an enclosing scope already holds is alpha-renamed the same way, and every
+//!    read of it is rewritten to match — see [`Resolver::shadow_rename`]. Left
+//!    sharing one name, the inner declaration wrote to the outer binding's
+//!    storage and the outer value did not survive the block:
+//!    `val a = 5; { val a = 100; println(a) }; println(a)` answered `100` twice
+//!    where Scala answers `100` then `5`.
+//!
+//!    The first claimant of a name keeps it verbatim, so a program that shadows
+//!    nothing compiles to exactly the bytecode it did before.
 //!
 //! 2. **Lambda lifting.** A hoisted `def` loses access to the enclosing call
 //!    frame, so any enclosing local it reads becomes an extra trailing
@@ -29,7 +40,9 @@
 //!    rejected with a diagnostic rather than silently lost.
 //!
 //! Class/object member `def`s are untouched: they already have their own
-//! `Class$method` namespace and an explicit `this`.
+//! `Class$method` namespace and an explicit `this`. A class BODY's `val`s are
+//! its field declarations rather than locals, and are excluded from renaming
+//! for that reason — see [`Resolver::walk_block_in`].
 
 use crate::ast::*;
 use std::collections::{HashMap, HashSet};
@@ -87,8 +100,13 @@ fn unique_name(base: &str, taken: &mut HashSet<String>) -> String {
 
 /// What a name resolves to in the scope stack.
 enum Binding {
-    /// A `val`/`var`/parameter/pattern/generator binding.
-    Value,
+    /// A `val`/`var`/parameter/pattern/generator binding, under the name it
+    /// COMPILES to. That is the source name for all but a shadowing binding,
+    /// which is alpha-renamed — see [`Resolver::shadow_rename`]. The scope map
+    /// is keyed by the SOURCE name, so a lookup still finds the innermost
+    /// binding written; the payload is what the declaration and every read of
+    /// it are rewritten to.
+    Value(String),
     /// A `def`, under its globally unique name.
     Fun(String),
 }
@@ -238,11 +256,14 @@ impl Resolver {
     fn push_frame<I: IntoIterator<Item = String>>(&mut self, names: I) {
         self.next_frame += 1;
         let frame = self.next_frame;
+        // A parameter is never renamed. It occupies slot `i` of a FRESH frame,
+        // so it cannot collide with anything outside that frame, and a binding
+        // it shadows is unreachable from the body by construction.
         let names: HashMap<String, Binding> = names
             .into_iter()
             .map(|n| {
                 self.taken.insert(n.clone());
-                (n, Binding::Value)
+                (n.clone(), Binding::Value(n))
             })
             .collect();
         self.frames.push(self.scopes.len());
@@ -258,21 +279,74 @@ impl Resolver {
         self.scopes.pop();
     }
 
-    fn bind_value(&mut self, name: &str) {
-        self.taken.insert(name.to_string());
+    /// Bind `name` as a value in the innermost scope and answer the name it
+    /// COMPILES to — `name` itself, or an alpha-renamed spelling when it
+    /// shadows a binding the compiler would otherwise hand it the same storage
+    /// as. The caller must write the answer back into the AST node that
+    /// declares it; every later read resolves through [`Resolver::lookup`],
+    /// which answers the same spelling.
+    fn bind_value(&mut self, name: &str) -> String {
+        let unique = self.shadow_rename(name);
+        self.taken.insert(unique.clone());
         if let Some(s) = self.scopes.last_mut() {
-            s.names.insert(name.to_string(), Binding::Value);
+            s.names
+                .insert(name.to_string(), Binding::Value(unique.clone()));
+        }
+        unique
+    }
+
+    /// The name a value binding of `name` declared right here must compile to.
+    ///
+    /// [`crate::compiler::Compiler::declare_place`] keys storage by NAME within
+    /// a frame: a second declaration of a name the frame already holds returns
+    /// the FIRST one's slot, and at the top level both are the same program
+    /// global. Scala instead scopes a binding to its block, so an inner
+    /// declaration shadows an outer one and the outer value is intact after the
+    /// block. Sharing the storage makes the inner write land on the outer
+    /// binding — `val a = 5; { val a = 100; println(a) }; println(a)` answered
+    /// `100` twice where Scala answers `100` then `5`.
+    ///
+    /// A fresh name is the whole fix, and it is minted only where an enclosing
+    /// scope already binds the name, so a program that shadows nothing compiles
+    /// to exactly the bytecode it did before.
+    ///
+    /// The enclosing binding's FRAME does not narrow that. A frame's slot table
+    /// is flat over the whole frame, so a declaration inside a nested block
+    /// keeps its name reachable for the rest of the frame and captures every
+    /// later read of that name, whatever the read was meant to resolve to:
+    ///
+    /// * an outer binding in the same frame — one slot under one name;
+    /// * an enclosing frame's local, which this frame reads as an upvalue bound
+    ///   into its own slot table under its own name;
+    /// * a class FIELD, which a method reads bare as `this.field` only while
+    ///   nothing local claims the name;
+    /// * even a top-level GLOBAL, which lives in its own namespace but loses to
+    ///   the slot regardless, because
+    ///   [`crate::compiler::Compiler::var_ref`] answers `scope.slots` before it
+    ///   looks at globals. Excluding this case is what left
+    ///   `val a = 5; List(1,2).foreach { x => { val a = x * 10; println(a) }; println(a) }`
+    ///   answering the inner value for both reads.
+    fn shadow_rename(&mut self, name: &str) -> String {
+        let enclosing = self.scopes[..self.scopes.len().saturating_sub(1)]
+            .iter()
+            .rev()
+            .any(|s| matches!(s.names.get(name), Some(Binding::Value(_))));
+        if enclosing {
+            unique_name(name, &mut self.taken)
+        } else {
+            name.to_string()
         }
     }
 
     /// Names bound as values in the innermost open frame — what a call site in
     /// that frame can hand to a callee without capturing anything itself.
+    /// Spelled as they COMPILE, which is how a capture is recorded.
     fn visible_in_frame(&self) -> HashSet<String> {
         let base = *self.frames.last().unwrap_or(&0);
         let mut out = HashSet::new();
         for s in &self.scopes[base..] {
-            for (n, b) in &s.names {
-                if matches!(b, Binding::Value) {
+            for b in s.names.values() {
+                if let Binding::Value(n) = b {
                     out.insert(n.clone());
                 }
             }
@@ -280,38 +354,75 @@ impl Resolver {
         out
     }
 
-    /// Resolve `name`. A `def` hit yields its unique global name; a value hit
-    /// records a capture on every lifted `def` whose frame the binding sits
-    /// outside of.
+    /// Resolve `name` to the name it COMPILES to: a `def` hit yields its unique
+    /// global name, and a value hit the (possibly alpha-renamed) spelling of
+    /// whichever binding is innermost. Every reference site writes the answer
+    /// back, which is what makes a shadowed binding's reads follow the rename.
+    ///
+    /// A value hit also records a capture on every lifted `def` whose frame the
+    /// binding sits outside of.
     fn lookup(&mut self, name: &str) -> Option<String> {
         let mut found = None;
         for (i, s) in self.scopes.iter().enumerate().rev() {
-            if let Some(b) = s.names.get(name) {
-                found = Some((i, matches!(b, Binding::Fun(_))));
+            if s.names.contains_key(name) {
+                found = Some(i);
                 break;
             }
         }
-        let (idx, is_fun) = found?;
-        if is_fun {
-            return match self.scopes[idx].names.get(name) {
-                Some(Binding::Fun(g)) => Some(g.clone()),
-                _ => None,
-            };
-        }
+        let idx = found?;
+        let bound = match self.scopes[idx].names.get(name) {
+            Some(Binding::Fun(g)) => return Some(g.clone()),
+            Some(Binding::Value(v)) => v.clone(),
+            None => return None,
+        };
         // A top-level (frame 0) binding is a program global — reachable from any
         // subroutine, so it is never threaded as a parameter.
         if self.scopes[idx].frame != 0 {
             for li in 0..self.lift_stack.len() {
                 let l = self.lift_stack[li];
                 if idx < self.lifted[l].scope_base
-                    && !self.lifted[l].params.iter().any(|p| p == name)
-                    && !self.lifted[l].captures.iter().any(|c| c == name)
+                    && !self.lifted[l].params.iter().any(|p| *p == bound)
+                    && !self.lifted[l].captures.iter().any(|c| *c == bound)
                 {
-                    self.lifted[l].captures.push(name.to_string());
+                    self.lifted[l].captures.push(bound.clone());
                 }
             }
         }
-        None
+        Some(bound)
+    }
+
+    /// Bind every name `p` introduces and rewrite it in place to the name it
+    /// compiles to. A pattern binder is a declaration like any other, so
+    /// `case Some(a) =>` inside a block that already binds `a` has to rename
+    /// exactly as `val a` would.
+    ///
+    /// Only binders are touched. `Pattern::Stable` is a REFERENCE to a
+    /// singleton (`case None =>`) and `Pattern::Constructor`'s `name` is the
+    /// extractor's; neither is bound here, and neither may be rewritten.
+    fn rebind_pattern(&mut self, p: &mut Pattern) {
+        match p {
+            Pattern::Bind(n) => *n = self.bind_value(&n.clone()),
+            Pattern::Typed { name, .. } => {
+                if name != "_" {
+                    *name = self.bind_value(&name.clone());
+                }
+            }
+            Pattern::Constructor { elems, .. } | Pattern::Tuple(elems) | Pattern::Alt(elems) => {
+                for e in elems {
+                    self.rebind_pattern(e);
+                }
+            }
+            Pattern::At { name, pat } => {
+                *name = self.bind_value(&name.clone());
+                self.rebind_pattern(pat);
+            }
+            Pattern::Cons(h, t) => {
+                self.rebind_pattern(h);
+                self.rebind_pattern(t);
+            }
+            Pattern::Rest(Some(n)) => *n = self.bind_value(&n.clone()),
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Stable(_) | Pattern::Rest(None) => {}
+        }
     }
 
     /// Record a call from the innermost lifted `def` (if any) to `callee`.
@@ -349,7 +460,7 @@ impl Resolver {
             // lowers a bare field name to `this.field`, so a lifted `def` that
             // captures one receives that read as its argument.
             self.push_frame(c.field_names.clone());
-            self.walk_block(&mut c.body)?;
+            self.walk_block_in(&mut c.body, false)?;
             self.pop_frame();
             for m in &mut c.methods {
                 let names: Vec<String> = std::iter::once("this".to_string())
@@ -376,7 +487,25 @@ impl Resolver {
     /// see each other), walk each statement in order, then drop the `def`
     /// statements (they now live in the lifted table).
     fn walk_block(&mut self, stmts: &mut Vec<Stmt>) -> Result<(), String> {
-        self.push_scope();
+        self.walk_block_in(stmts, true)
+    }
+
+    /// [`Resolver::walk_block`], with control over whether the statements get a
+    /// scope of their own.
+    ///
+    /// A CLASS BODY passes `false`, because its `val`/`var` statements are not
+    /// locals that shadow the frame — they ARE the frame's field declarations,
+    /// already pre-bound by the `push_frame` that opened it. Given a scope of
+    /// their own they would read as an inner block redeclaring every field, and
+    /// `class C(val step: Int) { val doubled: Int = step * 2 }` alpha-renamed
+    /// `doubled` to a local that nothing ever read: `c.doubled` answered `null`.
+    /// Declaring into the frame-root scope itself makes the statement and the
+    /// pre-binding one binding again. A block NESTED in the body still pushes,
+    /// so a genuine shadow inside it still renames.
+    fn walk_block_in(&mut self, stmts: &mut Vec<Stmt>, scoped: bool) -> Result<(), String> {
+        if scoped {
+            self.push_scope();
+        }
         let mut ids: HashMap<usize, usize> = HashMap::new();
         for (i, s) in stmts.iter().enumerate() {
             if let StmtKind::DefDecl(f) = &s.kind {
@@ -441,7 +570,9 @@ impl Resolver {
             }
         }
         stmts.retain(|s| !matches!(s.kind, StmtKind::DefDecl(_)));
-        self.pop_scope();
+        if scoped {
+            self.pop_scope();
+        }
         Ok(())
     }
 
@@ -455,24 +586,23 @@ impl Resolver {
                 // Bound only after its initializer, so `val x = x` reads the
                 // outer `x` exactly as the compiler lowers it.
                 let n = name.clone();
-                self.bind_value(&n);
+                *name = self.bind_value(&n);
                 Ok(())
             }
             // `val (a, b) = pair` — the initializer is walked first, then every
             // name the pattern binds enters the current scope.
             StmtKind::Destructure { pat, init } => {
                 self.walk_expr(init)?;
-                let mut names = HashSet::new();
-                pattern_binds(pat, &mut names);
-                for n in names {
-                    self.bind_value(&n);
-                }
+                self.rebind_pattern(pat);
                 Ok(())
             }
             StmtKind::Assign { name, value, .. } => {
                 self.walk_expr(value)?;
                 let n = name.clone();
-                self.lookup(&n);
+                if let Some(g) = self.lookup(&n) {
+                    *name = g;
+                }
+                let n = name.clone();
                 if let Some(&l) = self.lift_stack.last() {
                     self.lifted[l].assigns.insert(n);
                 }
@@ -571,11 +701,7 @@ impl Resolver {
                 self.walk_expr(scrut)?;
                 for arm in arms.iter_mut() {
                     self.push_scope();
-                    let mut binds = HashSet::new();
-                    pattern_binds(&arm.pat, &mut binds);
-                    for b in binds {
-                        self.bind_value(&b);
-                    }
+                    self.rebind_pattern(&mut arm.pat);
                     if let Some(g) = &mut arm.guard {
                         self.walk_expr(g)?;
                     }
@@ -592,11 +718,7 @@ impl Resolver {
                 self.walk_block(body)?;
                 for arm in catches.iter_mut() {
                     self.push_scope();
-                    let mut binds = HashSet::new();
-                    pattern_binds(&arm.pat, &mut binds);
-                    for b in binds {
-                        self.bind_value(&b);
-                    }
+                    self.rebind_pattern(&mut arm.pat);
                     if let Some(g) = &mut arm.guard {
                         self.walk_expr(g)?;
                     }
@@ -627,21 +749,17 @@ impl Resolver {
                                 self.walk_expr(s)?;
                             }
                             let n = name.clone();
-                            self.bind_value(&n);
+                            *name = self.bind_value(&n);
                         }
                         ForEnum::GenColl { pat, coll, .. } => {
                             self.walk_expr(coll)?;
-                            let mut names = HashSet::new();
-                            pattern_binds(pat, &mut names);
-                            for n in names {
-                                self.bind_value(&n);
-                            }
+                            self.rebind_pattern(pat);
                         }
                         ForEnum::Guard(g) => self.walk_expr(g)?,
                         ForEnum::Val { name, value } => {
                             self.walk_expr(value)?;
                             let n = name.clone();
-                            self.bind_value(&n);
+                            *name = self.bind_value(&n);
                         }
                     }
                 }
@@ -722,35 +840,6 @@ impl Resolver {
             }
         }
         Ok(())
-    }
-}
-
-/// Add every name a pattern binds to `out`.
-fn pattern_binds(p: &Pattern, out: &mut HashSet<String>) {
-    match p {
-        Pattern::Bind(n) => {
-            out.insert(n.clone());
-        }
-        Pattern::Typed { name, .. } if name != "_" => {
-            out.insert(name.clone());
-        }
-        Pattern::Constructor { elems, .. } | Pattern::Tuple(elems) | Pattern::Alt(elems) => {
-            for e in elems {
-                pattern_binds(e, out);
-            }
-        }
-        Pattern::At { name, pat } => {
-            out.insert(name.clone());
-            pattern_binds(pat, out);
-        }
-        Pattern::Cons(h, t) => {
-            pattern_binds(h, out);
-            pattern_binds(t, out);
-        }
-        Pattern::Rest(Some(n)) => {
-            out.insert(n.clone());
-        }
-        _ => {}
     }
 }
 
