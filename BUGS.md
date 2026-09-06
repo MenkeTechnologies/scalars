@@ -303,8 +303,18 @@ reported as parse/compile errors, never silently mis-run.
   `splitAt`/`span`/`partition`/`init`/`tail`/`head`/`last`/`headOption`/
   `lastOption`; `zip`/`zipWithIndex`/`unzip`/`flatten`/`grouped`/`sliding`;
   `groupBy`; `mkString` in all three arities; `toList`/`toSeq`/`toVector`/
-  `toArray`/`toSet`/`toMap`; the set algebra `union`/`intersect`/`diff`/
-  `subsetOf`/`incl`/`excl`; and the operators `++`, `:+`, `+:`, `+`, `-`.
+  `toArray`/`toSet`/`toMap`/`toIndexedSeq`/`toIterable`;
+  `permutations`/`combinations`; `updated`; `startsWith`/`endsWith`; the set
+  algebra `union`/`intersect`/`diff`/`subsetOf`/`incl`/`excl`; and the
+  operators `++`, `:+`, `+:`, `+`, `-`.
+  `permutations` and `combinations` enumerate DISTINCT results in Scala's own
+  order: the elements are renumbered by the position their value first appeared
+  and the walk runs over that, so `List(3,2,1).permutations` leads with
+  `List(3, 2, 1)` and a receiver with repeats yields each arrangement once.
+  `toIterable` is `this` for every collection (a `Vector` stays a `Vector`, a
+  `ListBuffer` a `ListBuffer`), while `toSeq` is `this` only for an immutable
+  sequence — a `Set`, a `Map` and every mutable sequence copy out to a `List`,
+  and an `Array` to an `ArraySeq`.
   `Map` adds `apply`/`get`/`getOrElse`/`contains`/`keys`/`keySet`/`values`/
   `updated`/`removed`/`+`/`-`/`++`, and its closure-taking methods pass the
   `Tuple2` Scala does, so `m.map { case (k, v) => … }` works.
@@ -645,6 +655,18 @@ reported as parse/compile errors, never silently mis-run.
   mutable` in Scala. That is a leniency, not a wrong answer — every program the
   reference accepts behaves identically.
 
+  A QUALIFIED spelling of a name this frontend answers unqualified resolves to
+  the same thing: `scala.util.Try(e)` is the `Try(e)` expansion,
+  `scala.collection.immutable.List(1)` and `immutable.List(1)` are the `List`
+  literal, and `scala.Some(1)` is `Some(1)`. The stripped prefixes are only the
+  packages that hold nothing of their own — `scala`, `scala.util`,
+  `scala.util.control`, `scala.collection.immutable` and their shorter
+  spellings. `scala.math` and `scala.collection.mutable` are NOT stripped,
+  because their members are not their bare names (`math.signum(5)` is `1` and
+  there is no bare `signum`; `mutable.Set(1)` builds a different collection
+  than `Set(1)`), and a capitalized selection is required, so a value that
+  happens to be named `util` still answers its own methods.
+
 - **`xs: _*` outside an argument position.** The spread is parsed where Scala
   allows it — as an argument — and rejected everywhere else, which is also what
   Scala does. A spread handed to a parameter that is not repeated is a compile
@@ -708,6 +730,27 @@ reported as parse/compile errors, never silently mis-run.
   union and intersection types (`Int | String`, `A & B`) parse and are erased,
   which is what the `match` a program writes against them already checks;
   `opaque type`, `type` aliases and `inline def` behave as the reference does.
+
+- **`BigInt` and `BigDecimal`.** `BigInt(2).pow(70)` and
+  `BigDecimal("1.5") + BigDecimal("2.25")` are `not found: BigInt` /
+  `not found: BigDecimal`. Only the `scala.math.Ordering` companion knows the
+  two names, as element types it erases.
+
+  The obstruction is the value model, not the arithmetic. Every number here is
+  one fusevm `Value` — an `i64` or an `f64` — and the whole numeric surface is
+  built on that: the 32-bit wrap analysis, `Double.toString`, the mixed
+  `Int`/`Double` dispatch, `%` and `/` by zero, the boxed companions. An
+  arbitrary-precision number is a HEAP value with none of those properties, so
+  it cannot be an operand of the existing arithmetic without a runtime type
+  test on the fast path of every `+`. Adding one is not a small change to the
+  frontend and it is not a change to the frontend at all where the arithmetic
+  ops live, which is the vendored VM this crate must not modify. What it would
+  take instead is host-side operands (`Value::Obj` carrying a bignum) plus an
+  arithmetic path that dispatches on them, and `BigDecimal` additionally needs
+  `java.math.BigDecimal`'s scale and rounding rules, which decide its
+  `toString` and its `==`. Left out rather than approximated with an `i64`,
+  which would silently answer a wrapped number for the exact case these types
+  exist to serve.
 
 - **A `LazyList` combinator that must see every element terminates only on a
   finite list**, as in Scala — `toList`, `sum`, `length`, `mkString`,

@@ -380,13 +380,16 @@ Implemented and checked against the reference `scala`:
   `reverse`/`distinct`), slicing
   (`take`/`drop`/`slice`/`splitAt`/`span`/`partition`/`takeWhile`/`dropWhile`/
   `init`/`tail`/`headOption`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
-  `grouped`/`sliding`), `groupBy`, `mkString`, the `to*` conversions, the set
+  `grouped`/`sliding`), arrangement (`permutations`/`combinations`/`updated`),
+  prefix tests (`startsWith`/`endsWith`), `groupBy`, `mkString`, the `to*`
+  conversions, the set
   algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`), and
   `Map`'s `apply`/`get`/`getOrElse`/`keys`/`values`/`updated`, and the
   companions' `IterableFactory` members — `List.empty`, `List.fill(n)(v)` (whose
   fill expression is by-name and re-evaluated per element),
-  `Vector.tabulate(n)(f)`, `List.range(a, b[, step])`, `List.concat(…)` and
-  `List.from(xs)`. `toString` is
+  `Vector.tabulate(n)(f)`, `List.range(a, b[, step])`, `List.concat(…)`,
+  `List.from(xs)` and the `Range` companion (`Range(a, b[, step])`,
+  `Range.inclusive(…)`). `toString` is
   byte-faithful, which for `Set`/`Map` means reproducing Scala's representation
   split: up to four entries the insertion-ordered `Set(…)`/`Map(…)`, beyond that
   a CHAMP `HashSet(…)`/`HashMap(…)` in trie order (the JVM hash codes, the
@@ -618,7 +621,7 @@ probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `localdef`, `oop`, `range`, `array`, `math`, `coll`, `hashcoll`, `infix`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
 `nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, `breaks`,
-`params`, `fmt`, `apply`, `narrow`, `braces`, …). It needs a real `scala` on
+`params`, `fmt`, `apply`, `narrow`, `braces`, `arrange`, `seqmore`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -774,14 +777,61 @@ receiver and the same window size. The rewrite also fixed an empty receiver
 answering one empty window where the reference answers none — invisible in
 `println` (`List("")` and `List()` both print `List()`) and visible in `.size`.
 
+Two further modes were added by counting rather than by taste — every member
+they generate appeared ZERO times in both the frozen corpus and the rest of the
+generator, so nothing in the harness could have said whether it worked. Both
+found gaps on their first run. `arrange` covers `permutations`, `combinations`,
+`updated` and the `Range` companion; `seqmore` covers the leftovers
+(`scanLeft`/`scanRight`, `reduceLeft`/`reduceRight`, `startsWith`/`endsWith`,
+`toArray`/`toIndexedSeq`/`toIterable`, `keySet`, `orNull`, `withFilter`, the
+`strip*` family). What they turned up: `toIterable` answered `List(…)` for every
+receiver where Scala's is `this` (a `Vector` stays a `Vector`, a `ListBuffer` a
+`ListBuffer`), `toSeq` copied where Scala's is `this` for an immutable sequence
+and an `ArraySeq` for an `Array`, `startsWith`/`endsWith` existed only for
+`String`, `toIndexedSeq` was missing outright, an out-of-range `updated` on an
+EMPTY receiver reported `max 0` where the reference reports `max -1`, and — found
+while wiring the last of those — `Set(1,2,3)(2)` read the set POSITIONALLY and
+answered the element `3` where Scala's `Set.apply` is `contains` and answers
+`true`.
+
+The same `apply` work exposed a performance shape rather than a wrong answer.
+Reading one element copied the whole receiver: `seq_kind_items` clones every
+element on each dispatch, so `while (i < n) s += v(i)` over an 8000-element
+`Vector` moved 64 million values to read 8000 of them, and `v.length` inside a
+loop copied the collection to answer a number it already knew. The O(1) reads
+now go straight to the heap — `length`/`size`/`isEmpty`/`nonEmpty`/`head`/`last`
+and a positional `apply` — and `seq_kind`, which asked only "what kind is this?",
+no longer clones and discards the elements to find out. Measured by running a
+binary built from the previous `origin/main` INTERLEAVED with this one so both
+arms see the same load (this machine runs many builds at once), minimum user CPU
+of seven alternating pairs:
+
+```text
+  while (i < 8000) s += v(i)          2.10s -> 0.02s   105x
+  while (i < 4000) s += v.length      0.54s -> 0.01s    54x
+  while (i < 4000) s += v.head        1.07s -> 0.02s    53x
+  while (i < 4000) s += v.size+v.last 1.64s -> 0.02s    82x
+  sorted/map/filter/groupBy           0.02s -> 0.02s   unchanged
+  string building + count             0.01s -> 0.01s   unchanged
+```
+
+The indexed loop was quadratic and is now linear (0.00s / 0.01s / 0.03s at
+n = 2000 / 4000 / 8000, against 0.14s / 0.53s / 2.08s).
+
 Next waves, in priority order:
 
 1. **Lazy views** — `.view` and `LazyList`. (`Iterator` itself is done: it is a
    real consumable iterator, not a strict `Iterable`.)
 2. **The broader standard library** — `scala.io`, `scala.util.Random`, `BigInt`
-   and `BigDecimal`, and `scala.collection.*` as a namespace. (`scala.util.Try` is
-   done, and `Either`'s right-biased surface with `Either.left`'s
-   `LeftProjection` beside it.)
+   and `BigDecimal`. (`scala.util.Try` is done, and `Either`'s right-biased
+   surface with `Either.left`'s `LeftProjection` beside it. Package-QUALIFIED
+   spellings now resolve too: `scala.util.Try(e)`, `scala.Some(1)` and
+   `scala.collection.immutable.List(1)` are the same expressions their bare
+   names compile to.) `BigInt`/`BigDecimal` are the hard one and are left out
+   rather than approximated: every number here is one `i64` or `f64`, and the
+   32-bit wrap analysis, `Double.toString` and the mixed `Int`/`Double`
+   dispatch are all built on that — an arbitrary-precision operand needs a host
+   value plus an arithmetic path that dispatches on it. See `BUGS.md`.
 3. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement. Both
    are refused rather than approximated: reading one by name used to answer the
    whole match and `${name}` in a replacement used to be copied through
