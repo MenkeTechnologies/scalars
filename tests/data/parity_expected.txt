@@ -540,3 +540,34 @@ object T extends App { println("1.5".toDoubleOption); println("x".toDoubleOption
 object T extends App { println(List(1,2,3).sliding(0, 1).toList) }		java.lang.IllegalArgumentException: requirement failed: size=0 and step=1, but both must be positive
 object T extends App { println(List(1,2,3).sliding(2, 0).toList) }		java.lang.IllegalArgumentException: requirement failed: size=2 and step=0, but both must be positive
 object T extends App { println(List(1,2,3).grouped(0).toList) }		java.lang.IllegalArgumentException: requirement failed: size=0 and step=0, but both must be positive
+object T extends App { println(List(1,2,3).permutations.toList); println(List(3,2,1).permutations.toList) }	List(List(1, 2, 3), List(1, 3, 2), List(2, 1, 3), List(2, 3, 1), List(3, 1, 2), List(3, 2, 1))\nList(List(3, 2, 1), List(3, 1, 2), List(2, 3, 1), List(2, 1, 3), List(1, 3, 2), List(1, 2, 3))\n
+object T extends App { println(List(2,1,1).permutations.toList); println(List(1,1,2).permutations.toList) }	List(List(2, 1, 1), List(1, 2, 1), List(1, 1, 2))\nList(List(1, 1, 2), List(1, 2, 1), List(2, 1, 1))\n
+object T extends App { println(Vector(1,2,3).permutations.toList); println(List[Int]().permutations.toList) }	List(Vector(1, 2, 3), Vector(1, 3, 2), Vector(2, 1, 3), Vector(2, 3, 1), Vector(3, 1, 2), Vector(3, 2, 1))\nList(List())\n
+object T extends App { println("bca".permutations.toList); println("aab".permutations.toList) }	List(bca, bac, cba, cab, abc, acb)\nList(aab, aba, baa)\n
+object T extends App { val it = List(1,2).permutations; println(it.toList); println(it.toList) }	List(List(1, 2), List(2, 1))\nList()\n
+object T extends App { println(List(1,2,3,4).combinations(2).toList); println(List(3,2,1).combinations(2).toList) }	List(List(1, 2), List(1, 3), List(1, 4), List(2, 3), List(2, 4), List(3, 4))\nList(List(3, 2), List(3, 1), List(2, 1))\n
+object T extends App { println(List(2,1,1).combinations(2).toList); println(List(1,1,2,2).combinations(2).toList); println(List(1,1,2,2).combinations(3).toList) }	List(List(2, 1), List(1, 1))\nList(List(1, 1), List(1, 2), List(2, 2))\nList(List(1, 1, 2), List(1, 2, 2))\n
+object T extends App { println(List(1,2,3).combinations(0).toList); println(List(1,2,3).combinations(4).toList); println(List(1,2,3).combinations(-1).toList) }	List(List())\nList()\nList()\n
+object T extends App { println("cba".combinations(2).toList); println(Vector(1,2,3).combinations(2).toList) }	List(cb, ca, ba)\nList(Vector(1, 2), Vector(1, 3), Vector(2, 3))\n
+object T extends App { println(List(1,2,3).updated(1, 9)); println(Vector(1,2,3).updated(0, 9)); println(Seq(1,2,3).updated(2, 9)) }	List(1, 9, 3)\nVector(9, 2, 3)\nList(1, 2, 9)\n
+object T extends App { println(Array(1,2,3).updated(1, 9).mkString(",")); println("abc".updated(1, 'z')); println((1 to 3).updated(1, 9)) }	1,9,3\nazc\nVector(1, 9, 3)\n
+object T extends App { println(scala.collection.mutable.ListBuffer(1,2,3).updated(1, 9)); println(scala.collection.mutable.ArrayBuffer(1,2,3).updated(1, 9)) }	ListBuffer(1, 9, 3)\nArrayBuffer(1, 9, 3)\n
+object T extends App { println(List(1,2,3).updated(5, 9)) }		java.lang.IndexOutOfBoundsException: 5 is out of bounds (min 0, max 2)
+object T extends App { println(List[Int]().updated(0, 9)) }		java.lang.IndexOutOfBoundsException: 0 is out of bounds (min 0, max -1)
+object T extends App { println(Vector[Int]().updated(0, 9)) }		java.lang.IndexOutOfBoundsException: 0 is out of bounds (empty vector)
+object T extends App { println(scala.collection.mutable.ListBuffer(1,2).updated(9, 0)) }		java.lang.IndexOutOfBoundsException: 9
+object T extends App { println("abc".updated(5, 'z')) }		java.lang.StringIndexOutOfBoundsException: Index 5 out of bounds for length 3
+object T extends App { println(Range(1, 5)); println(Range(1, 5).toList); println(Range(5, 1).toList) }	Range 1 until 5\nList(1, 2, 3, 4)\nList()\n
+object T extends App { println(Range(1, 10, 3).toList); println(Range(10, 1, -3).toList); println(Range(1, 10, 4)) }	List(1, 4, 7)\nList(10, 7, 4)\ninexact Range 1 until 10 by 4\n
+object T extends App { println(Range.inclusive(1, 5).toList); println(Range.inclusive(1, 10, 3).toList); println(Range.inclusive(1, 5)) }	List(1, 2, 3, 4, 5)\nList(1, 4, 7, 10)\nRange 1 to 5\n
+object T extends App { println(Range(1, 10, 0).toList) }		java.lang.IllegalArgumentException: step cannot be 0.
+object T extends App { println(scala.util.Try(1 / 0)); println(scala.util.Try(7 / 1)); println(scala.util.Success(3)) }	Failure(java.lang.ArithmeticException: / by zero)\nSuccess(7)\nSuccess(3)\n
+object T extends App { println(scala.Some(1)); println(scala.None); println(scala.List(1,2)); println(scala.collection.immutable.Vector(1,2)) }	Some(1)\nNone\nList(1, 2)\nVector(1, 2)\n
+object T extends App { println(List(1,2).toIterable); println(Vector(1,2).toIterable); println(Set(1,2).toIterable); println(Map("a" -> 1).toIterable) }	List(1, 2)\nVector(1, 2)\nSet(1, 2)\nMap(a -> 1)\n
+object T extends App { println(scala.collection.mutable.ListBuffer(1,2).toIterable); println(scala.collection.mutable.ArrayBuffer(1,2).toIterable); println((1 to 3).toIterable) }	ListBuffer(1, 2)\nArrayBuffer(1, 2)\nRange 1 to 3\n
+object T extends App { println(List(1,2).toSeq); println(Vector(1,2).toSeq); println(Set(1,2).toSeq); println((1 to 3).toSeq) }	List(1, 2)\nVector(1, 2)\nList(1, 2)\nRange 1 to 3\n
+object T extends App { println(Array(1,2).toSeq); println(Array(1,2).toIterable); println(scala.collection.mutable.ListBuffer(1,2).toSeq) }	ArraySeq(1, 2)\nArraySeq(1, 2)\nList(1, 2)\n
+object T extends App { println(List(1,2,3).toIndexedSeq); println(Array(1,2).toIndexedSeq); println("ab".toIndexedSeq); println(Set(1,2).toIndexedSeq) }	Vector(1, 2, 3)\nArraySeq(1, 2)\nab\nVector(1, 2)\n
+object T extends App { println(List(1,2,3).startsWith(List(1,2))); println(List(1,2,3).startsWith(List(2))); println(List(1,2,3).startsWith(List())) }	true\nfalse\ntrue\n
+object T extends App { println(List(1,2,3).startsWith(List(2,3), 1)); println(List(1,2,3).startsWith(List(1,2,3,4))); println(Vector(1,2,3).startsWith(Vector(1))) }	true\nfalse\ntrue\n
+object T extends App { println(List(1,2,3).endsWith(List(2,3))); println(List(1,2,3).endsWith(List(3,2))); println(List(1,2).endsWith(List(0,1,2))) }	true\nfalse\nfalse\n
