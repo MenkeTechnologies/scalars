@@ -2162,6 +2162,169 @@ fn pair_elems(r: &mut Rng, n: usize) -> String {
     out.join(", ")
 }
 
+/// The string INTERPOLATORS — `s`, `f` and `raw`, in both the single-quoted and
+/// the triple-quoted delimiter.
+///
+/// Its own mode because the axis is the LEXER's, not any evaluator's: what a
+/// splice is, which escapes decode, and where the literal ends. Counted at zero
+/// across the whole generator before it existed — no probe in this file had ever
+/// written `"""` or `raw"`, so a triple-quoted interpolated string was a shape
+/// the fuzzer could not produce at all. It was also unparseable: the prefix was
+/// recognised and the third quote was not, so `s"""x $v"""` lexed as an empty
+/// interpolation followed by a stray plain literal and the parser rejected the
+/// program.
+///
+/// The three prefixes do not agree with each other on any of the axes, which is
+/// the point of crossing them: `raw` keeps `\t` as two characters where `s`
+/// decodes it, `f` reads a `%`-spec after each splice where the other two treat
+/// `%` as text, and the triple-quoted form takes a bare `"` as content and
+/// closes at the LAST of a run of quotes.
+fn g_interp(r: &mut Rng) -> String {
+    // The Scala-source spelling of each escape, i.e. a BACKSLASH followed by
+    // the escape character. `s`/`f` decode them; `raw` keeps both characters.
+    const ESC: &[&str] = &["\\t", "\\n", "\\\\", "\\u0041"];
+    // `f`-conversions applied to a `String` splice and to an `Int` splice.
+    const SFMT: &[&str] = &["%s", "%6s", "%-6s", "%.2s"];
+    const IFMT: &[&str] = &["%d", "%05d", "%,d", "%+d", "%x"];
+    const IVS: &[&str] = &["7", "-7", "1234567", "0", "42"];
+    let u = r.next_u64() % 100_000;
+    let sv = pick(r, STRS);
+    let iv = pick(r, IVS);
+    let esc = pick(r, ESC);
+    let triple = r.below(2) == 0;
+    // The delimiter, and nothing else about the literal, is what the third quote
+    // changes.
+    let q = if triple { "\"\"\"" } else { "\"" };
+    match r.below(10) {
+        // `s` with a bare-identifier splice and an escape.
+        0 => format!("{{ val s{u} = {sv}; println(s{q}a{esc}b $s{u} c{q}) }}"),
+        // `s` with a `${expr}` splice, whose braces must balance.
+        1 => format!("{{ val s{u} = {sv}; println(s{q}[${{s{u}.length + {iv}}}]{q}) }}"),
+        // `raw` — the same body with the escape kept verbatim. Printed with its
+        // LENGTH beside it, which is what tells the two decodings apart when the
+        // escape renders as whitespace.
+        2 => format!(
+            "{{ val s{u} = {sv}; val t{u} = raw{q}a{esc}b $s{u}{q}; \
+             println(t{u}); println(t{u}.length) }}"
+        ),
+        // `f` with a conversion after each splice.
+        3 => format!(
+            "{{ val s{u} = {sv}; println(f{q}${{s{u}}}{}|${{{iv}}}{}{q}) }}",
+            pick(r, SFMT),
+            pick(r, IFMT)
+        ),
+        // `$$` is one literal `$`, and `%%` one literal `%` under `f`.
+        4 => format!("println(f{q}$$ {} %%{q})", pick(r, IFMT).replace('%', "%%")),
+        // A `"` INSIDE the literal: content in the triple-quoted form, and the
+        // close is at the LAST of a run of quotes, so the second probe here is
+        // the string `<value>"`.
+        5 if triple => format!(
+            "{{ val s{u} = {sv}; println(s{q}q\"$s{u}\"q{q}); \
+             println(s{q}$s{u}{q}\".length) }}"
+        ),
+        // The single-quoted form has to escape it instead.
+        5 => format!("{{ val s{u} = {sv}; println(s{q}q\\\"$s{u}\\\"q{q}) }}"),
+        // Two splices with no literal between them, and one at each end.
+        6 => format!("{{ val s{u} = {sv}; println(s{q}$s{u}${{{iv}}}$s{u}{q}) }}"),
+        // Interpolating a COLLECTION — it goes through the same `toString` an
+        // ordinary concatenation would.
+        7 => format!(
+            "{{ val l{u} = List({}, {}); println(s{q}l=$l{u} n=${{l{u}.sum}}{q}) }}",
+            pick(r, INTS),
+            pick(r, INTS)
+        ),
+        // The `f` interpolator over a Double, where the conversion decides the
+        // notation the bare splice would not have used.
+        8 => format!(
+            "{{ val d{u} = {}; println(f{q}${{d{u}}}%.3f|${{d{u}}}%e|${{d{u}}}{q}) }}",
+            pick(r, DBLS)
+        ),
+        // A multi-line body: only the triple-quoted form may hold a real
+        // newline, so the single-quoted arm writes the escape instead.
+        _ if triple => format!("{{ val s{u} = {sv}; println(s{q}one $s{u}\none more{q}) }}"),
+        _ => format!("{{ val s{u} = {sv}; println(s{q}one $s{u}\\nn more{q}) }}"),
+    }
+}
+
+/// `lazy val` — the binding whose initializer runs at most once, at its FIRST
+/// read rather than at its declaration.
+///
+/// Its own mode because two separate things are observable and neither is
+/// reachable from any other mode here: the ORDER the initializer's side effects
+/// interleave with the surrounding output, and the fact that a second read
+/// produces none. Counted at zero across the whole generator before it existed.
+///
+/// Half the arms exist for SHADOWING specifically. A `lazy val` is compiled as a
+/// read barrier keyed on the NAME, so any inner binding that reuses the name has
+/// to displace it: a `def` parameter, a lambda parameter, a class constructor
+/// parameter. Before this mode, `lazy val a = 5` followed by
+/// `def f(a: Int = 1) = a * 10` forced the parameter as though it were the cell
+/// and the body multiplied `null` — a shape no probe in this file could write.
+fn g_lazyval(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    match r.below(10) {
+        // The initializer runs at the first READ, not at the declaration, and
+        // not again.
+        0 => format!(
+            "{{ lazy val v{u} = {{ println(\"init\"); {a} }}; println(\"before\"); \
+             println(v{u}); println(v{u}); println(v{u} + {b}) }}"
+        ),
+        // Never read — the initializer never runs.
+        1 => format!("{{ lazy val v{u} = {{ println(\"init\"); {a} }}; println(\"done\") }}"),
+        // A `def` parameter of the SAME NAME shadows it, and its default is what
+        // an omitted argument gets.
+        2 => format!(
+            "{{ lazy val v{u} = {a}; def f{u}(v{u}: Int = {b}, w: Int = 2): Int = v{u} * 10 + w; \
+             println(f{u}()); println(f{u}(w = 9)); println(f{u}(7)); println(v{u}) }}"
+        ),
+        // A LAMBDA parameter of the same name shadows it inside the body, and
+        // the enclosing binding is still lazy outside.
+        3 => format!(
+            "{{ lazy val v{u} = {{ println(\"init\"); {a} }}; \
+             val f{u} = (v{u}: Int) => v{u} + 1; println(f{u}({b})); println(v{u}) }}"
+        ),
+        // A lambda that does NOT rebind the name reads the lazy one, and forcing
+        // it inside the closure is still a force.
+        4 => format!(
+            "{{ lazy val v{u} = {{ println(\"init\"); {a} }}; \
+             println(List({a}, {b}).map(x => x + v{u})) }}"
+        ),
+        // A class constructor parameter of the same name.
+        5 => format!(
+            "{{ lazy val v{u} = {a}; class C{u}(v{u}: Int) {{ def q = v{u} * 2 }}; \
+             println(new C{u}({b}).q); println(v{u}) }}"
+        ),
+        // One lazy val whose initializer forces another: the inner one's effect
+        // is ordered inside the outer one's.
+        6 => format!(
+            "{{ lazy val p{u} = {{ println(\"p\"); {a} }}; \
+             lazy val q{u} = {{ println(\"q\"); p{u} + {b} }}; println(\"go\"); \
+             println(q{u}); println(q{u}); println(p{u}) }}"
+        ),
+        // An initializer that THROWS is retried on the next read — the failure
+        // is not memoized.
+        7 => format!(
+            "{{ lazy val v{u} = {{ println(\"try\"); {a} / 0 }}; \
+             try {{ println(v{u}) }} catch {{ case e: ArithmeticException => println(\"c1\") }}; \
+             try {{ println(v{u}) }} catch {{ case e: ArithmeticException => println(\"c2\") }} }}"
+        ),
+        // Read through a `def`, which is where the force has to survive being a
+        // whole frame away from the declaration.
+        8 => format!(
+            "{{ lazy val v{u} = {{ println(\"init\"); {a} }}; def g{u}(): Int = v{u} + {b}; \
+             println(\"before\"); println(g{u}()); println(g{u}()) }}"
+        ),
+        // A lazy val holding a COLLECTION, forced by a member access rather than
+        // by a bare read.
+        _ => format!(
+            "{{ lazy val v{u} = {{ println(\"init\"); List({a}, {b}) }}; \
+             println(v{u}.sum); println(v{u}.length); println(v{u}) }}"
+        ),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     All,
@@ -2212,6 +2375,8 @@ enum Mode {
     Arrange,
     SeqMore,
     Braces,
+    Interp,
+    LazyVal,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -2264,6 +2429,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Braces => "braces",
         Mode::Arrange => "arrange",
         Mode::SeqMore => "seqmore",
+        Mode::Interp => "interp",
+        Mode::LazyVal => "lazyval",
     }
 }
 
@@ -2317,6 +2484,8 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "braces" => Mode::Braces,
         "arrange" => Mode::Arrange,
         "seqmore" => Mode::SeqMore,
+        "interp" => Mode::Interp,
+        "lazyval" => Mode::LazyVal,
         _ => return None,
     })
 }
@@ -2369,6 +2538,8 @@ const CONCRETE: &[Mode] = &[
     Mode::Arrange,
     Mode::SeqMore,
     Mode::Braces,
+    Mode::Interp,
+    Mode::LazyVal,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -2611,19 +2782,46 @@ fn g_fmt(r: &mut Rng) -> String {
         "1e-300",
         "-7.25",
         "0.045",
+        // Large enough that `%,.2f` shows its separators — the float half of the
+        // same blind spot the `GROUPED` pool closes for `%,d`.
+        "1234567.891",
+        "-9876543.5",
         "1.0 / 0.0",
         "-1.0 / 0.0",
         "0.0 / 0.0",
     ];
     const FCONV: &[&str] = &[
         "%f", "%.0f", "%.1f", "%.2f", "%.3f", "%10.2f", "%-10.2f", "%+.2f", "%012.3f", "% .2f",
-        "%e", "%.0e", "%.1e", "%.3e", "%E", "%.2E", "%14.3e", "%-14.3e", "%+.3e",
+        "%e", "%.0e", "%.1e", "%.3e", "%E", "%.2E", "%14.3e", "%-14.3e", "%+.3e", "%,.2f",
+        "%,015.2f",
     ];
     const ICONV: &[&str] = &[
-        "%d", "%5d", "%-5d", "%05d", "%+d", "% d", "%x", "%X", "%o", "%,d",
+        "%d", "%5d", "%-5d", "%05d", "%+d", "% d", "%x", "%X", "%o", "%,d", "%,012d", "%,-12d",
+        "%,+d",
+    ];
+    // The shared `INTS` pool tops out at 42, and every value in it is BELOW the
+    // first grouping boundary — so `%,d` sat in the conversion pool for as long
+    // as this mode has existed while no value it was ever applied to could show
+    // a separator. The whole grouping flag went unimplemented underneath a
+    // conversion the fuzzer emitted, and no run could tell. These are the
+    // magnitudes that put a separator — and at four groups, three of them — into
+    // the answer, on both signs and past `Int`.
+    const GROUPED: &[&str] = &[
+        "999",
+        "1000",
+        "1234567",
+        "-1234567",
+        "1000000000",
+        "-1000000000",
+        "1234567890123L",
+        "100000",
     ];
     let x = pick(r, TIES);
-    let n = pick(r, INTS);
+    let n = if r.below(2) == 0 {
+        pick(r, GROUPED)
+    } else {
+        pick(r, INTS)
+    };
     let s = pick(r, STRS);
     match r.below(8) {
         0 => format!("println(f\"${{{x}}}{}\")", pick(r, FCONV)),
@@ -2699,6 +2897,8 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Braces => g_braces(r),
         Mode::Arrange => g_arrange(r),
         Mode::SeqMore => g_seqmore(r),
+        Mode::Interp => g_interp(r),
+        Mode::LazyVal => g_lazyval(r),
         Mode::All => unreachable!(),
     }
 }
