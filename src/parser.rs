@@ -2360,6 +2360,20 @@ impl Parser {
             // built (`mutable.ArrayBuffer(1,2,3)(1)` is the element `2`). Without
             // this the flattening would silently append the index as a fourth
             // element.
+            // `scala.util.Try(e)` / `immutable.List(1)` / `scala.Some(1)` — a
+            // member of a package whose contents this frontend answers under the
+            // BARE name (see [`is_plain_pkg`]). The selection IS that bare
+            // identifier, so it is parsed as one: that is what gets `Try` its
+            // `try`/`catch` expansion and `List` its collection literal, neither
+            // of which the receiver-dispatch path can produce.
+            if is_plain_member(&e, &name) {
+                e = if self.is(&Tok::LParen) {
+                    self.bare_application(name, line)?
+                } else {
+                    Expr::Var(name)
+                };
+                continue;
+            }
             let factory = is_mutable_pkg(&e) && mutable_factory_name(&name);
             let mut args = Vec::new();
             while self.is(&Tok::LParen) {
@@ -2379,6 +2393,63 @@ impl Parser {
             });
         }
         Ok(e)
+    }
+
+    /// The expression a bare identifier immediately applied to an argument list
+    /// denotes. Cursor is on the `(`.
+    ///
+    /// Factored out of `primary`'s identifier arm so that a PACKAGE-QUALIFIED
+    /// spelling of the same name reaches the same construction:
+    /// `scala.util.Try(e)` has to become the `try`/`catch` expansion that a bare
+    /// `Try(e)` becomes, and `scala.collection.immutable.List(1)` the same
+    /// literal a bare `List(1)` becomes. Before this existed the qualified forms
+    /// fell through to receiver dispatch on a package path that is not a value,
+    /// and reported `value util is not a member of Null`.
+    fn bare_application(&mut self, name: String, line: u32) -> Result<Expr, String> {
+        // `List(...)` / `Map(...)` / `Array(...)` collection literals.
+        // A name an `import` selector bound to a
+        // `scala.collection.mutable` factory means THAT factory,
+        // even when the same name also denotes an immutable one:
+        // `import scala.collection.mutable.Set` makes a bare
+        // `Set(1, 2)` the mutable set. An explicit import outranks
+        // the default scope in Scala, and this is the one place the
+        // two disagree about a name.
+        if let Some(ctor) = self.imported_mutable_ctor(&name) {
+            let elems = self.arg_list()?;
+            return Ok(eta_bare_args(Expr::Collection { ctor, elems }));
+        }
+        // `ListBuffer`/`ArrayBuffer`/`Buffer` are the mutable names
+        // that can only mean the mutable collection, so they work
+        // unqualified. A bare `Set`/`Map` with no import naming the
+        // mutable one stays immutable, as in Scala.
+        if matches!(
+            name.as_str(),
+            "List" | "Map" | "Array" | "Seq" | "Vector" | "Set" | "IndexedSeq" | "Iterator"
+        ) {
+            let elems = self.arg_list()?;
+            return Ok(eta_bare_args(Expr::Collection { ctor: name, elems }));
+        }
+        // `Try(e)` — `scala.util.Try`'s factory. Desugared HERE,
+        // not in the compiler, because the expansion introduces a
+        // `catch` binder and only the AST that `crate::resolve`
+        // still sees can have a frame slot allocated for it. A
+        // compiler-side expansion ran after resolve, so the binder
+        // was unbound and the `catch` silently failed to catch.
+        if name == "Try" {
+            let args = self.arg_list()?;
+            if let [body] = args.as_slice() {
+                return Ok(try_factory(body, line));
+            }
+            return Ok(eta_bare_args(Expr::Call { name, args, line }));
+        }
+        if let Some(ctor) = mutable_buffer_ctor(&name) {
+            let elems = self.arg_list()?;
+            return Ok(eta_bare_args(Expr::Collection {
+                ctor: ctor.to_string(),
+                elems,
+            }));
+        }
+        self.call(name, line)
     }
 
     /// Whether the cursor is on a token that can only begin a top-level
@@ -2724,57 +2795,7 @@ impl Parser {
                     self.skip_bracket_group();
                 }
                 if self.is(&Tok::LParen) {
-                    // `List(...)` / `Map(...)` / `Array(...)` collection literals.
-                    // A name an `import` selector bound to a
-                    // `scala.collection.mutable` factory means THAT factory,
-                    // even when the same name also denotes an immutable one:
-                    // `import scala.collection.mutable.Set` makes a bare
-                    // `Set(1, 2)` the mutable set. An explicit import outranks
-                    // the default scope in Scala, and this is the one place the
-                    // two disagree about a name.
-                    if let Some(ctor) = self.imported_mutable_ctor(&name) {
-                        let elems = self.arg_list()?;
-                        return Ok(eta_bare_args(Expr::Collection { ctor, elems }));
-                    }
-                    // `ListBuffer`/`ArrayBuffer`/`Buffer` are the mutable names
-                    // that can only mean the mutable collection, so they work
-                    // unqualified. A bare `Set`/`Map` with no import naming the
-                    // mutable one stays immutable, as in Scala.
-                    if matches!(
-                        name.as_str(),
-                        "List"
-                            | "Map"
-                            | "Array"
-                            | "Seq"
-                            | "Vector"
-                            | "Set"
-                            | "IndexedSeq"
-                            | "Iterator"
-                    ) {
-                        let elems = self.arg_list()?;
-                        return Ok(eta_bare_args(Expr::Collection { ctor: name, elems }));
-                    }
-                    // `Try(e)` — `scala.util.Try`'s factory. Desugared HERE,
-                    // not in the compiler, because the expansion introduces a
-                    // `catch` binder and only the AST that `crate::resolve`
-                    // still sees can have a frame slot allocated for it. A
-                    // compiler-side expansion ran after resolve, so the binder
-                    // was unbound and the `catch` silently failed to catch.
-                    if name == "Try" {
-                        let args = self.arg_list()?;
-                        if let [body] = args.as_slice() {
-                            return Ok(try_factory(body, line));
-                        }
-                        return Ok(eta_bare_args(Expr::Call { name, args, line }));
-                    }
-                    if let Some(ctor) = mutable_buffer_ctor(&name) {
-                        let elems = self.arg_list()?;
-                        return Ok(eta_bare_args(Expr::Collection {
-                            ctor: ctor.to_string(),
-                            elems,
-                        }));
-                    }
-                    return self.call(name, line);
+                    return self.bare_application(name, line);
                 }
                 // `once { … }` — a brace group standing in for a plain call's
                 // single parenthesized argument, the same substitution
@@ -3827,6 +3848,98 @@ fn is_mutable_path(path: &[String]) -> bool {
             .as_slice(),
         ["mutable"] | ["collection", "mutable"] | ["scala", "collection", "mutable"]
     )
+}
+
+/// The dotted segments of a paren-less selection chain — `scala.util` is
+/// `["scala", "util"]` — or `None` for anything that is not one. Only
+/// zero-argument selections rooted at a bare identifier qualify, which is the
+/// shape a package path parses to.
+fn path_segments(e: &Expr) -> Option<Vec<&str>> {
+    match e {
+        Expr::Var(n) => Some(vec![n.as_str()]),
+        Expr::Method {
+            recv, name, args, ..
+        } if args.is_empty() => {
+            let mut segs = path_segments(recv)?;
+            segs.push(name.as_str());
+            Some(segs)
+        }
+        _ => None,
+    }
+}
+
+/// Every package path this frontend recognizes, in every spelling a program may
+/// reach it by. Used only to tell "this selection is still walking a package"
+/// from "this selection names a member of one" — `scala.util` continues the
+/// path, `scala.util.Try` ends it.
+const PACKAGE_PATHS: &[&[&str]] = &[
+    &["scala"],
+    &["scala", "math"],
+    &["math"],
+    &["scala", "util"],
+    &["util"],
+    &["scala", "util", "control"],
+    &["util", "control"],
+    &["control"],
+    &["scala", "collection"],
+    &["collection"],
+    &["scala", "collection", "immutable"],
+    &["collection", "immutable"],
+    &["immutable"],
+    &["scala", "collection", "mutable"],
+    &["collection", "mutable"],
+    &["mutable"],
+    &["java"],
+    &["java", "lang"],
+];
+
+/// The package paths that carry NO members of their own here: what they contain
+/// is spelled exactly as the bare name, so the qualifier can be dropped.
+///
+/// Deliberately a subset of [`PACKAGE_PATHS`] rather than all of it.
+/// `scala.math` and `scala.collection.mutable` are namespaces whose members are
+/// NOT their bare spellings — `math.signum(5)` is `1` where a bare `signum` is
+/// not defined at all, and `mutable.Set(1)` builds a different collection than
+/// `Set(1)` — and both already resolve on their own paths. Dropping their
+/// qualifier would silently change which value the program builds.
+const PLAIN_PACKAGES: &[&[&str]] = &[
+    &["scala"],
+    &["scala", "util"],
+    &["util"],
+    &["scala", "util", "control"],
+    &["util", "control"],
+    &["control"],
+    &["scala", "collection", "immutable"],
+    &["collection", "immutable"],
+    &["immutable"],
+];
+
+/// Whether selecting `name` off `e` names a member of a [`PLAIN_PACKAGES`] path
+/// — so the selection is the bare `name`.
+///
+/// Three things must hold, and each rules out a real mis-parse:
+///
+/// * `e` is one of those paths, and
+/// * the path EXTENDED by `name` is not itself a package, or `scala.util` would
+///   be read as the member `util` of `scala` and the walk would stop one
+///   segment early, and
+/// * `name` is capitalized. Everything these packages hold is a type or an
+///   object, so this is free here, and it is what keeps a value that happens to
+///   be named `util`/`control`/`immutable` answering its own methods: `util.f()`
+///   stays a call on `util`.
+fn is_plain_member(e: &Expr, name: &str) -> bool {
+    if !name.starts_with(char::is_uppercase) {
+        return false;
+    }
+    let Some(segs) = path_segments(e) else {
+        return false;
+    };
+    if !PLAIN_PACKAGES.contains(&segs.as_slice()) {
+        return false;
+    }
+    let mut extended = segs;
+    extended.push(name);
+    !PACKAGE_PATHS.contains(&extended.as_slice())
 }
 
 /// Whether `e` is the `scala.collection.mutable` package path — spelled

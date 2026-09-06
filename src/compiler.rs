@@ -4759,6 +4759,18 @@ impl Compiler {
                 .emit(Op::CallBuiltin(crate::host::RANGE_LIST, 3), line);
             return Ok(());
         }
+        // `Range(a, b)` / `Range(a, b, step)` — the `Range` companion's `apply`,
+        // spelled as the call it looks like. Skipped when the program binds
+        // `Range` itself, so a user `def Range` or `case class Range` still wins.
+        if name == "Range"
+            && !self.func_arity.contains_key(name)
+            && !self.classes.contains_key(name)
+        {
+            if let Some(e) = range_factory("apply", args, line) {
+                return self.expr(&e);
+            }
+        }
+
         // `Option(x)` — the factory whose `null` case is `None`. Only when the
         // program has not bound `Option` itself.
         if name == "Option"
@@ -6100,6 +6112,16 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
             })),
         });
     }
+    // `Range(a, b)` / `Range.inclusive(a, b)` and their stepped forms — see
+    // [`range_factory`]. Answered before `factory_conversion`, which has no
+    // entry for `Range`: a range is not rebuilt from a generic sequence, it IS
+    // the `until`/`to` expression.
+    if owner == "Range" {
+        if let Some(e) = range_factory(name, args, line) {
+            return Some(e);
+        }
+    }
+
     // `X.empty` is that collection's empty literal. It is answered before the
     // element-wise members so `Map.empty` works too, where `Map.fill` would need
     // pairs and is left alone.
@@ -6137,6 +6159,35 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
             rest.iter()
                 .fold(first.clone(), |acc, x| m(acc, "++", vec![x.clone()])),
         ),
+        _ => return None,
+    })
+}
+
+/// The `scala.collection.immutable.Range` companion's two factories, as the
+/// operator-spelled range this frontend already builds: `Range(a, b)` is
+/// `a until b`, `Range.inclusive(a, b)` is `a to b`, and the three-argument form
+/// of either appends `by step`.
+///
+/// Desugared rather than given its own builtin for the same reason
+/// [`companion_factory`] desugars: the `until`/`to`/`by` path already carries
+/// the empty/inexact `toString`, the `step cannot be 0.` requirement, the
+/// descending-step comparison flip and the `Range`-derived collection kind, and
+/// a second construction path for the same value could only drift from it.
+fn range_factory(name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+    let preposition = match name {
+        "apply" => "until",
+        "inclusive" => "to",
+        _ => return None,
+    };
+    let m = |recv: Expr, name: &str, arg: Expr| Expr::Method {
+        recv: Box::new(recv),
+        name: name.to_string(),
+        args: vec![arg],
+        line,
+    };
+    Some(match args {
+        [a, b] => m(a.clone(), preposition, b.clone()),
+        [a, b, step] => m(m(a.clone(), preposition, b.clone()), "by", step.clone()),
         _ => return None,
     })
 }
