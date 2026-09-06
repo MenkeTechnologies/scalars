@@ -2062,7 +2062,10 @@ fn g_arrange(r: &mut Rng) -> String {
         ),
         // The qualified spellings of names this frontend answers unqualified.
         _ => two(
-            format!("scala.util.Try({lo} / {})", hi - hi),
+            // A literal zero, which is what `hi - hi` formatted to — and what
+            // `clippy::eq_op` fails the build over ("equal expressions as
+            // operands to `-`"). The case is the divide-by-zero `Try` catches.
+            format!("scala.util.Try({lo} / 0)"),
             format!("scala.collection.immutable.{xs}"),
         ),
     }
