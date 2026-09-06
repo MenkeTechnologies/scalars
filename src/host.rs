@@ -6565,6 +6565,30 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         if let Some(r) = mut_map_fast(recv, rep, n, name, args) {
             return r;
         }
+        // The COUNT reads, answered off the entry count [`map_rep_len`] already
+        // has. They are the read side of the same copy [`mut_map_fast`] exists
+        // to avoid on the write side: `map_rep_entries` below clones every
+        // entry, so `m.size` inside a loop over a 4 000-entry `Map` copied
+        // 4 000 pairs to answer a number the heap already knew, and the loop as
+        // a whole moved 16 million of them. The bodies are the same expressions
+        // the `("size", 0)` / `("isEmpty", 0)` / `("nonEmpty", 0)` arms below
+        // evaluate — a shortcut to the same answer, never a second definition.
+        //
+        // The KEYED reads (`apply`/`get`/`contains`/`getOrElse`) are NOT here.
+        // They cost the same copy, but skipping it would not make them cheaper:
+        // [`map_get`] is a scan, so they are `O(n)` either way, and the scan
+        // compares keys with [`value_eq`], which re-enters the heap for an
+        // object key. A shortcut would have to hold the heap borrow across that
+        // comparison, which panics. Making those `O(1)` needs an index beside
+        // the entries, not a shorter path to the same scan.
+        if args.is_empty() {
+            match name {
+                "size" => return Ok(Value::int(n as i64)),
+                "isEmpty" => return Ok(Value::bool(n == 0)),
+                "nonEmpty" => return Ok(Value::bool(n != 0)),
+                _ => {}
+            }
+        }
     }
     let (rep, entries) = map_rep_entries(recv).unwrap_or((HashRep::Small, Vec::new()));
     // Every closure-taking `Map` method passes one `Tuple2` argument. Built on
