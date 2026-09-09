@@ -192,6 +192,10 @@ struct Resolver {
     scopes: Vec<Scope>,
     /// Scope index where each open frame begins; `frames[0]` is the top level.
     frames: Vec<usize>,
+    /// Every binding declared `val`, by its RENAMED name. A compound assignment
+    /// through one of these is a growable member call, never a rebinding — see
+    /// the `StmtKind::Assign` arm of [`Lifter::walk_stmt`].
+    immutable: HashSet<String>,
     /// Names a lifted `def` may not take: existing `def`s, class/object names,
     /// and (accumulated during the walk) every value binding, since the compiler
     /// resolves a bare name against one flat table covering all of them.
@@ -228,6 +232,7 @@ impl Resolver {
         Resolver {
             scopes: vec![global],
             frames: vec![0],
+            immutable: HashSet::new(),
             taken,
             lifted: Vec::new(),
             lifted_idx: HashMap::new(),
@@ -579,14 +584,20 @@ impl Resolver {
     fn walk_stmt(&mut self, s: &mut Stmt) -> Result<(), String> {
         match &mut s.kind {
             StmtKind::DefDecl(_) => unreachable!("handled by walk_block"),
-            StmtKind::Local { name, init, .. } => {
+            StmtKind::Local {
+                name, init, is_val, ..
+            } => {
                 if let Some(e) = init {
                     self.walk_expr(e)?;
                 }
                 // Bound only after its initializer, so `val x = x` reads the
                 // outer `x` exactly as the compiler lowers it.
                 let n = name.clone();
+                let was_val = *is_val;
                 *name = self.bind_value(&n);
+                if was_val {
+                    self.immutable.insert(name.clone());
+                }
                 Ok(())
             }
             // `val (a, b) = pair` — the initializer is walked first, then every
@@ -596,15 +607,25 @@ impl Resolver {
                 self.rebind_pattern(pat);
                 Ok(())
             }
-            StmtKind::Assign { name, value, .. } => {
+            StmtKind::Assign { name, op, value } => {
                 self.walk_expr(value)?;
                 let n = name.clone();
                 if let Some(g) = self.lookup(&n) {
                     *name = g;
                 }
                 let n = name.clone();
+                // `buf += x` on a `val` is NOT a rebinding. Scala rejects a
+                // write to a `val`, so the only reading that compiles is the
+                // growable MEMBER call (SLS 6.12.4), and the compiler emits
+                // exactly that. Recording it as an assignment made a local `def`
+                // that merely appended to a captured `ListBuffer` fail with
+                // "a captured binding is read-only here", which is a refusal of
+                // a program Scala runs.
+                let member_call = *op != AssignOp::Assign && self.immutable.contains(&n);
                 if let Some(&l) = self.lift_stack.last() {
-                    self.lifted[l].assigns.insert(n);
+                    if !member_call {
+                        self.lifted[l].assigns.insert(n);
+                    }
                 }
                 Ok(())
             }

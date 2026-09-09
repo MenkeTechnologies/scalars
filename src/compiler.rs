@@ -279,6 +279,18 @@ struct ClassMeta {
     /// Primary-constructor arity (the `new`/`apply`/`unapply` argument count —
     /// the leading prefix of `field_names`).
     arity: usize,
+    /// The names of the BY-NAME constructor parameters (`class C(v: => Int)`).
+    ///
+    /// Their slot and their field hold the caller's THUNK rather than a value,
+    /// and every read of the name runs it again — which is the whole of what
+    /// by-name means and what was wrong before: the argument was evaluated once,
+    /// at construction, so `class H(v: => Int) { def get = v }` answered the same
+    /// number for every `get` where Scala answers a new one each time.
+    ///
+    /// Scala rejects `val`/`var` on such a parameter, and so rejects it on a
+    /// `case class` entirely, so the thunk can never escape as a member, a
+    /// `toString` component or a constructor-pattern binding.
+    by_name_params: Vec<String>,
     /// Each primary-constructor parameter's DEFAULT, same order and length as
     /// the arity prefix; `None` where it has none. Spliced at the construction
     /// site by [`Compiler::adapt_ctor_args`], which is where Scala evaluates it.
@@ -412,6 +424,14 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         .chain(prog.objects.iter().flat_map(|o| o.methods.iter()))
         .filter(|f| f.sig.iter().any(|p| p.by_name))
         .map(|f| f.name.clone())
+        // A CLASS with a by-name constructor parameter is a by-name callee too:
+        // `new C(e)` passes `e` as a thunk exactly as `f(e)` does.
+        .chain(
+            prog.classes
+                .iter()
+                .filter(|c| c.param_by_name.iter().any(|b| *b))
+                .map(|c| c.name.clone()),
+        )
         .collect();
 
     // Classes to emit constructors/methods for: the user's, plus the built-in
@@ -517,6 +537,13 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             ClassMeta {
                 field_names,
                 arity: cd.params.len(),
+                by_name_params: cd
+                    .params
+                    .iter()
+                    .zip(&cd.param_by_name)
+                    .filter(|(_, by)| **by)
+                    .map(|(p, _)| p.clone())
+                    .collect(),
                 param_defaults: cd.param_defaults.clone(),
                 is_case: cd.is_case,
                 is_trait: cd.is_trait,
@@ -825,6 +852,7 @@ fn builtin_case1(name: &str, field: &str) -> ClassDecl {
         parents: Vec::new(),
         super_args: Vec::new(),
         params: vec![field.to_string()],
+        param_by_name: vec![false],
         param_tys: vec![None],
         param_defaults: vec![None],
         body: Vec::new(),
@@ -2336,12 +2364,24 @@ impl Compiler {
         self.obj_counter += 1;
         let opt = self.declare_place(&format!(" unopt_{}", self.obj_counter));
         self.emit_store(opt);
-        // A `None` fails the pattern.
+        // A `None` fails the pattern — and so does a `false` from a BOOLEAN
+        // extractor, whose `unapply` answers the test itself rather than an
+        // `Option` (SLS 8.1.8). Which of the two an extractor is cannot be seen
+        // from here: `ObjMeta` records the method NAMES an object declares, not
+        // their return types. So the distinction is drawn at run time, off the
+        // value. Reading `isDefined` unconditionally is what a boolean extractor
+        // used to die on, with `value isDefined is not a member of Boolean`.
         self.emit_load(opt);
-        let dc = self.b.add_constant(Value::str("isDefined".to_string()));
-        self.b.emit(Op::LoadConst(dc), 0);
-        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::EXTRACTED, 1), 0);
         fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+        // A BOOLEAN extractor binds nothing, and the test above was the whole
+        // pattern — there is no payload to open, and asking for one is what
+        // reported `value get is not a member of Boolean`. `case Name()` on a
+        // plain `unapply` is exactly that form: Scala's `Option`-returning
+        // extractors always bind at least one value.
+        if !seq && elems.is_empty() {
+            return Ok(());
+        }
         // The payload.
         self.emit_load(opt);
         let gc = self.b.add_constant(Value::str("get".to_string()));
@@ -2872,6 +2912,23 @@ impl Compiler {
         let c = self.b.add_constant(Value::str(field.to_string()));
         self.b.emit(Op::LoadConst(c), 0);
         self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
+        // A BY-NAME constructor parameter's field holds the caller's thunk, so
+        // the read is a call. Forcing at the READ, once per read, is what makes
+        // `class H(v: => Int) { def get = v }` answer a new value each time.
+        if self.field_is_by_name(field) {
+            self.b.emit(Op::CallBuiltin(crate::host::APPLY, 0), 0);
+        }
+    }
+
+    /// Whether `field` is a by-name constructor parameter of the class being
+    /// compiled. A by-name parameter is private to its class (Scala rejects
+    /// `val` on one), so the question only ever has to be asked of the enclosing
+    /// class, never of an arbitrary receiver's.
+    fn field_is_by_name(&self, field: &str) -> bool {
+        self.current_class
+            .as_ref()
+            .and_then(|(cname, _)| self.classes.get(cname))
+            .is_some_and(|m| m.by_name_params.iter().any(|p| p == field))
     }
 
     /// Finish a compound assignment whose *current value* is already on the
@@ -3428,7 +3485,7 @@ impl Compiler {
             return Ok(args.to_vec());
         };
         let named_any = args.iter().any(|a| matches!(a, Expr::NamedArg { .. }));
-        if !named_any && args.len() >= meta.arity {
+        if !named_any && args.len() >= meta.arity && meta.by_name_params.is_empty() {
             return Ok(args.to_vec());
         }
         let params = &meta.field_names[..meta.arity.min(meta.field_names.len())];
@@ -3463,6 +3520,14 @@ impl Compiler {
         let mut out = Vec::with_capacity(params.len());
         for (i, slot) in slots.into_iter().enumerate() {
             match slot.or_else(|| meta.param_defaults.get(i).cloned().flatten()) {
+                // A by-name parameter is passed as the zero-argument thunk the
+                // constructor stores and each read forces — the same lowering
+                // `adapt_args` gives a `def`'s by-name parameter.
+                Some(e) if meta.by_name_params.contains(&params[i]) => out.push(Expr::Lambda {
+                    params: Vec::new(),
+                    body: Box::new(e),
+                    partial: false,
+                }),
                 Some(e) => out.push(e),
                 // Left for the arity check to report, which names the class and
                 // the counts.
@@ -4503,6 +4568,19 @@ impl Compiler {
             slots.insert(p.clone(), i as u16);
             self.vals.insert(p.clone(), true);
         }
+        // The constructor body reads a by-name parameter out of its SLOT, which
+        // holds the thunk — so it forces exactly where a `def` body does. A
+        // `val once = v` field initializer therefore runs the argument once, at
+        // construction, and freezes that value, which is what Scala does.
+        let saved_ctor_by_name = std::mem::replace(
+            &mut self.by_name,
+            cd.params
+                .iter()
+                .zip(&cd.param_by_name)
+                .filter(|(_, by)| **by)
+                .map(|(p, _)| p.clone())
+                .collect(),
+        );
         self.scope = Some(Scope {
             slots,
             next_slot: cd.params.len() as u16,
@@ -4519,11 +4597,32 @@ impl Compiler {
         // class body can read the fields its supertypes just initialized.
         let mut level = cd;
         while let Some(parent) = level.parents.first().and_then(|p| by_name.get(p.as_str())) {
-            for (name, arg) in parent.params.iter().zip(&level.super_args) {
-                self.expr(arg)?;
+            for ((name, by), arg) in parent
+                .params
+                .iter()
+                .zip(&parent.param_by_name)
+                .zip(&level.super_args)
+            {
+                // A BY-NAME parent parameter takes the argument unevaluated, the
+                // same as one written at a `new` — so `class S(x: => Int) extends
+                // Q(x * 2, 1)` does not run `x * 2` here, and each read of `a`
+                // inside `Q` runs it afresh. Evaluating it at this point ran the
+                // subclass's own by-name argument once, at construction.
+                if *by {
+                    self.expr(&Expr::Lambda {
+                        params: Vec::new(),
+                        body: Box::new(arg.clone()),
+                        partial: false,
+                    })?;
+                } else {
+                    self.expr(arg)?;
+                }
                 let place = self.declare_place(name);
                 self.emit_store(place);
                 self.vals.insert(name.clone(), true);
+                if *by {
+                    self.by_name.insert(name.clone());
+                }
             }
             level = parent;
         }
@@ -4570,6 +4669,7 @@ impl Compiler {
         self.vals = saved_vals;
         self.lazies = saved_lazies;
         self.widths = saved_widths;
+        self.by_name = saved_ctor_by_name;
         Ok(())
     }
 
@@ -7233,6 +7333,13 @@ fn boxed_vars_expr(body: &Expr, by_name_callees: &HashSet<String>) -> HashSet<St
 struct BoxScan<'a> {
     declared: HashSet<String>,
     assigned_in_lambda: HashSet<String>,
+    /// Names READ from inside a nested lambda. Paired with [`Self::assigned`],
+    /// this is the other half of the capture problem: a write inside the closure
+    /// is not the only way the two copies drift apart — a write OUTSIDE it,
+    /// after the closure was built, does the same.
+    read_in_lambda: HashSet<String>,
+    /// Names assigned ANYWHERE in this frame, inside a lambda or not.
+    assigned: HashSet<String>,
     /// See [`Compiler::by_name_callees`] — an argument in one of these calls is
     /// a thunk by the time it runs, so it is walked as a lambda body.
     by_name_callees: &'a HashSet<String>,
@@ -7243,13 +7350,23 @@ impl<'a> BoxScan<'a> {
         Self {
             declared: HashSet::new(),
             assigned_in_lambda: HashSet::new(),
+            read_in_lambda: HashSet::new(),
+            assigned: HashSet::new(),
             by_name_callees,
         }
     }
 
     fn finish(self) -> HashSet<String> {
+        // A local needs a cell when it is declared here as a `var`, it is
+        // ASSIGNED at all (a name that never changes cannot drift), and a closure
+        // in this frame touches it — writing it (the closure's copy would be the
+        // one that changed) or reading it (the frame's copy would be).
         self.declared
-            .intersection(&self.assigned_in_lambda)
+            .iter()
+            .filter(|n| {
+                self.assigned.contains(*n)
+                    && (self.assigned_in_lambda.contains(*n) || self.read_in_lambda.contains(*n))
+            })
             .cloned()
             .collect()
     }
@@ -7278,6 +7395,7 @@ impl<'a> BoxScan<'a> {
                 }
                 StmtKind::Destructure { init, .. } => self.expr(init, in_lambda),
                 StmtKind::Assign { name, value, .. } => {
+                    self.assigned.insert(name.clone());
                     if in_lambda {
                         self.assigned_in_lambda.insert(name.clone());
                     }
@@ -7320,8 +7438,9 @@ impl<'a> BoxScan<'a> {
             // nothing about the write, and missing it here would leave the
             // closure updating its own copy.
             Expr::CompoundAssign { target, value, .. } => {
-                if in_lambda {
-                    if let Expr::Var(name) = &**target {
+                if let Expr::Var(name) = &**target {
+                    self.assigned.insert(name.clone());
+                    if in_lambda {
                         self.assigned_in_lambda.insert(name.clone());
                     }
                 }
@@ -7395,9 +7514,15 @@ impl<'a> BoxScan<'a> {
                     self.expr(a, thunk);
                 }
             }
-            Expr::New { args, .. } => {
+            Expr::New { name, args, .. } => {
+                // The same rule as a call: an argument to a BY-NAME constructor
+                // parameter becomes a thunk, so a `var` it reads has to live in a
+                // cell. Without this, `var n = 1; val h = new H(n * 10)` captured
+                // n's value at construction and every later `h.get` answered it
+                // again after `n` had moved on.
+                let thunk = in_lambda || self.by_name_callees.contains(name);
                 for a in args {
-                    self.expr(a, in_lambda);
+                    self.expr(a, thunk);
                 }
             }
             Expr::Method {
@@ -7437,8 +7562,17 @@ impl<'a> BoxScan<'a> {
             | Expr::Null
             | Expr::MainArg { .. }
             | Expr::MainArgv
-            | Expr::Placeholder
-            | Expr::Var(_) => {}
+            | Expr::Placeholder => {}
+            // A `var` merely READ from inside a closure still needs a cell if
+            // the enclosing frame later writes it: the capture is by value, so
+            // the closure would keep answering the value the name had when it
+            // was built. `var n = 1; val f = () => n * 10; n = 5; f()` answered
+            // 10 twice where Scala answers 10 then 50.
+            Expr::Var(name) => {
+                if in_lambda {
+                    self.read_in_lambda.insert(name.clone());
+                }
+            }
         }
     }
 }

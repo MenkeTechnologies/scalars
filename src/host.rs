@@ -402,6 +402,17 @@ pub const LAZYLIST_NEW: u16 = 781;
 /// initializer, and only a thunk defers that read until after the binding
 /// exists.
 pub const LAZY_CONS: u16 = 782;
+/// Builtin id for the "did the extractor match" test behind
+/// `case Name(…) =>` on a user `object`. Pops the value `Name.unapply` answered
+/// and returns a `Bool`.
+///
+/// It exists because that answer has TWO shapes. Scala's `unapply` usually
+/// returns an `Option`, and the test is `isDefined` — but an `unapply` declared
+/// to return `Boolean` is a valid extractor too (SLS 8.1.8), one that binds
+/// nothing and whose result IS the test. The compiler cannot tell them apart:
+/// it records which methods an `object` declares, not their return types. So the
+/// question is asked of the VALUE, where the two shapes are distinct.
+pub const EXTRACTED: u16 = 783;
 
 /// The [`SF32_ARITH`] operator codes, shared with the compiler.
 pub mod f32_op {
@@ -543,11 +554,28 @@ fn b_type_reg(vm: &mut VM, _argc: u8) -> Value {
 /// Whether `class` is `ty` or declares it as a supertype.
 fn class_conforms(class: &str, ty: &str) -> bool {
     class == ty
+        || builtin_super(class).is_some_and(|s| s == ty)
         || TYPES.with(|t| {
             t.borrow()
                 .get(class)
                 .is_some_and(|i| i.supers.iter().any(|s| s == ty))
         })
+}
+
+/// The supertype of a BUILT-IN case class, for the typed patterns the `TYPES`
+/// registry cannot answer: it holds only classes a program declared, so
+/// `case o: Option[_]` on a `Some` reached it, found no entry, and failed —
+/// silently taking the default arm rather than the one Scala takes.
+///
+/// Each of these three hierarchies is sealed in the standard library, so one
+/// level is the whole of it.
+fn builtin_super(class: &str) -> Option<&'static str> {
+    match class {
+        "Some" | "None" => Some("Option"),
+        "Right" | "Left" => Some("Either"),
+        "Success" | "Failure" => Some("Try"),
+        _ => None,
+    }
 }
 
 /// How many of `class`'s fields Scala's derived `case class` members see. An
@@ -674,6 +702,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(LAZY_FORCE, b_lazy_force);
     vm.register_builtin(LAZYLIST_NEW, b_lazylist_new);
     vm.register_builtin(LAZY_CONS, b_lazy_cons);
+    vm.register_builtin(EXTRACTED, b_extracted);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -1929,6 +1958,37 @@ fn seq_kind(v: &Value) -> Option<SeqKind> {
     if let Value::Obj(id) = v {
         HEAP.with(|h| match h.borrow().get(*id as usize) {
             Some(HeapVal::Seq(k, _)) => Some(*k),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Read a `Seq` handle's kind and elements UNDER THE HEAP BORROW, without
+/// copying them. For the questions that are answered from a length, an
+/// emptiness, or a kind tag — where [`seq_kind_items`]'s copy is the entire cost
+/// of the call and is thrown away one line later.
+///
+/// The closure must not take a MUTABLE heap borrow (nothing that allocates a
+/// value); reading further handles is fine, since `RefCell` allows any number of
+/// shared borrows at once.
+fn with_seq<R>(v: &Value, f: impl FnOnce(SeqKind, &[Value]) -> R) -> Option<R> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Seq(k, items)) => Some(f(*k, items)),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// [`with_seq`] for a `Map` handle: its representation and entries, borrowed.
+fn with_map<R>(v: &Value, f: impl FnOnce(HashRep, &[(Value, Value)]) -> R) -> Option<R> {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HeapVal::Map(rep, m)) => Some(f(*rep, m)),
             _ => None,
         })
     } else {
@@ -3658,13 +3718,13 @@ fn mut_size_hint(len: usize, n: Option<usize>) -> usize {
 /// `List`, whose size is not known without walking it, and the length for every
 /// kind that stores one.
 fn known_size(v: &Value) -> Option<usize> {
-    if let Some((kind, items)) = seq_kind_items(v) {
-        return match kind {
-            SeqKind::List if !items.is_empty() => None,
-            _ => Some(items.len()),
-        };
+    if let Some(n) = with_seq(v, |kind, items| match kind {
+        SeqKind::List if !items.is_empty() => None,
+        _ => Some(items.len()),
+    }) {
+        return n;
     }
-    as_map(v).map(|m| m.len())
+    with_map(v, |_, m| m.len())
 }
 
 thread_local! {
@@ -3993,6 +4053,17 @@ fn b_istype(vm: &mut VM, _argc: u8) -> Value {
     Value::bool(value_is_type(&v, &ty))
 }
 
+/// `EXTRACTED` builtin: pop what a user `unapply` answered and push whether the
+/// pattern matched. A `Boolean` result is the answer itself (the boolean
+/// extractor); anything else is an `Option`, and the answer is `isDefined`.
+fn b_extracted(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    match &v {
+        Value::Bool(b) => Value::bool(*b),
+        _ => Value::bool(matches!(as_option(&v), Some(Some(_)))),
+    }
+}
+
 /// `SMATCHERR` builtin: pop the unmatched scrutinee and raise `scala.MatchError`,
 /// with the boxed class name Scala reports (`java.lang.Integer`, …).
 fn b_matcherr(vm: &mut VM, _argc: u8) -> Value {
@@ -4021,6 +4092,36 @@ fn b_matcherr(vm: &mut VM, _argc: u8) -> Value {
 /// typed-pattern test). Covers the primitive/`String` types this frontend
 /// models; `Any`/`AnyRef`/`AnyVal` match everything.
 fn value_is_type(v: &Value, ty: &str) -> bool {
+    // ERASURE. A typed pattern is a JVM `instanceof`, and the JVM has no type
+    // arguments to test — `case l: List[String]` is `l: List[?]` at run time,
+    // which is why Scala warns "the type test cannot be checked at runtime" and
+    // then matches ANY `List`. Measured against the reference: a `List("a")` run
+    // past `case x: List[Int]` and `case x: List[String]` takes the FIRST arm.
+    //
+    // The name arrives here with its arguments attached (the parser keeps them,
+    // because `List[Int]` is where a collection's element type is written down),
+    // so every parameterized pattern used to reach `class_conforms` with a name
+    // no class has and fail — `case l: List[_]`, `case m: Map[_, _]`, `case o:
+    // Option[_]` all silently fell through to the default arm.
+    //
+    // ARRAYS ARE THE EXCEPTION, because they are the one Scala generic the JVM
+    // reifies: `Array[Int]` is `int[]` and does not match `Array[String]`.
+    // A TUPLE type spelled out: `case t: (Int, String)` is `Tuple2`, and its
+    // arity is the only part of it the JVM keeps. Nothing else reaches here
+    // parenthesized — a function type carries its `=>`, and a pattern cannot be
+    // one.
+    if let Some(rest) = ty.strip_prefix('(') {
+        if let Some(inner) = rest.strip_suffix(')') {
+            return value_is_type(v, &format!("Tuple{}", tuple_type_arity(inner)));
+        }
+    }
+    if let Some(open) = ty.find('[') {
+        let base = &ty[..open];
+        if base == "Array" {
+            return array_is_type(v, ty[open + 1..].trim_end_matches(']').trim());
+        }
+        return value_is_type(v, base);
+    }
     match ty {
         "String" | "CharSequence" => matches!(v, Value::Str(_)),
         "Int" | "Integer" | "Long" | "Short" | "Byte" => matches!(v, Value::Int(_)),
@@ -4037,11 +4138,11 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Vector" | "IndexedSeq" => matches!(seq_kind(v), Some(SeqKind::Vector)),
         "Array" => matches!(seq_kind(v), Some(SeqKind::Array)),
         "Set" => matches!(seq_kind(v), Some(k) if k.is_set()),
-        "Map" => as_map(v).is_some(),
+        "Map" => with_map(v, |_, _| true).unwrap_or(false),
         // `Nil` is the empty `List`; `::` is a non-empty one (the cons cell
         // class). Both are shape tests, not `==` against a singleton.
-        "Nil" => matches!(seq_kind_items(v), Some((SeqKind::List, xs)) if xs.is_empty()),
-        "::" => matches!(seq_kind_items(v), Some((SeqKind::List, xs)) if !xs.is_empty()),
+        "Nil" => with_seq(v, |k, xs| k == SeqKind::List && xs.is_empty()).unwrap_or(false),
+        "::" => with_seq(v, |k, xs| k == SeqKind::List && !xs.is_empty()).unwrap_or(false),
         // `TupleN` — the type a tuple pattern (`case (a, b) =>`) tests against.
         _ if ty.starts_with("Tuple") => match ty[5..].parse::<usize>() {
             Ok(n) => matches!(seq_or_tuple_len(v), Some(len) if len == n),
@@ -4060,6 +4161,73 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         // compiler registered for it (`case c: Shape` on a `Circle`).
         _ => with_obj(v, |o| class_conforms(&o.class, ty)).unwrap_or(false),
     }
+}
+
+/// The number of components in the body of a parenthesized tuple type — the
+/// top-level commas plus one. `[…]` groups are skipped, so
+/// `(Map[String, Int], Int)` is a `Tuple2`, not a `Tuple3`.
+fn tuple_type_arity(inner: &str) -> usize {
+    let mut depth = 0usize;
+    let mut n = 1usize;
+    for c in inner.chars() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => n += 1,
+            _ => {}
+        }
+    }
+    n
+}
+
+/// Whether `v` is an `Array` whose ELEMENT type satisfies `elem` — the reified
+/// half of [`value_is_type`].
+///
+/// Arrays are the one generic the JVM keeps at run time, and the reference shows
+/// it: `Array(1, 2)` takes `case x: Array[Int]`, `Array("a")` takes
+/// `case x: Array[String]`, and `Array[Any](1)` takes neither — it is an
+/// `Object[]`, so it only reaches `case x: Array[_]`.
+///
+/// There is no element type stored beside the elements here, so it is READ OFF
+/// THEM: an array whose every element is an `Int` is an `Array[Int]`. That is
+/// exact for a non-empty array of a primitive this frontend models, and it is
+/// the whole of what a pattern can ask.
+///
+/// GAP, deliberate, and it is the DECLARED element type that is missing in both
+/// halves of it. An EMPTY array carries no element to read, so it satisfies every
+/// primitive element type rather than only its own — `Array[String]()` takes an
+/// earlier `case _: Array[Int]` arm where Scala skips it. And an `Array[Any](1)`
+/// holds a boxed `Int`, which reads here as an `int[]`, so it takes
+/// `case _: Array[Int]` where Scala takes only `Array[Any]`. Both need the
+/// declared type recorded in the value, which is a representation change.
+fn array_is_type(v: &Value, elem: &str) -> bool {
+    with_seq(v, |kind, items| {
+        kind == SeqKind::Array && array_elems_are(items, elem)
+    })
+    .unwrap_or(false)
+}
+
+/// The element half of [`array_is_type`], split out so the test runs under the
+/// heap borrow rather than over a copy of the array.
+fn array_elems_are(items: &[Value], elem: &str) -> bool {
+    // `Array[_]` is the unbounded wildcard, and the reference takes it for EVERY
+    // array, primitive-element ones included — measured: `Array(1)`, `Array(true)`
+    // and `Array("a")` all match `case _: Array[_]`. `Array[Any]` is narrower: it
+    // is `Object[]`, which an `int[]` does not conform to.
+    if elem == "_" {
+        return true;
+    }
+    let boxed = matches!(elem, "Any" | "AnyRef" | "Object");
+    let prim = |x: &Value| {
+        matches!(
+            x,
+            Value::Int(_) | Value::Float(_) | Value::Status(_) | Value::Bool(_)
+        )
+    };
+    if boxed {
+        return !items.iter().any(prim);
+    }
+    items.iter().all(|x| value_is_type(x, elem))
 }
 
 /// Format one value with a Java-`Formatter` conversion spec
@@ -7351,7 +7519,7 @@ fn opt(v: Option<Value>) -> Value {
 
 /// Whether `v` is an immutable `Set` handle.
 fn is_set(v: &Value) -> bool {
-    matches!(seq_kind_items(v), Some((SeqKind::Set(_), _)))
+    with_seq(v, |k, _| k.is_set()).unwrap_or(false)
 }
 
 /// `set + e` (`incl`) / `set - e` (`excl`), preserving the set.s representation.

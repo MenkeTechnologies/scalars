@@ -2507,6 +2507,9 @@ enum Mode {
     Interp,
     LazyVal,
     Shadow,
+    TypePat,
+    ByName,
+    CloseVar,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -2562,6 +2565,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Interp => "interp",
         Mode::LazyVal => "lazyval",
         Mode::Shadow => "shadow",
+        Mode::TypePat => "typepat",
+        Mode::ByName => "byname",
+        Mode::CloseVar => "closevar",
     }
 }
 
@@ -2618,6 +2624,9 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "interp" => Mode::Interp,
         "lazyval" => Mode::LazyVal,
         "shadow" => Mode::Shadow,
+        "typepat" => Mode::TypePat,
+        "byname" => Mode::ByName,
+        "closevar" => Mode::CloseVar,
         _ => return None,
     })
 }
@@ -2673,6 +2682,9 @@ const CONCRETE: &[Mode] = &[
     Mode::Interp,
     Mode::LazyVal,
     Mode::Shadow,
+    Mode::TypePat,
+    Mode::ByName,
+    Mode::CloseVar,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -2976,6 +2988,346 @@ fn g_fmt(r: &mut Rng) -> String {
     }
 }
 
+/// TYPED patterns, and the two pattern forms that had never been written here:
+/// a type test carrying TYPE ARGUMENTS, and an extractor whose `unapply` answers
+/// a `Boolean`.
+///
+/// Chosen by counting. `case x: List[` counted zero across the whole generator,
+/// and so did every other parameterized type test — every `patmatch` arm tested
+/// against a bare name. That blind spot hid a SILENT wrong answer: the type name
+/// reaches the runtime test with its arguments attached, no class is called
+/// `List[_]`, so `case l: List[_]` failed its test and the scrutinee quietly took
+/// the DEFAULT arm. The same count was zero for `def unapply(…): Boolean`, whose
+/// pattern died on `value isDefined is not a member of Boolean`.
+///
+/// Every arm ends in a total `case _`, so a wrong test does not throw a
+/// `MatchError` that a frontend could pass by throwing one too — it prints the
+/// wrong branch, which is the divergence being looked for.
+///
+/// Arrays are generated with their DECLARED element type matching their
+/// contents. They are the one Scala generic the JVM reifies, and this frontend
+/// reads the element type off the elements (see `host::array_is_type`), so an
+/// empty `Array[String]()` or an `Array[Any](1)` is a known gap, not a finding.
+fn g_typepat(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let s = pick(r, STRS);
+    // A literal that is always negative and always written ONCE — `-{b}` would
+    // spell `--42` whenever the pool handed back a negative, which neither side
+    // parses, and a program the REFERENCE rejects carries no signal at all.
+    let neg = pick(r, &["-1", "-7", "-42", "-100"]);
+    // A heterogeneous pool: every arm maps a whole list of it, so ONE program
+    // exercises the match against several runtime shapes at once.
+    let pool =
+        format!("List({a}, {s}, 1.5, true, List({a}, {b}), Map(\"k\" -> {a}), Some({b}), (1, 2))");
+    match r.below(14) {
+        // The parameterized collection tests, in the order Scala reaches them.
+        0 => format!(
+            "{{ def d{u}(x: Any): String = x match {{ case l: List[Int] => \"L\" + l.size; \
+               case m: Map[String, Int] => \"M\" + m.size; case o: Option[Int] => \"O\" + o; \
+               case t: (Int, Int) => \"T\" + t._1; case _ => \"x\" }}; \
+               println({pool}.map(d{u})) }}"
+        ),
+        // ERASURE, stated as a program: two arms whose only difference is the
+        // type ARGUMENT. Scala erases both, so the first one always wins.
+        1 => format!(
+            "{{ def d{u}(x: Any): String = x match {{ case l: List[Int] => \"i\"; \
+               case l: List[String] => \"s\"; case _ => \"x\" }}; \
+               println(List(List({a}), List({s})).map(d{u})) }}"
+        ),
+        // `Seq` and `Iterable` accept several representations; the named kinds
+        // accept only their own.
+        2 => format!(
+            "{{ def d{u}(x: Any): String = x match {{ case v: Vector[Int] => \"V\"; \
+               case l: List[Int] => \"L\"; case s: Seq[Int] => \"S\"; case _ => \"x\" }}; \
+               println(List(List({a}), Vector({a}), Array({a}).toSeq, {s}).map(d{u})) }}"
+        ),
+        // A reified ARRAY element type. Each array's contents match its arm.
+        3 => format!(
+            "{{ def d{u}(x: Any): String = x match {{ case a: Array[Int] => \"I\" + a.length; \
+               case a: Array[String] => \"S\" + a.length; case a: Array[Double] => \"D\"; \
+               case a: Array[_] => \"A\"; case _ => \"x\" }}; \
+               println(List(Array({a}, {b}), Array({s}), Array(1.5), Array(true), {a}).map(d{u})) }}"
+        ),
+        // A BOOLEAN extractor: `unapply` answers the test itself and binds
+        // nothing, so the pattern is written with empty parentheses.
+        4 => format!(
+            "object Ev{u} {{ def unapply(n: Int): Boolean = n % 2 == 0 }}\n{sep}\
+             {{ def d{u}(n: Int): String = n match {{ case Ev{u}() => \"e\"; case _ => \"o\" }}; \
+               println(List({a}, {b}, {a} + 1).map(d{u})) }}"
+        ),
+        // A boolean extractor UNDER A GUARD, and a second one after it — the
+        // failing arm has to fall through rather than fault.
+        5 => format!(
+            "object Ev{u} {{ def unapply(n: Int): Boolean = n % 2 == 0 }}\n\
+             object Ng{u} {{ def unapply(n: Int): Boolean = n < 0 }}\n{sep}\
+             {{ def d{u}(n: Int): String = n match {{ case Ev{u}() if n > 10 => \"be\"; \
+               case Ng{u}() => \"n\"; case Ev{u}() => \"e\"; case _ => \"o\" }}; \
+               println(List({a}, {b}, -3, 12).map(d{u})) }}"
+        ),
+        // An `Option`-returning extractor beside a boolean one, so the two
+        // shapes are decided in the same match.
+        6 => format!(
+            "object Hf{u} {{ def unapply(n: Int): Option[Int] = if (n % 2 == 0) Some(n / 2) else None }}\n\
+             object Ev{u} {{ def unapply(n: Int): Boolean = n % 2 == 0 }}\n{sep}\
+             {{ def d{u}(n: Int): String = n match {{ case Hf{u}(k) => \"h\" + k; \
+               case Ev{u}() => \"e\"; case _ => \"o\" }}; println(List({a}, {b}, 8).map(d{u})) }}"
+        ),
+        // An `@`-binding over a typed pattern: the whole scrutinee AND the test.
+        7 => format!(
+            "{{ def d{u}(x: Any): String = x match {{ case l @ (_: List[Int]) => \"L\" + l; \
+               case n @ (_: Int) if n > 0 => \"P\" + n; case n: Int => \"N\" + n; \
+               case o => \"o\" + o }}; println(List(List({a}), {a}, {neg}, {s}).map(d{u})) }}"
+        ),
+        // An `@`-binding over a CONSTRUCTOR pattern, and one nested inside it.
+        8 => format!(
+            "case class Pt{u}(x: Int, y: Int)\n{sep}\
+             {{ def d{u}(p: Any): String = p match {{ \
+               case w @ Pt{u}(a @ 0, _) => \"z\" + w + a; \
+               case w @ Pt{u}(a, b) if a > b => \"g\" + w; case w @ Pt{u}(_, _) => \"p\" + w; \
+               case _ => \"x\" }}; \
+               println(List(Pt{u}(0, {a}), Pt{u}({b}, 0), Pt{u}(0, 0), {a}).map(d{u})) }}"
+        ),
+        // A typed pattern in a `case class`'s FIELD position, which is where the
+        // test runs against a value the pattern already destructured.
+        9 => format!(
+            "case class Bx{u}(v: Any)\n{sep}\
+             {{ def d{u}(p: Bx{u}): String = p match {{ case Bx{u}(n: Int) => \"i\" + n; \
+               case Bx{u}(t: String) => \"s\" + t.length; case Bx{u}(l: List[Int]) => \"l\"; \
+               case Bx{u}(_) => \"x\" }}; \
+               println(List(Bx{u}({a}), Bx{u}({s}), Bx{u}(List({b})), Bx{u}(true)).map(d{u})) }}"
+        ),
+        // The user hierarchy: a typed pattern on a SUPERTYPE, which the registry
+        // answers, beside the parameterized ones it cannot.
+        10 => format!(
+            "trait Sh{u}\nclass Ci{u}(val r: Int) extends Sh{u}\nclass Sq{u}(val e: Int) extends Sh{u}\n{sep}\
+             {{ def d{u}(x: Any): String = x match {{ case c: Ci{u} => \"c\" + c.r; \
+               case s: Sh{u} => \"s\"; case l: List[Int] => \"L\"; case _ => \"x\" }}; \
+               println(List(new Ci{u}({a}), new Sq{u}({b}), List({a}), {s}).map(d{u})) }}"
+        ),
+        // A typed pattern in a `catch`, next to one in a plain `match` over the
+        // same throwable — the two take different paths to the same answer.
+        11 => format!(
+            "{{ val e{u}: Any = try {{ {a} / 0 }} catch {{ case t: Throwable => t }}; \
+               println(e{u} match {{ case a: ArithmeticException => \"A\" + a.getMessage; \
+               case t: Throwable => \"T\"; case _ => \"x\" }}) }}"
+        ),
+        // ALTERNATIVES of typed patterns, which bind nothing and so may mix
+        // shapes, plus a bound alternative of literals.
+        12 => format!(
+            "{{ def d{u}(x: Any): String = x match {{ case _: Int | _: Double => \"num\"; \
+               case v @ ({s} | \"zz\") => \"s\" + v; case _: List[Int] | _: Vector[Int] => \"seq\"; \
+               case _ => \"x\" }}; println(List({a}, 1.5, {s}, List({b}), true).map(d{u})) }}"
+        ),
+        // A typed pattern inside a for-comprehension's generator pattern, which
+        // FILTERS rather than failing — Scala's `case` generator is a `withFilter`.
+        _ => format!(
+            "{{ val xs{u}: List[Any] = List({a}, {s}, List({b}), 1.5, {b}); \
+               println(for {{ case n: Int <- xs{u} }} yield n * 2); \
+               println(xs{u}.collect {{ case t: String => t.length; case l: List[Int] => l.size }}) }}"
+        ),
+    }
+}
+
+/// BY-NAME parameters — an argument evaluated at each READ of the parameter
+/// rather than once at the call.
+///
+/// Chosen by counting: `: => ` counted zero in every generated program, so
+/// nothing here had ever written one. The `def` form turned out to be right; the
+/// CLASS form was not, and could not have been found any other way — a
+/// constructor parameter was evaluated once, at construction, so
+/// `class H(v: => Int) { def get = v }` answered the same number for every read
+/// where Scala runs the argument again each time.
+///
+/// Each arm prints a COUNTER as well as the values, because the count is what
+/// separates the two behaviors: a memoizing frontend can print the same values
+/// and still have run the argument the wrong number of times.
+fn g_byname(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    match r.below(12) {
+        // The `def` form: read twice, so the argument runs twice.
+        0 => format!(
+            "{{ var n{u} = 0; def k{u}(): Int = {{ n{u} += 1; n{u} }}; \
+               def tw{u}(x: => Int): Int = x + x; println(tw{u}(k{u}())); println(n{u}) }}"
+        ),
+        // NEVER read: the argument must not run at all.
+        1 => format!(
+            "{{ var n{u} = 0; def k{u}(): Int = {{ n{u} += 1; n{u} }}; \
+               def no{u}(x: => Int): Int = {a}; println(no{u}(k{u}())); println(n{u}) }}"
+        ),
+        // A by-name argument that THROWS, in the arm that never reads it — the
+        // raise happens at the read or not at all.
+        2 => format!(
+            "{{ def safe{u}(x: => Int, d: Int): Int = try x catch {{ case _: ArithmeticException => d }}; \
+               println(safe{u}({a} / 0, {b})); println(safe{u}({a}, {b})) }}"
+        ),
+        // Short-circuit built out of by-name parameters, which is what the
+        // feature exists for.
+        3 => format!(
+            "{{ var n{u} = 0; def side{u}(): Boolean = {{ n{u} += 1; true }}; \
+               def and{u}(l: Boolean, r: => Boolean): Boolean = if (l) r else false; \
+               println(and{u}(false, side{u}())); println(and{u}(true, side{u}())); println(n{u}) }}"
+        ),
+        // The CLASS form: each read of the field runs the argument again.
+        4 => format!(
+            "class H{u}(v: => Int) {{ def get = v }}\n{sep}\
+             {{ var n{u} = 0; def k{u}(): Int = {{ n{u} += 1; n{u} }}; val h{u} = new H{u}(k{u}()); \
+               println(h{u}.get); println(h{u}.get); println(n{u}) }}"
+        ),
+        // A class that FREEZES it into a `val` field as well: the `val` runs the
+        // argument once, at construction, and never again.
+        5 => format!(
+            "class F{u}(v: => Int) {{ val once = v; def live = v }}\n{sep}\
+             {{ var n{u} = 0; def k{u}(): Int = {{ n{u} += 1; n{u} }}; val f{u} = new F{u}(k{u}()); \
+               println(f{u}.once); println(f{u}.live); println(f{u}.once); println(f{u}.live); \
+               println(n{u}) }}"
+        ),
+        // A by-name argument that reads a mutable local: the thunk sees the
+        // CURRENT value, so a write between two reads shows through.
+        6 => format!(
+            "class H{u}(v: => Int) {{ def get = v }}\n{sep}\
+             {{ var m{u} = {a}; val h{u} = new H{u}(m{u} * 10); println(h{u}.get); \
+               m{u} = {b}; println(h{u}.get) }}"
+        ),
+        // Through a SUPERCLASS constructor argument, which is itself by-name at
+        // the parent — so nothing is evaluated until the parent's field is read.
+        7 => format!(
+            "class P{u}(a: => Int, b: Int) {{ def s = a + b }}\n\
+             class C{u}(x: => Int) extends P{u}(x * 2, {b}) {{ def own = x }}\n{sep}\
+             {{ var n{u} = 0; def k{u}(): Int = {{ n{u} += 1; n{u} }}; val c{u} = new C{u}(k{u}()); \
+               println(n{u}); println(c{u}.own); println(c{u}.s); println(n{u}) }}"
+        ),
+        // A by-name parameter captured by a LAMBDA inside the callee: the read
+        // is a frame further in than the declaration.
+        8 => format!(
+            "{{ var n{u} = 0; def k{u}(): Int = {{ n{u} += 1; n{u} }}; \
+               def each{u}(x: => Int): List[Int] = List(1, 2, 3).map(i => i * x); \
+               println(each{u}(k{u}())); println(n{u}) }}"
+        ),
+        // A by-name loop body, the `while` written as a library function.
+        9 => format!(
+            "{{ def rep{u}(c: => Boolean)(body: => Unit): Unit = if (c) {{ body; rep{u}(c)(body) }}; \
+               var i{u} = 0; var t{u} = 0; rep{u}(i{u} < 3) {{ i{u} += 1; t{u} += i{u} }}; \
+               println(t{u}); println(i{u}) }}"
+        ),
+        // A by-name parameter with a DEFAULT, so the default itself arrives as a
+        // thunk and runs at the read.
+        10 => format!(
+            "{{ var n{u} = 0; def k{u}(): Int = {{ n{u} += 1; n{u} }}; \
+               def d{u}(x: => Int = k{u}()): Int = x + x; println(d{u}()); println(n{u}); \
+               println(d{u}({a})); println(n{u}) }}"
+        ),
+        // A by-name parameter feeding a `lazy val`, which memoizes what the
+        // by-name parameter would not.
+        _ => format!(
+            "{{ var n{u} = 0; def k{u}(): Int = {{ n{u} += 1; n{u} }}; \
+               def memo{u}(x: => Int): Int = {{ lazy val v = x; v + v }}; \
+               println(memo{u}(k{u}())); println(n{u}) }}"
+        ),
+    }
+}
+
+/// A CLOSURE over a mutable local, and a write to that local from the frame the
+/// closure was built in.
+///
+/// Chosen by counting: every closure in this generator captured a `val`, or was
+/// called before anything wrote the `var` it captured. The write-then-read order
+/// counted zero — and it was wrong. Captures are threaded by VALUE here, and the
+/// boxing analysis only cell-boxed a local the closure itself ASSIGNED, so
+/// `var n = 1; val f = () => n * 10; n = 5; f()` answered 10 twice where Scala
+/// answers 10 then 50.
+///
+/// The order is load-bearing in every arm: the closure is built, the local is
+/// written, and only then is the closure called. Reversing those last two steps
+/// makes every arm pass against a frontend with no boxing at all.
+fn g_closevar(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let s = pick(r, STRS);
+    match r.below(12) {
+        // The plain shape, inside a `def` so the local is a frame slot rather
+        // than a program global.
+        0 => format!(
+            "{{ def run{u}(): Unit = {{ var n = {a}; val f = () => n * 10; println(f()); \
+               n = {b}; println(f()) }}; run{u}() }}"
+        ),
+        // The closure both READS and WRITES, and the enclosing frame writes too.
+        1 => format!(
+            "{{ def run{u}(): Unit = {{ var n = {a}; val f = () => {{ n += 1; n }}; \
+               println(f()); n = {b}; println(f()); println(n) }}; run{u}() }}"
+        ),
+        // A closure stored in a collection and called after the write.
+        2 => format!(
+            "{{ def run{u}(): Unit = {{ var n = {a}; val fs = List(() => n, () => n * 2); \
+               n = {b}; println(fs.map(_())) }}; run{u}() }}"
+        ),
+        // A closure RETURNED from the frame that wrote the local — it has to see
+        // the last value written, not the one at capture.
+        3 => format!(
+            "{{ def mk{u}(): () => Int = {{ var n = {a}; val f = () => n; n = {b}; f }}; \
+               println(mk{u}()()) }}"
+        ),
+        // The captured local is a STRING, so a stale copy is the wrong shape's
+        // length rather than a near-miss number.
+        4 => format!(
+            "{{ def run{u}(): Unit = {{ var t = {s}; val f = () => t.length; println(f()); \
+               t = t + \"zzz\"; println(f()) }}; run{u}() }}"
+        ),
+        // Two closures over the SAME local: they share one cell, so a write
+        // through either is seen by the other.
+        5 => format!(
+            "{{ def run{u}(): Unit = {{ var n = {a}; val inc = () => {{ n += 1 }}; \
+               val get = () => n; inc(); inc(); println(get()); n = {b}; println(get()) }}; run{u}() }}"
+        ),
+        // The write happens inside a LOOP between calls.
+        6 => format!(
+            "{{ def run{u}(): Unit = {{ var n = 0; val f = () => n; \
+               for (i <- 1 to 3) {{ n = i * {a}; println(f()) }} }}; run{u}() }}"
+        ),
+        // Captured by a lambda passed to a collection op rather than by a stored
+        // one — the same capture, a different call shape.
+        7 => format!(
+            "{{ def run{u}(): Unit = {{ var k = {a}; val g = (x: Int) => x + k; \
+               println(List(1, 2, 3).map(g)); k = {b}; println(List(1, 2, 3).map(g)) }}; run{u}() }}"
+        ),
+        // A NESTED closure: the inner one captures through the outer one.
+        8 => format!(
+            "{{ def run{u}(): Unit = {{ var n = {a}; val outer = () => {{ val inner = () => n * 2; \
+               inner() }}; println(outer()); n = {b}; println(outer()) }}; run{u}() }}"
+        ),
+        // The local is written from inside a DIFFERENT closure, and read from
+        // this one — neither of them is where the other's write lands.
+        9 => format!(
+            "{{ def run{u}(): Unit = {{ var n = {a}; val w = (v: Int) => {{ n = v }}; \
+               val rd = () => n; println(rd()); w({b}); println(rd()); n = {a} + {b}; println(rd()) }}; \
+               run{u}() }}"
+        ),
+        // A closure over a local that a `try`/`catch` writes.
+        10 => format!(
+            "{{ def run{u}(): Unit = {{ var n = {a}; val f = () => n; \
+               try {{ n = {b}; throw new RuntimeException(\"x\") }} \
+               catch {{ case _: RuntimeException => n = n + 1 }}; println(f()) }}; run{u}() }}"
+        ),
+        // Captured by a by-name ARGUMENT, which is a closure the caller never
+        // wrote. The write sits between the two reads and in the CALLER's frame:
+        // a local `def` writing an enclosing local is rejected here by design
+        // (see BUGS.md, "A local `def` may not *assign* to a binding it
+        // captures"), so a program shaped that way would be testing that
+        // documented refusal rather than this mode's subject.
+        _ => format!(
+            "{{ def run{u}(): Unit = {{ var n = {a}; val seen = mutable.ListBuffer[Int](); \
+               def take(x: => Int): Unit = {{ seen += x }}; take(n * 10); n = {b}; take(n * 10); \
+               println(seen) }}; run{u}() }}"
+        ),
+    }
+}
+
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
     let m = if mode == Mode::All {
         *pick(r, CONCRETE)
@@ -3033,6 +3385,9 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Interp => g_interp(r),
         Mode::LazyVal => g_lazyval(r),
         Mode::Shadow => g_shadow(r),
+        Mode::TypePat => g_typepat(r),
+        Mode::ByName => g_byname(r),
+        Mode::CloseVar => g_closevar(r),
         Mode::All => unreachable!(),
     }
 }

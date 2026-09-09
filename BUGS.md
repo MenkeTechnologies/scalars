@@ -1233,20 +1233,38 @@ derived collection keeps the receiver's: `Set(1,2,3,4,5).filter(_ > 1)` is a
 four-element `HashSet`, while `Set(1,2,3).map(_ * 2)` is a `Set3`. `groupBy`
 builds through a `HashMap` builder and so is always hashed.
 
-## Block-local `def`s: how they work
+## Block-local `def`s and block-scoped `val`s: how they work
 
-The compiler consumes a flat function namespace, so `src/resolve.rs` sits between
-the parser and the compiler:
+The compiler consumes a flat namespace — one function table, and one storage slot
+per name per frame — so `src/resolve.rs` sits between the parser and the compiler
+and gives both halves of that namespace their unique names.
 
 1. The AST is walked with a scope stack. Each block pre-binds its own `def`s
    (giving forward references and mutual recursion inside one block), and every
    `Var`/`Call` is rewritten to the unique global name of whichever `def` it
    actually resolves to. `val`s and parameters shadow an outer `def` from their
    declaration onward.
-2. Each hoisted `def` gets the enclosing-frame locals its body reads appended as
+2. **Value bindings are renamed by the same walk, for the same reason.** A `val`,
+   `var`, pattern binder, `for` generator or destructured name that re-uses a name
+   an enclosing scope already bound is given a fresh one, and every read of it in
+   its scope is rewritten to match. Without that step the compiler's
+   `declare_place` handed the inner declaration the OUTER binding's slot back —
+   the two spellings were one storage location — so the inner binding did not
+   shadow the outer one, it overwrote it, and the outer value was gone for the
+   rest of the frame. That was wrong for every scope that introduces a binding:
+   a brace block, an `if` branch, a `for` or `while` body, a `match` or `catch`
+   arm's binder, a for-comprehension's `val` clause, a destructuring `val (a, b)`.
+   The `catch` case did not merely answer a stale value — it leaked the THROWABLE
+   into the outer name.
+3. Each hoisted `def` gets the enclosing-frame locals its body reads appended as
    extra parameters, and every call site passes them; capture sets propagate
    through calls to a fixpoint, so a local `def` that calls a sibling capturing
    `k` threads `k` too.
+
+Renaming is what makes a *shadow* distinguishable from a *write*, so it is also
+what decides which name a later write reaches: `var a = 5; { val a = 100 }; a = 7`
+assigns the outer binding, and before the rename the frontend rejected that
+program outright as a "reassignment to val".
 
 Final names are chosen only after the whole program is walked, and the first
 claimant of a name keeps it verbatim — a program with no collisions compiles to

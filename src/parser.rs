@@ -416,6 +416,7 @@ impl Parser {
         // Primary-constructor parameters (all become fields).
         let mut params = Vec::new();
         let mut param_tys = Vec::new();
+        let mut param_by_name = Vec::new();
         let mut param_defaults: Vec<Option<Expr>> = Vec::new();
         if self.is(&Tok::LParen) {
             self.advance();
@@ -427,11 +428,17 @@ impl Parser {
                 }
                 let pname = self.ident()?;
                 let mut pty = None;
+                let mut by_name = false;
                 if self.is(&Tok::Colon) {
                     self.advance();
+                    // `x: => Int` — a by-name constructor parameter, read the
+                    // same way `parse_def` reads one: `type_ref` folds the arrow
+                    // into the type string, so the leading `=>` is the marker.
+                    by_name = self.is(&Tok::FatArrow);
                     pty = Some(self.type_ref()?);
                 }
                 param_tys.push(pty);
+                param_by_name.push(by_name);
                 // `x: Int = 0` — a default, kept unevaluated so the
                 // construction can splice it exactly where Scala evaluates it.
                 let mut pdefault = None;
@@ -493,6 +500,7 @@ impl Parser {
             parents,
             super_args,
             params,
+            param_by_name,
             param_tys,
             param_defaults,
             body,
@@ -1488,7 +1496,7 @@ impl Parser {
     /// Used everywhere a `=>` after the type is unambiguously part of the type
     /// (`val`/`def`/parameter/lambda-parameter annotations).
     fn type_ref(&mut self) -> Result<String, String> {
-        self.type_ref_inner(true, false)
+        self.type_ref_inner(true, false, false)
     }
 
     /// A type reference that STOPS at a following `with`, for `given Ty with
@@ -1496,16 +1504,21 @@ impl Parser {
     /// appends it to the type and `given Sh[Int] with` became the type
     /// `Sh[Int]with`.
     fn type_ref_stop_with(&mut self) -> Result<String, String> {
-        self.type_ref_inner(true, true)
+        self.type_ref_inner(true, true, false)
     }
 
     /// A type reference in a context where a following `=>` is NOT part of the
     /// type (a `case name: Type =>` pattern, where `=>` is the arm separator).
     fn type_ref_no_arrow(&mut self) -> Result<String, String> {
-        self.type_ref_inner(false, false)
+        self.type_ref_inner(false, false, true)
     }
 
-    fn type_ref_inner(&mut self, allow_arrow: bool, stop_with: bool) -> Result<String, String> {
+    fn type_ref_inner(
+        &mut self,
+        allow_arrow: bool,
+        stop_with: bool,
+        stop_union: bool,
+    ) -> Result<String, String> {
         let mut s = String::new();
         loop {
             match self.peek().clone() {
@@ -1516,6 +1529,13 @@ impl Parser {
                 // against them, and the annotation itself is diagnostic. Only
                 // accepted mid-type, so a `|` that starts one is still an
                 // operator.
+                // In PATTERN position a bare `|` is Scala's alternation, not a
+                // union type: `case _: Int | _: Double =>` is two patterns. Read
+                // as a type it swallowed the separator and the next pattern with
+                // it, and the arm then failed to parse at all. A union type is
+                // still writable there — parenthesized, as `case x: (Int | Long)`,
+                // which comes through the bracket/paren group intact.
+                Tok::Op(o) if stop_union && (o == "|" || o == "&") => break,
                 Tok::Op(o) if !s.is_empty() && (o == "|" || o == "&") => {
                     s.push_str(&o);
                     self.advance();
@@ -1557,24 +1577,28 @@ impl Parser {
                     s.push_str("=>");
                     self.advance();
                 }
-                // A parenthesized parameter-type tuple in a function type. Balance
-                // the group (it is not a lambda — this is a type position).
+                // A parenthesized type group: the parameter list of a function
+                // type (`(Int, Int) => Int`) or a TUPLE type (`(Int, String)`).
+                // Balanced here (it is not a lambda — this is a type position),
+                // and kept with its CONTENTS, because a typed pattern written
+                // `case t: (Int, Int)` has nothing else to say how wide the tuple
+                // is. Collapsing the group to `()` lost that, and the pattern
+                // then tested against a type name no value has.
                 Tok::LParen => {
                     let mut depth = 0;
                     loop {
-                        match self.advance() {
+                        let t = self.advance();
+                        match &t {
                             Tok::LParen => depth += 1,
-                            Tok::RParen => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
+                            Tok::RParen => depth -= 1,
                             Tok::Eof => break,
                             _ => {}
                         }
+                        s.push_str(&type_tok_text(&t));
+                        if depth == 0 {
+                            break;
+                        }
                     }
-                    s.push_str("()");
                 }
                 _ => break,
             }
@@ -3701,6 +3725,10 @@ fn type_tok_text(t: &Tok) -> String {
         Tok::Ident(w) => w.clone(),
         Tok::LBracket => "[".to_string(),
         Tok::RBracket => "]".to_string(),
+        // A tuple/parameter group keeps its parentheses, so a `(Int, String)`
+        // type stays readable as one and its ARITY survives.
+        Tok::LParen => "(".to_string(),
+        Tok::RParen => ")".to_string(),
         Tok::Comma => ",".to_string(),
         Tok::Dot => ".".to_string(),
         _ => String::new(),

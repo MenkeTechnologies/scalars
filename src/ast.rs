@@ -118,6 +118,16 @@ pub struct ClassDecl {
     /// construction is what reproduces that exactly, and it is the same thing
     /// `Compiler::adapt_args` does for a `def`.
     pub param_defaults: Vec<Option<Expr>>,
+    /// Whether each [`Self::params`] entry is BY-NAME (`x: => Int`), same order
+    /// and length.
+    ///
+    /// A by-name constructor parameter is always private to the class: Scala
+    /// rejects `val`/`var` on one ("val parameters may not be call-by-name"),
+    /// and so rejects a `case class` with one outright, since every case-class
+    /// parameter is a `val`. So it is never a member, never in a `toString`, and
+    /// never bound by a constructor pattern — the only thing that reads it is the
+    /// class's own body and methods, and each such read runs the argument again.
+    pub param_by_name: Vec<bool>,
     /// The declared type of each [`Self::params`] entry, same order and length.
     /// Scala requires an annotation on every constructor parameter, so this is
     /// the width of every field the primary constructor contributes — which is
