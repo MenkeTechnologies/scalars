@@ -4106,22 +4106,49 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
     //
     // ARRAYS ARE THE EXCEPTION, because they are the one Scala generic the JVM
     // reifies: `Array[Int]` is `int[]` and does not match `Array[String]`.
-    // A TUPLE type spelled out: `case t: (Int, String)` is `Tuple2`, and its
-    // arity is the only part of it the JVM keeps. Nothing else reaches here
-    // parenthesized — a function type carries its `=>`, and a pattern cannot be
-    // one.
+    //
+    // A PARENTHESIZED GROUP is three different types, told apart by what
+    // separates its top-level components. A comma makes it a TUPLE
+    // (`case t: (Int, String)` is `Tuple2`, and the arity is the only part of it
+    // the JVM keeps). A `|` or `&` makes it a UNION or INTERSECTION — which is
+    // the ONLY spelling a pattern can use, since an unparenthesized `|` there is
+    // Scala's alternation (see `Parser::type_ref_no_arrow`). Neither means the
+    // parentheses were only grouping. Measured: `1` takes `case x: (Int | Long)`
+    // and `case x: (Int & Any)`; before this both were read as a one-component
+    // tuple and matched nothing.
     if let Some(rest) = ty.strip_prefix('(') {
         if let Some(inner) = rest.strip_suffix(')') {
-            return value_is_type(v, &format!("Tuple{}", tuple_type_arity(inner)));
+            if let Some(parts) = split_top(inner, ',') {
+                return value_is_type(v, &format!("Tuple{}", parts.len()));
+            }
+            return value_is_type(v, inner);
         }
     }
+    // `|` binds LOOSER than `&`, so it is split first: `Int & Any | String`
+    // groups as `(Int & Any) | String`. Both are also reachable unparenthesized,
+    // from a type annotation rather than a pattern — `type_ref` folds them into
+    // the type string the same way.
+    if let Some(parts) = split_top(ty, '|') {
+        return parts.iter().any(|p| value_is_type(v, p.trim()));
+    }
+    if let Some(parts) = split_top(ty, '&') {
+        return parts.iter().all(|p| value_is_type(v, p.trim()));
+    }
     if let Some(open) = ty.find('[') {
-        let base = &ty[..open];
+        let base = simple_name(&ty[..open]);
         if base == "Array" {
             return array_is_type(v, ty[open + 1..].trim_end_matches(']').trim());
         }
         return value_is_type(v, base);
     }
+    // A QUALIFIED name — `scala.util.Try`, `scala.collection.immutable.List`,
+    // `java.lang.RuntimeException`. Every name this frontend can answer for is a
+    // single identifier: a class name is one token, the built-in table below is
+    // keyed by simple names, and `thrown_class` reports one. So the package
+    // prefix is not part of any answer here, and carrying it only stopped the
+    // name from being recognised — `case t: scala.util.Try[Int]` on a `Success`
+    // silently took the default arm where the reference takes the `Try` one.
+    let ty = simple_name(ty);
     match ty {
         "String" | "CharSequence" => matches!(v, Value::Str(_)),
         "Int" | "Integer" | "Long" | "Short" | "Byte" => matches!(v, Value::Int(_)),
@@ -4163,21 +4190,39 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
     }
 }
 
-/// The number of components in the body of a parenthesized tuple type — the
-/// top-level commas plus one. `[…]` groups are skipped, so
-/// `(Map[String, Int], Int)` is a `Tuple2`, not a `Tuple3`.
-fn tuple_type_arity(inner: &str) -> usize {
+/// Split a type string on TOP-LEVEL occurrences of `sep` — those outside every
+/// `[…]` and `(…)` group — or `None` when it holds none.
+///
+/// One routine for all three separators a type can carry, because they differ
+/// only in what the caller does with the parts: `,` gives a tuple's components
+/// (so `(Map[String, Int], Int)` is a `Tuple2`, not a `Tuple3`), `|` a union's
+/// alternatives, `&` an intersection's.
+fn split_top(ty: &str, sep: char) -> Option<Vec<&str>> {
     let mut depth = 0usize;
-    let mut n = 1usize;
-    for c in inner.chars() {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    for (i, c) in ty.char_indices() {
         match c {
             '[' | '(' => depth += 1,
             ']' | ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => n += 1,
+            _ if c == sep && depth == 0 => {
+                parts.push(&ty[start..i]);
+                start = i + c.len_utf8();
+            }
             _ => {}
         }
     }
-    n
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(&ty[start..]);
+    Some(parts)
+}
+
+/// A type name's last dotted segment — its simple name, which is the only form
+/// anything here is keyed by. See the call site in [`value_is_type`].
+fn simple_name(ty: &str) -> &str {
+    ty.rsplit('.').next().unwrap_or(ty)
 }
 
 /// Whether `v` is an `Array` whose ELEMENT type satisfies `elem` — the reified

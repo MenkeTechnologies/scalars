@@ -3731,6 +3731,13 @@ fn type_tok_text(t: &Tok) -> String {
         Tok::RParen => ")".to_string(),
         Tok::Comma => ",".to_string(),
         Tok::Dot => ".".to_string(),
+        // A UNION or INTERSECTION inside the group. Dropping these left
+        // `(Int | Long)` spelled `(IntLong)` — a name no type has, so the
+        // pattern matched nothing. Parentheses are the only way to write one in
+        // a pattern (a bare `|` there is alternation), so this is where every
+        // union pattern arrives.
+        Tok::Op(o) if o == "|" || o == "&" => o.clone(),
+        Tok::FatArrow => "=>".to_string(),
         _ => String::new(),
     }
 }

@@ -647,3 +647,53 @@ object T extends App { val a = 5; { val a = List(1,2,3); println(a.sum) }; print
 object T extends App { def f(x: Int): Int = { { val x = 9; println(x) }; x }; println(f(3)); println(f(4)) }	9\n3\n9\n4\n
 object T extends App { val a = 5; val r = List(1,2).map { x => { val a = x + 1; a * 10 } }; println(r); println(a) }	List(20, 30)\n5\n
 class C(val a: Int) { def m(): Int = { { val a = 9; println(a) }; a } }; object T extends App { println(new C(5).m()) }	9\n5\n
+object T extends App { def d(x: Any): String = x match { case l: List[Int] => "L" + l.size; case m: Map[String, Int] => "M" + m.size; case o: Option[Int] => "O" + o; case t: (Int, Int) => "T" + t._1; case _ => "x" }; println(List(1, "a", 1.5, true, List(1,2), Map("k" -> 3), Some(9), (4, 5)).map(d)) }	List(x, x, x, x, L2, M1, OSome(9), T4)\n
+object T extends App { def d(x: Any): String = x match { case l: List[Int] => "i"; case l: List[String] => "s"; case _ => "x" }; println(List(List(1), List("a")).map(d)) }	List(i, i)\n
+object T extends App { def d(x: Any): String = x match { case v: Vector[Int] => "V"; case l: List[Int] => "L"; case s: Seq[Int] => "S"; case _ => "x" }; println(List(List(1), Vector(2), Array(3).toSeq, "q").map(d)) }	List(L, V, S, x)\n
+object T extends App { def d(x: Any): String = x match { case a: Array[Int] => "I" + a.length; case a: Array[String] => "S" + a.length; case a: Array[Double] => "D"; case a: Array[_] => "A"; case _ => "x" }; println(List(Array(1, 2), Array("a"), Array(1.5), Array(true), 7).map(d)) }	List(I2, S1, D, A, x)\n
+object T extends App { def d(x: Any): String = x match { case o: Option[Int] => "O" + o; case _ => "x" }; println(List(Some(1), None, Some("s"), 3).map(d)) }	List(OSome(1), ONone, OSome(s), x)\n
+object T extends App { def d(x: Any): String = x match { case e: Either[Int, String] => "E" + e; case _ => "x" }; println(List(Right(1), Left(2), 3).map(d)) }	List(ERight(1), ELeft(2), x)\n
+object T extends App { def d(x: Any): String = x match { case t: scala.util.Try[Int] => "T" + t; case _ => "x" }; println(List(scala.util.Success(1), scala.util.Failure(new RuntimeException("b")), 3).map(d)) }	List(TSuccess(1), TFailure(java.lang.RuntimeException: b), x)\n
+object T extends App { def d(x: Any): String = x match { case t: (Int, String) => "2"; case t: (Int, Int, Int) => "3"; case _ => "x" }; println(List((1, "a"), (1, 2, 3), (1, 2), 9).map(d)) }	List(2, 3, 2, x)\n
+object T extends App { def d(x: Any): String = x match { case t: (Map[String, Int], Int) => "p"; case _ => "x" }; println(List((Map("a" -> 1), 2), (1, 2, 3)).map(d)) }	List(p, x)\n
+object Ev { def unapply(n: Int): Boolean = n % 2 == 0 }; object T extends App { def d(n: Int): String = n match { case Ev() => "e"; case _ => "o" }; println(List(1, 2, 3, 4).map(d)) }	List(o, e, o, e)\n
+object Ev { def unapply(n: Int): Boolean = n % 2 == 0 }; object Ng { def unapply(n: Int): Boolean = n < 0 }; object T extends App { def d(n: Int): String = n match { case Ev() if n > 10 => "be"; case Ng() => "n"; case Ev() => "e"; case _ => "o" }; println(List(3, 4, -3, 12).map(d)) }	List(o, e, n, be)\n
+object Hf { def unapply(n: Int): Option[Int] = if (n % 2 == 0) Some(n / 2) else None }; object Ev { def unapply(n: Int): Boolean = n % 2 == 0 }; object T extends App { def d(n: Int): String = n match { case Hf(k) => "h" + k; case Ev() => "e"; case _ => "o" }; println(List(3, 4, 8).map(d)) }	List(o, h2, h4)\n
+object T extends App { def d(x: Any): String = x match { case l @ (_: List[Int]) => "L" + l; case n @ (_: Int) if n > 0 => "P" + n; case n: Int => "N" + n; case o => "o" + o }; println(List(List(4), 5, -7, "z").map(d)) }	List(LList(4), P5, N-7, oz)\n
+case class Pt(x: Int, y: Int); object T extends App { def d(p: Any): String = p match { case w @ Pt(a @ 0, _) => "z" + w + a; case w @ Pt(a, b) if a > b => "g" + w; case w @ Pt(_, _) => "p" + w; case _ => "x" }; println(List(Pt(0, 3), Pt(5, 0), Pt(0, 0), 1).map(d)) }	List(zPt(0,3)0, gPt(5,0), zPt(0,0)0, x)\n
+case class Bx(v: Any); object T extends App { def d(p: Bx): String = p match { case Bx(n: Int) => "i" + n; case Bx(t: String) => "s" + t.length; case Bx(l: List[Int]) => "l"; case Bx(_) => "x" }; println(List(Bx(3), Bx("ab"), Bx(List(1)), Bx(true)).map(d)) }	List(i3, s2, l, x)\n
+trait Sh; class Ci(val r: Int) extends Sh; class Sq(val e: Int) extends Sh; object T extends App { def d(x: Any): String = x match { case c: Ci => "c" + c.r; case s: Sh => "s"; case l: List[Int] => "L"; case _ => "x" }; println(List(new Ci(2), new Sq(3), List(1), "q").map(d)) }	List(c2, s, L, x)\n
+object T extends App { val e: Any = try { 1 / 0 } catch { case t: Throwable => t }; println(e match { case a: ArithmeticException => "A" + a.getMessage; case t: Throwable => "T"; case _ => "x" }) }	A/ by zero\n
+object T extends App { def d(x: Any): String = x match { case _: Int | _: Double => "num"; case v @ ("a" | "zz") => "s" + v; case _: List[Int] | _: Vector[Int] => "seq"; case _ => "x" }; println(List(1, 1.5, "a", List(2), true).map(d)) }	List(num, num, sa, seq, x)\n
+object T extends App { val xs: List[Any] = List(1, "a", List(2), 1.5, 3); println(for { case n: Int <- xs } yield n * 2); println(xs.collect { case t: String => t.length; case l: List[Int] => l.size }) }	List(2, 6)\nList(1, 1)\n
+object T extends App { def d(x: Any): String = x match { case x: (Int | Long) => "n"; case _ => "x" }; println(List(1, "a").map(d)) }	List(n, x)\n
+object T extends App { def d(x: Any): String = x match { case s: Set[Int] => "S" + s.size; case m: Map[Int, Int] => "M"; case _ => "x" }; println(List(Set(1, 2), Map(1 -> 2), 3).map(d)) }	List(S2, M, x)\n
+object T extends App { var n = 0; def k(): Int = { n += 1; n }; def tw(x: => Int): Int = x + x; println(tw(k())); println(n) }	3\n2\n
+object T extends App { var n = 0; def k(): Int = { n += 1; n }; def no(x: => Int): Int = 5; println(no(k())); println(n) }	5\n0\n
+object T extends App { def safe(x: => Int, d: Int): Int = try x catch { case _: ArithmeticException => d }; println(safe(1 / 0, 9)); println(safe(4, 9)) }	9\n4\n
+object T extends App { var n = 0; def side(): Boolean = { n += 1; true }; def and(l: Boolean, r: => Boolean): Boolean = if (l) r else false; println(and(false, side())); println(and(true, side())); println(n) }	false\ntrue\n1\n
+class H(v: => Int) { def get = v }; object T extends App { var n = 0; def k(): Int = { n += 1; n }; val h = new H(k()); println(h.get); println(h.get); println(n) }	1\n2\n2\n
+class F(v: => Int) { val once = v; def live = v }; object T extends App { var n = 0; def k(): Int = { n += 1; n }; val f = new F(k()); println(f.once); println(f.live); println(f.once); println(f.live); println(n) }	1\n2\n1\n3\n3\n
+class H2(v: => Int) { def get = v }; object T extends App { var m = 3; val h = new H2(m * 10); println(h.get); m = 7; println(h.get) }	30\n70\n
+class P(a: => Int, b: Int) { def s = a + b }; class C(x: => Int) extends P(x * 2, 5) { def own = x }; object T extends App { var n = 0; def k(): Int = { n += 1; n }; val c = new C(k()); println(n); println(c.own); println(c.s); println(n) }	0\n1\n9\n2\n
+object T extends App { var n = 0; def k(): Int = { n += 1; n }; def each(x: => Int): List[Int] = List(1, 2, 3).map(i => i * x); println(each(k())); println(n) }	List(1, 4, 9)\n3\n
+object T extends App { def rep(c: => Boolean)(body: => Unit): Unit = if (c) { body; rep(c)(body) }; var i = 0; var t = 0; rep(i < 3) { i += 1; t += i }; println(t); println(i) }	6\n3\n
+object T extends App { var n = 0; def k(): Int = { n += 1; n }; def d(x: => Int = k()): Int = x + x; println(d()); println(n); println(d(5)); println(n) }	3\n2\n10\n2\n
+object T extends App { var n = 0; def k(): Int = { n += 1; n }; def memo(x: => Int): Int = { lazy val v = x; v + v }; println(memo(k())); println(n) }	2\n1\n
+class Q(v: => String) { def a = v; def b = v.length }; object T extends App { var c = 0; def s(): String = { c += 1; "s" * c }; val q = new Q(s()); println(q.a); println(q.b); println(c) }	s\n2\n2\n
+object T extends App { def run(): Unit = { var n = 3; val f = () => n * 10; println(f()); n = 7; println(f()) }; run() }	30\n70\n
+object T extends App { def run(): Unit = { var n = 3; val f = () => { n += 1; n }; println(f()); n = 7; println(f()); println(n) }; run() }	4\n8\n8\n
+object T extends App { def run(): Unit = { var n = 3; val fs = List(() => n, () => n * 2); n = 7; println(fs.map(_())) }; run() }	List(7, 14)\n
+object T extends App { def mk(): () => Int = { var n = 3; val f = () => n; n = 7; f }; println(mk()()) }	7\n
+object T extends App { def run(): Unit = { var t = "ab"; val f = () => t.length; println(f()); t = t + "zzz"; println(f()) }; run() }	2\n5\n
+object T extends App { def run(): Unit = { var n = 3; val inc = () => { n += 1 }; val get = () => n; inc(); inc(); println(get()); n = 7; println(get()) }; run() }	5\n7\n
+object T extends App { def run(): Unit = { var n = 0; val f = () => n; for (i <- 1 to 3) { n = i * 4; println(f()) } }; run() }	4\n8\n12\n
+object T extends App { def run(): Unit = { var k = 3; val g = (x: Int) => x + k; println(List(1, 2, 3).map(g)); k = 7; println(List(1, 2, 3).map(g)) }; run() }	List(4, 5, 6)\nList(8, 9, 10)\n
+object T extends App { def run(): Unit = { var n = 3; val outer = () => { val inner = () => n * 2; inner() }; println(outer()); n = 7; println(outer()) }; run() }	6\n14\n
+object T extends App { def run(): Unit = { var n = 3; val w = (v: Int) => { n = v }; val rd = () => n; println(rd()); w(7); println(rd()); n = 10; println(rd()) }; run() }	3\n7\n10\n
+object T extends App { def run(): Unit = { var n = 3; val f = () => n; try { n = 7; throw new RuntimeException("x") } catch { case _: RuntimeException => n = n + 1 }; println(f()) }; run() }	8\n
+import scala.collection.mutable; object T extends App { def run(): Unit = { var n = 3; val seen = mutable.ListBuffer[Int](); def take(x: => Int): Unit = { seen += x }; take(n * 10); n = 7; take(n * 10); println(seen) }; run() }	ListBuffer(30, 70)\n
+import scala.collection.mutable; object T extends App { def run(): Unit = { val buf = mutable.ListBuffer[Int](); def add(x: Int): Unit = { buf += x }; add(1); add(2); println(buf) }; run() }	ListBuffer(1, 2)\n
+import scala.collection.mutable; object T extends App { val sb = new StringBuilder(); def app(s: String): Unit = { sb ++= s }; app("a"); app("b"); println(sb.toString) }	ab\n
+object T extends App { var a = 5; { val a = 100; println(a) }; a = 7; println(a) }	100\n7\n
+object T extends App { def run(): Unit = { var n = 1; val f = () => n; println(f()); println(n) }; run() }	1\n1\n
