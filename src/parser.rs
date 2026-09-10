@@ -184,6 +184,29 @@ impl Parser {
                 }
                 self.skip_seps();
             }
+            // A top-level `given`, `extension`, `implicit def` or `implicit
+            // val` — members of the same synthetic `Foo$package` object a
+            // top-level `def` belongs to, and the only declarations here that a
+            // SOFT keyword introduces.
+            //
+            // They have to be recognised before the modifier skip below, which
+            // advances over bare identifiers to the next hard declaration
+            // keyword. Falling into it did not fail, it MIS-PARSED:
+            // `given Sh[Int] with { def s(a: Int) = … }` had its header thrown
+            // away and its `def s` read as an ordinary top-level function, so
+            // the instance was registered under no type at all and the `using`
+            // clause of `show(3)` was filled with the argument instead.
+            // Measured: the reference prints `i3` where this reported
+            // `value s is not a member of Int`. A top-level `extension` lost its
+            // receiver the same way — `3.dbl` reported `value dbl is not a
+            // member of Int` — and a top-level `implicit val` never reached the
+            // implicit scope. Inside an `object` body all four already worked,
+            // which is why nothing had noticed: that path goes through
+            // `statement`, which this now shares.
+            if self.at_soft_declaration_start() {
+                top_stmts.push(self.statement()?);
+                continue;
+            }
             // Leading modifiers (`final`, `sealed`, `abstract`, …) arrive as
             // bare idents; skip to the declaration keyword.
             while !self.is(&Tok::Eof) && !self.at_declaration_start() {
@@ -2480,6 +2503,23 @@ impl Parser {
     /// declaration: `case` (of `case class`/`case object`), `object`, the
     /// `class`/`trait` soft keywords, or the `def`/`val`/`var` of a Scala 3
     /// top-level definition.
+    /// Whether the cursor is on a declaration introduced by a SOFT keyword —
+    /// `given`, `extension`, `implicit def`, `implicit val`/`var`. The lexer
+    /// hands all four back as ordinary identifiers, so the top-level loop cannot
+    /// tell them from the modifiers it skips without asking; see its call site.
+    fn at_soft_declaration_start(&self) -> bool {
+        match self.peek() {
+            Tok::Ident(w) if w == "given" => self.starts_given(),
+            Tok::Ident(w) if w == "extension" => {
+                matches!(self.peek_at(1), Tok::LParen | Tok::LBracket)
+            }
+            Tok::Ident(w) if w == "implicit" => {
+                matches!(self.peek_at(1), Tok::Def | Tok::Val | Tok::Var)
+            }
+            _ => false,
+        }
+    }
+
     fn at_declaration_start(&self) -> bool {
         self.is(&Tok::Object)
             || self.is(&Tok::Case)

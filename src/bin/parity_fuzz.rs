@@ -2510,6 +2510,9 @@ enum Mode {
     TypePat,
     ByName,
     CloseVar,
+    Givens,
+    TryChain,
+    MethVal,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -2568,6 +2571,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::TypePat => "typepat",
         Mode::ByName => "byname",
         Mode::CloseVar => "closevar",
+        Mode::Givens => "givens",
+        Mode::TryChain => "trychain",
+        Mode::MethVal => "methval",
     }
 }
 
@@ -2627,6 +2633,9 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "typepat" => Mode::TypePat,
         "byname" => Mode::ByName,
         "closevar" => Mode::CloseVar,
+        "givens" => Mode::Givens,
+        "trychain" => Mode::TryChain,
+        "methval" => Mode::MethVal,
         _ => return None,
     })
 }
@@ -2685,6 +2694,9 @@ const CONCRETE: &[Mode] = &[
     Mode::TypePat,
     Mode::ByName,
     Mode::CloseVar,
+    Mode::Givens,
+    Mode::TryChain,
+    Mode::MethVal,
 ];
 
 /// `scala.util.control.Breaks` — the only loop-exit idiom Scala has, and a
@@ -3328,6 +3340,273 @@ fn g_closevar(r: &mut Rng) -> String {
     }
 }
 
+/// `given`/`using` resolution, `implicit`, and `extension` — declared OUTSIDE
+/// the entry object, which is where Scala 3 puts them.
+///
+/// Chosen by counting: `given ` and `using ` counted zero in every generated
+/// program and `implicit` counted zero too, so nothing here had ever written
+/// one. The placement is the axis that mattered. All four work inside an
+/// `object` body, which is the only place the corpus had them; at TOP level the
+/// parser's modifier skip walked over the header to the next hard keyword, so
+/// `given Sh[Int] with {{ def s(a: Int) = … }}` had its `def s` read as an
+/// ordinary top-level function and the instance was registered under no type at
+/// all. Nothing failed at the point of the mistake — `show(3)` then filled its
+/// `using` clause with the argument and reported
+/// `value s is not a member of Int`.
+///
+/// Every trait, instance and method name carries the probe's own `{u}`: forty
+/// probes share one program, and two anonymous `given`s of the same type in it
+/// would be an AMBIGUITY the reference rejects, which compares nothing.
+fn g_givens(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let s = pick(r, STRS);
+    match r.below(12) {
+        // The type-class shape, resolved from the ARGUMENT's type.
+        0 => format!(
+            "trait Sh{u}[A] {{ def s(x: A): String }}\n\
+             given Sh{u}[Int] with {{ def s(x: Int): String = \"i\" + x }}\n\
+             given Sh{u}[String] with {{ def s(x: String): String = \"s\" + x.length }}\n\
+             def show{u}[A](x: A)(using sh: Sh{u}[A]): String = sh.s(x)\n{sep}\
+             {{ println(show{u}({a})); println(show{u}({s})) }}"
+        ),
+        // `summon`, which asks for an instance with no argument to infer from.
+        1 => format!(
+            "trait Sh{u}[A] {{ def s(x: A): String }}\n\
+             given Sh{u}[Int] with {{ def s(x: Int): String = \"i\" + x }}\n{sep}\
+             {{ println(summon[Sh{u}[Int]].s({a})) }}"
+        ),
+        // Inference through a CONSTRUCTED parameter type: `A` is read off the
+        // elements, not off the argument.
+        2 => format!(
+            "trait Sh{u}[A] {{ def s(x: A): String }}\n\
+             given Sh{u}[Int] with {{ def s(x: Int): String = \"i\" + x }}\n\
+             def chain{u}[A](xs: List[A])(using sh: Sh{u}[A]): List[String] = xs.map(x => sh.s(x))\n{sep}\
+             {{ println(chain{u}(List({a}, {b}))) }}"
+        ),
+        // A METHOD VALUE taken off the resolved instance, whose static type is
+        // the trait rather than any implementation.
+        3 => format!(
+            "trait Sh{u}[A] {{ def s(x: A): String }}\n\
+             given Sh{u}[Int] with {{ def s(x: Int): String = \"i\" + x }}\n\
+             def chain{u}[A](xs: List[A])(using sh: Sh{u}[A]): List[String] = xs.map(sh.s)\n{sep}\
+             {{ println(chain{u}(List({a}, {b}))) }}"
+        ),
+        // A given by VALUE rather than by body, of a type only this probe uses.
+        4 => format!(
+            "case class Cf{u}(n: Int)\n\
+             given Cf{u} = Cf{u}({a})\n\
+             def use{u}(x: Int)(using c: Cf{u}): Int = x + c.n\n{sep}\
+             {{ println(use{u}({b})); println(use{u}({b})(using Cf{u}(100))) }}"
+        ),
+        // An explicit `using` argument overrides the one in scope, and the
+        // clause still has a DEFAULT to fall back to.
+        5 => format!(
+            "case class Cf{u}(n: Int)\n\
+             given Cf{u} = Cf{u}({a})\n\
+             def use{u}(x: Int = 1)(using c: Cf{u}): Int = x * c.n\n{sep}\
+             {{ println(use{u}()); println(use{u}({b})) }}"
+        ),
+        // The Scala 2 spelling, which resolves through the same scope.
+        6 => format!(
+            "case class Im{u}(n: Int)\n\
+             implicit val iv{u}: Im{u} = Im{u}({a})\n\
+             def old{u}(x: Int)(implicit c: Im{u}): Int = x - c.n\n{sep}\
+             {{ println(old{u}({b})) }}"
+        ),
+        // An `extension` at top level, the placement that had the same fault.
+        7 => format!(
+            "extension (x: Int) def dbl{u}: Int = x * 2\n\
+             extension (x: String) def rep{u}: String = x + x\n{sep}\
+             {{ println({a}.dbl{u}); println({s}.rep{u}); println(List({a}, {b}).map(_.dbl{u})) }}"
+        ),
+        // An extension taking an ARGUMENT, and one chained onto another.
+        8 => format!(
+            "extension (x: Int) def plus{u}(y: Int): Int = x + y\n\
+             extension (x: Int) def sq{u}: Int = x * x\n{sep}\
+             {{ println({a}.plus{u}({b})); println({a}.sq{u}.plus{u}({b})) }}"
+        ),
+        // A given whose instance METHOD is itself generic over the receiver, so
+        // the instance is threaded through a second call.
+        9 => format!(
+            "trait Sh{u}[A] {{ def s(x: A): String }}\n\
+             given Sh{u}[Int] with {{ def s(x: Int): String = \"i\" + x }}\n\
+             def one{u}[A](x: A)(using sh: Sh{u}[A]): String = sh.s(x)\n\
+             def two{u}[A](x: A, y: A)(using sh: Sh{u}[A]): String = one{u}(x) + one{u}(y)\n{sep}\
+             {{ println(two{u}({a}, {b})) }}"
+        ),
+        // A given declared INSIDE the entry body next to one outside it: the two
+        // scopes have to stay separate types or the program is ambiguous.
+        10 => format!(
+            "case class Ot{u}(n: Int)\n\
+             given Ot{u} = Ot{u}({a})\n{sep}\
+             {{ case class In{u}(n: Int); given In{u} = In{u}({b}); \
+                def f{u}(using o: Ot{u}, i: In{u}): Int = o.n * 100 + i.n; println(f{u}) }}"
+        ),
+        // An implicit CONVERSION, which is a given of a `Conversion` type.
+        _ => format!(
+            "case class Wr{u}(n: Int)\n\
+             given Conversion[Int, Wr{u}] = (n: Int) => Wr{u}(n * 2)\n\
+             def take{u}(w: Wr{u}): Int = w.n\n{sep}\
+             {{ println(take{u}({a})); println(take{u}(Wr{u}({b}))) }}"
+        ),
+    }
+}
+
+/// `scala.util.Try` and `Either` combinator CHAINS.
+///
+/// Chosen by counting: `Success` and `Failure` counted zero across the whole
+/// generator, `Try(` counted one, and `.recover` and `.fold(` counted zero — so
+/// the failure-carrying half of both types had never been generated. `fold` was
+/// missing outright and refused every program that reached it.
+///
+/// Each arm runs BOTH cases of its type in one probe, because the whole point of
+/// these combinators is which of the two they short-circuit on: a chain tested
+/// only on its success case cannot tell `map` from `flatMap` from `recover`.
+fn g_trychain(r: &mut Rng) -> String {
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, DIVS);
+    let s = pick(r, STRS);
+    // A divisor that is a variable, so the reference cannot constant-fold the
+    // division away and refuse the program at compile time.
+    let d = format!("{{ val dv{u} = List({b}, 0); ");
+    match r.below(12) {
+        0 => format!("{d} println(dv{u}.map(v => scala.util.Try(100 / v))) }}"),
+        1 => format!("{d} println(dv{u}.map(v => scala.util.Try(100 / v).map(_ + {a}))) }}"),
+        2 => format!("{d} println(dv{u}.map(v => scala.util.Try(100 / v).getOrElse({a}))) }}"),
+        3 => format!(
+            "{d} println(dv{u}.map(v => scala.util.Try(100 / v)\
+               .fold(e => \"e:\" + e.getMessage, x => \"v\" + x))) }}"
+        ),
+        4 => format!(
+            "{d} println(dv{u}.map(v => scala.util.Try(100 / v)\
+               .recover {{ case _: ArithmeticException => {a} }})) }}"
+        ),
+        5 => format!(
+            "{d} println(dv{u}.map(v => scala.util.Try(100 / v).toOption)); \
+               println(dv{u}.map(v => scala.util.Try(100 / v).toEither)) }}"
+        ),
+        6 => format!(
+            "{d} println(dv{u}.map(v => scala.util.Try(100 / v)\
+               .flatMap(x => scala.util.Try(x / dv{u}.head)).isSuccess)) }}"
+        ),
+        7 => format!("{d} println(dv{u}.map(v => scala.util.Try(100 / v).filter(_ > {a}))) }}"),
+        8 => format!(
+            "{d} println(dv{u}.map(v => scala.util.Try(100 / v).isSuccess)); \
+               println(dv{u}.map(v => scala.util.Try(100 / v).orElse(scala.util.Try({a})))) }}"
+        ),
+        // The `Either` half, both cases in one list.
+        9 => format!(
+            "{{ val es{u}: List[Either[String, Int]] = List(Right({a}), Left({s})); \
+               println(es{u}.map(_.map(_ * 2))); println(es{u}.map(_.getOrElse(0))) }}"
+        ),
+        10 => format!(
+            "{{ val es{u}: List[Either[String, Int]] = List(Right({a}), Left({s})); \
+               println(es{u}.map(_.fold(t => \"l\" + t.length, n => \"r\" + n))); \
+               println(es{u}.map(_.swap)) }}"
+        ),
+        _ => format!(
+            "{{ val es{u}: List[Either[String, Int]] = List(Right({a}), Left({s})); \
+               println(es{u}.map(_.isRight)); println(es{u}.map(_.toOption)); \
+               println(es{u}.collect {{ case Right(n) => n }}); \
+               println(es{u}.map(_.flatMap(n => Right(n + 1)))) }}"
+        ),
+    }
+}
+
+/// A METHOD used as a VALUE — `xs.map(o.f)`, `val g = k.f _`.
+///
+/// Chosen by counting: every function value in this generator was a lambda, a
+/// placeholder, or a BARE `def` name. The qualified form counted zero, and it
+/// was not a refusal — the receiver was pushed as the method's argument, so
+/// `List(1, 2).map(O.f)` with `def f(x: Int) = x * 2` reported
+/// `operator Mul is not defined for operands List(1, 2) and 2`, a message about
+/// a program nobody wrote.
+///
+/// Every arm CALLS the value it takes, since a method value that is built and
+/// never applied cannot show which method it denotes.
+fn g_methval(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let s = pick(r, STRS);
+    match r.below(10) {
+        // On an `object`, which is the receiver with no instance behind it.
+        0 => format!(
+            "object Ob{u} {{ def f(x: Int): Int = x * 2 }}\n{sep}\
+             {{ println(List({a}, {b}).map(Ob{u}.f)); println(List({a}).map(Ob{u}.f(_))) }}"
+        ),
+        // On an INSTANCE, whose method is dispatched on its runtime class.
+        1 => format!(
+            "class Kl{u}(val k: Int) {{ def f(x: Int): Int = x * k }}\n{sep}\
+             {{ val o{u} = new Kl{u}({a}); println(List(1, 2, 3).map(o{u}.f)) }}"
+        ),
+        // Bound to a name first, with the `_` spelling that means the same.
+        2 => format!(
+            "class Kl{u}(val k: Int) {{ def f(x: Int): Int = x + k }}\n{sep}\
+             {{ val o{u} = new Kl{u}({a}); val g{u} = o{u}.f _; println(g{u}({b})); \
+               println(List({b}).map(g{u})) }}"
+        ),
+        // A TWO-parameter method, so the expansion's arity is not one.
+        3 => format!(
+            "object Ob{u} {{ def add(x: Int, y: Int): Int = x + y }}\n{sep}\
+             {{ val g{u} = Ob{u}.add _; println(g{u}({a}, {b})); \
+               println(List(({a}, {b})).map(t => Ob{u}.add(t._1, t._2))) }}"
+        ),
+        // Through a TRAIT-typed binding, whose method has no body at that type,
+        // so the value's method is chosen by the receiver's runtime class.
+        //
+        // The receiver is a NAMED binding, not a lambda parameter: a parameter's
+        // static class is not knowable here (see `Compiler::method_value`), so
+        // `ts.map(t => xs.map(t.f))` is a documented refusal rather than a
+        // finding, and generating it would report the same gap forever.
+        4 => format!(
+            "trait Tr{u} {{ def f(x: Int): Int }}\n\
+             class Ia{u} extends Tr{u} {{ def f(x: Int): Int = x + {a} }}\n\
+             class Ib{u} extends Tr{u} {{ def f(x: Int): Int = x * {b} }}\n{sep}\
+             {{ val p{u}: Tr{u} = new Ia{u}; val q{u}: Tr{u} = new Ib{u}; \
+               println(List(1, 2).map(p{u}.f)); println(List(1, 2).map(q{u}.f)) }}"
+        ),
+        // Passed as a PARAMETER of function type, one frame away from where it
+        // was taken.
+        5 => format!(
+            "class Kl{u}(val k: Int) {{ def f(x: Int): Int = x - k }}\n\
+             def run{u}(g: Int => Int, xs: List[Int]): List[Int] = xs.map(g)\n{sep}\
+             {{ println(run{u}((new Kl{u}({a})).f, List(1, 2, 3))) }}"
+        ),
+        // Returned from a method, so the receiver outlives the expression that
+        // named it.
+        6 => format!(
+            "class Kl{u}(val k: Int) {{ def f(x: Int): Int = x * k }}\n\
+             def mk{u}(n: Int): Int => Int = {{ val o = new Kl{u}(n); o.f }}\n{sep}\
+             {{ val g{u} = mk{u}({a}); println(g{u}({b})); println(List(1, 2).map(g{u})) }}"
+        ),
+        // A method value taken off a MUTABLE receiver, then the receiver moved:
+        // Scala evaluates the receiver once, at the expansion.
+        7 => format!(
+            "class Kl{u}(val k: Int) {{ def f(x: Int): Int = x + k }}\n{sep}\
+             {{ var o{u} = new Kl{u}({a}); val g{u} = o{u}.f _; o{u} = new Kl{u}({b}); \
+               println(g{u}(0)) }}"
+        ),
+        // A String-returning method, so a wrong expansion is a wrong SHAPE
+        // rather than a near-miss number.
+        8 => format!(
+            "class Kl{u}(val p: String) {{ def f(x: String): String = p + x }}\n{sep}\
+             {{ val o{u} = new Kl{u}({s}); println(List({s}, \"z\").map(o{u}.f)) }}"
+        ),
+        // A zero-parameter method, which is a CALL and not a value — the arm
+        // that pins the boundary the expansion must not cross.
+        _ => format!(
+            "class Kl{u}(val k: Int) {{ def n: Int = k * 2; def f(x: Int): Int = x + k }}\n{sep}\
+             {{ val o{u} = new Kl{u}({a}); println(o{u}.n); println(List({b}).map(o{u}.f)) }}"
+        ),
+    }
+}
+
 fn gen_probe(r: &mut Rng, mode: Mode) -> String {
     let m = if mode == Mode::All {
         *pick(r, CONCRETE)
@@ -3388,6 +3667,9 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::TypePat => g_typepat(r),
         Mode::ByName => g_byname(r),
         Mode::CloseVar => g_closevar(r),
+        Mode::Givens => g_givens(r),
+        Mode::TryChain => g_trychain(r),
+        Mode::MethVal => g_methval(r),
         Mode::All => unreachable!(),
     }
 }

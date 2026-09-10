@@ -158,6 +158,11 @@ struct Compiler {
     /// [`Compiler::sub_name`]), which is the only key the call site can pick
     /// from what it statically knows.
     overloads: HashMap<String, Vec<usize>>,
+    /// How many parameters each class/object method declares, keyed the same way
+    /// as [`Self::overloads`] (`Owner$method`) and holding only the names that
+    /// declare exactly ONE arity — which is what makes a method value's shape
+    /// knowable without a type system. See [`Compiler::method_value`].
+    member_arity: HashMap<String, usize>,
     /// Whether any declared type overrides `toString`. When none does, a `+`
     /// with a `String` operand keeps the raw `Op::Add` lowering it always had
     /// (see [`Compiler::concat_operand`]).
@@ -648,6 +653,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // `inherit_into_objects` has spliced in the supertype ones it does not
     // already have — so every subroutine actually emitted is accounted for.
     let mut overloads: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut member_arity: HashMap<String, usize> = HashMap::new();
     let declared = classes
         .iter()
         .map(|cd| {
@@ -680,7 +686,21 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         for (name, ars) in arities {
             if ars.len() > 1 {
                 overloads.insert(method_sub_name(owner, name), ars);
+            } else {
+                member_arity.insert(method_sub_name(owner, name), ars[0]);
             }
+        }
+    }
+    // A trait's ABSTRACT methods carry an arity too, and it is the only one a
+    // value typed by the trait can be asked for: `def chain[A](xs: List[A])(using
+    // sh: Sh[A]) = xs.map(sh.s)` names `Sh.s`, never an implementation. They are
+    // excluded from the loop above because nothing emits a subroutine for them,
+    // so they are added here — for `member_arity` only, which no emission reads.
+    for cd in &classes {
+        for m in cd.methods.iter().filter(|m| m.is_abstract) {
+            member_arity
+                .entry(method_sub_name(&cd.name, &m.name))
+                .or_insert(m.params.len());
         }
     }
 
@@ -712,6 +732,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         objects: obj_meta,
         method_index,
         overloads,
+        member_arity,
         imports: prog.imports.clone(),
         wildcards: prog.import_wildcards.clone(),
         lazies: HashSet::new(),
@@ -3665,13 +3686,18 @@ impl Compiler {
     /// What the callee's type parameters are bound to at this call site, as
     /// `(type param, concrete type)`.
     ///
-    /// The rule is bounded and deliberately simple: a type parameter is
-    /// inferred from a VALUE parameter declared to be exactly that parameter.
-    /// `def show[A](x: A)(using Sh[A])` called `show(1)` binds `A` to the
-    /// static type of `1`. Inference through a constructed type (`xs: List[A]`)
-    /// or through a return position is NOT attempted — that needs a real type
-    /// system, and guessing there would resolve to the wrong given rather than
-    /// report that it could not.
+    /// The rule is bounded and deliberately simple, and it has exactly two
+    /// halves. A type parameter is inferred from a VALUE parameter declared to
+    /// be exactly that parameter — `def show[A](x: A)(using Sh[A])` called
+    /// `show(1)` binds `A` to the static type of `1` — or from one declared
+    /// `C[A]`, whose argument's ELEMENT type is read by
+    /// [`Compiler::element_type_name`], so `def chain[A](xs: List[A])(using
+    /// Sh[A])` resolves at `chain(List(1, 2, 3))`.
+    ///
+    /// Nothing else: not a two-argument constructor (`Map[K, V]` says nothing
+    /// about which of them a value stands for), not a nested one, not a return
+    /// position. Those need a real type system, and guessing there would resolve
+    /// to the wrong given rather than report that it could not.
     fn infer_type_args(&self, name: &str, args: &[Expr]) -> Vec<(String, String)> {
         let Some(f) = self.func_type_params.get(name) else {
             return Vec::new();
@@ -3682,15 +3708,43 @@ impl Compiler {
         let mut out = Vec::new();
         for tp in f {
             for (i, p) in sig.iter().enumerate().take(params.len().min(args.len())) {
-                if p.ty.as_deref().map(str::trim) == Some(tp.as_str()) {
-                    if let Some(t) = self.static_type_name(&args[i]) {
-                        out.push((tp.clone(), t));
-                        break;
-                    }
+                let Some(pty) = p.ty.as_deref().map(str::trim) else {
+                    continue;
+                };
+                let found = if pty == tp.as_str() {
+                    self.static_type_name(&args[i])
+                } else if type_arg_of(pty).as_deref() == Some(tp.as_str()) {
+                    self.element_type_name(&args[i])
+                } else {
+                    None
+                };
+                if let Some(t) = found {
+                    out.push((tp.clone(), t));
+                    break;
                 }
             }
         }
         out
+    }
+
+    /// The static type of the ELEMENTS of a collection expression, for the one
+    /// shape it can be read from without a type system: a literal built by a
+    /// collection factory, whose first element is right there.
+    ///
+    /// This is what makes `def chain[A](xs: List[A])(using sh: Sh[A])` resolvable
+    /// at `chain(List(1, 2, 3))`. Without it `A` stayed unbound, the `using`
+    /// clause went unfilled, and the call was left to an arity path that pads
+    /// with `null` rather than reporting — so the program did not fail on the
+    /// unresolved given, it failed on `value head is not a member of Null`,
+    /// where the reference runs it.
+    fn element_type_name(&self, e: &Expr) -> Option<String> {
+        let Expr::Collection { ctor, elems } = e else {
+            return None;
+        };
+        if !SEQ_CTORS.contains(&ctor.as_str()) {
+            return None;
+        }
+        self.static_type_name(elems.first()?)
     }
 
     /// The name of an expression's static type, for the shapes this frontend
@@ -3761,11 +3815,22 @@ impl Compiler {
         let (params, sig, captured) = self.func_sig.get(name)?;
         let visible = params.len().checked_sub(*captured)?;
         let first = sig[..visible].iter().position(|p| p.implicit_clause)?;
-        if args.len() != first {
+        // The explicit clause may be written SHORT when its trailing parameters
+        // carry defaults: `def use(x: Int = 1)(using c: Cf)` called `use()`
+        // passes no argument at all. Each omitted position is spliced with its
+        // default HERE, before the implicit argument is appended, so the
+        // implicit still lands in its own slot — `adapt_args` fills by position
+        // and would otherwise put the instance where `x` belongs. A position
+        // with no default means this is a different call than the one being
+        // filled, and it is left to the arity path.
+        if args.len() > first {
             return None;
         }
-        let subst = self.infer_type_args(name, args);
         let mut out = args.to_vec();
+        for p in &sig[args.len()..first] {
+            out.push(p.default.clone()?);
+        }
+        let subst = self.infer_type_args(name, args);
         for p in &sig[first..visible] {
             let ty = substitute_type(p.ty.as_deref()?, &subst);
             // A clause this frontend cannot resolve is left for the ordinary
@@ -4020,6 +4085,13 @@ impl Compiler {
             full.extend_from_slice(args);
             return self.call(&f, &full, line);
         }
+        // A METHOD used as a VALUE — `xs.map(o.f)`. Eta-expansion, the same
+        // rewrite `var_ref` gives a bare `def` name, and it has to come after
+        // every rule above that reads a receiver of its own: those all name
+        // arity-0 members or built-ins, which this declines.
+        if let Some(eta) = self.method_value(recv, name, args) {
+            return self.expr(&eta);
+        }
         let w = self.method_width(recv, name, args);
         // A lambda argument's parameters are typed by the traversal, so the
         // widths are decided HERE — the lambda body itself is compiled much
@@ -4035,6 +4107,85 @@ impl Compiler {
             self.narrow(w, line);
         }
         Ok(())
+    }
+
+    /// The eta-expansion of a method used as a VALUE — `xs.map(o.f)`,
+    /// `xs.map(k.f)`, `val h = k.f _` — into the lambda `($eta0, …) =>
+    /// recv.f($eta0, …)`. `None` when the reference is an ordinary call.
+    ///
+    /// The counterpart for a bare `def` name has always existed (see
+    /// [`Compiler::var_ref`]); the qualified form had not, and it is not a
+    /// refusal — the receiver was pushed as the method's ARGUMENT, so
+    /// `List(1, 2).map(O.f)` where `def f(x: Int) = x * 2` reported
+    /// `operator Mul is not defined for operands List(1, 2) and 2`, a message
+    /// about the wrong program entirely.
+    ///
+    /// The RECEIVER is evaluated ONCE, where the method value is written, and
+    /// the closure holds that value — which is why the expansion binds it in a
+    /// block rather than closing over the expression that named it. Measured
+    /// against the reference: `var o = new Kl(1); val g = o.f _; o = new
+    /// Kl(100); g(0)` answers `1`, not `100`, and `run((new Kl(2)).f, xs)`
+    /// constructs one `Kl` rather than one per element.
+    ///
+    /// One restriction, because the alternative is a wrong answer rather than an
+    /// error: the method name must declare a single arity. Which overload a
+    /// method value denotes is decided by the expected function type, which this
+    /// frontend does not model, so guessing would silently pick one.
+    ///
+    /// Two receivers it cannot answer for, both because the ARITY is not
+    /// knowable from them. A BUILT-IN receiver's method arities live in the
+    /// host's dispatch rather than in a table, so `xs.map(s.charAt)` is still
+    /// refused; and so is a receiver whose static class this frontend cannot
+    /// name — a lambda parameter, whose width analysis carries a numeric type
+    /// but no element CLASS, so `ts.map(t => xs.map(t.f))` over a `List[Tr]`
+    /// takes the ordinary path.
+    fn method_value(&mut self, recv: &Expr, name: &str, args: &[Expr]) -> Option<Expr> {
+        if !args.is_empty() {
+            return None;
+        }
+        let owner = match recv {
+            Expr::Var(o) if self.objects.contains_key(o) => o.clone(),
+            _ => self.class_of(recv)?,
+        };
+        // A binding's recorded class keeps whatever the annotation said, type
+        // arguments included, and the method table is keyed by the bare name.
+        let arity = *self
+            .member_arity
+            .get(&method_sub_name(&base_type(&owner), name))?;
+        if arity == 0 {
+            return None;
+        }
+        self.obj_counter += 1;
+        // A leading space, as every other synthetic binding here does: no source
+        // name can collide with it.
+        let held = format!(" etarecv_{}", self.obj_counter);
+        let params: Vec<String> = (0..arity).map(|i| format!("$eta{i}")).collect();
+        let lambda = Expr::Lambda {
+            params: params.clone(),
+            body: Box::new(Expr::Method {
+                recv: Box::new(Expr::Var(held.clone())),
+                name: name.to_string(),
+                args: params.into_iter().map(Expr::Var).collect(),
+                line: 0,
+            }),
+            partial: false,
+        };
+        Some(Expr::Block(vec![
+            Stmt {
+                line: 0,
+                kind: StmtKind::Local {
+                    is_val: true,
+                    is_lazy: false,
+                    ty: None,
+                    name: held,
+                    init: Some(recv.clone()),
+                },
+            },
+            Stmt {
+                line: 0,
+                kind: StmtKind::Expr(lambda),
+            },
+        ]))
     }
 
     /// Fold a trailing argument clause back into the call it continues.
@@ -5331,10 +5482,19 @@ impl Compiler {
                 init.map_or(NumTy::Unknown, |e| self.elem_ty(e)),
             ),
         };
+        // The CLASS follows the same rule as the width: the declared type when
+        // it names one, the initializer otherwise. Reading it only from the
+        // initializer left every annotated binding classless — a `def`'s
+        // parameter has no initializer at all, so `def q(sh: Sh[Int]) =
+        // xs.map(sh.s)` could not see that `sh` is a `Sh` and the method value
+        // had no arity to expand to.
+        let declared_cls = ty
+            .map(base_type)
+            .filter(|t| self.classes.contains_key(t.as_str()));
         Width {
             num,
             elem,
-            cls: init.and_then(|e| self.class_of(e)),
+            cls: declared_cls.or_else(|| init.and_then(|e| self.class_of(e))),
             conv: declared_conv(ty),
         }
     }
@@ -6708,6 +6868,19 @@ const LAZYLIST_CALL: &str = "lazylist$";
 /// Whether `e` names the `LazyList` companion.
 fn is_lazylist_companion(e: &Expr) -> bool {
     matches!(e, Expr::Var(n) if n == "LazyList")
+}
+
+/// The single type argument of a `C[A]` type, or `None` when the type has none
+/// or has more than one. One argument is the whole of what
+/// [`Compiler::infer_type_args`] can bind: with two there is nothing to say
+/// which of them a `List`-shaped argument's elements stand for.
+fn type_arg_of(ty: &str) -> Option<String> {
+    let open = ty.find('[')?;
+    let inner = ty[open + 1..].strip_suffix(']')?.trim();
+    if inner.contains(',') || inner.is_empty() {
+        return None;
+    }
+    Some(inner.to_string())
 }
 
 fn base_type(ty: &str) -> String {

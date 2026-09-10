@@ -1164,6 +1164,26 @@ reported as parse/compile errors, never silently mis-run.
   refusal, not a wrong answer.
 - **Singleton `object` `val`s initialize eagerly**, before `main`, rather than
   lazily on first access. Observably identical for pure initializers.
+- **A METHOD VALUE needs a receiver whose class can be named, and a method that
+  declares one arity.** `xs.map(o.f)` eta-expands to `($eta0) => o.f($eta0)`,
+  with the receiver evaluated once where the value is written. Three receivers
+  do not reach it, all refusals rather than wrong answers. A BUILT-IN receiver's
+  method arities live in the host's dispatch rather than in a table, so
+  `xs.map(s.charAt)` reports `String.charAt: wrong number of arguments`. A LAMBDA
+  PARAMETER has no static class here — the width analysis carries an element's
+  numeric type but not its class — so `ts.map(t => xs.map(t.f))` over a
+  `List[Tr]` reports that the receiver is not a number. And an OVERLOADED name
+  is declined outright: which of its arities a method value denotes is decided
+  by the expected function type, which this frontend does not model. The
+  explicit `xs.map(t.f(_))` spelling works in every one of those cases.
+- **A given is resolved by the TEXT of its declared type, so inference reaches
+  one level.** A type parameter is bound from a value parameter declared to be
+  exactly that parameter (`def show[A](x: A)(using Sh[A])`), or from one declared
+  `C[A]` whose argument is a collection LITERAL, whose first element names the
+  type (`def chain[A](xs: List[A])(using Sh[A])` at `chain(List(1, 2, 3))`).
+  Nothing else: not a two-parameter constructor, not a nested one, not a return
+  position, and not a `C[A]` argument that is a variable rather than a literal.
+  An unresolved clause is left to the arity path.
 
 ## Object model: how it works
 
@@ -1265,6 +1285,15 @@ Renaming is what makes a *shadow* distinguishable from a *write*, so it is also
 what decides which name a later write reaches: `var a = 5; { val a = 100 }; a = 7`
 assigns the outer binding, and before the rename the frontend rejected that
 program outright as a "reassignment to val".
+
+The same walk records which of the renamed bindings were declared `val`, because
+that is what decides whether a compound assignment through one is a write at all.
+`buf += x` on a `val` is not a rebinding — Scala rejects a write to a `val`, so
+the only reading that compiles is the growable **member** call (SLS 6.12.4), and
+that is what the compiler emits. Counting it as an assignment made a local `def`
+that merely appended to a captured `ListBuffer` fail with "a captured binding is
+read-only here", which refuses a program Scala runs. A compound assignment
+through a `var` is still a write and still propagates into the capture set.
 
 Final names are chosen only after the whole program is walked, and the first
 claimant of a name keeps it verbatim — a program with no collisions compiles to

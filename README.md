@@ -106,7 +106,13 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   the receiver's type, and implicit conversions applied where Scala applies
   them. A type-class instance is a singleton `object`, which already works as a
   value, so `def show[A: Sh](x: A)` resolves to the right instance from the
-  argument's type. Two candidates of one type is an error, not a pick.
+  argument's type. Two candidates of one type is an error, not a pick. All four
+  — `given`, `using`, `implicit`, `extension` — are read at the TOP level of a
+  file as well as inside an `object` body, which is where Scala 3 puts them. A
+  type parameter is inferred either from a value parameter declared to be exactly
+  that parameter (`def show[A](x: A)(using Sh[A])`) or from one declared `C[A]`,
+  whose argument's element type is read off a collection literal — so
+  `def chain[A](xs: List[A])(using Sh[A])` resolves at `chain(List(1, 2, 3))`.
 - **`LazyList`** — a real lazy structure, not a materialized vector: elements
   are produced on demand and memoised, so `LazyList.from(1)`,
   `.iterate(seed)(f)` and `.continually(v)` are infinite and usable.
@@ -362,7 +368,12 @@ Implemented and checked against the reference `scala`:
   `x => { … }`, `Int => Int` function-type annotations) and the `_`-placeholder
   form (`_ + 1`, `_ * 2`, `_ + _`, the applied `_(1)`, the typed `(_: Int) + 1`,
   and the bare `_` argument
-  that eta-expands its enclosing call, `xs.map(f(_))`). Both spellings work in
+  that eta-expands its enclosing call, `xs.map(f(_))`). A METHOD is a function
+  value too, bare (`xs.map(fib)`) or qualified (`xs.map(o.f)`, `xs.map(Ob.f)`,
+  `val g = o.f _`), eta-expanded to a lambda of the method's arity — for a
+  receiver that is a name and a method name that declares one arity, since which
+  overload a method value denotes is decided by a type this frontend does not
+  model. Both spellings work in
   the BRACE form of an argument as well as the parenthesized one —
   `xs.map { _ * 2 }`, `xs.foldLeft(0) { _ + _ }`, `xs.sortBy { -_ }`,
   `once { 7 }`, and the trailing clause of a curried `def`, `use(3) { _ + 1 }` —

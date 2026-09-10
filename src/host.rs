@@ -2584,13 +2584,20 @@ fn b_make_mutmap(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// `IS_GROWABLE` builtin — whether the popped value mutates in place.
+///
+/// Every answer is a TAG: the sequence's kind, or the map's representation. It
+/// is asked on every compound assignment whose receiver might be growable, which
+/// is once per `buf += x`, so copying the collection to read that tag made
+/// appending `n` elements to a `ListBuffer` copy it `n` times — the loop was
+/// quadratic in the length of the buffer it was filling. Borrowed now, like the
+/// other reads that answer off a tag.
 fn b_is_growable(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
-    let mutable_seq = seq_kind_items(&v).is_some_and(|(k, _)| k.is_mutable());
-    let mutable_map = matches!(
-        map_rep_entries(&v),
-        Some((HashRep::Mutable(_) | HashRep::Linked, _))
-    );
+    let mutable_seq = with_seq(&v, |k, _| k.is_mutable()).unwrap_or(false);
+    let mutable_map = with_map(&v, |rep, _| {
+        matches!(rep, HashRep::Mutable(_) | HashRep::Linked)
+    })
+    .unwrap_or(false);
     Value::bool(mutable_seq || mutable_map)
 }
 
@@ -4165,7 +4172,7 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Vector" | "IndexedSeq" => matches!(seq_kind(v), Some(SeqKind::Vector)),
         "Array" => matches!(seq_kind(v), Some(SeqKind::Array)),
         "Set" => matches!(seq_kind(v), Some(k) if k.is_set()),
-        "Map" => with_map(v, |_, _| true).unwrap_or(false),
+        "Map" => is_map(v),
         // `Nil` is the empty `List`; `::` is a non-empty one (the cons cell
         // class). Both are shape tests, not `==` against a singleton.
         "Nil" => with_seq(v, |k, xs| k == SeqKind::List && xs.is_empty()).unwrap_or(false),
@@ -7567,6 +7574,12 @@ fn is_set(v: &Value) -> bool {
     with_seq(v, |k, _| k.is_set()).unwrap_or(false)
 }
 
+/// Whether `v` is a `Map` handle — the borrowed answer to the question
+/// `as_map(v).is_some()` used to copy the whole map to answer.
+fn is_map(v: &Value) -> bool {
+    with_map(v, |_, _| true).unwrap_or(false)
+}
+
 /// `set + e` (`incl`) / `set - e` (`excl`), preserving the set.s representation.
 fn set_incl(set: &Value, e: Value, add: bool) -> Value {
     let (kind, mut items) =
@@ -8818,6 +8831,20 @@ fn try_method(
             Err(err) => Err(err),
         },
         ("recover" | "recoverWith", 1, Ok(_)) => Ok(recv.clone()),
+        // `fold` collapses both cases to one value, and it is the ONE `Try`
+        // combinator that has to be given both functions at once: the handler
+        // comes FIRST (`fold(fa: Throwable => U, fb: T => U)`), matching
+        // `Either.fold`'s left-then-right order.
+        //
+        // Scala's `Success` case re-catches a throw from `fb` and hands it to
+        // `fa`. That is not modelled, for the same reason `map` above does not:
+        // a closure that faults reports a fault string, and there is no
+        // throwable value left to pass on. A `fold` whose `fb` throws is
+        // therefore this frontend's fault rather than `fa`'s answer — the same
+        // corner `map` already has, and narrower than the refusal it replaces,
+        // which was every `fold`.
+        ("fold", 2, Ok(v)) => invoke_closure(vm, &args[1], std::slice::from_ref(v)),
+        ("fold", 2, Err(e)) => invoke_closure(vm, &args[0], std::slice::from_ref(e)),
         // `failed` INVERTS the two cases: a `Failure`'s exception becomes a
         // `Success`, and a `Success` becomes a `Failure` saying so.
         ("failed", 0, Err(e)) => Ok(make_try_success(e.clone())),
@@ -12247,7 +12274,7 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             }
             // `set + e` / `map + (k -> v)` — the immutable `+` of `Set`/`Map`.
             Value::Obj(_) if is_set(a) => Ok(set_incl(a, b.clone(), true)),
-            Value::Obj(_) if map_rep_entries(a).is_some() => {
+            Value::Obj(_) if is_map(a) => {
                 let (rep, mut entries) = map_rep_entries(a).unwrap();
                 match as_seq_or_tuple(b) {
                     Some(t) if t.len() == 2 => {
@@ -12277,7 +12304,7 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         // Scala (`"a" - 1` does not compile). Report it rather than coercing.
         // `set - e` / `map - k` — the immutable `-` of `Set`/`Map`.
         NumOp::Sub if is_set(a) => Ok(set_incl(a, b.clone(), false)),
-        NumOp::Sub if map_rep_entries(a).is_some() => {
+        NumOp::Sub if is_map(a) => {
             let (rep, entries) = map_rep_entries(a).unwrap();
             Ok(new_map(
                 rep,
