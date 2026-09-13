@@ -5733,18 +5733,33 @@ fn append_in_place(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Va
     if args.len() != 1 || !kind.is_buffer() {
         return None;
     }
-    let appends =
-        matches!(name, "+=" | "addOne" | "append") || (name == "enqueue" && kind == SeqKind::Queue);
+    // The APPEND-ALL forms belong here for the same reason as the single-element
+    // ones: `buf ++= xs` also only pushes onto the end. Left out, `b ++= List(i)`
+    // in a loop took the general path's copy-and-rebuild and measured a clean
+    // 4x per doubling — 38.1G instructions retired at 10 000 iterations against
+    // the 0.35G that `b += i` took for the same work.
+    //
+    // `prependAll` is deliberately NOT here even though [`is_add_all_form`]
+    // names it: it writes to the FRONT, so it needs the rebuild.
+    let all = matches!(name, "++=" | "addAll" | "appendAll");
+    let appends = all
+        || matches!(name, "+=" | "addOne" | "append")
+        || (name == "enqueue" && kind == SeqKind::Queue);
     if !appends {
         return None;
     }
+    // `spread` can allocate (a `Map` argument's pairs), and `str_chars` renders
+    // a collection argument — so both run BEFORE the mutable borrow below.
     let adds = if kind == SeqKind::StrBuf {
+        // A `StringBuilder`'s argument may need a user `toString`, which needs
+        // the VM this function does not take. That is why an object argument
+        // falls through, and an `all` form's argument is always an object.
         if matches!(args[0], Value::Obj(_)) {
             return None;
         }
         str_chars(&args[0])
     } else {
-        vec![args[0].clone()]
+        spread(&args[0], all)
     };
     HEAP.with(|h| {
         if let Some(HeapVal::Seq(_, xs)) = h.borrow_mut().get_mut(id) {
