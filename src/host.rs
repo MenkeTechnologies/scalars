@@ -2829,6 +2829,41 @@ fn reject_char_endpoint(start: &Value, end: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// The elements `v` contributes to a `flatMap`/`flatten`, if it is an
+/// `IterableOnce` in Scala's sense.
+///
+/// Three shapes reach `flatMap` that are NOT `Seq` handles, each because
+/// `Predef` converts them on the way in:
+///
+/// * an `Option`, via `option2Iterable` — `Some(x)` is one element and `None`
+///   is none. This is what makes `for { o <- opts; v <- o } yield v` work.
+/// * a `String`, via `augmentString` — a `Seq[Char]`. This is what makes
+///   `for { s <- words; c <- s } yield c` work.
+/// * a `Map`, whose elements are its `(k, v)` pairs, so
+///   `xs.flatMap(n => Map(n -> n))` yields the pairs.
+///
+/// `flatten` already read `Option` and fell back to [`as_seq_or_tuple`], while
+/// `flatMap` read neither and rejected all three with "flatMap function must
+/// return a collection" — `List("ab", "cd").flatMap(s => s)` answered that
+/// error where Scala answers `List(a, b, c, d)`. Both now ask here, so the two
+/// agree about what counts as flattenable by construction rather than by two
+/// lists kept in step.
+///
+/// The `Tuple` arm is [`as_seq_or_tuple`]'s and is kept for `flatten`, which
+/// accepted it before.
+fn as_iterable_once(v: &Value) -> Option<Vec<Value>> {
+    if let Value::Str(_) = v {
+        return Some(str_chars(v));
+    }
+    if let Some(inner) = as_option(v) {
+        return Some(inner.into_iter().collect());
+    }
+    if let Some(entries) = as_map(v) {
+        return Some(entries.into_iter().map(|(k, x)| new_pair(k, x)).collect());
+    }
+    as_seq_or_tuple(v)
+}
+
 /// Read a tuple/seq's elements (a `Tuple2` is a 2-element sequence).
 fn as_seq_or_tuple(v: &Value) -> Option<Vec<Value>> {
     if let Value::Obj(id) = v {
@@ -6174,7 +6209,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             let mut out = Vec::new();
             for it in &items {
                 let r = invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
-                match as_seq(&r) {
+                match as_iterable_once(&r) {
                     Some(inner) => out.extend(inner),
                     None => return Err("scalars: flatMap function must return a collection".into()),
                 }
@@ -7656,10 +7691,7 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
                 // `List[Option[A]].flatten` drops the empties and unwraps the
                 // rest — an `Option` is an `IterableOnce` in Scala, so it
                 // flattens exactly like a one-or-zero element collection.
-                match as_option(it) {
-                    Some(inner) => out.extend(inner),
-                    None => out.extend(as_seq_or_tuple(it)?),
-                }
+                out.extend(as_iterable_once(it)?);
             }
             out
         }

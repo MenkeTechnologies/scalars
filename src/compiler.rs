@@ -2377,6 +2377,23 @@ impl Compiler {
         fail_jumps: &mut Vec<usize>,
     ) -> Result<(), String> {
         let seq = method == "unapplySeq";
+        // A trailing `_*` in an `unapplySeq` pattern absorbs the remainder, so
+        // the length test below is `>=` the FIXED arity rather than `==`, and
+        // the named form binds `drop(fixed)`. This is exactly what
+        // [`Self::match_seq_pattern`] does for the `case List(h, t @ _*)`
+        // spelling; `match_user_extractor` did not, so the `Pattern::Rest`
+        // reached [`Self::match_pattern`] as an ordinary element and reported
+        // "`_*` is only valid as the last element of a sequence pattern" about
+        // a `_*` that was last. `case Nz(h, rest @ _*)` is the shape.
+        let (fixed, rest) = match (seq, elems.last()) {
+            (true, Some(Pattern::Rest(r))) => (&elems[..elems.len() - 1], Some(r.clone())),
+            _ => (elems, None),
+        };
+        if seq && fixed.iter().any(|p| matches!(p, Pattern::Rest(_))) {
+            return Err(
+                "scalars: `_*` is only valid as the last element of a sequence pattern".to_string(),
+            );
+        }
         // `Name.unapply(scrutinee)`.
         self.emit_load(vplace);
         let sub = self.sub_name(name, method, 1)?;
@@ -2418,18 +2435,19 @@ impl Compiler {
             let lc = self.b.add_constant(Value::str("length".to_string()));
             self.b.emit(Op::LoadConst(lc), 0);
             self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
-            self.b.emit(Op::LoadInt(elems.len() as i64), 0);
-            self.b.emit(Op::NumEq, 0);
+            self.b.emit(Op::LoadInt(fixed.len() as i64), 0);
+            self.b
+                .emit(if rest.is_some() { Op::NumGe } else { Op::NumEq }, 0);
             fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
         }
         // A single binding takes the payload itself; several read it
         // positionally — by index for a sequence, by `_1`.. for a tuple.
-        for (i, elem) in elems.iter().enumerate() {
+        for (i, elem) in fixed.iter().enumerate() {
             self.emit_load(got);
             if seq {
                 self.b.emit(Op::LoadInt(i as i64), 0);
                 self.b.emit(Op::CallBuiltin(crate::host::APPLY, 1), 0);
-            } else if elems.len() > 1 {
+            } else if fixed.len() > 1 {
                 let acc = self.b.add_constant(Value::str(format!("_{}", i + 1)));
                 self.b.emit(Op::LoadConst(acc), 0);
                 self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), 0);
@@ -2438,6 +2456,13 @@ impl Compiler {
             let ep = self.declare_place(&format!(" unuel_{}", self.obj_counter));
             self.emit_store(ep);
             self.match_pattern(elem, ep, fail_jumps)?;
+        }
+        // The named `_*`, bound to everything past the fixed elements.
+        if let Some(Some(rname)) = rest {
+            let dp = self.bind_accessor1(got, "drop", fixed.len() as i64, "unrest");
+            let dst = self.declare_place(&rname);
+            self.emit_load(dp);
+            self.emit_store(dst);
         }
         Ok(())
     }

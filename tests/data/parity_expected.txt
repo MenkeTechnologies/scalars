@@ -743,3 +743,19 @@ object T extends App { def d(x: Any): String = x match { case t: scala.util.Try[
 object T extends App { def d(x: Any): String = x match { case v: (Int | Long) => "n"; case v: (Int & Any) => "i"; case _ => "x" }; println(List(1, "a").map(d)) }	List(n, x)\n
 object T extends App { def d(x: Any): String = x match { case e: java.lang.RuntimeException => "R"; case t: java.lang.Throwable => "T"; case _ => "x" }; println(List(new RuntimeException("a"), new Exception("b"), 3).map(d)) }	List(R, T, x)\n
 trait Tr { def f(x: Int): Int }; class Ia extends Tr { def f(x: Int): Int = x + 1 }; class Ib extends Tr { def f(x: Int): Int = x * 3 }; object T extends App { val p: Tr = new Ia; val q: Tr = new Ib; println(List(1, 2).map(p.f)); println(List(1, 2).map(q.f)) }	List(2, 3)\nList(3, 6)\n
+object T extends App { println(for { s <- List("ab", "cd"); c <- s } yield c) }	List(a, b, c, d)\n
+object T extends App { println(List("ab", "cd").flatMap(s => s)); println(List("ab").flatMap(_.toUpperCase)) }	List(a, b, c, d)\nList(A, B)\n
+object T extends App { println(List(Some(1), None, Some(3)).flatMap(o => o)); println(for { o <- List(Some(1), None, Some(3)); v <- o } yield v) }	List(1, 3)\nList(1, 3)\n
+object T extends App { println(List(1, 2).flatMap(n => Map(n -> n))) }	List((1,1), (2,2))\n
+object T extends App { println(Vector("ab", "c").flatMap(s => s)); println(Set("ab", "cd").flatMap(s => s)) }	Vector(a, b, c)\nSet(a, b, c, d)\n
+object T extends App { println(List("ab", "cd").flatten); println(List(Map(1 -> 2), Map(3 -> 4)).flatten); println(List(Some(1), None).flatten) }	List(a, b, c, d)\nList((1,2), (3,4))\nList(1)\n
+object T extends App { println("abc".flatMap(c => c.toString * 2)) }	aabbcc\n
+object Nz { def unapplySeq(s: String): Option[Seq[String]] = Some(s.split(",").toList) }; object T extends App { "x,y,z,w" match { case Nz(h, rest @ _*) => println(s"$h + $rest"); case _ => println("no") } }	x + List(y, z, w)\n
+object Nz { def unapplySeq(s: String): Option[Seq[String]] = Some(s.split(",").toList) }; object T extends App { "a" match { case Nz(h, rest @ _*) => println(s"$h + $rest"); case _ => println("no") } }	a + List()\n
+object Nz { def unapplySeq(s: String): Option[Seq[String]] = Some(s.split(",").toList) }; object T extends App { "a,b" match { case Nz(all @ _*) => println("all " + all); case _ => println("no") }; "a,b,c" match { case Nz(_, _*) => println("atleast1"); case _ => println("no") } }	all List(a, b)\natleast1\n
+object Nz { def unapplySeq(s: String): Option[Seq[String]] = Some(s.split(",").toList) }; object T extends App { "a,b,c" match { case Nz(x, y) => println("two"); case Nz(x, y, z) => println("three"); case _ => println("no") }; "p,q,r" match { case Nz(a, b, rest @ _*) => println(s"$a $b $rest"); case _ => println("no") } }	three\np q List(r)\n
+object T extends App { val xs = List(1,2,3,4,5); println(for { x <- xs if x > 1; y <- List(10,20,30) if y < 30; if x + y > 12 } yield (x, y)) }	List((2,20), (3,10), (3,20), (4,10), (4,20), (5,10), (5,20))\n
+object T extends App { println(for { x <- List(1,2,3); y = x * 2 if y > 4 } yield y); println(for { x <- 1 to 3; y <- 1 to x } yield x * 10 + y) }	List(6)\nVector(11, 21, 22, 31, 32, 33)\n
+object T extends App { println(for { (k, v) <- Map("a" -> 1, "b" -> 2) } yield k + v); println(for { x <- "abc" } yield x.toUpper) }	List(a1, b2)\nABC\n
+object T extends App { val v: Any = List(1,2,3); v match { case l @ List(1, rest @ _*) => println("head1 " + l + " rest " + rest); case _ => println("no") } }	head1 List(1, 2, 3) rest List(2, 3)\n
+object T extends App { val r: Either[String, Int] = Right(3); val l: Either[String, Int] = Left("bad"); println(r.swap); println(l.swap); println(r.filterOrElse(_ > 5, "small")); println(r.toSeq); println(l.toSeq) }	Left(3)\nRight(bad)\nLeft(small)\nList(3)\nList()\n
