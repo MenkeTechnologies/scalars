@@ -21,7 +21,7 @@
 //!
 //!    *Values.* A `val`/`var`/pattern binder/generator that shadows a binding
 //!    an enclosing scope already holds is alpha-renamed the same way, and every
-//!    read of it is rewritten to match — see [`Resolver::shadow_rename`]. Left
+//!    read of it is rewritten to match — see `Resolver::shadow_rename`. Left
 //!    sharing one name, the inner declaration wrote to the outer binding's
 //!    storage and the outer value did not survive the block:
 //!    `val a = 5; { val a = 100; println(a) }; println(a)` answered `100` twice
@@ -42,7 +42,7 @@
 //! Class/object member `def`s are untouched: they already have their own
 //! `Class$method` namespace and an explicit `this`. A class BODY's `val`s are
 //! its field declarations rather than locals, and are excluded from renaming
-//! for that reason — see [`Resolver::walk_block_in`].
+//! for that reason — see `Resolver::walk_block_in`.
 
 use crate::ast::*;
 use std::collections::{HashMap, HashSet};
