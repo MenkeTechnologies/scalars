@@ -386,8 +386,8 @@ impl Resolver {
             for li in 0..self.lift_stack.len() {
                 let l = self.lift_stack[li];
                 if idx < self.lifted[l].scope_base
-                    && !self.lifted[l].params.iter().any(|p| *p == bound)
-                    && !self.lifted[l].captures.iter().any(|c| *c == bound)
+                    && !self.lifted[l].params.contains(&bound)
+                    && !self.lifted[l].captures.contains(&bound)
                 {
                     self.lifted[l].captures.push(bound.clone());
                 }
