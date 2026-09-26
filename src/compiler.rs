@@ -163,7 +163,8 @@ struct Compiler {
     /// declare exactly ONE arity — which is what makes a method value's shape
     /// knowable without a type system. See [`Compiler::method_value`].
     member_arity: HashMap<String, usize>,
-    /// Whether any declared type overrides `toString`. When none does, a `+`
+    /// Whether any declared type overrides `toString` (or `getMessage`, which a
+    /// user throwable renders through). When none does, a `+`
     /// with a `String` operand keeps the raw `Op::Add` lowering it always had
     /// (see [`Compiler::concat_operand`]).
     has_user_tostring: bool,
@@ -506,6 +507,11 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 field_names.push(f.clone());
             }
         }
+        // A class extending a JDK throwable carries that throwable's state in
+        // one hidden field, after every field a program can name.
+        if throwable_base(cd, &by_name).is_some() {
+            field_names.push(crate::host::THROWABLE_FIELD.to_string());
+        }
         let responds = mro
             .iter()
             .filter_map(|a| by_name.get(a.as_str()))
@@ -753,7 +759,13 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             .iter()
             .flat_map(|cd| cd.methods.iter())
             .chain(objects.iter().flat_map(|od| od.methods.iter()))
-            .any(|m| m.name == "toString"),
+            // A user throwable renders through an overridden `getMessage`.
+            .any(|m| {
+                matches!(
+                    m.name.as_str(),
+                    "toString" | "getMessage" | "getLocalizedMessage"
+                )
+            }),
         current_class: None,
         current_object: None,
         obj_counter: 0,
@@ -895,6 +907,26 @@ fn builtin_none() -> ObjectDecl {
 }
 
 /// The synthetic name of a class constructor subroutine.
+/// The base-most USER class of `cd`'s superclass chain, when that class
+/// extends a built-in JDK throwable (`class E(m: String) extends Exception(m)`)
+/// — the one whose `extends` arguments are the throwable's constructor
+/// arguments. `None` for a class that is not a throwable.
+fn throwable_base<'a>(
+    cd: &'a ClassDecl,
+    by_name: &HashMap<&str, &'a ClassDecl>,
+) -> Option<&'a ClassDecl> {
+    let mut level = cd;
+    // Bounded like `linearize`, so a cyclic `extends` terminates.
+    for _ in 0..64 {
+        let parent = level.parents.first()?;
+        match by_name.get(parent.as_str()) {
+            Some(p) => level = p,
+            None => return crate::host::is_builtin_throwable(parent).then_some(level),
+        }
+    }
+    None
+}
+
 fn ctor_name(class: &str) -> String {
     format!("{class}$new")
 }
@@ -2060,7 +2092,19 @@ impl Compiler {
         self.push_unwind(UnwindKind::Try);
         let mut handled_jumps = Vec::new();
         for arm in catches {
-            let ty = catch_type_name(&arm.pat)?;
+            // A pattern other than a type test or a bare binding — `case
+            // NonFatal(e)`, `case MyErr(code)` — takes whatever is in flight
+            // and is then matched like any `match` arm; a mismatch puts the
+            // exception back, exactly as a rejecting guard does.
+            let extractor = !matches!(
+                arm.pat,
+                Pattern::Typed { .. } | Pattern::Bind(_) | Pattern::Wildcard
+            );
+            let ty = if extractor {
+                "Throwable"
+            } else {
+                catch_type_name(&arm.pat)
+            };
             let c = self.b.add_constant(Value::str(ty.to_string()));
             self.b.emit(Op::LoadConst(c), 0);
             self.b.emit(Op::CallBuiltin(crate::host::EXC_MATCH, 1), 0);
@@ -2074,27 +2118,29 @@ impl Compiler {
             let held = self.declare_place(&format!(" exc_{}", self.obj_counter));
             self.b.emit(Op::CallBuiltin(crate::host::EXC_TAKE, 0), 0);
             self.emit_store(held);
-            if let Some(name) = catch_binding(&arm.pat) {
+            let mut rejects = Vec::new();
+            if extractor {
+                self.match_pattern(&arm.pat, held, &mut rejects)?;
+            } else if let Some(name) = catch_binding(&arm.pat) {
                 let p = self.declare_place(name);
                 self.emit_load(held);
                 self.emit_store(p);
             }
-            let j_guard = match &arm.guard {
-                Some(g) => {
-                    self.expr(g)?;
-                    Some(self.b.emit(Op::JumpIfFalse(0), 0))
-                }
-                None => None,
-            };
+            if let Some(g) = &arm.guard {
+                self.expr(g)?;
+                rejects.push(self.b.emit(Op::JumpIfFalse(0), 0));
+            }
             self.block_expr(&arm.body)?;
             self.emit_store(res);
             self.unwind_check();
             handled_jumps.push(self.b.emit(Op::Jump(0), 0));
-            // Guard rejected the arm: re-arm the exception and fall through to
-            // the next one, which must still see it.
-            if let Some(jg) = j_guard {
+            // The pattern or the guard rejected the arm: re-arm the exception
+            // and fall through to the next one, which must still see it.
+            if !rejects.is_empty() {
                 let at = self.b.current_pos();
-                self.b.patch_jump(jg, at);
+                for j in rejects {
+                    self.b.patch_jump(j, at);
+                }
                 self.emit_load(held);
                 self.b.emit(Op::CallBuiltin(crate::host::EXC_RESTORE, 1), 0);
                 self.b.emit(Op::Pop, 0);
@@ -2315,6 +2361,26 @@ impl Compiler {
         // DECLARATION rather than by its runtime value.
         if let Some(m) = self.user_extractor(name) {
             return self.match_user_extractor(name, &m, elems, vplace, fail_jumps);
+        }
+        // `scala.util.control.NonFatal(e)` — a test, not a destructuring: it
+        // binds the scrutinee itself when it is a non-fatal throwable. Only
+        // when no binding of that name is in scope, which would shadow it.
+        if matches!(name, "NonFatal" | "scala.util.control.NonFatal")
+            && !self
+                .scope
+                .as_ref()
+                .is_some_and(|s| s.slots.contains_key(name))
+        {
+            let [inner] = elems else {
+                return Err(format!(
+                    "scalars: wrong number of arguments for pattern `NonFatal` (expected 1, found {})",
+                    elems.len()
+                ));
+            };
+            self.emit_load(vplace);
+            self.b.emit(Op::CallBuiltin(crate::host::NONFATAL, 1), 0);
+            fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+            return self.match_pattern(inner, vplace, fail_jumps);
         }
         self.var_ref(name)?;
         self.emit_load(vplace);
@@ -4802,6 +4868,20 @@ impl Compiler {
             }
             level = parent;
         }
+        // The JDK throwable the chain bottoms out in takes the base class's
+        // `extends` arguments, evaluated in the scope the loop above just
+        // bound, and its `(message, cause)` becomes the hidden field.
+        if let Some(base) = throwable_base(cd, by_name) {
+            for a in &base.super_args {
+                self.expr(a)?;
+            }
+            self.b.emit(
+                Op::CallBuiltin(crate::host::THROWABLE_STATE, base.super_args.len() as u8),
+                0,
+            );
+            let place = self.declare_place(crate::host::THROWABLE_FIELD);
+            self.emit_store(place);
+        }
         let supers: Vec<String> = self.classes[&cd.name].supers.clone();
         for anc in supers.iter().rev() {
             let Some(p) = by_name.get(anc.as_str()) else {
@@ -6328,16 +6408,13 @@ fn seq_pattern_ctor(name: &str) -> bool {
     matches!(name, "List" | "Seq" | "Vector" | "IndexedSeq" | "Array")
 }
 
-/// The caught type of a `catch` arm's pattern. A bare `case e =>` / `case _ =>`
-/// catches everything, which is `Throwable` — Scala infers exactly that.
-fn catch_type_name(p: &Pattern) -> Result<&str, String> {
+/// The caught type of a `catch` arm's type-test pattern. A bare `case e =>` /
+/// `case _ =>` catches everything, which is `Throwable` — Scala infers exactly
+/// that. Every other pattern is matched after the take (see `try_expr`).
+fn catch_type_name(p: &Pattern) -> &str {
     match p {
-        Pattern::Typed { ty, .. } => Ok(ty),
-        Pattern::Bind(_) | Pattern::Wildcard => Ok("Throwable"),
-        _ => Err(
-            "scalars: only `case e: Type`, `case _: Type`, `case e` and `case _` are supported in `catch`"
-                .to_string(),
-        ),
+        Pattern::Typed { ty, .. } => ty,
+        _ => "Throwable",
     }
 }
 

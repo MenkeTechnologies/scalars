@@ -167,6 +167,23 @@ reported as parse/compile errors, never silently mis-run.
   that global rather than to the heap builtins, which is what makes an outside
   write visible to the object's own `def`s (`Cfg.n = 10; Cfg.bump()` answers
   `11`).
+- **User classes extending a JDK throwable.** `class E(m: String) extends
+  Exception(m)` — directly, or through a user ancestor — keeps the message and
+  cause it passed up (`Exception()`, `(msg)`, `(msg, cause)`, and the
+  `(cause)` overload whose message is `cause.toString`) in a hidden record
+  field, answers `getMessage`/`getLocalizedMessage`/`getCause`, is caught by
+  every JDK supertype (`case e: Exception` catches an `E extends
+  IllegalStateException`), matches `isInstanceOf`/typed patterns the same way,
+  and renders as `Throwable.toString` does — `E: msg`, or `E` for a null
+  message — including for a `case class` and through an overridden
+  `getMessage`.
+- **Any pattern in a `catch` arm.** Beyond `case e: Type` / `case e` / `case _`,
+  an arm may be an extractor — `case NonFatal(e)`, `case Code(n)` for a case
+  class throwable — with or without a guard. The in-flight exception is taken,
+  matched like a `match` arm, and put back for the next arm (and the enclosing
+  `try`) when the pattern or guard rejects it. `NonFatal` accepts every
+  throwable but `VirtualMachineError`, `ThreadDeath`, `InterruptedException`,
+  `LinkageError` and `ControlThrowable`.
 - **`try` with neither a `catch` nor a `finally`.** Reference `scala` 3.8.4
   compiles it, warns "A try without catch or finally is equivalent to putting
   its body in a block; no exceptions are handled", and runs the body — so it
@@ -790,12 +807,6 @@ reported as parse/compile errors, never silently mis-run.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
   namespace, and the many `String`/numeric methods beyond the wired subset
   above.
-- **`case NonFatal(e)` and other extractor patterns in `catch`.** Only
-  `case e: Type`, `case _: Type`, `case e` and `case _` arms are modeled.
-- **User exception classes inside the hierarchy.** `class MyErr(m: String)
-  extends Exception` can be thrown and caught *by its own name*, but the JDK
-  throwables are not part of the registered class hierarchy, so `case e:
-  Exception` will not catch it.
 - **Named regex groups.** `(?<name>…)` and `${name}` in a replacement are not
   modeled; numbered groups (`$1`, `Match.group(1)`, `case r(a, b)`) are. Both
   spellings now say so instead of answering something. `m.group("y")` went

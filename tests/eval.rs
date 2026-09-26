@@ -5578,3 +5578,76 @@ fn a_blocks_value_is_its_trailing_if() {
     assert!(ok, "{out}");
     assert_eq!(out, "List(lo, hi, hi)\np\n7\n()\nList(-3, 6, 9)\n");
 }
+
+#[test]
+fn user_class_extending_a_jdk_throwable_is_one() {
+    // A class extending `Exception`/`RuntimeException` (directly or through a
+    // user ancestor) carries the message and cause it passed up, is caught by
+    // every JDK supertype, renders the way `Throwable.toString` does — even as
+    // a `case class`, and through an overridden `getMessage` — and matches an
+    // extractor pattern in `catch`. Frozen against Scala 3.9.0. Before, `case
+    // e: Exception` did not catch it and `getMessage` was not a member.
+    let src = r#"
+class MyErr(m: String) extends Exception(m)
+class Sub(m: String) extends MyErr("sub:" + m)
+class NoMsg extends RuntimeException
+class WithCause(c: Throwable) extends Exception("wrapped", c)
+case class CE(code: Int) extends RuntimeException("code " + code)
+class Ov extends Exception("x") { override def getMessage = "overridden" }
+object M extends App {
+  try throw new MyErr("boom") catch { case e: Exception => println("exc " + e.getMessage + " | " + e) }
+  try throw new Sub("s") catch { case e: MyErr => println("sub " + e.getMessage + " | " + e) }
+  try throw new Sub("s") catch { case e: IllegalStateException => println("no") ; case e: RuntimeException => println("no2"); case e: Throwable => println("thr " + e.getMessage) }
+  try throw new NoMsg catch { case e: RuntimeException => println("nomsg " + e.getMessage + " | " + e) }
+  try throw new WithCause(new RuntimeException("inner")) catch { case e: Exception => println("cause " + e.getCause + " | " + e.getMessage) }
+  try throw new CE(4) catch { case e: RuntimeException => println("ce " + e.getMessage + " | " + e) }
+  try throw new CE(5) catch { case CE(c) => println("pat " + c) }
+  try throw new Ov catch { case e: Exception => println("ov " + e.getMessage + " | " + e) }
+  println(new MyErr("v").isInstanceOf[Exception])
+  println(new MyErr("v").getLocalizedMessage)
+  throw new MyErr("final")
+}
+"#;
+    let (out, err, ok) = run_full(src);
+    assert!(!ok);
+    assert_eq!(
+        out,
+        "exc boom | MyErr: boom\n\
+         sub sub:s | Sub: sub:s\n\
+         thr sub:s\n\
+         nomsg null | NoMsg\n\
+         cause java.lang.RuntimeException: inner | wrapped\n\
+         ce code 4 | CE: code 4\n\
+         pat 5\n\
+         ov overridden | Ov: overridden\n\
+         true\n\
+         v\n"
+    );
+    assert!(err.contains("MyErr: final"), "stderr: {err}");
+}
+
+#[test]
+fn catch_takes_extractor_patterns_and_non_fatal() {
+    // `case NonFatal(e)` and other extractor patterns in `catch`: the exception
+    // is taken, matched like any `match` arm, and put back for the next arm
+    // (or the enclosing `try`) when the pattern does not match. Frozen against
+    // Scala 3.9.0; every arm here used to be refused at compile time.
+    let src = r#"
+import scala.util.control.NonFatal
+case class Code(n: Int) extends Exception("code")
+object M extends App {
+  try throw new RuntimeException("r") catch { case NonFatal(e) => println("nf " + e.getMessage) }
+  try 1 / 0 catch { case NonFatal(e) => println("nf2 " + e) }
+  try {
+    try throw Code(7) catch { case Code(3) => println("wrong") }
+  } catch { case Code(n) => println("outer " + n) }
+  try throw Code(9) catch { case Code(n) if n > 10 => println("big"); case Code(n) => println("small " + n) }
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "nf r\nnf2 java.lang.ArithmeticException: / by zero\nouter 7\nsmall 9\n"
+    );
+}

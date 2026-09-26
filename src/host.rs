@@ -414,6 +414,27 @@ pub const LAZY_CONS: u16 = 782;
 /// question is asked of the VALUE, where the two shapes are distinct.
 pub const EXTRACTED: u16 = 783;
 
+/// Builtin id for the JDK throwable state a USER class inherits by extending a
+/// built-in throwable (`class E(m: String) extends Exception(m)`). Pops the
+/// `argc` arguments the class passed to that constructor and returns the
+/// `(message, cause)` pair its record keeps under [`THROWABLE_FIELD`]:
+/// `()` is `(null, null)`, `(msg)` is `(msg, null)`, `(msg, cause)` is both,
+/// and a lone THROWABLE argument is the `Exception(Throwable cause)` overload,
+/// whose message is `cause.toString`.
+pub const THROWABLE_STATE: u16 = 784;
+
+/// Builtin id for the `scala.util.control.NonFatal` extractor: pops a value and
+/// answers whether it is a throwable that `NonFatal.unapply` accepts — every
+/// one except `VirtualMachineError`, `ThreadDeath`, `InterruptedException`,
+/// `LinkageError` and `ControlThrowable`, and their subclasses.
+pub const NONFATAL: u16 = 785;
+
+/// The hidden record field holding a user throwable's `(message, cause)` pair
+/// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
+/// program can write, and it sits after the constructor fields, so a case
+/// class's derived `toString`/`equals`/`unapply` never see it.
+pub const THROWABLE_FIELD: &str = " throwable";
+
 /// The [`SF32_ARITH`] operator codes, shared with the compiler.
 pub mod f32_op {
     pub const ADD: i64 = 0;
@@ -703,6 +724,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(LAZYLIST_NEW, b_lazylist_new);
     vm.register_builtin(LAZY_CONS, b_lazy_cons);
     vm.register_builtin(EXTRACTED, b_extracted);
+    vm.register_builtin(THROWABLE_STATE, b_throwable_state);
+    vm.register_builtin(NONFATAL, b_nonfatal);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -989,9 +1012,82 @@ fn b_exc_match(vm: &mut VM, _argc: u8) -> Value {
         // the same test) catches everything, including a thrown user object that
         // is outside the modeled hierarchy.
         Some(_) if want == "Throwable" => true,
-        Some(c) => throwable_is_a(&c, &want),
+        Some(c) => throwable_conforms(&c, &want),
         None => false,
     })
+}
+
+/// Whether `name` is one of the modeled JDK throwables — the classes a user
+/// class can extend to BE a throwable (see [`THROWABLE_STATE`]).
+pub fn is_builtin_throwable(name: &str) -> bool {
+    throwable_fqn(name).is_some()
+}
+
+/// A USER throwable's `(message, cause)` — its [`THROWABLE_FIELD`] — or `None`
+/// for a value that is not one.
+fn user_throwable_state(v: &Value) -> Option<(Value, Value)> {
+    let state = with_obj(v, |o| {
+        o.fields
+            .iter()
+            .find(|(f, _)| &**f == THROWABLE_FIELD)
+            .map(|(_, s)| s.clone())
+    })??;
+    match as_seq_or_tuple(&state)?.as_slice() {
+        [msg, cause] => Some((msg.clone(), cause.clone())),
+        _ => None,
+    }
+}
+
+/// Whether `v` is any throwable: a built-in one or a user class extending one.
+fn is_throwable_value(v: &Value) -> bool {
+    as_exc(v).is_some() || user_throwable_state(v).is_some()
+}
+
+/// `THROWABLE_STATE` builtin — see [`THROWABLE_STATE`].
+fn b_throwable_state(vm: &mut VM, argc: u8) -> Value {
+    let mut args: Vec<Value> = (0..argc).map(|_| vm.pop()).collect();
+    args.reverse();
+    let (msg, cause) = match args.as_slice() {
+        [] => (Value::Undef, Value::Undef),
+        [c] if is_throwable_value(c) => (Value::str(scala_str(c)), c.clone()),
+        [m] => (m.clone(), Value::Undef),
+        [m, c, ..] => (m.clone(), c.clone()),
+    };
+    heap_push(HeapVal::Tuple(vec![msg, cause]))
+}
+
+/// `NONFATAL` builtin — see [`NONFATAL`].
+fn b_nonfatal(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    if !is_throwable_value(&v) {
+        return Value::bool(false);
+    }
+    let fatal = thrown_class(&v).is_some_and(|c| {
+        [
+            "VirtualMachineError",
+            "ThreadDeath",
+            "InterruptedException",
+            "LinkageError",
+            "ControlThrowable",
+        ]
+        .iter()
+        .any(|f| throwable_conforms(&c, f))
+    });
+    Value::bool(!fatal)
+}
+
+/// Whether the thrown class `class` is `want` or a subclass of it — through
+/// the JDK hierarchy for a built-in throwable, and for a user class through its
+/// registered supertypes, which may themselves reach a built-in throwable
+/// (`class E extends IllegalStateException` is a `RuntimeException`).
+fn throwable_conforms(class: &str, want: &str) -> bool {
+    throwable_is_a(class, want)
+        || class_conforms(class, want)
+        || TYPES.with(|t| {
+            t.borrow()
+                .get(class)
+                .is_some_and(|i| i.supers.iter().any(|s| throwable_is_a(s, want)))
+        })
 }
 
 /// `EXC_RESTORE` builtin — see [`EXC_RESTORE`].
@@ -3159,6 +3255,13 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     match (name, args.len()) {
         ("hashCode", 0) => Ok(Value::int(obj_hash(&class, is_case, &fields, recv))),
         ("equals", 1) => Ok(Value::bool(obj_eq(recv, &args[0]))),
+        // The `Throwable` members a user class inherits by extending one.
+        ("getMessage" | "getLocalizedMessage" | "getCause", 0)
+            if user_throwable_state(recv).is_some() =>
+        {
+            let (msg, cause) = user_throwable_state(recv).unwrap_or((Value::Undef, Value::Undef));
+            Ok(if name == "getCause" { cause } else { msg })
+        }
         // `scala.Product`, which every `case class`/`case object` implements.
         // The primary-constructor prefix is what Scala exposes, matching the
         // derived `unapply` and `toString`.
@@ -3350,6 +3453,19 @@ fn obj_to_string(v: &Value) -> String {
                     } else {
                         format!("class {name}")
                     };
+                }
+                // A user class extending a JDK throwable renders the way
+                // `Throwable.toString` does — `Class: message`, or the bare
+                // class name for a null message — and that holds for a `case
+                // class` too: Scala does not derive a `toString` where a
+                // superclass other than `AnyRef` already defines one.
+                if let Some((_, state)) = o.fields.iter().find(|(f, _)| &**f == THROWABLE_FIELD) {
+                    if let Some(parts) = as_seq_or_tuple(state) {
+                        return match parts.first() {
+                            Some(Value::Undef) | None => o.class.to_string(),
+                            Some(m) => format!("{}: {}", o.class, scala_str(m)),
+                        };
+                    }
                 }
                 if o.is_case && o.is_object {
                     // A `case object` prints as its bare name (`None`), not `None()`.
@@ -4227,8 +4343,9 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
             ty == "Throwable" || thrown_class(v).is_some_and(|thrown| throwable_is_a(&thrown, ty))
         }
         // A user instance conforms to its own class and to every supertype the
-        // compiler registered for it (`case c: Shape` on a `Circle`).
-        _ => with_obj(v, |o| class_conforms(&o.class, ty)).unwrap_or(false),
+        // compiler registered for it (`case c: Shape` on a `Circle`) — and a
+        // user throwable to the JDK throwables above the one it extends.
+        _ => with_obj(v, |o| throwable_conforms(&o.class, ty)).unwrap_or(false),
     }
 }
 
@@ -11058,7 +11175,13 @@ fn user_tostring_present(vm: &VM) -> bool {
     USER_TOSTRING.with(|c| match c.get() {
         Some(known) => known,
         None => {
-            let found = vm.chunk.names.iter().any(|n| n.ends_with("$toString"));
+            // An overridden `getMessage` counts: a user throwable renders
+            // through it (see [`obj_to_string_vm`]).
+            let found = vm.chunk.names.iter().any(|n| {
+                n.ends_with("$toString")
+                    || n.ends_with("$getMessage")
+                    || n.ends_with("$getLocalizedMessage")
+            });
             c.set(Some(found));
             found
         }
@@ -11134,6 +11257,23 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
             // statement boundary to pick up; the value still has to render.
             Err(_) => return obj_to_string(v),
         }
+    }
+    // A user throwable renders through `Throwable.toString`, which reads the
+    // message through `getLocalizedMessage` — so an overridden `getMessage`
+    // shows up in the rendering too, not only when called.
+    if let Some((stored, _)) = user_throwable_state(v) {
+        let msg = match call_user_method(vm, v, "getLocalizedMessage", &[])
+            .or_else(|| call_user_method(vm, v, "getMessage", &[]))
+        {
+            Some(Ok(m)) => m,
+            Some(Err(_)) => return obj_to_string(v),
+            None => stored,
+        };
+        let class = with_obj(v, |o| o.class.to_string()).unwrap_or_default();
+        return match msg {
+            Value::Undef => class,
+            m => format!("{class}: {}", scala_str(&m)),
+        };
     }
     let id = if let Value::Obj(i) = v { *i } else { 0 };
     let shape = HEAP.with(|h| {
