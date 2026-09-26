@@ -800,8 +800,6 @@ reported as parse/compile errors, never silently mis-run.
   the same `C$f$1` subroutine, and the runtime is dynamically typed, so the
   argument's static type — which is what Scala resolves on — is not available.
   Argument COUNT is modelled (see above); argument type is not.
-- **`printf`.** `println`, `print`, `"…".format(…)` and `x.formatted(spec)` are
-  wired; the bare `printf(fmt, args…)` spelling is not.
 - **Symbolic operators beyond the wired set.** `/:`, `:\` and user-defined
   symbolic method names.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a

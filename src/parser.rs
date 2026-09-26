@@ -2731,6 +2731,29 @@ impl Parser {
                         partial: false,
                     });
                 }
+                // `printf(fmt, args…)` is `Predef.printf`, which is defined as
+                // `Console.print(fmt.format(args: _*))` — so it lowers to exactly
+                // that, and shares `format`'s conversions and errors.
+                if name == "printf" && matches!(next, Some(Tok::LParen)) {
+                    let line = self.line();
+                    self.advance(); // printf
+                    let mut args = self.arg_list()?;
+                    if args.is_empty() {
+                        return Err(format!(
+                            "scalars: missing argument for parameter text of method printf (line {line})"
+                        ));
+                    }
+                    let fmt = args.remove(0);
+                    return Ok(Expr::Println {
+                        newline: false,
+                        arg: Some(Box::new(Expr::Method {
+                            recv: Box::new(fmt),
+                            name: "format".to_string(),
+                            args,
+                            line,
+                        })),
+                    });
+                }
                 // `scala.util.control.Breaks`. Scala ships `break`/`breakable` as
                 // ordinary methods, but they are the language's only loop-exit
                 // idiom, so they are recognized here rather than left to the

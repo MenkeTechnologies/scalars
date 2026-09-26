@@ -5651,3 +5651,30 @@ object M extends App {
         "nf r\nnf2 java.lang.ArithmeticException: / by zero\nouter 7\nsmall 9\n"
     );
 }
+
+#[test]
+fn printf_is_print_of_format() {
+    // `Predef.printf(text, xs*)` is `Console.print(text.format(xs*))`: no
+    // trailing newline, the `Formatter` conversions, and `%s` through each
+    // argument's `toString`. Frozen against Scala 3.9.0; `printf` used to be
+    // `not found`.
+    let src = r#"
+case class P(x: Int)
+object M extends App {
+  printf("%d-%s%n", 3, "x")
+  printf("plain\n")
+  printf("%5.2f|%-4s|%x\n", 3.14159, "ab", 255)
+  printf("%s and %s\n", P(1), List(1, 2))
+  val n = 7
+  printf("n=%d\n", n)
+  printf("%s", "no newline")
+  println()
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "3-x\nplain\n 3.14|ab  |ff\nP(1) and List(1, 2)\nn=7\nno newline\n"
+    );
+}

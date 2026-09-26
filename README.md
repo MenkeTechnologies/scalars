@@ -305,7 +305,8 @@ Implemented and checked against the reference `scala`:
   expected (an argument, a `val` initializer), with the numeric widening
   `3: Double` actually widening; Scala's `+` string concatenation
   and `*` string repetition; the `java.util.Formatter` conversions behind the
-  `f"…"` interpolator, `"…".format(…)`, `String.format(…)` and `x.formatted(…)`
+  `f"…"` interpolator, `"…".format(…)`, `String.format(…)`, `x.formatted(…)` and
+  `printf(…)`
   (`%s %d %f %e %E %x %X %o %b %c`, with the flags, width and precision, rounded
   HALF_UP off the shortest round-tripping decimal exactly as Java rounds);
   `Int`-vs-`Double` division dispatch (integer `/ 0`
@@ -320,7 +321,13 @@ Implemented and checked against the reference `scala`:
   raised are catchable with their JDK messages (`ArithmeticException: / by
   zero`, `NumberFormatException: For input string: "zz"`, `scala.MatchError`);
   `new RuntimeException("…")` and the other built-in throwables construct
-  without a user `class`, and expose `getMessage`/`toString`.
+  without a user `class`, and expose `getMessage`/`toString`. A user class
+  extending one (`class E(m: String) extends Exception(m)`, or a `case class`)
+  IS a throwable: it keeps the message and cause it passed up, answers
+  `getMessage`/`getCause`, is caught by every JDK supertype, and renders as
+  `Throwable.toString` does. A handler arm may also be an extractor pattern —
+  `case NonFatal(e)`, `case Code(n)` — and an arm whose pattern or guard
+  rejects the exception leaves it in flight for the next one.
 - **Ranges** — `a to b`, `a until b`, `… by s` as first-class values with
   Scala's `Range.toString` (`Range 1 to 10 by 3`, and the `empty `/`inexact `
   prefixes), `sum`/`length`/`map`/`filter`/`toList`/`reverse`/`mkString`/…; used
