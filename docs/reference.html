@@ -149,7 +149,7 @@ println(try { 1 / 0 } catch { case _: ArithmeticException =&gt; -1 })   // =&gt;
         </article>
         <article class="doc-entry" id="doc-keywords-15">
           <h3><a class="doc-anchor" href="#doc-keywords-15">#</a> <code>catch</code></h3>
-          <p>The handler block of a `try`. Arms are patterns — `case e: T`, `case e`, with an optional guard — and a typed arm walks the modelled JVM throwable hierarchy.</p>
+          <p>The handler block of a `try`. Arms are patterns — `case e: T`, `case e`, or an extractor such as `case NonFatal(e)`, with an optional guard — and a typed arm walks the modelled JVM throwable hierarchy, which a user class extending a throwable joins. An arm that rejects the exception leaves it in flight for the next.</p>
           <pre><code class="lang-scala">catch { case e: T [if guard] =&gt; expr; … }
 try { "z".toInt } catch { case e: NumberFormatException =&gt; println(e.getMessage) }   // =&gt; For input string: "z"</code></pre>
         </article>
@@ -2928,31 +2928,37 @@ println(3.0)   // =&gt; 3.0</code></pre>
 print("a"); print("b")   // =&gt; ab</code></pre>
         </article>
         <article class="doc-entry" id="doc-predef-and-interpolation-3">
-          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-3">#</a> <code>s"…"</code></h3>
+          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-3">#</a> <code>printf</code></h3>
+          <p>Print `text.format(args*)` with no trailing newline — `Predef.printf`'s own definition, so it takes the `Formatter` conversions `format` does.</p>
+          <pre><code class="lang-scala">printf(text: String, xs: Any*): Unit
+printf("%d-%s%n", 3, "x")   // =&gt; 3-x</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-predef-and-interpolation-4">
+          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-4">#</a> <code>s"…"</code></h3>
           <p>The standard interpolator: `$name` and `${expr}` splices are evaluated and rendered with the same formatting `println` uses. Backslash escapes are decoded.</p>
           <pre><code class="lang-scala">s"text $name text ${expr}"
 println(s"a${1 + 1}b")   // =&gt; a2b</code></pre>
         </article>
-        <article class="doc-entry" id="doc-predef-and-interpolation-4">
-          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-4">#</a> <code>f"…"</code></h3>
+        <article class="doc-entry" id="doc-predef-and-interpolation-5">
+          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-5">#</a> <code>f"…"</code></h3>
           <p>The formatting interpolator: each splice may carry a trailing `%…` conversion, applied through the same formatter `String.format` would use.</p>
           <pre><code class="lang-scala">f"${expr}%spec"
 println(f"${3.14159}%.2f")   // =&gt; 3.14</code></pre>
         </article>
-        <article class="doc-entry" id="doc-predef-and-interpolation-5">
-          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-5">#</a> <code>raw"…"</code></h3>
+        <article class="doc-entry" id="doc-predef-and-interpolation-6">
+          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-6">#</a> <code>raw"…"</code></h3>
           <p>The raw interpolator: splices are still evaluated but backslash escapes are kept literal, so `raw"\n"` is a backslash followed by `n`.</p>
           <pre><code class="lang-scala">raw"text\n$name"
 println(raw"a\nb")   // =&gt; a\nb</code></pre>
         </article>
-        <article class="doc-entry" id="doc-predef-and-interpolation-6">
-          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-6">#</a> <code>format specs</code></h3>
+        <article class="doc-entry" id="doc-predef-and-interpolation-7">
+          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-7">#</a> <code>format specs</code></h3>
           <p>The conversions an `f"…"` splice accepts: `%d` integer, `%f` fixed-point (default six decimals), `%e` scientific, `%s` string, `%x`/`%o` radix, `%%` a literal percent — with the usual width, `-` left-justify, `0` zero-pad and `.n` precision flags. Note that `String.format` as a method is not implemented; use an `f` interpolator.</p>
           <pre><code class="lang-scala">f"${x}%[flags][width][.prec]conv"
 println(f"${7}%05d")   // =&gt; 00007</code></pre>
         </article>
-        <article class="doc-entry" id="doc-predef-and-interpolation-7">
-          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-7">#</a> <code>rust { … }</code></h3>
+        <article class="doc-entry" id="doc-predef-and-interpolation-8">
+          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-8">#</a> <code>rust { … }</code></h3>
           <p>An inline Rust block: its body is compiled to a cdylib and its `extern "C"` functions become callable from Scala code. The compile result is cached, so only the first run pays for it.</p>
           <pre><code class="lang-scala">rust { pub extern "C" fn name(x: i64) -&gt; i64 { … } }
 rust { pub extern "C" fn triple(x: i64) -&gt; i64 { x * 3 } }

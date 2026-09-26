@@ -129,7 +129,7 @@ pub const CORPUS: &[Entry] = &[
     (
         "catch",
         "Keywords",
-        "The handler block of a `try`. Arms are patterns — `case e: T`, `case e`, with an optional guard — and a typed arm walks the modelled JVM throwable hierarchy.",
+        "The handler block of a `try`. Arms are patterns — `case e: T`, `case e`, or an extractor such as `case NonFatal(e)`, with an optional guard — and a typed arm walks the modelled JVM throwable hierarchy, which a user class extending a throwable joins. An arm that rejects the exception leaves it in flight for the next.",
         "catch { case e: T [if guard] => expr; … }\ntry { \"z\".toInt } catch { case e: NumberFormatException => println(e.getMessage) }   // => For input string: \"z\"",
     ),
     (
@@ -2669,6 +2669,12 @@ pub const CORPUS: &[Entry] = &[
         "Predef and Interpolation",
         "Print one Scala-formatted argument with no trailing newline.",
         "print(x: Any): Unit\nprint(\"a\"); print(\"b\")   // => ab",
+    ),
+    (
+        "printf",
+        "Predef and Interpolation",
+        "Print `text.format(args*)` with no trailing newline — `Predef.printf`'s own definition, so it takes the `Formatter` conversions `format` does.",
+        "printf(text: String, xs: Any*): Unit\nprintf(\"%d-%s%n\", 3, \"x\")   // => 3-x",
     ),
     (
         "s\"…\"",
