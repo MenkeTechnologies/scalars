@@ -4721,39 +4721,42 @@ fn a_def_in_a_nested_block_still_shadows_the_outer_one() {
 }
 
 #[test]
-fn a_named_regex_group_is_refused_rather_than_answered_wrongly() {
+fn a_named_regex_group_reads_its_own_group() {
     // `m.group("y")` went through `to_int`, which reads a `String` as 0 — group
-    // 0, the whole match. `"(?<y>[0-9]{4})-(?<m>[0-9]{2})"` on `2026-08` gave
-    // `2026-08` for both names instead of `2026` and `08`.
-    let (_, err, ok) = run_full(&wrap(
-        "val r = \"(?<y>[0-9]{4})-(?<m>[0-9]{2})\".r\n\
-         println(r.findFirstMatchIn(\"2026-08\").get.group(\"y\"))",
-    ));
-    assert!(!ok);
-    assert!(err.contains("named regex group"), "stderr {err:?}");
-    // The numbered form is modeled and must keep working.
+    // 0, the whole match — so `"(?<y>[0-9]{4})-(?<m>[0-9]{2})"` on `2026-08`
+    // gave `2026-08` for both names; it was then refused. A named group is
+    // numbered by its opening parenthesis like any other, one that did not
+    // take part is `null`, and an undeclared name is Java's
+    // `IllegalArgumentException`. Frozen against Scala 3.9.0.
     let (out, ok) = run(&wrap(
         "val r = \"(?<y>[0-9]{4})-(?<m>[0-9]{2})\".r\n\
-         println(r.findFirstMatchIn(\"2026-08\").get.group(1))",
+         val m = r.findFirstMatchIn(\"2026-08\").get\n\
+         println(m.group(\"y\") + \"/\" + m.group(\"m\") + \" \" + m.group(1))\n\
+         val alt = \"(?<a>x)|(?<b>y)\".r.findFirstMatchIn(\"y\").get\n\
+         println(alt.group(\"a\")); println(alt.group(\"b\"))\n\
+         try println(m.group(\"nope\")) catch { case e: IllegalArgumentException => println(e.getMessage) }",
     ));
     assert!(ok);
-    assert_eq!(out, "2026\n");
+    assert_eq!(out, "2026/08 2026\nnull\ny\nNo group with name <nope>\n");
 }
 
 #[test]
-fn a_named_group_in_a_replacement_is_refused() {
-    // `${d}` was copied through verbatim: `"a1b2".replaceAll("(?<d>[0-9])",
-    // "<${d}>")` answered `a<${d}>b<${d}>` where Java splices `a<1>b<2>`.
-    let (_, err, ok) = run_full(&wrap(
-        r##"println("a1b2".replaceAll("(?<d>[0-9])", "<${d}>"))"##,
-    ));
-    assert!(!ok);
-    assert!(err.contains("named regex group"), "stderr {err:?}");
+fn a_named_group_in_a_replacement_is_spliced() {
+    // `${d}` was copied through verbatim — `"a1b2".replaceAll("(?<d>[0-9])",
+    // "<${d}>")` answered `a<${d}>b<${d}>` — and was then refused. Java splices
+    // the group, and an undeclared name is an `IllegalArgumentException` that
+    // spells it in braces. Frozen against Scala 3.9.0.
     let (out, ok) = run(&wrap(
-        r##"println("a1b2".replaceAll("(?<d>[0-9])", "<$1>"))"##,
+        r##"println("a1b2".replaceAll("(?<d>[0-9])", "<${d}>"))
+println("2026-08".replaceFirst("(?<y>\\d+)-(?<m>\\d+)", "${m}/${y}"))
+println("a1b2".replaceAll("(?<d>[0-9])", "<$1>"))
+try println("a1".replaceAll("(?<d>[0-9])", "${zz}")) catch { case e: IllegalArgumentException => println(e.getMessage) }"##,
     ));
     assert!(ok);
-    assert_eq!(out, "a<1>b<2>\n");
+    assert_eq!(
+        out,
+        "a<1>b<2>\n08/2026\na<1>b<2>\nNo group with name {zz}\n"
+    );
 }
 
 #[test]

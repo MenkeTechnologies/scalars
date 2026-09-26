@@ -114,12 +114,17 @@ reported as parse/compile errors, never silently mis-run.
   `String.split`; `"…".r` and `new Regex(…)` building a `Regex` that answers
   `findFirstIn`, `findAllIn`, `findFirstMatchIn`, `findAllMatchIn`,
   `replaceAllIn`, `replaceFirstIn`, `matches`, `split` and `regex`; and
-  `Regex.Match` with `group`/`subgroups`/`matched`. A `Regex` also works in
+  `Regex.Match` with `group`/`subgroups`/`matched` — `group` by number or by the
+  NAME of a `(?<name>…)` group (`null` when it did not take part, Java's
+  `IllegalArgumentException: No group with name <x>` when the pattern declares
+  none). A `Regex` also works in
   PATTERN position via `unapplySeq` — `case r(a, b) => …`, which matches the
   WHOLE input (so `"a1"` does not match `"([0-9]+)".r`) and binds `null` for a
   group that did not participate. A replacement's `$N` splices are Java's,
   including its "longest group number that exists" rule and its
-  `IndexOutOfBoundsException` for a group the pattern does not have. The match
+  `IndexOutOfBoundsException` for a group the pattern does not have, and so are
+  its `${name}` splices (`IllegalArgumentException: No group with name {x}` for
+  an undeclared name). The match
   scan follows `java.util.regex.Matcher.find` rather than the Rust iterator: Java
   resumes AT the previous match's end (so an empty match is allowed there) and
   only steps forward a character after an empty match — which is what makes
@@ -805,14 +810,6 @@ reported as parse/compile errors, never silently mis-run.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
   namespace, and the many `String`/numeric methods beyond the wired subset
   above.
-- **Named regex groups.** `(?<name>…)` and `${name}` in a replacement are not
-  modeled; numbered groups (`$1`, `Match.group(1)`, `case r(a, b)`) are. Both
-  spellings now say so instead of answering something. `m.group("y")` went
-  through `to_int`, which reads a `String` as 0 — group 0, the whole match — so
-  `"(?<y>[0-9]{4})-(?<m>[0-9]{2})".r` on `2026-08` answered `2026-08` for BOTH
-  names where Scala answers `2026` and `08`; and `${d}` in a replacement was
-  copied through, so `"a1b2".replaceAll("(?<d>[0-9])", "<${d}>")` answered
-  `a<${d}>b<${d}>` against Java's `a<1>b<2>`.
 - **`getClass` on a collection, a tuple, a function or an `Array`.** Those
   runtime classes are private implementation details — `List(1).getClass.getName`
   is `scala.collection.immutable.$colon$colon`, a one-element `Vector` is

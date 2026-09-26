@@ -966,14 +966,10 @@ Next waves, in priority order:
    32-bit wrap analysis, `Double.toString` and the mixed `Int`/`Double`
    dispatch are all built on that — an arbitrary-precision operand needs a host
    value plus an arithmetic path that dispatches on it. See `BUGS.md`.
-3. **Named regex groups** — `(?<name>…)` and `${name}` in a replacement. Both
-   are refused rather than approximated: reading one by name used to answer the
-   whole match and `${name}` in a replacement used to be copied through
-   verbatim.
-4. **Overloading a block-level `def`** — a class member's overload resolves by
+3. **Overloading a block-level `def`** — a class member's overload resolves by
    argument count, but the flat `def` namespace has no such split, so two
    same-name `def`s in one block are refused.
-5. **`@main` beyond the plain parameter list** — a repeated parameter
+4. **`@main` beyond the plain parameter list** — a repeated parameter
    (`rest: String*`), and choosing between two `@main` methods the way
    `--main-class` does.
 

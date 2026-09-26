@@ -1201,6 +1201,9 @@ enum HeapVal {
     Match {
         matched: Arc<str>,
         groups: Vec<Option<Arc<str>>>,
+        /// The source of the pattern that produced the match, which is where a
+        /// named group's number is read from (`group("y")`).
+        pattern: Arc<str>,
     },
     /// A boxed `var` — one mutable slot shared by the frame that declared it and
     /// every closure that captured it (see [`CELL_NEW`]). Never user-visible: the
@@ -10059,7 +10062,11 @@ fn regex_matches(re: &fancy_regex::Regex, s: &str) -> Vec<(usize, usize)> {
 /// exists), `\x` is a literal `x`, and everything else is copied through. A
 /// reference to a group the pattern does not have throws, as Java's does; a
 /// group that exists but did not participate splices nothing.
-fn expand_replacement(repl: &str, caps: &fancy_regex::Captures) -> Result<String, String> {
+fn expand_replacement(
+    repl: &str,
+    re: &fancy_regex::Regex,
+    caps: &fancy_regex::Captures,
+) -> Result<String, String> {
     let mut out = String::new();
     let mut it = repl.chars().peekable();
     while let Some(c) = it.next() {
@@ -10091,17 +10098,20 @@ fn expand_replacement(repl: &str, caps: &fancy_regex::Captures) -> Result<String
                     out.push_str(g.as_str());
                 }
             }
-            // `${name}` — a named-group reference. Not modeled (`BUGS.md`), and
-            // copying it through emitted the six characters `${d}` where Java
-            // splices the group: `"a1b2".replaceAll("(?<d>[0-9])", "<${d}>")`
-            // answered `a<${d}>b<${d}>` against Java's `a<1>b<2>`. A silent
-            // wrong answer becomes the rejection the gap is documented as.
+            // `${name}` — a named-group reference. A group that exists but
+            // did not participate splices nothing; a name the pattern does not
+            // declare is Java's `IllegalArgumentException`, whose message
+            // spells the name in braces.
             '$' if it.peek() == Some(&'{') => {
                 let name: String = it.by_ref().skip(1).take_while(|&c| c != '}').collect();
-                return Err(format!(
-                    "scalars: a named regex group (`${{{name}}}` in a replacement) is not \
-                     modeled — use the group's number"
-                ));
+                if named_group_index(re, &name).is_none() {
+                    return Err(format!(
+                        "scalars: java.lang.IllegalArgumentException: No group with name {{{name}}}"
+                    ));
+                }
+                if let Some(g) = caps.name(&name) {
+                    out.push_str(g.as_str());
+                }
             }
             _ => out.push(c),
         }
@@ -10123,7 +10133,7 @@ fn regex_replace(s: &str, pat: &str, repl: &str, first_only: bool) -> Result<Val
             _ => continue,
         };
         out.push_str(&s[last..start]);
-        out.push_str(&expand_replacement(repl, &caps)?);
+        out.push_str(&expand_replacement(repl, &re, &caps)?);
         last = end;
         if first_only {
             break;
@@ -10161,6 +10171,11 @@ fn java_split(s: &str, pat: &str) -> Result<Vec<String>, String> {
     Ok(parts)
 }
 
+/// The group number of the named group `name` in `re`, if it declares one.
+fn named_group_index(re: &fancy_regex::Regex, name: &str) -> Option<usize> {
+    re.capture_names().position(|n| n == Some(name))
+}
+
 /// Build the `Regex.Match` handle for the match of `re` starting at `start`.
 fn make_match(re: &fancy_regex::Regex, s: &str, start: usize) -> Value {
     let Ok(Some(caps)) = re.captures_from_pos(s, start) else {
@@ -10170,7 +10185,12 @@ fn make_match(re: &fancy_regex::Regex, s: &str, start: usize) -> Value {
     let groups = (1..caps.len())
         .map(|i| caps.get(i).map(|g| Arc::from(g.as_str())))
         .collect();
-    heap_push(HeapVal::Match { matched, groups })
+    let pattern = Arc::from(re.as_str());
+    heap_push(HeapVal::Match {
+        matched,
+        groups,
+        pattern,
+    })
 }
 
 /// The `scala.util.matching.Regex` / `Regex.Match` surface, dispatched off a
@@ -10180,28 +10200,35 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
     let Value::Obj(id) = recv else { return None };
     let held = HEAP.with(|h| match h.borrow().get(*id as usize) {
         Some(HeapVal::Regex(p)) => Some(Ok(p.clone())),
-        Some(HeapVal::Match { matched, groups }) => Some(Err((matched.clone(), groups.clone()))),
+        Some(HeapVal::Match {
+            matched,
+            groups,
+            pattern,
+        }) => Some(Err((matched.clone(), groups.clone(), pattern.clone()))),
         _ => None,
     })?;
     let pat = match held {
         Ok(p) => p,
         // A `Match`: its groups are 1-based, and group 0 is the whole match.
-        Err((matched, groups)) => {
+        Err((matched, groups, pattern)) => {
             return Some(match (name, args.len()) {
                 ("matched" | "toString", 0) => Ok(Value::str(matched.to_string())),
                 ("groupCount", 0) => Ok(Value::int(groups.len() as i64)),
                 ("group", 1) => {
-                    // `m.group("name")`. Named groups are not modeled (`BUGS.md`),
-                    // and `to_int` on a `String` is 0 — which is group 0, the
-                    // whole match. `"(?<y>[0-9]{4})-(?<m>[0-9]{2})".r` on
-                    // `2026-08` therefore answered `2026-08` for BOTH
-                    // `group("y")` and `group("m")` instead of `2026` and `08`.
-                    // An honest rejection is what the documented gap says.
+                    // `m.group("name")` — a Java named group, numbered by its
+                    // opening parenthesis like any other. A name the pattern
+                    // does not declare is Java's `IllegalArgumentException`.
                     if let Value::Str(g) = &args[0] {
-                        return Some(Err(format!(
-                            "scalars: a named regex group (`group(\"{g}\")`) is not modeled — \
-                             use the group's number"
-                        )));
+                        let index = regex_compile(&pattern)
+                            .ok()
+                            .and_then(|re| named_group_index(&re, g));
+                        return Some(match index.and_then(|i| groups.get(i.wrapping_sub(1))) {
+                            Some(Some(text)) => Ok(Value::str(text.to_string())),
+                            Some(None) => Ok(Value::Undef),
+                            None => Err(format!(
+                                "scalars: java.lang.IllegalArgumentException: No group with name <{g}>"
+                            )),
+                        });
                     }
                     let i = args[0].to_int();
                     if i == 0 {
