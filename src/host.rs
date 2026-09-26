@@ -12490,6 +12490,12 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         // operand is non-numeric, so a numeric `a` here implies a non-numeric `b`.)
         NumOp::Add => match a {
             Value::Str(_) => Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b)))),
+            // A `null` LEFT operand at run time is a `String`-typed value that
+            // holds `null`: every other reference type has no `+` and does not
+            // compile, and a literal `null + …` is refused by the compiler. So
+            // it is `String.+`, which concatenates the text `null` — `s + "y"`
+            // with `s: String = null` is `nully`, `s + 1` is `null1`.
+            Value::Undef => Ok(Value::str(format!("null{}", scala_str(b)))),
             Value::Int(_) | Value::Float(_) if matches!(b, Value::Str(_)) => {
                 Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b))))
             }

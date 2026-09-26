@@ -5994,6 +5994,19 @@ impl Compiler {
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        // A literal `null` has type `Null`, which has no `+`: Scala 3 rejects
+        // `null + "a"` at compile time. (A `String` VALUE holding null does
+        // concatenate, which the runtime `+` answers — only the literal is
+        // statically known to be `Null`.)
+        if op == BinOp::Add && matches!(lhs, Expr::Null) {
+            let shown = match rhs {
+                Expr::Str(s) => s.clone(),
+                _ => "…".to_string(),
+            };
+            return Err(format!(
+                "scalars: `+` is not defined between `null` and `{shown}`"
+            ));
+        }
         // `&&` / `||` short-circuit: keep the deciding operand as the result.
         match op {
             BinOp::And => {

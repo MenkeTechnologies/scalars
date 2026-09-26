@@ -5681,3 +5681,14 @@ object M extends App {
         "3-x\nplain\n 3.14|ab  |ff\nP(1) and List(1, 2)\nn=7\nno newline\n"
     );
 }
+
+#[test]
+fn a_string_value_holding_null_concatenates() {
+    // `String.+` on a `String` that is `null` concatenates the text `null`
+    // (reference: `nully`, `null1`, `nullnull`); only the LITERAL `null`, whose
+    // type `Null` has no `+`, is refused (`boolean_or_null_plus_string_is_rejected`).
+    let (out, _) = run(&wrap(
+        r#"val s: String = null; println(s + "y"); println(s + 1); println(s + null); println(s"a${s}b")"#,
+    ));
+    assert_eq!(out, "nully\nnull1\nnullnull\nanullb\n");
+}
