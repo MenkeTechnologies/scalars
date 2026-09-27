@@ -856,6 +856,8 @@ fn opens_region(kind: &Tok, head: Option<&Tok>) -> bool {
         | Tok::Finally
         | Tok::Else
         | Tok::For => true,
+        // `given Sh[Int] with` and the instance's members on the deeper lines.
+        Tok::Ident(w) if w == "with" => matches!(head, Some(Tok::Ident(h)) if h == "given"),
         Tok::Ident(w) => matches!(w.as_str(), "then" | "do" | "yield"),
         Tok::Colon => match head {
             Some(Tok::Object | Tok::Case) => true,

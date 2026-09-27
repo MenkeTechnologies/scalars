@@ -44,7 +44,8 @@ reported as parse/compile errors, never silently mis-run.
   indentation region into the `{ … }` block the parser already reads. A region
   opens after a token that ends its line — `=`, `=>`, `match`, `try`, `catch`,
   `finally`, `else`, `for`, `then`, `do`, `yield`, the `:` of an
-  `object`/`class`/`trait`/`enum` header, and the `)` closing an
+  `object`/`class`/`trait`/`enum` header, the `with` ending a `given` header,
+  and the `)` closing an
   `extension (x: T)` receiver — when the next line is indented deeper and does
   not start with `{`; it closes before the first shallower line, when the
   bracket around it closes, and at end of file. No region opens inside `( )` or
@@ -695,8 +696,8 @@ reported as parse/compile errors, never silently mis-run.
   enums with a case of the same name are a redeclaration.
 - **What the optional-braces pass does not cover.** A `:` at the end of a line
   with no lambda parameters (`xs.foreach:` followed by an indented block
-  argument) is not an argument, and a `given … with` body and an indentation
-  region inside `( )` are not regions. A singleton object's `lazy val` initializes with the object, which
+  argument) is not an argument, and an indentation region inside `( )` is not a
+  region. A singleton object's `lazy val` initializes with the object, which
   is eager here (see *Singleton `object` `val`s initialize eagerly* below).
 - **Widening stops at one collection layer.** A declared `Double` converts a
   value and the elements of a `List`/`Vector`, but not a `Map`'s values, an

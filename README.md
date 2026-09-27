@@ -69,7 +69,8 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   stays on the JIT fast path.
 - **Scala 3 optional braces** — indentation regions after `=`, `=>`, `match`,
   `try`/`catch`/`finally`, `else`, `for`, `then`/`do`/`yield`, a template's `:`
-  (`object Main:`) and an `extension (x: T)` header become the blocks they
+  (`object Main:`), the `with` of a `given Sh[Int] with` header and an
+  `extension (x: T)` header become the blocks they
   stand for; `end` markers are accepted. The quiet control syntax parses too:
   `if c then … else …`, `while c do …`, `for x <- xs do …` / `yield`, the inline
   `catch case e: E => …`, and the fewer-braces argument `xs.foreach: x =>`.

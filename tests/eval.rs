@@ -6031,3 +6031,37 @@ fn an_enum_with_constructor_parameters_is_refused() {
         "an `enum` with constructor parameters",
     );
 }
+
+#[test]
+fn a_given_with_body_on_the_indented_lines() {
+    // `given Sh[Int] with` followed by an indented body is an indentation
+    // region like a template's `:`; it used to need braces
+    // (reference output, Scala 3.9.0).
+    let src = r#"
+trait Show[A]:
+  def show(a: A): String
+  def twice(a: A): String = show(a) + show(a)
+
+given Show[Int] with
+  def show(a: Int): String = "i" + a
+
+given strShow: Show[String] with
+  def show(a: String): String =
+    val t = a.trim
+    "s" + t
+  override def twice(a: String): String = "T" + show(a)
+
+def display[A](a: A)(using s: Show[A]): String = s.show(a)
+def both[A](a: A)(using s: Show[A]): String = s.twice(a)
+
+@main def run(): Unit =
+  println(display(3))
+  println(display(" x "))
+  println(both(4))
+  println(both("y"))
+  println(summon[Show[Int]].show(9))
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "i3\nsx\ni4i4\nTsy\ni9\n");
+}
