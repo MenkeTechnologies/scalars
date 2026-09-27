@@ -62,10 +62,21 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   both operands are `Int` (`7 / 2 == 3`) and floats when either is a `Double`
   (`7 / 2.0 == 3.5`), because fusevm's native divide is always floating.
 - **Scala 3 `+` rules** — a strict numeric hook supplies `String` concatenation
-  (`"x=" + x`, `1 + "a"`) for the mixed operands the VM's native arithmetic does
-  not compute, while rejecting `Boolean`/`null` `+ String` exactly as Scala 3
+  (`"x=" + x`, `1 + "a"`, and a `String` holding `null`: `s + "y"` is `nully`)
+  for the mixed operands the VM's native arithmetic does not compute, while
+  rejecting `Boolean + String` and a literal `null + String` exactly as Scala 3
   does (the universal `any2stringadd` was removed); most numeric arithmetic
   stays on the JIT fast path.
+- **Scala 3 optional braces** — indentation regions after `=`, `=>`, `match`,
+  `try`/`catch`/`finally`, `else`, `for`, `then`/`do`/`yield`, a template's `:`
+  (`object Main:`) and an `extension (x: T)` header become the blocks they
+  stand for; `end` markers are accepted. The quiet control syntax parses too:
+  `if c then … else …`, `while c do …`, `for x <- xs do …` / `yield`, the inline
+  `catch case e: E => …`, and the fewer-braces argument `xs.foreach: x =>`.
+- **Numeric widening to a declared `Double`** — an `Int`/`Long` becomes a
+  `Double` wherever the declared type says so: a parameter (`def sq(n: Double)`
+  called `sq(3)` is `9.0`), a `val`/`var`, a `def`'s result, a typed lambda
+  parameter, and an ascription.
 - **Widening past 2^53** — a mixed `Int`/`Double` pair whose integer an `f64`
   cannot hold exactly (`16677181699666569L`) is handed to the same hook rather
   than computed on the rounded value. Scala's answer is the *promoted* one — its
@@ -131,7 +142,9 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   after first argument: …` on *stdout*, status 0). Top-level `def`s and `val`s
   are the members of the synthetic `Foo$package` object, and a top-level `val`'s
   initializer runs before the entry body and before the command line is read.
-  `def main(args: Array[String])`'s `args` is the real argument vector.
+  `def main(args: Array[String])`'s `args` is the real argument vector, and
+  that object's `val`/`var`s (and its member classes and objects) initialize
+  before `main` runs.
 - **Verified against Scala** — the examples and test corpus are diffed
   byte-for-byte against a reference `scala` and frozen (CI needs no Scala
   toolchain), and a `parity-fuzz` binary differentially fuzzes this frontend
@@ -512,7 +525,7 @@ Implemented and checked against the reference `scala`:
   what makes `"xx9".split("x*")` answer `["", "", "9"]` and `"abc".split("")`
   answer `["a", "b", "c"]`.
 - **Control flow** — `if` / `else if` / `else` (statement *and* expression
-  position), `while`, and `for` comprehensions over both integer ranges
+  position, and Scala 3's `if … then`), `while` (and `while … do`), and `for` comprehensions over both integer ranges
   (`for (i <- a until b) …`, `for (i <- a to b) yield …` collecting a `Vector`)
   and collections (`for (x <- List(1,2,3)) yield x*2`, desugared to
   `.map`/`.flatMap`/`.withFilter`), with multiple generators, `if` guards, both

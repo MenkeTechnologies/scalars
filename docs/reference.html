@@ -82,7 +82,7 @@ println(n)   // =&gt; 5</code></pre>
         </article>
         <article class="doc-entry" id="doc-keywords-5">
           <h3><a class="doc-anchor" href="#doc-keywords-5">#</a> <code>if</code></h3>
-          <p>Conditional branch, and an expression: its value is the taken branch's. With no `else` the missing branch is Unit.</p>
+          <p>Conditional branch, and an expression: its value is the taken branch's. With no `else` the missing branch is Unit. Scala 3's `if cond then expr` form needs no parentheses.</p>
           <pre><code class="lang-scala">if (cond) expr [else expr]
 println(if (1 &lt; 2) "yes" else "no")   // =&gt; yes</code></pre>
         </article>
@@ -94,92 +94,116 @@ println(if (false) 1 else 2)   // =&gt; 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-keywords-7">
           <h3><a class="doc-anchor" href="#doc-keywords-7">#</a> <code>while</code></h3>
-          <p>Loop while the condition holds. A `while` is a statement — its value is Unit, so it is not usable as an operand.</p>
+          <p>Loop while the condition holds. A `while` is a statement — its value is Unit, so it is not usable as an operand. Scala 3's `while cond do body` form needs no parentheses.</p>
           <pre><code class="lang-scala">while (cond) { … }
 var i = 0
 while (i &lt; 3) { i += 1 }
 println(i)   // =&gt; 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-keywords-8">
-          <h3><a class="doc-anchor" href="#doc-keywords-8">#</a> <code>for</code></h3>
-          <p>Comprehension over a range or a collection, with optional `if` guards. Without `yield` the body runs for effect; with `yield` its results are collected. A counted integer range compiles to a dedicated loop rather than a materialized collection.</p>
+          <h3><a class="doc-anchor" href="#doc-keywords-8">#</a> <code>then</code></h3>
+          <p>Scala 3's end of an `if` condition: `if cond then a else b` takes the condition without parentheses. A `then` ending its line opens an indented block.</p>
+          <pre><code class="lang-scala">if cond then expr [else expr]
+val n = 5
+println(if n &gt; 3 then "big" else "small")   // =&gt; big</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-9">
+          <h3><a class="doc-anchor" href="#doc-keywords-9">#</a> <code>do</code></h3>
+          <p>Scala 3's end of a `while` condition or a bracket-less `for` enumerator list: `while cond do body`, `for x &lt;- xs do body`.</p>
+          <pre><code class="lang-scala">while cond do body
+var i = 0
+while i &lt; 3 do i += 1
+println(i)   // =&gt; 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-10">
+          <h3><a class="doc-anchor" href="#doc-keywords-10">#</a> <code>end</code></h3>
+          <p>A Scala 3 end marker (`end match`, `end run`, `end if`) on its own line. It documents where an indentation region ends; the outdent is what closes it.</p>
+          <pre><code class="lang-scala">end name
+def f(x: Int): Int =
+  x + 1
+end f
+println(f(1))   // =&gt; 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keywords-11">
+          <h3><a class="doc-anchor" href="#doc-keywords-11">#</a> <code>for</code></h3>
+          <p>Comprehension over a range or a collection, with optional `if` guards; the enumerators may be bracketed or, in Scala 3, bare up to `do`/`yield`. Without `yield` the body runs for effect; with `yield` its results are collected. A counted integer range compiles to a dedicated loop rather than a materialized collection.</p>
           <pre><code class="lang-scala">for (x &lt;- gen [if guard]) [yield] body
 for (i &lt;- 1 to 3 if i &gt; 1) print(i)   // =&gt; 23</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-9">
-          <h3><a class="doc-anchor" href="#doc-keywords-9">#</a> <code>extends</code></h3>
+        <article class="doc-entry" id="doc-keywords-12">
+          <h3><a class="doc-anchor" href="#doc-keywords-12">#</a> <code>extends</code></h3>
           <p>Name a supertype: its fields and concrete methods are inherited and its constructor receives the `extends P(args)` arguments. `extends App` instead makes the object body the program entry point.</p>
           <pre><code class="lang-scala">class C(…) extends P(args) [with T …]
 class A(val n: Int)
 class B(m: Int) extends A(m)
 println(new B(2).n)   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-10">
-          <h3><a class="doc-anchor" href="#doc-keywords-10">#</a> <code>new</code></h3>
+        <article class="doc-entry" id="doc-keywords-13">
+          <h3><a class="doc-anchor" href="#doc-keywords-13">#</a> <code>new</code></h3>
           <p>Construct an instance of a user `class`, of a built-in throwable, or of a mutable collection (`new ListBuffer[Int]()`). `new Array[T](n)` is the one form whose type argument is load-bearing — it picks the zero value the array is filled with.</p>
           <pre><code class="lang-scala">new Class(args)
 class P(val n: Int)
 println(new P(2).n)   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-11">
-          <h3><a class="doc-anchor" href="#doc-keywords-11">#</a> <code>return</code></h3>
+        <article class="doc-entry" id="doc-keywords-14">
+          <h3><a class="doc-anchor" href="#doc-keywords-14">#</a> <code>return</code></h3>
           <p>Early return from a `def`, exiting before the body's last expression. Only valid inside a method body.</p>
           <pre><code class="lang-scala">return expr
 def f(x: Int): Int = { if (x &lt; 0) return 0; x * 2 }
 println(f(-1))   // =&gt; 0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-12">
-          <h3><a class="doc-anchor" href="#doc-keywords-12">#</a> <code>match</code></h3>
+        <article class="doc-entry" id="doc-keywords-15">
+          <h3><a class="doc-anchor" href="#doc-keywords-15">#</a> <code>match</code></h3>
           <p>Match a scrutinee against `case` arms in order; the first arm whose pattern matches (and whose guard holds) supplies the value. No arm matching raises `scala.MatchError`. `match` binds looser than every operator, so it wraps the whole preceding expression.</p>
           <pre><code class="lang-scala">expr match { case pat [if guard] =&gt; expr; … }
 println(2 match { case 1 =&gt; "one"; case n =&gt; "n=" + n })   // =&gt; n=2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-13">
-          <h3><a class="doc-anchor" href="#doc-keywords-13">#</a> <code>case</code></h3>
+        <article class="doc-entry" id="doc-keywords-16">
+          <h3><a class="doc-anchor" href="#doc-keywords-16">#</a> <code>case</code></h3>
           <p>Introduce a `match` arm, a `catch` handler, a `{ case … }` function literal, or — before `class`/`object` — a case declaration with derived `toString`, `equals`, `hashCode`, `copy` and `unapply`.</p>
           <pre><code class="lang-scala">case pat [if guard] =&gt; expr
 case class P(x: Int)
 println(P(1))   // =&gt; P(1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-14">
-          <h3><a class="doc-anchor" href="#doc-keywords-14">#</a> <code>try</code></h3>
+        <article class="doc-entry" id="doc-keywords-17">
+          <h3><a class="doc-anchor" href="#doc-keywords-17">#</a> <code>try</code></h3>
           <p>Run a body with handlers. Its value is the body's, or the matching handler's. `try`/`catch`/`finally` lower to the `EXC_*` builtin family rather than to native unwinding.</p>
           <pre><code class="lang-scala">try { … } [catch { case … }] [finally { … }]
 println(try { 1 / 0 } catch { case _: ArithmeticException =&gt; -1 })   // =&gt; -1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-15">
-          <h3><a class="doc-anchor" href="#doc-keywords-15">#</a> <code>catch</code></h3>
+        <article class="doc-entry" id="doc-keywords-18">
+          <h3><a class="doc-anchor" href="#doc-keywords-18">#</a> <code>catch</code></h3>
           <p>The handler block of a `try`. Arms are patterns — `case e: T`, `case e`, or an extractor such as `case NonFatal(e)`, with an optional guard — and a typed arm walks the modelled JVM throwable hierarchy, which a user class extending a throwable joins. An arm that rejects the exception leaves it in flight for the next.</p>
           <pre><code class="lang-scala">catch { case e: T [if guard] =&gt; expr; … }
 try { "z".toInt } catch { case e: NumberFormatException =&gt; println(e.getMessage) }   // =&gt; For input string: "z"</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-16">
-          <h3><a class="doc-anchor" href="#doc-keywords-16">#</a> <code>finally</code></h3>
+        <article class="doc-entry" id="doc-keywords-19">
+          <h3><a class="doc-anchor" href="#doc-keywords-19">#</a> <code>finally</code></h3>
           <p>A block that runs on both the normal and the exceptional exit of a `try`, before an unhandled exception continues unwinding. Its own value is discarded.</p>
           <pre><code class="lang-scala">try { … } finally { … }
 try { println(1) } finally { println("done") }   // =&gt; 1 then done</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-17">
-          <h3><a class="doc-anchor" href="#doc-keywords-17">#</a> <code>throw</code></h3>
+        <article class="doc-entry" id="doc-keywords-20">
+          <h3><a class="doc-anchor" href="#doc-keywords-20">#</a> <code>throw</code></h3>
           <p>Raise an exception. It is an expression of type `Nothing`, so it may stand in operand position — the right of an `else`, the body of a `case` arm.</p>
           <pre><code class="lang-scala">throw expr
 def pick(b: Boolean): Int = if (b) 7 else throw new RuntimeException("no")
 println(pick(true))   // =&gt; 7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-18">
-          <h3><a class="doc-anchor" href="#doc-keywords-18">#</a> <code>true</code></h3>
+        <article class="doc-entry" id="doc-keywords-21">
+          <h3><a class="doc-anchor" href="#doc-keywords-21">#</a> <code>true</code></h3>
           <p>The Boolean true literal.</p>
           <pre><code class="lang-scala">true
 println(true &amp;&amp; false)   // =&gt; false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-19">
-          <h3><a class="doc-anchor" href="#doc-keywords-19">#</a> <code>false</code></h3>
+        <article class="doc-entry" id="doc-keywords-22">
+          <h3><a class="doc-anchor" href="#doc-keywords-22">#</a> <code>false</code></h3>
           <p>The Boolean false literal.</p>
           <pre><code class="lang-scala">false
 println(false || true)   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keywords-20">
-          <h3><a class="doc-anchor" href="#doc-keywords-20">#</a> <code>null</code></h3>
+        <article class="doc-entry" id="doc-keywords-23">
+          <h3><a class="doc-anchor" href="#doc-keywords-23">#</a> <code>null</code></h3>
           <p>The null reference literal. It prints as `null`, and it is what a no-argument throwable's `getMessage` answers.</p>
           <pre><code class="lang-scala">null
 val x = null
@@ -319,7 +343,7 @@ object T extends App { println("hi") }   // =&gt; hi</code></pre>
         </article>
         <article class="doc-entry" id="doc-declarations-and-modifiers-19">
           <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-19">#</a> <code>main</code></h3>
-          <p>The entry method scalars looks for when no object `extends App`. Its parameter list is accepted but not populated — command-line arguments are not passed through.</p>
+          <p>The entry method scalars looks for when no object `extends App`. Its parameter is bound to the command-line arguments, and the object's `val`s and member types are initialized before it runs.</p>
           <pre><code class="lang-scala">def main(args: Array[String]): Unit = { … }
 object T { def main(args: Array[String]): Unit = { println(0) } }   // =&gt; 0</code></pre>
         </article>

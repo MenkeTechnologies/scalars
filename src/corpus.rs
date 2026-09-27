@@ -69,7 +69,7 @@ pub const CORPUS: &[Entry] = &[
     (
         "if",
         "Keywords",
-        "Conditional branch, and an expression: its value is the taken branch's. With no `else` the missing branch is Unit.",
+        "Conditional branch, and an expression: its value is the taken branch's. With no `else` the missing branch is Unit. Scala 3's `if cond then expr` form needs no parentheses.",
         "if (cond) expr [else expr]\nprintln(if (1 < 2) \"yes\" else \"no\")   // => yes",
     ),
     (
@@ -81,13 +81,31 @@ pub const CORPUS: &[Entry] = &[
     (
         "while",
         "Keywords",
-        "Loop while the condition holds. A `while` is a statement — its value is Unit, so it is not usable as an operand.",
+        "Loop while the condition holds. A `while` is a statement — its value is Unit, so it is not usable as an operand. Scala 3's `while cond do body` form needs no parentheses.",
         "while (cond) { … }\nvar i = 0\nwhile (i < 3) { i += 1 }\nprintln(i)   // => 3",
+    ),
+    (
+        "then",
+        "Keywords",
+        "Scala 3's end of an `if` condition: `if cond then a else b` takes the condition without parentheses. A `then` ending its line opens an indented block.",
+        "if cond then expr [else expr]\nval n = 5\nprintln(if n > 3 then \"big\" else \"small\")   // => big",
+    ),
+    (
+        "do",
+        "Keywords",
+        "Scala 3's end of a `while` condition or a bracket-less `for` enumerator list: `while cond do body`, `for x <- xs do body`.",
+        "while cond do body\nvar i = 0\nwhile i < 3 do i += 1\nprintln(i)   // => 3",
+    ),
+    (
+        "end",
+        "Keywords",
+        "A Scala 3 end marker (`end match`, `end run`, `end if`) on its own line. It documents where an indentation region ends; the outdent is what closes it.",
+        "end name\ndef f(x: Int): Int =\n  x + 1\nend f\nprintln(f(1))   // => 2",
     ),
     (
         "for",
         "Keywords",
-        "Comprehension over a range or a collection, with optional `if` guards. Without `yield` the body runs for effect; with `yield` its results are collected. A counted integer range compiles to a dedicated loop rather than a materialized collection.",
+        "Comprehension over a range or a collection, with optional `if` guards; the enumerators may be bracketed or, in Scala 3, bare up to `do`/`yield`. Without `yield` the body runs for effect; with `yield` its results are collected. A counted integer range compiles to a dedicated loop rather than a materialized collection.",
         "for (x <- gen [if guard]) [yield] body\nfor (i <- 1 to 3 if i > 1) print(i)   // => 23",
     ),
     (
@@ -274,7 +292,7 @@ pub const CORPUS: &[Entry] = &[
     (
         "main",
         "Declarations and Modifiers",
-        "The entry method scalars looks for when no object `extends App`. Its parameter list is accepted but not populated — command-line arguments are not passed through.",
+        "The entry method scalars looks for when no object `extends App`. Its parameter is bound to the command-line arguments, and the object's `val`s and member types are initialized before it runs.",
         "def main(args: Array[String]): Unit = { … }\nobject T { def main(args: Array[String]): Unit = { println(0) } }   // => 0",
     ),
     // ══ Comprehensions and Ranges ══════════════════════════════════════════

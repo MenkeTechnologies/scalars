@@ -40,6 +40,38 @@ reported as parse/compile errors, never silently mis-run.
   that is what the reference does — the `DelayedInit` body runs during the
   object's `<clinit>`, ahead of the field, so `args.length` there raises
   `NullPointerException` on both sides.
+- **Scala 3 optional braces.** A pass over the token stream turns each
+  indentation region into the `{ … }` block the parser already reads. A region
+  opens after a token that ends its line — `=`, `=>`, `match`, `try`, `catch`,
+  `finally`, `else`, `for`, `then`, `do`, `yield`, the `:` of an
+  `object`/`class`/`trait`/`enum` header, and the `)` closing an
+  `extension (x: T)` receiver — when the next line is indented deeper and does
+  not start with `{`; it closes before the first shallower line, when the
+  bracket around it closes, and at end of file. No region opens inside `( )` or
+  `[ ]`. `end` markers (`end match`, `end run`) are dropped, the outdent having
+  already closed the region. On top of that the parser takes the quiet control
+  syntax — `if c then … else …`, `while c do …`, `for x <- xs do …` /
+  `yield …` (also with a tuple pattern, `for (k, v) <- m do`), a multi-line
+  bracket-less enumerator block, and the inline `catch case e: E => …` — and the
+  fewer-braces argument `f: x =>` / `f: (a, b) =>` with the lambda body on the
+  deeper lines. Before this, the body of a brace-less `def` ran its FIRST
+  statement and silently dropped the rest.
+- **Widening to a declared `Double`.** An `Int`/`Long` value becomes a `Double`
+  wherever the declared type is `Double` (or a `List[Double]`/`Vector[Double]`,
+  element-wise): a parameter (`def sq(n: Double)` called `sq(3)` is `9.0`), a
+  `val`/`var` and an assignment to one, a `def`'s result on every return path
+  (`def f(): Double = 3` is `3.0`), a lambda parameter declared `Double` or
+  `Float`, and an ascription, including one on a lambda body
+  (`xs.map(x => x: Double)`).
+- **A `def main` object's members.** Its `val`/`var`s are the object's fields and
+  initialize in declaration order before `main` runs (a forward reference reads
+  the field default, a `lazy val` waits for its first read), and a `class`,
+  `trait` or `object` declared inside it joins the type namespace. Both were
+  dropped: every read of such a `val` answered `null`, and such a type was `not
+  found`.
+- **A `String` holding `null` concatenates.** `s + "y"` with
+  `s: String = null` is `nully` (`String.+`); only the literal `null + …`, whose
+  type `Null` has no `+`, is refused.
 - **`apply` — `receiver(args)` — wherever Scala writes it.** The receiver may be
   a `List`/`Array`/`Vector` (indexing), a `Map` (lookup), a `String` (`s(i)`, i.e.
   `charAt`), or a function value; it may be a literal (`"pear"(1)`), a top-level
@@ -657,6 +689,21 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
+- **`enum`.** Neither the simple `enum Color { case Red, Green }` nor the ADT
+  form (`case Circle(r: Double)`) parses: `expected a top-level object/class
+  declaration, found Ident("Red")`. The sealed-trait-and-case-class spelling of
+  the same ADT works.
+- **What the optional-braces pass does not cover.** A `:` at the end of a line
+  with no lambda parameters (`xs.foreach:` followed by an indented block
+  argument) is not an argument, and a `given … with` body and an indentation
+  region inside `( )` are not regions. A singleton object's `lazy val` initializes with the object, which
+  is eager here (see *Singleton `object` `val`s initialize eagerly* below).
+- **Widening stops at one collection layer.** A declared `Double` converts a
+  value and the elements of a `List`/`Vector`, but not a `Map`'s values, an
+  `Option`'s content or a tuple's slot: `val m: Map[String, Double] =
+  Map("a" -> 1)` prints `Map(a -> 1)` where Scala prints `Map(a -> 1.0)`. A
+  `Char` does not widen to `Double` either (`val c: Double = 'a'` is `a`, not
+  `97.0`).
 - **A wildcard `import` binds only the members this frontend actually provides
   for that package.** `import scala.math._` binds `sqrt`, `Pi` and the rest of
   `scala.math`; `import scala.collection.mutable._` binds the collection
