@@ -6065,3 +6065,43 @@ def both[A](a: A)(using s: Show[A]): String = s.twice(a)
     assert!(ok);
     assert_eq!(out, "i3\nsx\ni4i4\nTsy\ni9\n");
 }
+
+#[test]
+fn a_colon_ending_its_line_passes_the_indented_block() {
+    // Scala 3's fewer-braces block argument: `f:` with the argument on the
+    // deeper lines is `f { … }` — a block, a lambda, a placeholder function or
+    // a `{ case … }` (reference output, Scala 3.9.0).
+    let src = r#"
+def twice(f: => Unit): Unit = { f; f }
+def wrap(tag: String)(body: => String): String = s"<$tag>$body</$tag>"
+
+@main def run(): Unit =
+  List(1, 2).foreach:
+    x =>
+      println(x * 10)
+  val ys = List(1, 2, 3).map:
+    _ + 1
+  println(ys)
+  twice:
+    print("t")
+    println("!")
+  val w = wrap("b"):
+    "bo" + "ld"
+  println(w)
+  val total = List(1, 2, 3).foldLeft(0):
+    (acc, x) => acc + x
+  println(total)
+  val r = List(3, 1, 2).sortBy:
+    x => -x
+  println(r)
+  val m = Map(1 -> "a").map:
+    case (k, v) => (v, k)
+  println(m)
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "10\n20\nList(2, 3, 4)\nt!\nt!\n<b>bold</b>\n6\nList(3, 2, 1)\nMap(a -> 1)\n"
+    );
+}

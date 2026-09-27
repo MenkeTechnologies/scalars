@@ -55,7 +55,8 @@ reported as parse/compile errors, never silently mis-run.
   `yield …` (also with a tuple pattern, `for (k, v) <- m do`), a multi-line
   bracket-less enumerator block, and the inline `catch case e: E => …` — and the
   fewer-braces argument `f: x =>` / `f: (a, b) =>` with the lambda body on the
-  deeper lines. Before this, the body of a brace-less `def` ran its FIRST
+  deeper lines, or `f:` ending its line with the whole argument (a block, a
+  lambda, `_ + 1`, `case …` arms) on the deeper lines. Before this, the body of a brace-less `def` ran its FIRST
   statement and silently dropped the rest.
 - **Widening to a declared `Double`.** An `Int`/`Long` value becomes a `Double`
   wherever the declared type is `Double` (or a `List[Double]`/`Vector[Double]`,
@@ -694,10 +695,9 @@ reported as parse/compile errors, never silently mis-run.
   case `extends Planet(5.97)` are refused with a diagnostic; a `val` in an
   enum body is refused too. The cases share the one flat type namespace, so two
   enums with a case of the same name are a redeclaration.
-- **What the optional-braces pass does not cover.** A `:` at the end of a line
-  with no lambda parameters (`xs.foreach:` followed by an indented block
-  argument) is not an argument, and an indentation region inside `( )` is not a
-  region. A singleton object's `lazy val` initializes with the object, which
+- **What the optional-braces pass does not cover.** An indentation region
+  inside `( )` is not a region, so a fewer-braces argument written inside an
+  argument list (`println(wrap("b"):` with the block below) does not parse. A singleton object's `lazy val` initializes with the object, which
   is eager here (see *Singleton `object` `val`s initialize eagerly* below).
 - **Widening stops at one collection layer.** A declared `Double` converts a
   value and the elements of a `List`/`Vector`, but not a `Map`'s values, an

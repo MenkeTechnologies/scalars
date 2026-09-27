@@ -754,6 +754,25 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
             stack.push(Open::ColonArg);
             continue;
         }
+        // The fewer-braces BLOCK argument: `f:` ending its line, with the
+        // argument on the deeper lines below, is the brace argument `f { … }`,
+        // which the parser already reads as a block, a lambda (`xs.map { x =>`),
+        // a placeholder function (`xs.map { _ + 1 }`) or a `{ case … }`. A
+        // template header's `:` is a region of its own and is left to
+        // `opens_region`.
+        if tok.kind == Tok::Colon
+            && !case_on_line
+            && !matches!(stack.last(), Some(Open::Paren))
+            && i > 0
+            && toks[i - 1].kind.can_end()
+            && !opens_region(&tok.kind, line_head.as_ref())
+        {
+            if let Some(ind) = colon_block_ahead(&toks, starts, i, line_indent) {
+                out.push(brace(Tok::LBrace, tok.line));
+                stack.push(Open::Region(ind));
+                continue;
+            }
+        }
         out.push(tok.clone());
         match tok.kind {
             Tok::LParen | Tok::LBracket => stack.push(Open::Paren),
@@ -780,6 +799,22 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
         }
     }
     out
+}
+
+/// The indentation of a fewer-braces block argument's first line, when the `:`
+/// at `colon` ends its line and the next line is indented deeper than `indent`
+/// and does not open a brace of its own.
+fn colon_block_ahead(
+    toks: &[Token],
+    starts: &[Option<u32>],
+    colon: usize,
+    indent: u32,
+) -> Option<u32> {
+    // The next real token has to START a line (`starts` is `None` for one that
+    // continues the colon's line); the lexer infers no separator after a `:`.
+    let next = (colon + 1..toks.len()).find(|&k| toks[k].kind != Tok::Newline)?;
+    let ind = starts[next]?;
+    (ind > indent && !matches!(toks[next].kind, Tok::LBrace | Tok::Eof)).then_some(ind)
 }
 
 /// Whether the `:` at `colon` introduces a fewer-braces lambda argument: it is

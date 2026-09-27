@@ -73,7 +73,8 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   `extension (x: T)` header become the blocks they
   stand for; `end` markers are accepted. The quiet control syntax parses too:
   `if c then … else …`, `while c do …`, `for x <- xs do …` / `yield`, the inline
-  `catch case e: E => …`, and the fewer-braces argument `xs.foreach: x =>`.
+  `catch case e: E => …`, and the fewer-braces argument — `xs.foreach: x =>`,
+  or `xs.map:` ending its line with the argument indented below.
 - **Numeric widening to a declared `Double`** — an `Int`/`Long` becomes a
   `Double` wherever the declared type says so: a parameter (`def sq(n: Double)`
   called `sq(3)` is `9.0`), a `val`/`var`, a `def`'s result, a typed lambda
