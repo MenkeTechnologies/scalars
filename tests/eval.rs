@@ -5896,3 +5896,29 @@ object Main {
     assert!(ok);
     assert_eq!(out, "P(1,x)\nA\n8\n3\na\n");
 }
+
+#[test]
+fn this_and_bare_to_string_in_a_singletons_methods() {
+    // A trait method inherited into a `case object` read `this` as an unbound
+    // name (`null`), and a bare `toString` in any class or object body did the
+    // same (reference output, Scala 3.9.0).
+    let src = r#"
+sealed trait C {
+  def lab: String = "c-" + toString
+  def isR: Boolean = this == R
+  def me: C = this
+}
+case object R extends C
+case class K(x: Int) extends C { def self: String = "k:" + toString }
+object O { def me = this; override def toString = "OO"; def t = toString }
+object Main {
+  def main(args: Array[String]): Unit = {
+    val c: C = R
+    println(List(R.lab, K(1).lab, R.isR, K(1).isR, c.me, K(2).self, O.me, O.t).mkString(" "))
+  }
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "c-R c-K(1) true false R k:K(2) OO OO\n");
+}

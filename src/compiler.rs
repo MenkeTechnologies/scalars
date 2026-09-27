@@ -2726,6 +2726,23 @@ impl Compiler {
                     return Ok(());
                 }
             }
+            // `this` in a singleton's method is the singleton. An object method
+            // has no receiver slot — it is dispatched statically — so without
+            // this a trait method inherited into a `case object` read `this` as
+            // an unbound name: `def me = this` answered `null`, and `this == Red`
+            // was false on `Red` itself.
+            if name == "this" {
+                return self.materialize_object(&obj);
+            }
+        }
+        // A bare `toString` / `hashCode` inside a class or object body is the
+        // receiver's own — `this.toString` — which Scala resolves as an
+        // inherited member of `Any`. Nothing above binds either name, so it
+        // read as an unbound global and rendered `null`.
+        if matches!(name, "toString" | "hashCode")
+            && (self.current_class.is_some() || self.current_object.is_some())
+        {
+            return self.method(&Expr::Var("this".to_string()), name, &[], 0);
         }
         // `Nil` — the empty `List`.
         if name == "Nil" {
