@@ -703,8 +703,8 @@ reported as parse/compile errors, never silently mis-run.
   value and the elements of a `List`/`Vector`, but not a `Map`'s values, an
   `Option`'s content or a tuple's slot: `val m: Map[String, Double] =
   Map("a" -> 1)` prints `Map(a -> 1)` where Scala prints `Map(a -> 1.0)`. A
-  `Char` does not widen to `Double` either (`val c: Double = 'a'` is `a`, not
-  `97.0`).
+  `Char` widens to `Double`/`Float` but not to a declared `Int`/`Long`
+  (`val i: Int = 'c'` is `c`, not `99`).
 - **A wildcard `import` binds only the members this frontend actually provides
   for that package.** `import scala.math._` binds `sqrt`, `Pi` and the rest of
   `scala.math`; `import scala.collection.mutable._` binds the collection

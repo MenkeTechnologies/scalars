@@ -6105,3 +6105,34 @@ def wrap(tag: String)(body: => String): String = s"<$tag>$body</$tag>"
         "10\n20\nList(2, 3, 4)\nt!\nt!\n<b>bold</b>\n6\nList(3, 2, 1)\nMap(a -> 1)\n"
     );
 }
+
+#[test]
+fn a_char_widens_to_a_declared_double() {
+    // `Char` widens to `Double` at its code point wherever a declared type asks
+    // for one — a `val`, a parameter, a result, an assignment, a `List[Double]`
+    // element (reference output, Scala 3.9.0).
+    let src = r#"
+def half(d: Double): Double = d / 2
+def g(): Double = 'b'
+@main def run(): Unit =
+  val c: Double = 'a'
+  println(c)
+  val f: Float = 'a'
+  println(f)
+  println(half('d'))
+  println(g())
+  var v: Double = 0
+  v = 'e'
+  println(v)
+  val l: List[Double] = List('a', 'b')
+  println(l)
+  val n: Double = 'a' + 1
+  println(n)
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "97.0\n97.0\n50.0\n98.0\n101.0\nList(97.0, 98.0)\n98.0\n"
+    );
+}

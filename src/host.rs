@@ -12005,10 +12005,20 @@ fn b_lazy_force(vm: &mut VM, _argc: u8) -> Value {
 /// `sq(3)` binds `3.0` and answers `9.0`, and `val d: Double = 3` is `3.0`.
 fn b_f64(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.stack.pop().unwrap_or(Value::Undef);
-    conv_elementwise(v, |x| match x {
+    conv_elementwise(v, widen_f64)
+}
+
+/// One value widened to `Double`: an `Int`/`Long`, a `Float`, or a `Char` — whose
+/// widening is its code point, so `val d: Double = 'a'` is `97.0`. `None` for
+/// anything else, which [`conv_elementwise`] leaves alone.
+fn widen_f64(x: &Value) -> Option<Value> {
+    match x {
         Value::Int(n) => Some(Value::float(*n as f64)),
-        _ => f32_of(x).map(|f| Value::float(f64::from(f))),
-    })
+        _ => f32_of(x)
+            .map(f64::from)
+            .or_else(|| as_char(x).map(|c| f64::from(u32::from(c))))
+            .map(Value::float),
+    }
 }
 
 /// [`SF32_STR`] — `Float.toString` of one value.
