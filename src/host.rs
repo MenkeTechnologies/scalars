@@ -429,6 +429,12 @@ pub const THROWABLE_STATE: u16 = 784;
 /// `LinkageError` and `ControlThrowable`, and their subclasses.
 pub const NONFATAL: u16 = 785;
 
+/// Builtin id for a conversion to a STRUCTURED declared type: pops the value and
+/// the type's text, and widens every `Int`/`Long`/`Char` the type places at a
+/// `Double` (or narrows to a `Float`) — through a `Map`'s keys and values, an
+/// `Option`'s or `Either`'s content, a tuple's slots and nested collections.
+pub const SCONV_SHAPE: u16 = 786;
+
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
 /// program can write, and it sits after the constructor fields, so a case
@@ -726,6 +732,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(EXTRACTED, b_extracted);
     vm.register_builtin(THROWABLE_STATE, b_throwable_state);
     vm.register_builtin(NONFATAL, b_nonfatal);
+    vm.register_builtin(SCONV_SHAPE, b_conv_shape);
 }
 
 // ── Exception unwinding ─────────────────────────────────────────────────────
@@ -12006,6 +12013,108 @@ fn b_lazy_force(vm: &mut VM, _argc: u8) -> Value {
 fn b_f64(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.stack.pop().unwrap_or(Value::Undef);
     conv_elementwise(v, widen_f64)
+}
+
+/// [`SCONV_SHAPE`] — convert a value to a structured declared type.
+fn b_conv_shape(vm: &mut VM, _argc: u8) -> Value {
+    let ty = vm.stack.pop().unwrap_or(Value::Undef);
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    conv_to_type(v, &ty.as_str_cow())
+}
+
+/// Convert `v` to the declared type `ty` (its source text), one type layer at a
+/// time: `Double`/`Float` convert the value itself; a tuple type converts each
+/// slot; `Map[K, V]` its keys and values; `Option[T]`/`Some[T]` the content;
+/// `Either[A, B]` a `Left` by `A` and a `Right` by `B`; any other `C[T]` the
+/// elements of a sequence or set. What the type does not describe — a value of
+/// another shape, a type this does not know — passes through unchanged, which
+/// is what a well-typed program's value already is there.
+fn conv_to_type(v: Value, ty: &str) -> Value {
+    let ty = ty.trim();
+    match ty {
+        "Double" => return widen_f64(&v).unwrap_or(v),
+        "Float" => return as_f32(&v).map(make_f32).unwrap_or(v),
+        _ => {}
+    }
+    if let Some(inner) = ty.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        let slots = split_type_args(inner);
+        let tuple = match &v {
+            Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+                Some(HeapVal::Tuple(t)) if t.len() == slots.len() => Some(t.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        return match tuple {
+            Some(items) => heap_push(HeapVal::Tuple(
+                items
+                    .into_iter()
+                    .zip(&slots)
+                    .map(|(x, t)| conv_to_type(x, t))
+                    .collect(),
+            )),
+            None => v,
+        };
+    }
+    let Some((ctor, args)) = ty
+        .strip_suffix(']')
+        .and_then(|t| t.split_once('['))
+        .map(|(c, a)| (c.rsplit('.').next().unwrap_or(c), split_type_args(a)))
+    else {
+        return v;
+    };
+    match (ctor, args.as_slice()) {
+        ("Option" | "Some", [t]) => match as_option(&v) {
+            Some(Some(x)) => make_some(conv_to_type(x, t)),
+            _ => v,
+        },
+        ("Either", [l, r]) => match as_either(&v) {
+            Some(Ok(x)) => make_either(true, conv_to_type(x, r)),
+            Some(Err(x)) => make_either(false, conv_to_type(x, l)),
+            None => v,
+        },
+        (_, [k, t]) => match map_rep_entries(&v) {
+            Some((rep, entries)) => new_map(
+                rep,
+                entries
+                    .into_iter()
+                    .map(|(a, b)| (conv_to_type(a, k), conv_to_type(b, t)))
+                    .collect(),
+            ),
+            None => v,
+        },
+        (_, [t]) => match seq_kind_items(&v) {
+            Some((kind, items)) => {
+                let items: Vec<Value> = items.into_iter().map(|x| conv_to_type(x, t)).collect();
+                match kind {
+                    SeqKind::Set(rep) => new_set(rep, items),
+                    _ => new_seq(kind, items),
+                }
+            }
+            None => v,
+        },
+        _ => v,
+    }
+}
+
+/// The comma-separated arguments of a type-argument list, split at the top
+/// level only: `String,List[Int]` is `["String", "List[Int]"]`.
+fn split_type_args(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out
 }
 
 /// One value widened to `Double`: an `Int`/`Long`, a `Float`, or a `Char` — whose

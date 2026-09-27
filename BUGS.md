@@ -699,12 +699,10 @@ reported as parse/compile errors, never silently mis-run.
   inside `( )` is not a region, so a fewer-braces argument written inside an
   argument list (`println(wrap("b"):` with the block below) does not parse. A singleton object's `lazy val` initializes with the object, which
   is eager here (see *Singleton `object` `val`s initialize eagerly* below).
-- **Widening stops at one collection layer.** A declared `Double` converts a
-  value and the elements of a `List`/`Vector`, but not a `Map`'s values, an
-  `Option`'s content or a tuple's slot: `val m: Map[String, Double] =
-  Map("a" -> 1)` prints `Map(a -> 1)` where Scala prints `Map(a -> 1.0)`. A
-  `Char` widens to `Double`/`Float` but not to a declared `Int`/`Long`
-  (`val i: Int = 'c'` is `c`, not `99`).
+- **Widening gaps.** A `Char` widens to `Double`/`Float` but not to a declared
+  `Int`/`Long` (`val i: Int = 'c'` is `c`, not `99`), and a function type's
+  result does not widen (`val f: Int => Double = x => x * 2` answers `6` for
+  `f(3)`, not `6.0`).
 - **A wildcard `import` binds only the members this frontend actually provides
   for that package.** `import scala.math._` binds `sqrt`, `Pi` and the rest of
   `scala.math`; `import scala.collection.mutable._` binds the collection

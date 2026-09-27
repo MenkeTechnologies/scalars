@@ -136,7 +136,7 @@ struct Compiler {
     /// (`SF64` for `: Double`, `SF32` for `: Float`), applied to every value it
     /// returns: `def f(): Double = 3` answers `3.0`. `None` outside a `def` and
     /// in a lambda, which declares no return type.
-    ret_conv: Option<u16>,
+    ret_conv: Option<Conv>,
     /// The packages a WILDCARD `import` opened — see
     /// [`Compiler::imported_wildcard`].
     wildcards: Vec<Vec<String>>,
@@ -1111,8 +1111,8 @@ impl Compiler {
                             self.b.emit(Op::LoadUndef, 0);
                         }
                     }
-                    if let (Some(id), true) = (conv, init.is_some()) {
-                        self.b.emit(Op::CallBuiltin(id, 1), s.line);
+                    if let (Some(c), true) = (conv.as_ref(), init.is_some()) {
+                        self.emit_conv(c, s.line);
                     }
                     self.unwind_check_dropping(1);
                     self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
@@ -1121,8 +1121,8 @@ impl Compiler {
                 }
                 if let Some(e) = init {
                     self.expr(e)?;
-                    if let Some(id) = conv {
-                        self.b.emit(Op::CallBuiltin(id, 1), s.line);
+                    if let Some(c) = &conv {
+                        self.emit_conv(c, s.line);
                     }
                     self.unwind_check_dropping(1);
                     self.emit_store(place);
@@ -3281,8 +3281,8 @@ impl Compiler {
             self.expr(value)?;
             // The declared width of the TARGET, applied to whatever was
             // assigned — the same conversion the declaration made.
-            if let Some(id) = self.widths.get(name).and_then(|w| w.conv) {
-                self.b.emit(Op::CallBuiltin(id, 1), line);
+            if let Some(c) = self.widths.get(name).and_then(|w| w.conv.clone()) {
+                self.emit_conv(&c, line);
             }
         } else {
             self.emit_load(place);
@@ -5917,8 +5917,23 @@ impl Compiler {
     /// Convert the value about to be returned to the declared return type,
     /// when the body declares a floating one (see [`Self::ret_conv`]).
     fn emit_ret_conv(&mut self, line: u32) {
-        if let Some(id) = self.ret_conv {
-            self.b.emit(Op::CallBuiltin(id, 1), line);
+        if let Some(c) = self.ret_conv.clone() {
+            self.emit_conv(&c, line);
+        }
+    }
+
+    /// Apply a declared-type conversion to the value on top of the stack.
+    fn emit_conv(&mut self, conv: &Conv, line: u32) {
+        match conv {
+            Conv::Width(id) => {
+                self.b.emit(Op::CallBuiltin(*id, 1), line);
+            }
+            Conv::Shape(ty) => {
+                let c = self.b.add_constant(Value::str(ty.clone()));
+                self.b.emit(Op::LoadConst(c), line);
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::SCONV_SHAPE, 2), line);
+            }
         }
     }
 
@@ -6021,9 +6036,11 @@ impl Compiler {
     /// unconditionally and each builtin passes through what it does not apply
     /// to.
     fn emit_f32_param(&mut self, ty: Option<&str>, slot: u16) {
-        let Some(id) = declared_conv(ty) else { return };
+        let Some(conv) = declared_conv(ty) else {
+            return;
+        };
         self.b.emit(Op::GetSlot(slot), 0);
-        self.b.emit(Op::CallBuiltin(id, 1), 0);
+        self.emit_conv(&conv, 0);
         self.b.emit(Op::SetSlot(slot), 0);
     }
 
@@ -6764,7 +6781,7 @@ struct Width {
     /// [`declared_conv`]. `Float` and `Double` are distinct runtime values, so
     /// `var d: Double = 0.0; d = 0.1f` has to widen at the assignment exactly
     /// as the declaration did.
-    conv: Option<u16>,
+    conv: Option<Conv>,
 }
 
 impl Width {
@@ -7060,7 +7077,21 @@ fn normalize_type(ty: &str) -> String {
         .collect()
 }
 
-fn declared_conv(ty: Option<&str>) -> Option<u16> {
+/// The conversion a value passes through on its way into a position declared
+/// `ty` — see [`declared_conv`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Conv {
+    /// A width builtin (`SF32` / `SF64`), applied to the value or, for a
+    /// one-layer sequence type, to each element.
+    Width(u16),
+    /// The declared type itself, walked at run time by `host::SCONV_SHAPE`:
+    /// a `Map`'s keys and values, an `Option`'s or `Either`'s content, a
+    /// tuple's slots and nested collections each convert to their own type
+    /// argument.
+    Shape(String),
+}
+
+fn declared_conv(ty: Option<&str>) -> Option<Conv> {
     let ty = ty.map(|t| t.trim_start_matches("=>").trim())?;
     // One collection layer counts: the ELEMENTS of a `List[Double]` are what
     // carry the width, and the conversion applies to them (see
@@ -7070,10 +7101,19 @@ fn declared_conv(ty: Option<&str>) -> Option<u16> {
         _ => ty,
     };
     match inner {
-        "Float" => Some(crate::host::SF32),
-        "Double" => Some(crate::host::SF64),
-        _ => None,
+        "Float" => return Some(Conv::Width(crate::host::SF32)),
+        "Double" => return Some(Conv::Width(crate::host::SF64)),
+        _ => {}
     }
+    // A structured type with a floating width somewhere inside it. Scala widens
+    // at every layer the expected type reaches: `val m: Map[String, Double] =
+    // Map("a" -> 1)` holds `1.0`.
+    let structured = ty.contains('[') || ty.starts_with('(');
+    let floating = ty
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == "Double" || w == "Float");
+    // A function type converts nothing: its result widens inside the body.
+    (structured && floating && !ty.contains("=>")).then(|| Conv::Shape(ty.to_string()))
 }
 
 fn declared_width(ty: &str) -> NumTy {

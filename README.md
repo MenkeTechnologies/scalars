@@ -79,7 +79,9 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   (at its code point) becomes a
   `Double` wherever the declared type says so: a parameter (`def sq(n: Double)`
   called `sq(3)` is `9.0`), a `val`/`var`, a `def`'s result, a typed lambda
-  parameter, and an ascription.
+  parameter, and an ascription. A structured declared type widens at every layer it
+  reaches: `Map[String, Double]` values, `Option[Double]`, `Either[Double, _]`,
+  a tuple's `Double` slot and nested collections (`List[List[Double]]`).
 - **Widening past 2^53** — a mixed `Int`/`Double` pair whose integer an `f64`
   cannot hold exactly (`16677181699666569L`) is handed to the same hook rather
   than computed on the rounded value. Scala's answer is the *promoted* one — its

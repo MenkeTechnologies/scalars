@@ -6136,3 +6136,47 @@ def g(): Double = 'b'
         "97.0\n97.0\n50.0\n98.0\n101.0\nList(97.0, 98.0)\n98.0\n"
     );
 }
+
+#[test]
+fn widening_follows_the_declared_type_through_every_layer() {
+    // A declared `Double`\/`Float` widens inside a `Map`'s values, an `Option`,
+    // an `Either`, a tuple slot and a nested collection — for a `val`, a `var`
+    // assignment, a parameter and a result (reference output, Scala 3.9.0).
+    let src = r#"
+def total(m: Map[String, Double]): Double = m.values.sum
+def pick(b: Boolean): Option[Double] = if b then Some(2) else None
+def pair(): (String, Double) = ("x", 5)
+@main def run(): Unit =
+  println(total(Map("a" -> 1, "b" -> 2)))
+  println(pick(true))
+  println(pick(false))
+  println(pair())
+  var o: Option[Double] = None
+  o = Some(7)
+  println(o)
+  val bs: Set[Double] = Set(1, 2, 3, 4, 5)
+  println(bs)
+  val lm: List[Map[String, Double]] = List(Map("k" -> 1))
+  println(lm)
+  val lt: List[(Int, Double)] = List((1, 2), (3, 4))
+  println(lt)
+  val vf: Vector[Option[Float]] = Vector(Some(1), None)
+  println(vf)
+  val e: Either[Double, String] = Left(3)
+  println(e)
+  val nested: Option[List[Double]] = Some(List(1, 2))
+  println(nested)
+  val m: Map[String, Double] = Map("a" -> 1, "b" -> 2)
+  println(m)
+  val ll: List[List[Double]] = List(List(1), List(2, 3))
+  println(ll)
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "3.0\nSome(2.0)\nNone\n(x,5.0)\nSome(7.0)\nHashSet(5.0, 1.0, 2.0, 3.0, 4.0)\n\
+         List(Map(k -> 1.0))\nList((1,2.0), (3,4.0))\nVector(Some(1.0), None)\nLeft(3.0)\n\
+         Some(List(1.0, 2.0))\nMap(a -> 1.0, b -> 2.0)\nList(List(1.0), List(2.0, 3.0))\n"
+    );
+}
