@@ -1758,9 +1758,7 @@ impl Parser {
 
     fn if_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::If)?;
-        self.eat(&Tok::LParen)?;
-        let cond = self.expression()?;
-        self.eat(&Tok::RParen)?;
+        let cond = self.if_condition()?;
         let then = self.braced_or_single()?;
         // A line break may precede `else`; the lexer does not separate before
         // `else`, but tolerate an explicit one defensively.
@@ -1778,11 +1776,59 @@ impl Parser {
 
     fn while_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::While)?;
-        self.eat(&Tok::LParen)?;
-        let cond = self.expression()?;
-        self.eat(&Tok::RParen)?;
+        // Scala 3's `while cond do body`, the condition unparenthesized.
+        let cond = if self.soft_keyword_ahead("do") {
+            let cond = self.expression()?;
+            self.eat_soft_keyword("do")?;
+            cond
+        } else {
+            self.eat(&Tok::LParen)?;
+            let cond = self.expression()?;
+            self.eat(&Tok::RParen)?;
+            cond
+        };
         let body = self.braced_or_single()?;
         Ok(StmtKind::While { cond, body })
+    }
+
+    /// Whether the soft keyword `word` (`then`, `do`) closes the construct the
+    /// cursor is in: it appears at bracket depth 0 before the statement ends.
+    /// That is what tells Scala 3's `if c then …` / `while c do …` from the
+    /// parenthesized form, whose condition is the first `( … )` alone.
+    fn soft_keyword_ahead(&self, word: &str) -> bool {
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match &t.kind {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return false;
+                    }
+                }
+                Tok::Ident(w) if depth == 0 && w == word => return true,
+                Tok::Newline | Tok::Semi | Tok::Else | Tok::Eof if depth == 0 => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Consume the soft keyword `word`, which [`Self::soft_keyword_ahead`]
+    /// found.
+    fn eat_soft_keyword(&mut self, word: &str) -> Result<(), String> {
+        match self.peek() {
+            Tok::Ident(w) if w == word => {
+                self.advance();
+                Ok(())
+            }
+            other => Err(format!(
+                "scalars: expected `{word}` but found {other:?} on line {}",
+                self.line()
+            )),
+        }
     }
 
     /// `for (enums) [yield] body` — a range comprehension. With `yield` it is an
@@ -1793,12 +1839,36 @@ impl Parser {
         self.eat(&Tok::For)?;
         // Scala accepts either bracketing for the enumerator group. Inside `( )`
         // the lexer suppresses line breaks, so `;` separates; inside `{ }` a line
-        // break separates and `;` is optional.
-        let braced = self.is(&Tok::LBrace);
-        self.eat(if braced { &Tok::LBrace } else { &Tok::LParen })?;
-        let enums = self.for_enums(braced)?;
-        self.skip_seps();
-        self.eat(if braced { &Tok::RBrace } else { &Tok::RParen })?;
+        // break separates and `;` is optional. Scala 3 also takes them with no
+        // bracket at all, up to `do`/`yield` (`for x <- xs do …`); an indented
+        // enumerator block reaches here already braced by the optional-braces
+        // pass.
+        let enums = if matches!(self.peek(), Tok::LBrace | Tok::LParen) {
+            let braced = self.is(&Tok::LBrace);
+            self.advance();
+            let enums = self.for_enums(if braced {
+                EnumsEnd::Brace
+            } else {
+                EnumsEnd::Paren
+            })?;
+            self.skip_seps();
+            self.eat(if braced { &Tok::RBrace } else { &Tok::RParen })?;
+            enums
+        } else {
+            self.for_enums(EnumsEnd::Keyword)?
+        };
+        // `do`/`yield` may start the line after an indented enumerator block,
+        // where a separator was inferred before it.
+        if self.is(&Tok::Newline)
+            && matches!(self.peek_at(1), Tok::Ident(w) if w == "do" || w == "yield")
+        {
+            self.advance();
+        }
+        // `do` is Scala 3's marker for the side-effecting form, and optional
+        // after a bracketed enumerator group.
+        if matches!(self.peek(), Tok::Ident(w) if w == "do") {
+            self.advance();
+        }
         if matches!(self.peek(), Tok::Ident(w) if w == "yield") {
             self.advance();
             // A `yield` body is a value expression (or block expression).
@@ -1828,12 +1898,19 @@ impl Parser {
     /// a range or a collection) and `if` guards. In the parenthesized form an
     /// explicit `;` separates them; in the brace form a line break does too, and
     /// a guard may stand alone on its own line.
-    fn for_enums(&mut self, braced: bool) -> Result<Vec<ForEnum>, String> {
-        let closer = if braced { Tok::RBrace } else { Tok::RParen };
+    fn for_enums(&mut self, end: EnumsEnd) -> Result<Vec<ForEnum>, String> {
+        let braced = end == EnumsEnd::Brace;
         let mut out = Vec::new();
         loop {
             self.skip_seps();
-            if self.is(&closer) {
+            let at_end = match end {
+                EnumsEnd::Brace => self.is(&Tok::RBrace),
+                EnumsEnd::Paren => self.is(&Tok::RParen),
+                EnumsEnd::Keyword => {
+                    matches!(self.peek(), Tok::Ident(w) if w == "do" || w == "yield")
+                }
+            };
+            if at_end {
                 break;
             }
             // A guard on its own (`for { x <- xs; if x > 1 }`) filters the
@@ -3138,11 +3215,23 @@ impl Parser {
     /// `if (cond) then [else els]` as a value-producing expression. Each branch
     /// is a single expression or a `{ … }` block (an [`Expr::Block`]); a missing
     /// `else` yields `Unit`.
-    fn if_expr(&mut self) -> Result<Expr, String> {
-        self.eat(&Tok::If)?;
+    /// An `if`'s condition, cursor just past `if`: `( cond )`, or Scala 3's
+    /// `cond then` with the parentheses optional and `then` ending it.
+    fn if_condition(&mut self) -> Result<Expr, String> {
+        if self.soft_keyword_ahead("then") {
+            let cond = self.expression()?;
+            self.eat_soft_keyword("then")?;
+            return Ok(cond);
+        }
         self.eat(&Tok::LParen)?;
         let cond = self.expression()?;
         self.eat(&Tok::RParen)?;
+        Ok(cond)
+    }
+
+    fn if_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::If)?;
+        let cond = self.if_condition()?;
         let then = self.branch_expr()?;
         // A line break may precede `else`; tolerate one defensively.
         let save = self.pos;
@@ -3185,7 +3274,11 @@ impl Parser {
         let catches = if self.is(&Tok::Catch) {
             self.advance();
             self.skip_seps();
-            self.catch_arms()?
+            if self.is(&Tok::Case) {
+                vec![self.inline_catch_arm()?]
+            } else {
+                self.catch_arms()?
+            }
         } else {
             self.pos = save;
             Vec::new()
@@ -3207,6 +3300,23 @@ impl Parser {
             catches,
             finalizer,
         })
+    }
+
+    /// Scala 3's single-arm `catch case e: E => handler` on one line, with no
+    /// brace around the arm. The handler is one statement (or a block), so the
+    /// statements after the `try` are not swallowed into it.
+    fn inline_catch_arm(&mut self) -> Result<MatchArm, String> {
+        self.eat(&Tok::Case)?;
+        let pat = self.pattern()?;
+        let guard = if self.is(&Tok::If) {
+            self.advance();
+            Some(self.expression()?)
+        } else {
+            None
+        };
+        self.eat(&Tok::FatArrow)?;
+        let body = self.braced_or_single()?;
+        Ok(MatchArm { pat, guard, body })
     }
 
     /// The `{ case … }` arms of a `catch`. Scala also allows a brace-less
@@ -4142,6 +4252,15 @@ fn try_factory(body: &Expr, line: u32) -> Expr {
         }],
         finalizer: None,
     }
+}
+
+/// What ends a `for`'s enumerator list: the `}` or `)` of its bracket, or — in
+/// Scala 3's bracket-less form — the `do`/`yield` keyword.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnumsEnd {
+    Brace,
+    Paren,
+    Keyword,
 }
 
 /// A function literal from its parameters and body. A parameter declared

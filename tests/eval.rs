@@ -5761,3 +5761,80 @@ object T {
         "9.0\n3.0\n4.0\n10.0\n9.0\nList(1.0, 2.0)\n7.0\n3.0\n5.0\n2.0\nList(1.0, 2.0)\n"
     );
 }
+
+#[test]
+fn scala3_optional_braces_and_quiet_control_syntax() {
+    // Indentation regions after `=`, `=>`, `match`, `try`/`catch`/`finally`,
+    // `then`/`else`/`do`/`yield`, `for` and a template's `:`, the unbracketed
+    // `if … then`, `while … do` and `for … do/yield`, the inline
+    // `catch case`, and `end` markers (reference output, Scala 3.9.0).
+    let src = r#"
+case class Point(x: Int, y: Int):
+  def norm: Int = x * x + y * y
+
+object Util:
+  def classify(n: Int): String =
+    if n < 0 then "neg"
+    else if n == 0 then "zero"
+    else
+      val big = n > 100
+      if big then "big" else "small"
+  end classify
+
+  def fact(n: Int): Long =
+    var acc = 1L
+    var i = 2
+    while i <= n do
+      acc *= i
+      i += 1
+    acc
+end Util
+
+@main def run(): Unit =
+  println(Point(3, 4).norm)
+  for n <- List(-5, 0, 7, 500) do
+    println(Util.classify(n))
+  println(Util.fact(10))
+  val pairs =
+    for
+      a <- 1 to 3
+      b <- 1 to 3
+      if a < b
+    yield (a, b)
+  println(pairs)
+  val r = List(1, 2, 3) match
+    case Nil => "empty"
+    case h :: t =>
+      val n = t.length
+      s"head $h rest $n"
+  println(r)
+  val q =
+    try
+      "12x".toInt
+    catch
+      case _: NumberFormatException =>
+        println("bad")
+        -1
+    finally
+      println("done")
+  println(q)
+  try println(1 / 0) catch case e: ArithmeticException => println("caught " + e.getMessage)
+  println("end")
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "25\nneg\nzero\nsmall\nbig\n3628800\nVector((1,2), (1,3), (2,3))\nhead 1 rest 2\n\
+         bad\ndone\n-1\ncaught / by zero\nend\n"
+    );
+}
+
+#[test]
+fn a_brace_less_def_body_runs_every_statement() {
+    // The body of `@main def run(): Unit =` on indented lines was its FIRST
+    // statement only; the rest were silently dropped.
+    let (out, ok) = run("@main def run(): Unit =\n  println(\"a\")\n  println(\"b\")\n");
+    assert!(ok);
+    assert_eq!(out, "a\nb\n");
+}

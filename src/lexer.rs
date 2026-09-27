@@ -241,6 +241,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     let mut paren_depth: i32 = 0;
     // A source line break has been seen since the last emitted token.
     let mut pending_newline = false;
+    // For the optional-braces pass: the indentation of every token that is the
+    // FIRST on its source line, index-aligned with `out` (`None` for the rest).
+    // A token that follows a multi-line string on the string's last line is not
+    // a line start — the string scanners never reset `at_line_start`.
+    let mut starts: Vec<Option<u32>> = Vec::new();
+    let mut at_line_start = true;
+    let mut line_begin = 0usize;
+    let mut line_indent = 0u32;
+    let mut indent_taken = false;
 
     // Push a real token, first materializing a pending newline into a separator
     // when the inference rule fires.
@@ -256,6 +265,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     kind: Tok::Newline,
                     line: $line,
                 });
+                starts.push(None);
             }
             pending_newline = false;
             match &kind {
@@ -264,6 +274,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 _ => {}
             }
             out.push(Token { kind, line: $line });
+            starts.push(at_line_start.then_some(line_indent));
+            at_line_start = false;
         }};
     }
 
@@ -275,11 +287,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             line += 1;
             pending_newline = true;
             i += 1;
+            at_line_start = true;
+            line_begin = i;
+            indent_taken = false;
             continue;
         }
         if c.is_whitespace() {
             i += 1;
             continue;
+        }
+        if at_line_start && !indent_taken {
+            line_indent = (i - line_begin) as u32;
+            indent_taken = true;
         }
 
         // comments
@@ -615,7 +634,171 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         kind: Tok::Eof,
         line,
     });
-    Ok(out)
+    starts.push(None);
+    Ok(optional_braces(out, &starts))
+}
+
+/// One open construct while [`optional_braces`] walks the stream: a bracket the
+/// source wrote, or an indentation region the pass opened.
+enum Open {
+    /// `(` or `[` — indentation is not significant inside either.
+    Paren,
+    /// A `{` the source wrote.
+    Brace,
+    /// An indentation region, with the indentation of its first line.
+    Region(u32),
+}
+
+/// Scala 3's optional braces, as a token-stream rewrite: an indentation region
+/// is turned into the `{ … }` block the parser already reads.
+///
+/// A region opens after a token that ENDS its line and may begin one — `=`,
+/// `=>`, `match`, `try`, `catch`, `finally`, `else`, `for`, `then`, `do`, `yield`, and
+/// the `:` of an `object`/`class`/`trait`/`enum` header — when the next line is
+/// indented deeper than the opener's own line and does not start with `{`. It
+/// closes before the first line indented less than the region, before the
+/// bracket that encloses it closes, and at the end of the file. Inside `( )` and
+/// `[ ]` no region opens, since indentation is not significant there.
+///
+/// Brace-style code is unaffected: its bodies either start with `{` or are
+/// single indented expressions, and wrapping those in a block does not change
+/// what they compute.
+fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(toks.len());
+    let mut stack: Vec<Open> = Vec::new();
+    let mut line_indent = 0u32;
+    let mut line_head: Option<Tok> = None;
+    let brace = |kind: Tok, line: u32| Token { kind, line };
+
+    // Emit a `}` for every region on top of the stack that `keep` rejects.
+    // A separator already emitted before the current token goes AFTER the
+    // braces, so the closed block ends the statement it belongs to.
+    fn close_regions(
+        out: &mut Vec<Token>,
+        stack: &mut Vec<Open>,
+        line: u32,
+        keep: impl Fn(u32) -> bool,
+    ) {
+        let sep = if matches!(out.last().map(|t| &t.kind), Some(Tok::Newline)) {
+            out.pop()
+        } else {
+            None
+        };
+        while let Some(Open::Region(r)) = stack.last() {
+            if keep(*r) {
+                break;
+            }
+            stack.pop();
+            out.push(Token {
+                kind: Tok::RBrace,
+                line,
+            });
+        }
+        if let Some(sep) = sep {
+            out.push(sep);
+        }
+    }
+
+    let mut skip = 0usize;
+    for (i, tok) in toks.iter().enumerate() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if let Some(ind) = starts[i] {
+            close_regions(&mut out, &mut stack, tok.line, |r| ind >= r);
+            line_indent = ind;
+            line_head = Some(tok.kind.clone());
+            // An end marker (`end match`, `end run`) only documents where a
+            // region ends; closing it is the outdent's job, done above.
+            if is_end_marker(&toks, starts, i) {
+                skip = 1;
+                continue;
+            }
+        }
+        match tok.kind {
+            Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                close_regions(&mut out, &mut stack, tok.line, |_| false);
+                stack.pop();
+            }
+            Tok::Eof => close_regions(&mut out, &mut stack, tok.line, |_| false),
+            _ => {}
+        }
+        out.push(tok.clone());
+        match tok.kind {
+            Tok::LParen | Tok::LBracket => stack.push(Open::Paren),
+            Tok::LBrace => stack.push(Open::Brace),
+            _ => {}
+        }
+        if matches!(stack.last(), Some(Open::Paren)) || !opens_region(&tok.kind, line_head.as_ref())
+        {
+            continue;
+        }
+        // The next real token must start a deeper line, and not with `{`.
+        let next = (i + 1..toks.len()).find(|&j| toks[j].kind != Tok::Newline);
+        if let Some(j) = next {
+            if let Some(ind) = starts[j] {
+                if ind > line_indent && toks[j].kind != Tok::LBrace && toks[j].kind != Tok::Eof {
+                    // A template's `:` IS the brace: `object A:` is `object A {`.
+                    if tok.kind == Tok::Colon {
+                        out.pop();
+                    }
+                    out.push(brace(Tok::LBrace, tok.line));
+                    stack.push(Open::Region(ind));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether the line starting at `i` is a Scala 3 end marker: `end` and one
+/// name or keyword, alone on the line.
+fn is_end_marker(toks: &[Token], starts: &[Option<u32>], i: usize) -> bool {
+    let is_end = matches!(&toks[i].kind, Tok::Ident(w) if w == "end");
+    let named = toks.get(i + 1).is_some_and(|t| {
+        matches!(
+            t.kind,
+            Tok::Ident(_)
+                | Tok::If
+                | Tok::While
+                | Tok::For
+                | Tok::Match
+                | Tok::Try
+                | Tok::New
+                | Tok::Val
+        )
+    }) && starts.get(i + 1) == Some(&None);
+    let alone = match toks.get(i + 2) {
+        Some(t) => {
+            matches!(t.kind, Tok::Newline | Tok::Eof | Tok::RBrace) || starts[i + 2].is_some()
+        }
+        None => true,
+    };
+    is_end && named && alone
+}
+
+/// Whether `kind`, ending a line whose first token is `head`, opens an
+/// indentation region (see [`optional_braces`]).
+fn opens_region(kind: &Tok, head: Option<&Tok>) -> bool {
+    match kind {
+        // `type T =` names a type, not a block.
+        Tok::Assign => !matches!(head, Some(Tok::Ident(w)) if w == "type"),
+        Tok::FatArrow
+        | Tok::Match
+        | Tok::Try
+        | Tok::Catch
+        | Tok::Finally
+        | Tok::Else
+        | Tok::For => true,
+        Tok::Ident(w) => matches!(w.as_str(), "then" | "do" | "yield"),
+        Tok::Colon => match head {
+            Some(Tok::Object | Tok::Case) => true,
+            Some(Tok::Ident(w)) => matches!(w.as_str(), "class" | "trait" | "enum"),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The `n`-byte window at `i`, or `""` when it would run past the end of `src`
