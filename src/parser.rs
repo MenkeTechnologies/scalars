@@ -26,20 +26,7 @@ pub const SPREAD: &str = "$spread";
 
 /// Parse Scala `src` into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
-    let tokens = crate::lexer::lex(src)?;
-    let mut p = Parser {
-        toks: tokens,
-        pos: 0,
-        funcs: Vec::new(),
-        classes: Vec::new(),
-        objects: Vec::new(),
-        imports: HashMap::new(),
-        wildcards: Vec::new(),
-        implicits: Vec::new(),
-        extensions: Vec::new(),
-        conversions: Vec::new(),
-        givens: 0,
-    };
+    let mut p = Parser::new(crate::lexer::lex(src)?);
     let mut prog = p.program()?;
     // Block-local `def`s are still statements at this point; scope, uniquely
     // rename, and lambda-lift them into the flat namespace the compiler wants.
@@ -72,6 +59,93 @@ struct Parser {
     /// be named by the program (`given Int = 5`), but it still has to be a
     /// binding for a call site to reference, so one is synthesized.
     givens: usize,
+    /// Every `enum` in the unit, mapped to its case names in declaration
+    /// order — collected by [`scan_enums`] before parsing starts, so a
+    /// qualified `Color.Red` resolves even where it is written above the `enum`.
+    enums: HashMap<String, Vec<String>>,
+}
+
+impl Parser {
+    fn new(toks: Vec<Token>) -> Self {
+        let enums = scan_enums(&toks);
+        Parser {
+            toks,
+            pos: 0,
+            funcs: Vec::new(),
+            classes: Vec::new(),
+            objects: Vec::new(),
+            imports: HashMap::new(),
+            wildcards: Vec::new(),
+            implicits: Vec::new(),
+            extensions: Vec::new(),
+            conversions: Vec::new(),
+            givens: 0,
+            enums,
+        }
+    }
+}
+
+/// The `enum`s of a token stream and their case names, in declaration order.
+///
+/// A case is a `case` at the top brace level of the enum body: `case Red,
+/// Green` names two, `case Circle(r: Double)` one. A `case` nested deeper is a
+/// `match` arm inside one of the enum's methods and is not a case of the enum.
+fn scan_enums(toks: &[Token]) -> HashMap<String, Vec<String>> {
+    let mut enums = HashMap::new();
+    let kind = |i: usize| toks.get(i).map(|t| &t.kind);
+    let mut i = 0;
+    while i < toks.len() {
+        let (Some(Tok::Ident(kw)), Some(Tok::Ident(name))) = (kind(i), kind(i + 1)) else {
+            i += 1;
+            continue;
+        };
+        if kw != "enum" {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        while j < toks.len() && !matches!(kind(j), Some(Tok::LBrace)) {
+            j += 1;
+        }
+        let mut cases = Vec::new();
+        let mut depth = 0usize;
+        while j < toks.len() {
+            match kind(j) {
+                Some(Tok::LBrace) => depth += 1,
+                Some(Tok::RBrace) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Some(Tok::Case) if depth == 1 => {
+                    while let Some(Tok::Ident(c)) = kind(j + 1) {
+                        cases.push(c.clone());
+                        if matches!(kind(j + 2), Some(Tok::Comma)) {
+                            j += 2;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        enums.insert(name.clone(), cases);
+        i = j;
+    }
+    enums
+}
+
+/// A primary constructor's parameters — see [`Parser::ctor_params`] and the
+/// same-named fields of [`ClassDecl`].
+#[derive(Default)]
+struct CtorParams {
+    params: Vec<String>,
+    param_tys: Vec<Option<String>>,
+    param_by_name: Vec<bool>,
+    param_defaults: Vec<Option<Expr>>,
 }
 
 /// The outcome of parsing a top-level `object`: the program entry point, or a
@@ -203,6 +277,10 @@ impl Parser {
             // implicit scope. Inside an `object` body all four already worked,
             // which is why nothing had noticed: that path goes through
             // `statement`, which this now shares.
+            if self.at_enum_start() {
+                self.enum_decl()?;
+                continue;
+            }
             if self.at_soft_declaration_start() {
                 top_stmts.push(self.statement()?);
                 continue;
@@ -397,6 +475,11 @@ impl Parser {
             // A class, trait or object declared inside the object is a member
             // type; it joins the flat namespace the way one declared in an
             // `extends App` body or a block does. It was skipped, so a
+            if self.at_enum_start() {
+                self.enum_decl()?;
+                self.skip_seps();
+                continue;
+            }
             // `def main` object's own `case class` was `not found`.
             if self.at_nested_declaration() {
                 self.nested_declaration()?;
@@ -457,50 +540,12 @@ impl Parser {
             self.skip_bracket_group();
         }
         // Primary-constructor parameters (all become fields).
-        let mut params = Vec::new();
-        let mut param_tys = Vec::new();
-        let mut param_by_name = Vec::new();
-        let mut param_defaults: Vec<Option<Expr>> = Vec::new();
-        if self.is(&Tok::LParen) {
-            self.advance();
-            self.skip_seps();
-            while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
-                // Optional `val`/`var`/modifier before the parameter name.
-                while self.is(&Tok::Val) || self.is(&Tok::Var) {
-                    self.advance();
-                }
-                let pname = self.ident()?;
-                let mut pty = None;
-                let mut by_name = false;
-                if self.is(&Tok::Colon) {
-                    self.advance();
-                    // `x: => Int` — a by-name constructor parameter, read the
-                    // same way `parse_def` reads one: `type_ref` folds the arrow
-                    // into the type string, so the leading `=>` is the marker.
-                    by_name = self.is(&Tok::FatArrow);
-                    pty = Some(self.type_ref()?);
-                }
-                param_tys.push(pty);
-                param_by_name.push(by_name);
-                // `x: Int = 0` — a default, kept unevaluated so the
-                // construction can splice it exactly where Scala evaluates it.
-                let mut pdefault = None;
-                if self.is(&Tok::Assign) {
-                    self.advance();
-                    self.skip_seps();
-                    pdefault = Some(self.expression()?);
-                }
-                param_defaults.push(pdefault);
-                params.push(pname);
-                if self.is(&Tok::Comma) {
-                    self.advance();
-                    self.skip_seps();
-                } else {
-                    break;
-                }
-            }
-            self.eat(&Tok::RParen)?;
-        }
+        let CtorParams {
+            params,
+            param_tys,
+            param_by_name,
+            param_defaults,
+        } = self.ctor_params()?;
         // `extends Parent[(args)] [with T]*`.
         let (parents, super_args) = self.parents_clause()?;
         // Class body (optional). `def`s → methods; `val`/`var` → fields + ctor
@@ -550,6 +595,250 @@ impl Parser {
             field_names,
             methods,
         })
+    }
+
+    /// A primary constructor's `( … )` clause, when the cursor is on one; empty
+    /// otherwise. Shared by `class` and by an `enum`'s parameterized `case`.
+    fn ctor_params(&mut self) -> Result<CtorParams, String> {
+        let mut out = CtorParams::default();
+        if !self.is(&Tok::LParen) {
+            return Ok(out);
+        }
+        self.advance();
+        self.skip_seps();
+        while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
+            // Optional `val`/`var`/modifier before the parameter name.
+            while self.is(&Tok::Val) || self.is(&Tok::Var) {
+                self.advance();
+            }
+            let pname = self.ident()?;
+            let mut pty = None;
+            let mut by_name = false;
+            if self.is(&Tok::Colon) {
+                self.advance();
+                // `x: => Int` — a by-name constructor parameter, read the
+                // same way `parse_def` reads one: `type_ref` folds the arrow
+                // into the type string, so the leading `=>` is the marker.
+                by_name = self.is(&Tok::FatArrow);
+                pty = Some(self.type_ref()?);
+            }
+            out.param_tys.push(pty);
+            out.param_by_name.push(by_name);
+            // `x: Int = 0` — a default, kept unevaluated so the
+            // construction can splice it exactly where Scala evaluates it.
+            let mut pdefault = None;
+            if self.is(&Tok::Assign) {
+                self.advance();
+                self.skip_seps();
+                pdefault = Some(self.expression()?);
+            }
+            out.param_defaults.push(pdefault);
+            out.params.push(pname);
+            if self.is(&Tok::Comma) {
+                self.advance();
+                self.skip_seps();
+            } else {
+                break;
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        Ok(out)
+    }
+
+    /// A Scala 3 `enum` (cursor on the `enum` word), lowered to the declarations
+    /// the reference compiles it to: a sealed trait named for the enum carrying
+    /// the body's `def`s; a `case object` per singleton case and a `case class`
+    /// per parameterized case, each extending it and answering its `ordinal`
+    /// (declaration position across ALL cases); and a companion `object` with
+    /// `fromOrdinal`, plus `values` and `valueOf` when every case is a
+    /// singleton — Scala defines those two only then.
+    ///
+    /// The cases join the flat type namespace, as a nested declaration does;
+    /// the qualified spelling `Color.Red` / `Shape.Circle(1)` / `case
+    /// Shape.Circle(r) =>` resolves to them through [`Parser::enums`].
+    fn enum_decl(&mut self) -> Result<(), String> {
+        let line = self.line();
+        self.advance(); // `enum`
+        let name = self.ident()?;
+        if self.is(&Tok::LBracket) {
+            self.skip_bracket_group();
+        }
+        if self.is(&Tok::LParen) {
+            return Err(format!(
+                "scalars: an `enum` with constructor parameters (`enum {name}(…)`) is not modelled (line {line})"
+            ));
+        }
+        let (mut parents, _) = self.parents_clause()?;
+        // `derives C1, C2` names type-class instances to derive; the runtime
+        // has no type classes to derive them for.
+        if matches!(self.peek(), Tok::Ident(w) if w == "derives") {
+            while !self.is(&Tok::LBrace) && !self.is(&Tok::Eof) {
+                self.advance();
+            }
+        }
+        self.eat(&Tok::LBrace)?;
+        self.skip_seps();
+        let mut methods = Vec::new();
+        // (case name, its class when parameterized) in declaration order.
+        let mut cases: Vec<(String, Option<ClassDecl>)> = Vec::new();
+        while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+            self.skip_member_modifiers();
+            if self.is(&Tok::Def) {
+                methods.push(self.parse_def()?);
+            } else if self.is(&Tok::Case) {
+                self.advance();
+                let case_line = self.line();
+                let case = self.ident()?;
+                if self.is(&Tok::LBracket) {
+                    self.skip_bracket_group();
+                }
+                if self.is(&Tok::LParen) {
+                    let CtorParams {
+                        params,
+                        param_tys,
+                        param_by_name,
+                        param_defaults,
+                    } = self.ctor_params()?;
+                    let (mut case_parents, super_args) = self.parents_clause()?;
+                    if !case_parents.contains(&name) {
+                        case_parents.insert(0, name.clone());
+                    }
+                    let field_names = params.clone();
+                    cases.push((
+                        case,
+                        Some(ClassDecl {
+                            name: String::new(),
+                            is_case: true,
+                            is_trait: false,
+                            parents: case_parents,
+                            super_args,
+                            params,
+                            param_by_name,
+                            param_tys,
+                            param_defaults,
+                            body: Vec::new(),
+                            field_names,
+                            methods: Vec::new(),
+                        }),
+                    ));
+                } else {
+                    cases.push((case, None));
+                    while self.is(&Tok::Comma) {
+                        self.advance();
+                        self.skip_seps();
+                        cases.push((self.ident()?, None));
+                    }
+                    if self.is(&Tok::Extends) {
+                        return Err(format!(
+                            "scalars: an `enum` case with an `extends` clause is not modelled (line {case_line})"
+                        ));
+                    }
+                }
+            } else {
+                return Err(format!(
+                    "scalars: only `case` and `def` members of an `enum` are modelled, found {} (line {})",
+                    self.peek(),
+                    self.line()
+                ));
+            }
+            self.skip_seps();
+        }
+        self.eat(&Tok::RBrace)?;
+
+        parents.retain(|p| p != &name);
+        self.declare_class(
+            ClassDecl {
+                name: name.clone(),
+                is_case: false,
+                is_trait: true,
+                parents,
+                super_args: Vec::new(),
+                params: Vec::new(),
+                param_by_name: Vec::new(),
+                param_tys: Vec::new(),
+                param_defaults: Vec::new(),
+                body: Vec::new(),
+                field_names: Vec::new(),
+                methods,
+            },
+            line,
+        )?;
+        let all_singletons = cases.iter().all(|(_, c)| c.is_none());
+        let mut singletons = Vec::new();
+        for (ordinal, (case, class)) in cases.into_iter().enumerate() {
+            let ordinal_def = self.snippet_defs(&format!("def ordinal: Int = {ordinal}"))?;
+            match class {
+                Some(mut c) => {
+                    c.name = case;
+                    c.methods = ordinal_def;
+                    self.declare_class(c, line)?;
+                }
+                None => {
+                    singletons.push((ordinal, case.clone()));
+                    self.declare_object(
+                        ObjectDecl {
+                            name: case,
+                            is_case: true,
+                            parents: vec![name.clone()],
+                            body: Vec::new(),
+                            methods: ordinal_def,
+                        },
+                        line,
+                    )?;
+                }
+            }
+        }
+        // The companion's members, written as the Scala the reference
+        // generates for them and parsed like any other source.
+        let arms = |key: &dyn Fn(usize, &str) -> String| {
+            singletons
+                .iter()
+                .map(|(o, c)| format!("case {} => {c}\n", key(*o, c)))
+                .collect::<String>()
+        };
+        let mut src = format!(
+            "def fromOrdinal(ordinal: Int): {name} = ordinal match {{\n{}case _ => throw new NoSuchElementException(\"enum {name} has no case with ordinal: \" + ordinal)\n}}\n",
+            arms(&|o, _| o.to_string())
+        );
+        let mut body = Vec::new();
+        if all_singletons {
+            src.push_str(&format!(
+                "def valueOf(name: String): {name} = name match {{\n{}case _ => throw new IllegalArgumentException(\"enum {name} has no case with name: \" + name)\n}}\n",
+                arms(&|_, c| format!("{c:?}"))
+            ));
+            let list = singletons
+                .iter()
+                .map(|(_, c)| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut p = Parser::new(crate::lexer::lex(&format!(
+                "val values: Array[{name}] = Array({list})\n"
+            ))?);
+            body.push(p.statement()?);
+        }
+        let companion_methods = self.snippet_defs(&src)?;
+        self.declare_object(
+            ObjectDecl {
+                name,
+                is_case: false,
+                parents: Vec::new(),
+                body,
+                methods: companion_methods,
+            },
+            line,
+        )
+    }
+
+    /// Parse generated source consisting only of `def`s.
+    fn snippet_defs(&self, src: &str) -> Result<Vec<Func>, String> {
+        let mut p = Parser::new(crate::lexer::lex(src)?);
+        let mut defs = Vec::new();
+        p.skip_seps();
+        while !p.is(&Tok::Eof) {
+            defs.push(p.parse_def()?);
+            p.skip_seps();
+        }
+        Ok(defs)
     }
 
     /// An `extends P[(args)] [with T]*` clause: the supertype names in source
@@ -978,6 +1267,13 @@ impl Parser {
     /// only a declaration when `class`/`object` follows it. Neither of those two
     /// words can be an identifier — both are reserved — so no expression
     /// statement can be mistaken for a declaration here.
+    /// Whether the cursor is on an `enum` declaration: the soft keyword and a
+    /// name.
+    fn at_enum_start(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(w) if w == "enum")
+            && matches!(self.peek_at(1), Tok::Ident(_))
+    }
+
     fn at_nested_declaration(&self) -> bool {
         if self.is(&Tok::Object) {
             return true;
@@ -1054,6 +1350,17 @@ impl Parser {
     /// [`Parser::declare_class`], and refusing a redeclaration for the same
     /// reason: one flat namespace cannot hold two.
     fn declare_object(&mut self, o: ObjectDecl, line: u32) -> Result<(), String> {
+        // An `enum`'s companion is synthesized (see `enum_decl`), and a
+        // program's own `object` of the same name adds members to that one
+        // companion, whichever comes first in the source.
+        if self.enums.contains_key(&o.name) {
+            if let Some(d) = self.objects.iter_mut().find(|d| d.name == o.name) {
+                d.parents.extend(o.parents);
+                d.body.extend(o.body);
+                d.methods.extend(o.methods);
+                return Ok(());
+            }
+        }
         if self.objects.iter().any(|d| d.name == o.name) {
             return Err(format!(
                 "scalars: object `{}` is already declared; shadowing object declarations are not modelled (line {line})",
@@ -2493,6 +2800,20 @@ impl Parser {
                     None => self.ident()?,
                 },
             };
+            // `Color.Red` / `Shape.Circle(1.0)` — an enum case, qualified by its
+            // enum. The cases live in the flat type namespace, so the qualified
+            // name is the bare one: a singleton read or a case-class apply.
+            if let Expr::Var(q) = &e {
+                if self.enums.get(q).is_some_and(|cs| cs.contains(&name)) {
+                    e = if self.is(&Tok::LParen) {
+                        let args = self.arg_list()?;
+                        Expr::Call { name, args, line }
+                    } else {
+                        Expr::Var(name)
+                    };
+                    continue;
+                }
+            }
             // `.copy(field = e, …)` — a `case class` copy with named/positional
             // updates. Named args (`field =`) are not general-purpose method args
             // in this frontend, so `copy` is parsed specially.
@@ -3572,6 +3893,22 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 self.advance();
+                // `case Color.Red =>` / `case Shape.Circle(r) =>` — an enum case
+                // qualified by its enum is the bare case (see `enum_decl`).
+                let name = match self.enums.get(&name).cloned() {
+                    Some(cases) if self.is(&Tok::Dot) => {
+                        self.advance();
+                        let case = self.ident()?;
+                        if !cases.contains(&case) {
+                            return Err(format!(
+                                "scalars: value {case} is not a member of {name} (line {})",
+                                self.line()
+                            ));
+                        }
+                        case
+                    }
+                    _ => name,
+                };
                 // `Foo(sub, …)` — a constructor/extractor pattern.
                 if self.is(&Tok::LParen) {
                     self.advance();
@@ -3664,7 +4001,7 @@ impl Parser {
     ) -> Result<Expr, String> {
         let mut result = Expr::Str(parts[0].clone());
         for (idx, esrc) in exprs.iter().enumerate() {
-            let mut val = parse_fragment(esrc)?;
+            let mut val = parse_fragment(esrc, &self.enums)?;
             if is_f {
                 let spec = fmts[idx].clone().unwrap_or_else(|| "%s".to_string());
                 val = Expr::Format {
@@ -3723,21 +4060,10 @@ fn dotted_operator(t: &Tok) -> Option<&'static str> {
 /// Parse a single expression from a splice source fragment (an interpolation's
 /// `$id` / `${expr}`). Runs a fresh sub-parser so the fragment can be any
 /// expression the grammar accepts.
-fn parse_fragment(src: &str) -> Result<Expr, String> {
-    let tokens = crate::lexer::lex(src)?;
-    let mut p = Parser {
-        toks: tokens,
-        pos: 0,
-        funcs: Vec::new(),
-        classes: Vec::new(),
-        objects: Vec::new(),
-        imports: HashMap::new(),
-        wildcards: Vec::new(),
-        implicits: Vec::new(),
-        extensions: Vec::new(),
-        conversions: Vec::new(),
-        givens: 0,
-    };
+fn parse_fragment(src: &str, enums: &HashMap<String, Vec<String>>) -> Result<Expr, String> {
+    let mut p = Parser::new(crate::lexer::lex(src)?);
+    // A splice sees the enclosing unit's enums: `s"${Color.Red}"`.
+    p.enums = enums.clone();
     p.skip_seps();
     // Scala's `${…}` holds a BLOCK, not just an expression, so a splice may
     // declare and sequence (`s"${ val q = 3; q * 2 }"`, which used to be

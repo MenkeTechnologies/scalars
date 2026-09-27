@@ -266,6 +266,15 @@ Implemented and checked against the reference `scala`:
   member `class` may be declared after the statement that constructs it. A
   `class Q` beside an `object Q` is the companion idiom and compiles; a genuine
   redeclaration is refused rather than silently resolved to one of the two.
+- **Scala 3 `enum`** — the simple form (`enum Color { case Red, Green }`), the
+  ADT form (`case Circle(r: Double)`, type parameters allowed) and a mix, in
+  braces or indentation, with `def`s in the body. Each case answers `ordinal`
+  (its position among all cases); the companion answers `fromOrdinal`, and
+  `values` / `valueOf` when every case is a singleton, raising the same
+  `NoSuchElementException` / `IllegalArgumentException` messages. `Color.Red`,
+  `Shape.Circle(1.0)` and the patterns `case Color.Red =>` /
+  `case Shape.Circle(r) =>` work wherever the enum is declared, and a
+  program's own `object Color` adds members to the companion.
 - **Bindings** — `val` / `var` with optional type ascription
   (`val x: Int = …`, `var s = …`), type inferred as storage; plain and compound
   assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`). Reassigning a `val`

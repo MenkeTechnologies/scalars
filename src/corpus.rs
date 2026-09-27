@@ -200,6 +200,12 @@ pub const CORPUS: &[Entry] = &[
         "case class Name(params)\ncase class P(x: Int, y: Int)\nprintln(P(1, 2).copy(y = 9))   // => P(1,9)",
     ),
     (
+        "enum",
+        "Declarations and Modifiers",
+        "A Scala 3 enumeration: singleton cases (`case Red, Green`), parameterized cases (`case Circle(r: Double)`), or both, with `def`s shared by every case. Each case answers `ordinal`; the companion answers `fromOrdinal`, and `values`/`valueOf` when every case is a singleton. A case is written `Color.Red` or matched `case Color.Red =>`. Constructor parameters on the enum itself are not modelled.",
+        "enum Name { case A, B; case C(x: Int) }\nenum Color { case Red, Green }\nprintln(Color.values.toList)   // => List(Red, Green)",
+    ),
+    (
         "case object",
         "Declarations and Modifiers",
         "A singleton with case-class semantics. It prints as its bare name rather than `Name()`, which is how the built-in `None` renders.",

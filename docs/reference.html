@@ -236,15 +236,22 @@ case class P(x: Int, y: Int)
 println(P(1, 2).copy(y = 9))   // =&gt; P(1,9)</code></pre>
         </article>
         <article class="doc-entry" id="doc-declarations-and-modifiers-4">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-4">#</a> <code>case object</code></h3>
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-4">#</a> <code>enum</code></h3>
+          <p>A Scala 3 enumeration: singleton cases (`case Red, Green`), parameterized cases (`case Circle(r: Double)`), or both, with `def`s shared by every case. Each case answers `ordinal`; the companion answers `fromOrdinal`, and `values`/`valueOf` when every case is a singleton. A case is written `Color.Red` or matched `case Color.Red =&gt;`. Constructor parameters on the enum itself are not modelled.</p>
+          <pre><code class="lang-scala">enum Name { case A, B; case C(x: Int) }
+enum Color { case Red, Green }
+println(Color.values.toList)   // =&gt; List(Red, Green)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-5">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-5">#</a> <code>case object</code></h3>
           <p>A singleton with case-class semantics. It prints as its bare name rather than `Name()`, which is how the built-in `None` renders.</p>
           <pre><code class="lang-scala">case object Name [extends P]
 sealed trait Shape
 case object Origin extends Shape
 println(Origin)   // =&gt; Origin</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-5">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-5">#</a> <code>override</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-6">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-6">#</a> <code>override</code></h3>
           <p>Replace a supertype's concrete member. The call dispatches on the receiver's runtime class, not on the declared type of the reference.</p>
           <pre><code class="lang-scala">override def f = expr
 class A { def f = 1 }
@@ -252,31 +259,31 @@ class B extends A { override def f = 2 }
 val a: A = new B()
 println(a.f)   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-6">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-6">#</a> <code>with</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-7">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-7">#</a> <code>with</code></h3>
           <p>Mix another supertype into a `class` or `trait`. Method lookup is the class itself, then its parents right to left — the linearization order.</p>
           <pre><code class="lang-scala">class C extends P with T1 with T2
 trait L { def tag = "L" }
 class R extends L
 println(new R().tag)   // =&gt; L</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-7">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-7">#</a> <code>super</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-8">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-8">#</a> <code>super</code></h3>
           <p>Call the supertype's implementation of a member, skipping this type in the linearization. Useful for wrapping rather than replacing an inherited method.</p>
           <pre><code class="lang-scala">super.member
 class A { def f = "a" }
 class B extends A { override def f = super.f + "b" }
 println(new B().f)   // =&gt; ab</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-8">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-8">#</a> <code>this</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-9">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-9">#</a> <code>this</code></h3>
           <p>The receiver inside a class or trait body. `this.f` and a bare `f` name the same field; `this` is passed implicitly to every method call on an instance.</p>
           <pre><code class="lang-scala">this[.member]
 class Box(val n: Int) { def twice: Int = this.n * 2 }
 println(new Box(3).twice)   // =&gt; 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-9">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-9">#</a> <code>sealed</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-10">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-10">#</a> <code>sealed</code></h3>
           <p>A soft keyword accepted and skipped: it documents that a hierarchy is closed, but this frontend performs no exhaustiveness analysis, so a non-exhaustive `match` over a sealed type is a run-time `MatchError` rather than a compile-time warning.</p>
           <pre><code class="lang-scala">sealed trait Name
 sealed trait Shape
@@ -284,65 +291,65 @@ case class Circle(r: Int) extends Shape
 val s: Shape = Circle(2)
 println(s match { case Circle(r) =&gt; r * r })   // =&gt; 4</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-10">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-10">#</a> <code>abstract</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-11">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-11">#</a> <code>abstract</code></h3>
           <p>A member modifier accepted and skipped. The runtime is dynamically typed, so an unimplemented member is only an error when it is actually called.</p>
           <pre><code class="lang-scala">abstract def f: T
 abstract class Base { def name: String }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-11">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-11">#</a> <code>final</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-12">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-12">#</a> <code>final</code></h3>
           <p>A member modifier accepted and skipped; it carries no run-time meaning here, since dispatch is by the receiver's class either way.</p>
           <pre><code class="lang-scala">final def f = expr
 class A { final def tag = "a" }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-12">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-12">#</a> <code>private</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-13">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-13">#</a> <code>private</code></h3>
           <p>A member modifier accepted and skipped. Every member is reachable at run time — visibility is not enforced.</p>
           <pre><code class="lang-scala">private val x = expr
 class A { private val secret = 1; def peek = secret }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-13">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-13">#</a> <code>protected</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-14">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-14">#</a> <code>protected</code></h3>
           <p>A member modifier accepted and skipped, like `private`; access control is not modelled.</p>
           <pre><code class="lang-scala">protected def f = expr
 class A { protected def helper = 1 }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-14">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-14">#</a> <code>implicit</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-15">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-15">#</a> <code>implicit</code></h3>
           <p>Accepted as a modifier and skipped. There is no implicit resolution in this frontend — an implicit parameter is never supplied automatically, and an implicit conversion never fires.</p>
           <pre><code class="lang-scala">implicit val x = expr
 class A { implicit val scale = 2 }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-15">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-15">#</a> <code>lazy</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-16">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-16">#</a> <code>lazy</code></h3>
           <p>Accepted as a modifier and skipped, so a `lazy val` is initialized eagerly at its declaration rather than on first use. A `lazy val` whose initializer diverges therefore diverges here.</p>
           <pre><code class="lang-scala">lazy val x = expr
 def f = { lazy val z = 1; z }
 println(f)   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-16">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-16">#</a> <code>package</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-17">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-17">#</a> <code>package</code></h3>
           <p>A package prologue line. It is parsed and skipped: names are not namespaced, and the object entry point is found regardless of the declared package.</p>
           <pre><code class="lang-scala">package name[.name…]
 package demo
 object T extends App { println(1) }   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-17">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-17">#</a> <code>import</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-18">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-18">#</a> <code>import</code></h3>
           <p>An import prologue line, tolerated and ignored. Imports are not tracked, so `scala.math` members are reachable through `math`/`Math` whether or not they were imported.</p>
           <pre><code class="lang-scala">import path[._]
 import scala.math._
 object T extends App { println(math.sqrt(16.0)) }   // =&gt; 4.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-18">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-18">#</a> <code>App</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-19">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-19">#</a> <code>App</code></h3>
           <p>The mixin whose object body scalars runs directly as the program, with no `main` method needed.</p>
           <pre><code class="lang-scala">object Name extends App { … }
 object T extends App { println("hi") }   // =&gt; hi</code></pre>
         </article>
-        <article class="doc-entry" id="doc-declarations-and-modifiers-19">
-          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-19">#</a> <code>main</code></h3>
+        <article class="doc-entry" id="doc-declarations-and-modifiers-20">
+          <h3><a class="doc-anchor" href="#doc-declarations-and-modifiers-20">#</a> <code>main</code></h3>
           <p>The entry method scalars looks for when no object `extends App`. Its parameter is bound to the command-line arguments, and the object's `val`s and member types are initialized before it runs.</p>
           <pre><code class="lang-scala">def main(args: Array[String]): Unit = { … }
 object T { def main(args: Array[String]): Unit = { println(0) } }   // =&gt; 0</code></pre>

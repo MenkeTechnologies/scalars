@@ -5922,3 +5922,112 @@ object Main {
     assert!(ok);
     assert_eq!(out, "c-R c-K(1) true false R k:K(2) OO OO\n");
 }
+
+#[test]
+fn a_scala3_enum_simple_and_adt() {
+    // `enum` lowers to a sealed trait, a `case object` per singleton case and a
+    // `case class` per parameterized one, each answering its `ordinal`, plus a
+    // companion with `fromOrdinal` (and `values`/`valueOf` when every case is a
+    // singleton). Reference output, Scala 3.9.0.
+    let src = r#"
+enum Color:
+  case Red, Green, Blue
+  def isRed: Boolean = this == Red
+  def label: String = "c-" + toString
+
+enum Shape:
+  case Circle(r: Double)
+  case Rect(w: Double, h: Double)
+  case Empty
+  def area: Double = this match
+    case Circle(r) => 3.0 * r * r
+    case Rect(w, h) => w * h
+    case Empty => 0.0
+
+enum Opt[+T]:
+  case Som(x: T)
+  case Non
+
+@main def run(): Unit =
+  println(Color.values.mkString(","))
+  println(List(Color.Red.isRed, Color.Blue.isRed, Color.Green.label, Color.Blue.ordinal, Color.fromOrdinal(2)))
+  try Color.fromOrdinal(7) catch case e: Exception => println(e.getClass.getName + ": " + e.getMessage)
+  try Color.valueOf("Pink") catch case e: Exception => println(e.getClass.getName + ": " + e.getMessage)
+  println(List(Shape.Rect(2, 3).area, Shape.Empty.area, Shape.Circle(1.5).ordinal, Shape.Empty.ordinal))
+  println(Shape.Empty)
+  println(Shape.Rect(1, 2) == Shape.Rect(1, 2))
+  val o: Opt[Int] = Opt.Som(3)
+  o match
+    case Opt.Som(x) => println(x + 1)
+    case Opt.Non => println("none")
+  println(Opt.Non)
+  println(List(Color.Red, Color.Blue).map(_.ordinal))
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Red,Green,Blue\n\
+         List(true, false, c-Green, 2, Blue)\n\
+         java.util.NoSuchElementException: enum Color has no case with ordinal: 7\n\
+         java.lang.IllegalArgumentException: enum Color has no case with name: Pink\n\
+         List(6.0, 0.0, 0, 2)\n\
+         Empty\n\
+         true\n\
+         4\n\
+         Non\n\
+         List(0, 2)\n"
+    );
+}
+
+#[test]
+fn an_enum_declared_after_its_use_with_a_companion() {
+    // The qualified `Dir.North` / `case Tree.Leaf(v) =>` resolves wherever the
+    // enum is written, and a program's own companion `object` adds to the
+    // synthesized one (reference output, Scala 3.9.0).
+    let src = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(s"first ${Dir.North} then ${Dir.values.last} default ${Dir.default}")
+    Dir.values.foreach(d => println(d.ordinal + ":" + d + ":" + d.turn))
+    println(sum(Tree.Node(Tree.Leaf(1), Tree.Node(Tree.Leaf(2), Tree.Leaf(3)))))
+    Dir.valueOf("South") match {
+      case Dir.North | Dir.South => println("vertical")
+      case _ => println("horizontal")
+    }
+  }
+  def sum(t: Tree): Int = t match {
+    case Tree.Leaf(v) => v
+    case Tree.Node(l, r) => sum(l) + sum(r)
+  }
+}
+
+object Dir {
+  def default: Dir = Dir.East
+}
+
+enum Dir {
+  case North, East, South, West
+  def turn: Dir = Dir.fromOrdinal((ordinal + 1) % 4)
+}
+
+enum Tree {
+  case Leaf(v: Int)
+  case Node(l: Tree, r: Tree)
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "first North then West default East\n0:North:East\n1:East:South\n2:South:West\n3:West:North\n6\nvertical\n"
+    );
+}
+
+#[test]
+fn an_enum_with_constructor_parameters_is_refused() {
+    rejects(
+        "enum Planet(mass: Double):\n  case Earth extends Planet(5.97)\n@main def run(): Unit = println(Planet.Earth)\n",
+        "an `enum` with constructor parameters",
+    );
+}

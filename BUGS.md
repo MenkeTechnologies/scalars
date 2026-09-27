@@ -689,10 +689,10 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **`enum`.** Neither the simple `enum Color { case Red, Green }` nor the ADT
-  form (`case Circle(r: Double)`) parses: `expected a top-level object/class
-  declaration, found Ident("Red")`. The sealed-trait-and-case-class spelling of
-  the same ADT works.
+- **`enum` with constructor parameters.** `enum Planet(mass: Double)` and a
+  case `extends Planet(5.97)` are refused with a diagnostic; a `val` in an
+  enum body is refused too. The cases share the one flat type namespace, so two
+  enums with a case of the same name are a redeclaration.
 - **What the optional-braces pass does not cover.** A `:` at the end of a line
   with no lambda parameters (`xs.foreach:` followed by an indented block
   argument) is not an argument, and a `given … with` body and an indentation
