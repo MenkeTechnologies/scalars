@@ -5869,3 +5869,30 @@ extension (n: Int)
     assert!(ok);
     assert_eq!(out, "25\n1\n2\n3\n6\n1=a\n2=b\nint 7\n");
 }
+
+#[test]
+fn a_def_main_object_declares_its_member_types() {
+    // A `case class`, `sealed trait`, `case object`, `class` or `object`
+    // declared inside an object with `def main` was skipped, so every use of
+    // one was `not found` (reference output, Scala 3.9.0).
+    let src = r#"
+object Main {
+  case class P(a: Int, b: String)
+  sealed trait T
+  case object A extends T
+  class Box(val v: Int) { def twice = v * 2 }
+  object Helper { def k = 3 }
+  def main(args: Array[String]): Unit = {
+    println(P(1, "x"))
+    println(A)
+    println(new Box(4).twice)
+    println(Helper.k)
+    val t: T = A
+    t match { case A => println("a") }
+  }
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "P(1,x)\nA\n8\n3\na\n");
+}

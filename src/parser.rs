@@ -394,6 +394,15 @@ impl Parser {
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             let lazy = self.skip_member_modifiers();
+            // A class, trait or object declared inside the object is a member
+            // type; it joins the flat namespace the way one declared in an
+            // `extends App` body or a block does. It was skipped, so a
+            // `def main` object's own `case class` was `not found`.
+            if self.at_nested_declaration() {
+                self.nested_declaration()?;
+                self.skip_seps();
+                continue;
+            }
             if self.is(&Tok::Def) {
                 if let Some(m) = self.try_main()? {
                     main = Some(m);
@@ -588,6 +597,8 @@ impl Parser {
                 || w == "protected"
                 || w == "final"
                 || w == "abstract"
+                || w == "sealed"
+                || w == "open"
                 || w == "implicit"
                 || w == "lazy")
         {
