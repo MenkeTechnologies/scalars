@@ -5838,3 +5838,34 @@ fn a_brace_less_def_body_runs_every_statement() {
     assert!(ok);
     assert_eq!(out, "a\nb\n");
 }
+
+#[test]
+fn fewer_braces_arguments_extension_blocks_and_tuple_generators() {
+    // `f: x =>` with the lambda body indented below is `f(x => { … })`, an
+    // `extension (x: T)` takes its methods from the indented lines, and the
+    // bracket-less `for (k, v) <- m do` reads `(k, v)` as a pattern
+    // (reference output, Scala 3.9.0). A typed `case x: Int =>` is still a
+    // pattern.
+    let src = r#"
+extension (n: Int)
+  def squared: Int = n * n
+
+@main def go(): Unit =
+  println(5.squared)
+  val xs = List(3, 1, 2)
+  xs.sorted.foreach: x =>
+    println(x)
+  val total = xs.foldLeft(0): (acc, x) =>
+    acc + x
+  println(total)
+  val m = Map(1 -> "a", 2 -> "b")
+  for (k, v) <- m do println(s"$k=$v")
+  (7: Any) match
+    case n: Int =>
+      println("int " + n)
+    case _ => println("other")
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "25\n1\n2\n3\n6\n1=a\n2=b\nint 7\n");
+}

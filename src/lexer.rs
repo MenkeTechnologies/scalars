@@ -647,6 +647,9 @@ enum Open {
     Brace,
     /// An indentation region, with the indentation of its first line.
     Region(u32),
+    /// The `(` a fewer-braces argument (`xs.foreach: x =>`) stands for; it
+    /// closes with the region of the lambda's body.
+    ColonArg,
 }
 
 /// Scala 3's optional braces, as a token-stream rewrite: an indentation region
@@ -654,7 +657,8 @@ enum Open {
 ///
 /// A region opens after a token that ENDS its line and may begin one — `=`,
 /// `=>`, `match`, `try`, `catch`, `finally`, `else`, `for`, `then`, `do`, `yield`, and
-/// the `:` of an `object`/`class`/`trait`/`enum` header — when the next line is
+/// the `:` of an `object`/`class`/`trait`/`enum` header, and the `)` closing an
+/// `extension`'s receiver — when the next line is
 /// indented deeper than the opener's own line and does not start with `{`. It
 /// closes before the first line indented less than the region, before the
 /// bracket that encloses it closes, and at the end of the file. Inside `( )` and
@@ -693,6 +697,14 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
                 kind: Tok::RBrace,
                 line,
             });
+            // A lambda body closing ends the argument it was passed as.
+            if matches!(stack.last(), Some(Open::ColonArg)) {
+                stack.pop();
+                out.push(Token {
+                    kind: Tok::RParen,
+                    line,
+                });
+            }
         }
         if let Some(sep) = sep {
             out.push(sep);
@@ -700,6 +712,9 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
     }
 
     let mut skip = 0usize;
+    // Whether the current line has had a `case` yet: its `x: T =>` is a typed
+    // pattern, never a fewer-braces argument.
+    let mut case_on_line = false;
     for (i, tok) in toks.iter().enumerate() {
         if skip > 0 {
             skip -= 1;
@@ -709,6 +724,7 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
             close_regions(&mut out, &mut stack, tok.line, |r| ind >= r);
             line_indent = ind;
             line_head = Some(tok.kind.clone());
+            case_on_line = false;
             // An end marker (`end match`, `end run`) only documents where a
             // region ends; closing it is the outdent's job, done above.
             if is_end_marker(&toks, starts, i) {
@@ -723,6 +739,20 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
             }
             Tok::Eof => close_regions(&mut out, &mut stack, tok.line, |_| false),
             _ => {}
+        }
+        case_on_line |= tok.kind == Tok::Case;
+        // Scala 3's fewer-braces argument: `f: x =>` with the lambda's body on
+        // the deeper lines below is `f(x => { … })`.
+        if tok.kind == Tok::Colon
+            && !case_on_line
+            && !matches!(stack.last(), Some(Open::Paren))
+            && i > 0
+            && toks[i - 1].kind.can_end()
+            && colon_lambda_ahead(&toks, starts, i, line_indent)
+        {
+            out.push(brace(Tok::LParen, tok.line));
+            stack.push(Open::ColonArg);
+            continue;
         }
         out.push(tok.clone());
         match tok.kind {
@@ -750,6 +780,41 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
         }
     }
     out
+}
+
+/// Whether the `:` at `colon` introduces a fewer-braces lambda argument: it is
+/// followed, on the same line, by lambda parameters — one name, or a
+/// parenthesized list — and an `=>` that ends the line, with the body on a
+/// deeper line.
+fn colon_lambda_ahead(toks: &[Token], starts: &[Option<u32>], colon: usize, indent: u32) -> bool {
+    let mut j = colon + 1;
+    match toks.get(j).map(|t| &t.kind) {
+        Some(Tok::Ident(_)) => j += 1,
+        Some(Tok::LParen) => {
+            let mut depth = 0;
+            loop {
+                match toks.get(j).map(|t| &t.kind) {
+                    Some(Tok::LParen) => depth += 1,
+                    Some(Tok::RParen) => {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    Some(Tok::Eof) | None => return false,
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        _ => return false,
+    }
+    if toks.get(j).map(|t| &t.kind) != Some(&Tok::FatArrow) || starts.get(j) != Some(&None) {
+        return false;
+    }
+    let body = (j + 1..toks.len()).find(|&k| toks[k].kind != Tok::Newline);
+    body.is_some_and(|k| starts[k].is_some_and(|ind| ind > indent))
 }
 
 /// Whether the line starting at `i` is a Scala 3 end marker: `end` and one
@@ -797,6 +862,8 @@ fn opens_region(kind: &Tok, head: Option<&Tok>) -> bool {
             Some(Tok::Ident(w)) => matches!(w.as_str(), "class" | "trait" | "enum"),
             _ => false,
         },
+        // `extension (x: T)` with its methods on the deeper lines below.
+        Tok::RParen => matches!(head, Some(Tok::Ident(w)) if w == "extension"),
         _ => false,
     }
 }

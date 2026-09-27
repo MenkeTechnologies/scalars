@@ -1843,7 +1843,28 @@ impl Parser {
         // bracket at all, up to `do`/`yield` (`for x <- xs do …`); an indented
         // enumerator block reaches here already braced by the optional-braces
         // pass.
-        let enums = if matches!(self.peek(), Tok::LBrace | Tok::LParen) {
+        // A `(` that is followed, after its match, by `<-` is a tuple PATTERN
+        // of the bracket-less form (`for (k, v) <- m do …`), not the bracket.
+        let paren_pattern = self.is(&Tok::LParen) && {
+            let mut depth = 0i32;
+            let mut i = self.pos;
+            loop {
+                match self.toks.get(i).map(|t| &t.kind) {
+                    Some(Tok::LParen) => depth += 1,
+                    Some(Tok::RParen) => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Some(Tok::Eof) | None => break,
+                    _ => {}
+                }
+                i += 1;
+            }
+            matches!(self.toks.get(i + 1).map(|t| &t.kind), Some(Tok::LArrow))
+        };
+        let enums = if !paren_pattern && matches!(self.peek(), Tok::LBrace | Tok::LParen) {
             let braced = self.is(&Tok::LBrace);
             self.advance();
             let enums = self.for_enums(if braced {
