@@ -11999,10 +11999,16 @@ fn b_lazy_force(vm: &mut VM, _argc: u8) -> Value {
     forced
 }
 
-/// [`SF64`] — widen a `Float` to `Double`, leaving everything else alone.
+/// [`SF64`] — widen a `Float`, or an integral value, to `Double`, leaving
+/// everything else alone. Scala widens an `Int`/`Long` argument to a `Double`
+/// parameter just as it widens a `Float`: `def sq(n: Double) = n * n` called
+/// `sq(3)` binds `3.0` and answers `9.0`, and `val d: Double = 3` is `3.0`.
 fn b_f64(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.stack.pop().unwrap_or(Value::Undef);
-    conv_elementwise(v, |x| f32_of(x).map(|f| Value::float(f64::from(f))))
+    conv_elementwise(v, |x| match x {
+        Value::Int(n) => Some(Value::float(*n as f64)),
+        _ => f32_of(x).map(|f| Value::float(f64::from(f))),
+    })
 }
 
 /// [`SF32_STR`] — `Float.toString` of one value.

@@ -132,6 +132,11 @@ struct Compiler {
     /// `String`; naming the type is what lets one extension call chain into
     /// another (`5.sq.dbl`).
     func_ret_ty: HashMap<String, String>,
+    /// The conversion to the declared return type of the body being lowered
+    /// (`SF64` for `: Double`, `SF32` for `: Float`), applied to every value it
+    /// returns: `def f(): Double = 3` answers `3.0`. `None` outside a `def` and
+    /// in a lambda, which declares no return type.
+    ret_conv: Option<u16>,
     /// The packages a WILDCARD `import` opened — see
     /// [`Compiler::imported_wildcard`].
     wildcards: Vec<Vec<String>>,
@@ -750,6 +755,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             .iter()
             .filter_map(|f| f.ret_ty.clone().map(|t| (f.name.clone(), t)))
             .collect(),
+        ret_conv: None,
         func_type_params: prog
             .functions
             .iter()
@@ -1179,6 +1185,7 @@ impl Compiler {
                 match val {
                     Some(e) => {
                         self.expr(e)?;
+                        self.emit_ret_conv(s.line);
                         self.b.emit(Op::ReturnValue, s.line);
                     }
                     None => {
@@ -1849,6 +1856,14 @@ impl Compiler {
     /// captured upvalues into frame slots, lower the body as the (single-value)
     /// result, and end with a `ReturnValue`.
     fn emit_closure(&mut self, pc: PendingClosure) -> Result<(), String> {
+        // A lambda declares no return type, whatever `def` it was written in.
+        let saved_ret = self.ret_conv.take();
+        let r = self.emit_closure_body(pc);
+        self.ret_conv = saved_ret;
+        r
+    }
+
+    fn emit_closure_body(&mut self, pc: PendingClosure) -> Result<(), String> {
         let ip = self.b.current_pos();
         self.b.add_sub_entry(pc.name_idx, ip);
 
@@ -5025,9 +5040,11 @@ impl Compiler {
             .get(&cd.name)
             .map(|m| m.field_names.iter().cloned().collect())
             .unwrap_or_default();
+        let saved_ret = std::mem::replace(&mut self.ret_conv, declared_conv(m.ret_ty.as_deref()));
         self.current_class = Some((cd.name.clone(), fields));
         self.push_unwind(UnwindKind::Def);
         self.tail(&m.body)?;
+        self.ret_conv = saved_ret;
         self.pop_unwind_to(self.b.current_pos());
         self.emit_return_unit(0);
         self.current_class = saved_class;
@@ -5074,9 +5091,11 @@ impl Compiler {
         }
         self.emit_f32_params(&m.sig, 0);
         let saved_obj = self.current_object.take();
+        let saved_ret = std::mem::replace(&mut self.ret_conv, declared_conv(m.ret_ty.as_deref()));
         self.current_object = Some(od.name.clone());
         self.push_unwind(UnwindKind::Def);
         self.tail(&m.body)?;
+        self.ret_conv = saved_ret;
         self.pop_unwind_to(self.b.current_pos());
         self.emit_return_unit(0);
         self.current_object = saved_obj;
@@ -5472,8 +5491,10 @@ impl Compiler {
         let saved_implicits = self.implicits.clone();
         self.push_implicit_params(&f.params, &f.sig, f.captured);
 
+        let saved_ret = std::mem::replace(&mut self.ret_conv, declared_conv(f.ret_ty.as_deref()));
         self.push_unwind(UnwindKind::Def);
         self.tail(&f.body)?;
+        self.ret_conv = saved_ret;
         self.pop_unwind_to(self.b.current_pos());
         // A body that returned on every path never reaches here; one that fell
         // through (e.g. ends in a loop) returns `Unit`.
@@ -5545,6 +5566,7 @@ impl Compiler {
             StmtKind::Expr(e) => {
                 self.expr(e)?;
                 self.unwind_check_dropping(1);
+                self.emit_ret_conv(s.line);
                 self.b.emit(Op::ReturnValue, s.line);
                 Ok(())
             }
@@ -5875,6 +5897,14 @@ impl Compiler {
     /// tuple, and it is structural (`() == ()` holds, `toString` is `()`), so
     /// returning the same value makes every `Unit` in the language one thing
     /// rather than adding a second representation.
+    /// Convert the value about to be returned to the declared return type,
+    /// when the body declares a floating one (see [`Self::ret_conv`]).
+    fn emit_ret_conv(&mut self, line: u32) {
+        if let Some(id) = self.ret_conv {
+            self.b.emit(Op::CallBuiltin(id, 1), line);
+        }
+    }
+
     fn emit_return_unit(&mut self, line: u32) {
         self.emit_unit(line);
         self.b.emit(Op::ReturnValue, line);

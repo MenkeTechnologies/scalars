@@ -2140,6 +2140,7 @@ impl Parser {
     /// expression or a `{ … }` block.
     fn lambda(&mut self) -> Result<Expr, String> {
         let params = self.lambda_params()?;
+        let line = self.line();
         let body = if self.is(&Tok::LBrace) {
             self.advance();
             Expr::Block(self.block()?)
@@ -2148,29 +2149,30 @@ impl Parser {
             // statement, not an expression — wrap it in a single-statement block.
             Expr::Block(vec![self.statement()?])
         } else {
-            self.expression()?
+            // The body is an `Expr`, so it takes a trailing ascription:
+            // `x => x: Double` ascribes the body, not the whole function.
+            let e = self.expression()?;
+            self.ascription_tail(e, line)?
         };
-        Ok(Expr::Lambda {
-            params,
-            body: Box::new(body),
-            partial: false,
-        })
+        Ok(typed_lambda(params, body, line))
     }
 
     /// A function literal's parameter list, through the `=>`: a single bare
     /// identifier or a parenthesized (optionally typed) list.
-    fn lambda_params(&mut self) -> Result<Vec<String>, String> {
+    fn lambda_params(&mut self) -> Result<Vec<(String, Option<String>)>, String> {
         let mut params = Vec::new();
         if self.is(&Tok::LParen) {
             self.advance();
             self.skip_seps();
             while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
                 let name = self.ident()?;
-                if self.is(&Tok::Colon) {
+                let ty = if self.is(&Tok::Colon) {
                     self.advance();
-                    self.type_ref()?;
-                }
-                params.push(name);
+                    Some(self.type_ref()?)
+                } else {
+                    None
+                };
+                params.push((name, ty));
                 if self.is(&Tok::Comma) {
                     self.advance();
                     self.skip_seps();
@@ -2180,7 +2182,7 @@ impl Parser {
             }
             self.eat(&Tok::RParen)?;
         } else {
-            params.push(self.ident()?);
+            params.push((self.ident()?, None));
         }
         self.eat(&Tok::FatArrow)?;
         self.skip_seps();
@@ -2558,11 +2560,9 @@ impl Parser {
             // `{ x => s1; s2 }` — the arrow's body is the rest of the brace group,
             // which may be several statements, so it is read as a block.
             let params = self.lambda_params()?;
-            return Ok(Expr::Lambda {
-                params,
-                body: Box::new(Expr::Block(self.block()?)),
-                partial: false,
-            });
+            let line = self.line();
+            let body = Expr::Block(self.block()?);
+            return Ok(typed_lambda(params, body, line));
         }
         Ok(Expr::Block(self.block()?))
     }
@@ -4141,5 +4141,56 @@ fn try_factory(body: &Expr, line: u32) -> Expr {
             body: vec![wrap("Failure", Expr::Var("_$try".to_string()))],
         }],
         finalizer: None,
+    }
+}
+
+/// A function literal from its parameters and body. A parameter declared
+/// `Double` or `Float` is rebound under that type at the top of the body, so
+/// the argument is widened the way Scala widens it: `((x: Double) => x)(2)` is
+/// `2.0`. The parameter itself is renamed out of the way (`x` becomes `x$arg`)
+/// so the rebinding is an ordinary typed `val` that shadows nothing.
+fn typed_lambda(params: Vec<(String, Option<String>)>, body: Expr, line: u32) -> Expr {
+    let mut rebinds = Vec::new();
+    let names = params
+        .into_iter()
+        .map(|(name, ty)| match ty.as_deref() {
+            Some("Double" | "Float") => {
+                let raw = format!("{name}$arg");
+                rebinds.push(Stmt {
+                    kind: StmtKind::Local {
+                        name,
+                        ty,
+                        init: Some(Expr::Var(raw.clone())),
+                        is_val: true,
+                        is_lazy: false,
+                    },
+                    line,
+                });
+                raw
+            }
+            _ => name,
+        })
+        .collect();
+    let body = if rebinds.is_empty() {
+        body
+    } else {
+        match body {
+            Expr::Block(stmts) => {
+                rebinds.extend(stmts);
+                Expr::Block(rebinds)
+            }
+            other => {
+                rebinds.push(Stmt {
+                    kind: StmtKind::Expr(other),
+                    line,
+                });
+                Expr::Block(rebinds)
+            }
+        }
+    };
+    Expr::Lambda {
+        params: names,
+        body: Box::new(body),
+        partial: false,
     }
 }

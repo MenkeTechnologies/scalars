@@ -5720,3 +5720,44 @@ object Main {
     assert!(ok);
     assert_eq!(out, "hi\n2\n1\ninit big\n42\n42\n");
 }
+
+#[test]
+fn an_integral_value_widens_to_a_declared_double() {
+    // Scala widens an `Int`/`Long` to `Double` wherever the declared type says
+    // `Double`: a parameter, a `val`/`var`, a return type, a typed lambda
+    // parameter, and an ascribed lambda body (reference: every line `.0`).
+    let src = r#"
+class C { def v: Double = 7 }
+object T {
+  def sq(n: Double): Double = n * n
+  def f(): Double = 3
+  def h(x: Int): Double = if (x > 0) x else -x
+  def m(x: Int): Double = x match { case 1 => 10; case _ => 20 }
+  def r(x: Int): Double = { if (x > 5) return x; 0 }
+  def lst(): List[Double] = List(1, 2)
+  def main(args: Array[String]): Unit = {
+    println(sq(3))
+    println(f())
+    println(h(-4))
+    println(m(1))
+    println(r(9))
+    println(lst())
+    println(new C().v)
+    val d: Double = 3
+    println(d)
+    var v: Double = 0
+    v = 5
+    println(v)
+    val fn = (x: Double) => x
+    println(fn(2))
+    println(List(1, 2).map(x => x: Double))
+  }
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "9.0\n3.0\n4.0\n10.0\n9.0\nList(1.0, 2.0)\n7.0\n3.0\n5.0\n2.0\nList(1.0, 2.0)\n"
+    );
+}
