@@ -5692,3 +5692,31 @@ fn a_string_value_holding_null_concatenates() {
     ));
     assert_eq!(out, "nully\nnull1\nnullnull\nanullb\n");
 }
+
+#[test]
+fn a_def_main_objects_vals_initialize_before_main() {
+    // The `val`/`var`s of an object with `def main` are its fields: they were
+    // dropped, so every read answered `null`. A forward reference reads the
+    // field default, and a `lazy val` still waits for its first read.
+    let src = r#"
+object Main {
+  private val greeting = "hi"
+  var count = 0
+  lazy val big = { println("init big"); 42 }
+  val early = later + 1
+  val later = 10
+  def bump(): Unit = count += 1
+  def main(args: Array[String]): Unit = {
+    println(greeting)
+    bump(); bump()
+    println(count)
+    println(early)
+    println(big)
+    println(big)
+  }
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok);
+    assert_eq!(out, "hi\n2\n1\ninit big\n42\n42\n");
+}

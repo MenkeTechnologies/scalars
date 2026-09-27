@@ -393,7 +393,7 @@ impl Parser {
         let mut main = None;
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-            self.skip_member_modifiers();
+            let lazy = self.skip_member_modifiers();
             if self.is(&Tok::Def) {
                 if let Some(m) = self.try_main()? {
                     main = Some(m);
@@ -401,7 +401,14 @@ impl Parser {
                     defs.push(self.parse_def()?);
                 }
             } else if self.is(&Tok::Val) || self.is(&Tok::Var) {
-                body.push(self.statement()?);
+                let mut stmt = self.statement()?;
+                // The modifier loop above consumed `lazy`, so the statement
+                // parser never saw it: an object's `lazy val` initialized
+                // eagerly, printing its side effects before `main` ran.
+                if let StmtKind::Local { is_lazy, .. } = &mut stmt.kind {
+                    *is_lazy |= lazy;
+                }
+                body.push(stmt);
             } else {
                 self.skip_member()?;
             }
@@ -411,9 +418,13 @@ impl Parser {
 
         if let Some(main) = main {
             // Entry object via `def main`: its helper `def`s join the flat
-            // function namespace; object-level `val`s are ignored (as before).
+            // function namespace, and its `val`/`var`s are the object's fields,
+            // initialized — in declaration order — before `main` runs, as the
+            // object's static initializer does. They were dropped, so every
+            // read of one answered `null`.
             self.funcs.extend(defs);
-            Ok(TopObject::Entry(name, main))
+            body.extend(main);
+            Ok(TopObject::Entry(name, body))
         } else {
             Ok(TopObject::Singleton(ObjectDecl {
                 name,
@@ -567,7 +578,10 @@ impl Parser {
     /// Skip the member modifiers that may precede a `def`/`val`/`var` inside a
     /// `class`/`trait`/`object` body. They carry no runtime meaning here (the
     /// runtime is dynamically typed and every member is reachable).
-    fn skip_member_modifiers(&mut self) {
+    /// Skip a member's modifiers, answering whether `lazy` was among them —
+    /// the one modifier that changes what the member does.
+    fn skip_member_modifiers(&mut self) -> bool {
+        let mut lazy = false;
         while matches!(self.peek(), Tok::Ident(w)
             if w == "override"
                 || w == "private"
@@ -577,8 +591,10 @@ impl Parser {
                 || w == "implicit"
                 || w == "lazy")
         {
+            lazy |= matches!(self.peek(), Tok::Ident(w) if w == "lazy");
             self.advance();
         }
+        lazy
     }
 
     /// Consume a `( … )` group, balancing nested parentheses. The cursor is on
