@@ -175,6 +175,10 @@ struct Compiler {
     /// with a `String` operand keeps the raw `Op::Add` lowering it always had
     /// (see [`Compiler::concat_operand`]).
     has_user_tostring: bool,
+    /// Whether any declared class overrides `equals`. When one does, `==`/`!=`
+    /// lower to the `SEQ_VM`/`SNE_VM` builtins that can run it; otherwise they
+    /// keep `Op::NumEq`/`Op::NumNe`.
+    has_user_equals: bool,
     /// `Some((name, fields))` while compiling a class method: the enclosing
     /// class's name and field-name set, so a bare identifier naming a field
     /// resolves to `this.field` and a bare sibling-method call to `this.m(...)`.
@@ -789,6 +793,10 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                     "toString" | "getMessage" | "getLocalizedMessage"
                 )
             }),
+        has_user_equals: classes
+            .iter()
+            .flat_map(|cd| cd.methods.iter())
+            .any(|m| m.name == "equals" && m.params.len() == 1),
         current_class: None,
         current_object: None,
         obj_counter: 0,
@@ -4698,8 +4706,14 @@ impl Compiler {
         line: u32,
     ) -> Result<(), String> {
         self.expr(recv)?;
-        for a in args {
-            self.expr(a)?;
+        let by_name = library_by_name_arg(name, args.len());
+        for (i, a) in args.iter().enumerate() {
+            if by_name == Some(i) && !self.method_index.contains_key(name) {
+                self.lambda(&[], a, false)?;
+                self.b.emit(Op::CallBuiltin(crate::host::BYNAME, 1), line);
+            } else {
+                self.expr(a)?;
+            }
         }
         let nc = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nc), line);
@@ -6359,6 +6373,17 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::LAZY_CONS, 2), 0);
             return Ok(());
         }
+        if self.has_user_equals && matches!(op, BinOp::Eq | BinOp::Ne) {
+            self.expr(lhs)?;
+            self.expr(rhs)?;
+            let id = if op == BinOp::Eq {
+                crate::host::SEQ_VM
+            } else {
+                crate::host::SNE_VM
+            };
+            self.b.emit(Op::CallBuiltin(id, 2), 0);
+            return Ok(());
+        }
         // took the branch above and never reaches here.
         self.expr(lhs)?;
         if op == BinOp::Add && yields_strings(rhs) {
@@ -6457,6 +6482,19 @@ impl Compiler {
                 e,
                 Expr::Int(_) | Expr::Long(_) | Expr::Float(_) | Expr::Char(_) | Expr::Bool(_)
             )
+    }
+}
+
+/// The position of the BY-NAME parameter of a library method, by name and
+/// argument count: `Option`/`Either`/`Try`.getOrElse(default) and
+/// `.orElse(alternative)`, `Map.getOrElse(key, default)` and
+/// `mutable.Map.getOrElseUpdate(key, op)`. The argument there is evaluated only
+/// when the method needs it, which a side effect or a recursive memo observes.
+fn library_by_name_arg(name: &str, argc: usize) -> Option<usize> {
+    match (name, argc) {
+        ("getOrElse" | "orElse", 1) => Some(0),
+        ("getOrElse" | "getOrElseUpdate", 2) => Some(1),
+        _ => None,
     }
 }
 

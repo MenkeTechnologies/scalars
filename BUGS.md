@@ -295,6 +295,32 @@ reported as parse/compile errors, never silently mis-run.
   Built-in `Option` (`Some(v)`, the `None` case object) rides the same model.
   Plain (non-`case`) classes use reference-identity `equals`/`hashCode` and a
   `Class@hex` `toString`, matching Scala.
+- **`override def equals`, honoured by `==`.** A class that overrides
+  `equals(o: Any)` answers `==`/`!=` through it, and so do a `List`/`Vector`/
+  tuple/`Option` holding such instances (they compare element by element with
+  `==`). The collection lookups run it with the receiver and order the 2.13
+  collections use, which an override that prints can observe: `contains` is
+  `element == target` front to back; `indexOf` is `target == element`;
+  `lastIndexOf` walks a `List` whole from the front but any other kind back
+  from the end; `distinct` hashes (running a `hashCode` override) and calls
+  `equals` only between elements whose hashes agree. A program with no override
+  keeps the native `Op::NumEq`.
+- **By-name arguments of library methods.** `getOrElse(d)` on an
+  `Option`/`Either`/`Try`, `orElse(alt)`, `Map.getOrElse(k, d)` and
+  `mutable.Map.getOrElseUpdate(k, op)` evaluate the argument only when it is
+  needed, so `memo.getOrElseUpdate(n, fib(n - 1) + fib(n - 2))` is a linear
+  memo rather than an exponential recursion, and a `throw` or side effect in a
+  default that is not taken never happens.
+- **A capitalized `val` binder.** `val Pat = "(\d+)".r` and `val Max: Int = 9`
+  bind a value, as Scala reads a lone identifier in a `val` (only a following
+  `(`, `@` or `::` makes it a pattern), so `case Pat(a) =>` and
+  `val Pat(a) = s` use it as an extractor.
+- **`Array.ofDim[T](d1, …)`**, of any rank, each row its own array filled with
+  `T`'s zero; **`StringOps.linesIterator`** (terminators `
+`, `
+` and a lone
+  ``); immutable **`Map.transform((k, v) => …)`**; and **`f.tupled`** /
+  **`f.curried`** on a function value of two or more parameters.
 - **`override def toString`, honoured wherever a value is rendered.** Scala
   renders every value through its `toString`, so an override answers for
   `println(p)`, `s"$p"` / `f"$p%s"`, `"x" + p`, `String.valueOf(p)`,
@@ -691,6 +717,21 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
+- **A user `equals`/`hashCode` inside a `Set` or as a `Map` key.** Membership
+  and deduplication of a `Set` and key lookup in a `Map` use the built-in
+  structural comparison, so `Set(new Pt(1, 2), new Pt(1, 2))` keeps both when
+  `Pt` overrides `equals`/`hashCode`. Building one needs the VM to run the
+  override, and the set/map constructors are reached from paths that do not
+  hold it.
+- **Unbounded `Iterator`s.** `Iterator.from(n)`, `Iterator.continually(x)` and
+  `Iterator.iterate(x)(f)` are not provided: an `Iterator` here is a consumed,
+  materialized sequence. Their `LazyList` counterparts are, and `Iterator(…)`,
+  `Iterator.range` and `xs.iterator` work.
+- **`Map.withDefaultValue` / `withDefault`.** A default would have to travel
+  with the map value through every combinator, and the map representation has
+  no slot for one.
+- **A qualified extractor in a pattern.** `case Obj.Re(a) =>` does not parse;
+  bind the extractor to a local first.
 - **`enum` with constructor parameters.** `enum Planet(mass: Double)` and a
   case `extends Planet(5.97)` are refused with a diagnostic; a `val` in an
   enum body is refused too. The cases share the one flat type namespace, so two

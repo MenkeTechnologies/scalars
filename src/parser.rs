@@ -1881,14 +1881,16 @@ impl Parser {
 
     /// Whether the token after `val`/`var` starts a PATTERN definition rather
     /// than a plain binder. `(` opens a tuple pattern; a capitalized identifier
-    /// is a constructor (`Some(x)`) or stable-id pattern; a lower-case one
-    /// followed by `::` is a cons pattern. A bare lower-case identifier is the
-    /// ordinary `val x = …`, which stays on the simple path.
+    /// followed by more pattern is a constructor (`Some(x)`) pattern; any
+    /// identifier followed by `::` is a cons pattern. A bare identifier before
+    /// `=` or `:` is the ordinary `val x = …` — capitalized or not, since Scala
+    /// reads a lone identifier in a `val` as a binder (`val Pat = "…".r`).
     fn starts_pattern_decl(&self) -> bool {
         match self.peek() {
             Tok::LParen => true,
             Tok::Ident(n) => {
-                n.chars().next().is_some_and(char::is_uppercase)
+                let binder = matches!(self.peek_at(1), Tok::Assign | Tok::Colon);
+                (n.chars().next().is_some_and(char::is_uppercase) && !binder)
                     || matches!(self.peek_at(1), Tok::ColonColon)
             }
             _ => false,
@@ -2887,6 +2889,25 @@ impl Parser {
                     args: vec![Expr::Str(ty)],
                     line,
                 };
+                continue;
+            }
+            // `Array.ofDim[T](d1, d2, …)` — the element type decides the fill
+            // value (`0`, `0.0`, `null`, …), so it is captured like
+            // `new Array[T](n)`'s.
+            if matches!(&e, Expr::Var(v) if v == "Array")
+                && name == "ofDim"
+                && self.is(&Tok::LBracket)
+            {
+                self.advance();
+                let ty = self.type_ref()?;
+                self.eat(&Tok::RBracket)?;
+                let dims = self.arg_list()?;
+                if dims.is_empty() {
+                    return Err(format!(
+                        "scalars: Array.ofDim needs at least one dimension (line {line})"
+                    ));
+                }
+                e = of_dim(&dims, ty, line);
                 continue;
             }
             // Optional `[T]` type arguments on a method (`xs.map[Int](f)`).
@@ -4160,6 +4181,37 @@ fn wrap_arg_placeholders(e: Expr) -> Expr {
         return e;
     }
     wrap_placeholders(e)
+}
+
+/// `Array.ofDim[T](d1, d2, …)`: the innermost dimension is `new Array[T](dN)`,
+/// and each outer one an `Array` of that many fresh inner arrays — built as
+/// `(0 until d).map(_ => inner).toArray`, so no two rows share storage.
+fn of_dim(dims: &[Expr], ty: String, line: u32) -> Expr {
+    let (outer, rest) = dims.split_first().expect("ofDim has a dimension");
+    if rest.is_empty() {
+        return Expr::Call {
+            name: NEW_ARRAY.to_string(),
+            args: vec![outer.clone(), Expr::Str(ty)],
+            line,
+        };
+    }
+    let method = |recv: Expr, name: &str, args: Vec<Expr>| Expr::Method {
+        recv: Box::new(recv),
+        name: name.to_string(),
+        args,
+        line,
+    };
+    let row = Expr::Lambda {
+        params: vec!["_$dim".to_string()],
+        body: Box::new(of_dim(rest, ty, line)),
+        partial: false,
+    };
+    let rows = method(
+        method(Expr::Int(0), "until", vec![outer.clone()]),
+        "map",
+        vec![row],
+    );
+    method(rows, "toArray", Vec::new())
 }
 
 /// Expand the placeholders of a call whose argument list holds a BARE `_`.

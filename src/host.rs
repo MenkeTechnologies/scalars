@@ -437,6 +437,18 @@ pub const NONFATAL: u16 = 785;
 /// `Double` (or narrows to a `Float`) — through a `Map`'s keys and values, an
 /// `Option`'s or `Either`'s content, a tuple's slots and nested collections.
 pub const SCONV_SHAPE: u16 = 786;
+/// Builtin id for Scala `==` in a program whose classes override `equals`:
+/// pops two values and answers [`eq_vm`], which runs the override. `Op::NumEq`
+/// reaches [`numeric_hook`], a plain `Fn(NumOp, &Value, &Value)` that cannot
+/// re-enter the VM, so a program without an override keeps that op.
+pub const SEQ_VM: u16 = 787;
+/// Builtin id for Scala `!=` under the same condition as [`SEQ_VM`].
+pub const SNE_VM: u16 = 788;
+/// Builtin id that marks a library method's BY-NAME argument: pops the
+/// zero-parameter closure the compiler built around the argument expression and
+/// answers it wrapped, so [`b_method`] can tell it from a function VALUE and run
+/// it only when the method needs it (`opt.getOrElse(expensive)`).
+pub const BYNAME: u16 = 789;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -712,6 +724,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_PRIORITYQUEUE, b_make_priorityqueue);
     vm.register_builtin(IS_GROWABLE, b_is_growable);
     vm.register_builtin(SADD, b_add);
+    vm.register_builtin(SEQ_VM, b_eq_vm);
+    vm.register_builtin(SNE_VM, b_ne_vm);
+    vm.register_builtin(BYNAME, b_byname);
     vm.register_builtin(MAKE_OPTION, b_make_option);
     vm.register_builtin(NLR_RAISE, b_nlr_raise);
     vm.register_builtin(NLR_TAKE, b_nlr_take);
@@ -1692,6 +1707,13 @@ enum DerivedFn {
     AndThen(Value, Value),
     /// `f compose g` — `x => f(g(x))`.
     Compose(Value, Value),
+    /// `f.tupled` — `t => f(t._1, …, t._n)`.
+    Tupled(Value),
+    /// `f.curried` — one argument at a time: holds `f`, its arity, and the
+    /// arguments taken so far; the last one applies `f` to all of them.
+    Curried(Value, usize, Vec<Value>),
+    /// A library method's by-name argument, not yet evaluated (see [`BYNAME`]).
+    ByName(Value),
 }
 
 /// A live Scala class instance behind a [`HeapVal::Record`].
@@ -1726,6 +1748,7 @@ pub fn reset_heap() {
     // compiles its own, so a stale hit would jump into unrelated bytecode.
     METHOD_ENTRIES.with(|t| t.borrow_mut().clear());
     USER_TOSTRING.with(|t| t.set(None));
+    USER_EQUALS.with(|t| t.set(None));
     // The table-order ledger is keyed by arena index, which the clear above
     // invalidates; a stale id would claim a fresh collection is already sorted.
     MUT_SORTED.with(|t| t.borrow_mut().clear());
@@ -3475,6 +3498,24 @@ fn invoke_derived(vm: &mut VM, d: &DerivedFn, args: &[Value]) -> Result<Value, S
             let mid = invoke_closure(vm, g, args)?;
             invoke_closure(vm, f, std::slice::from_ref(&mid))
         }
+        DerivedFn::ByName(thunk) => invoke_closure(vm, thunk, &[]),
+        DerivedFn::Tupled(f) => {
+            let parts = as_seq_or_tuple(&arg).unwrap_or_else(|| vec![arg.clone()]);
+            invoke_closure(vm, f, &parts)
+        }
+        DerivedFn::Curried(f, arity, taken) => {
+            let mut taken = taken.clone();
+            taken.push(arg);
+            if taken.len() == *arity {
+                invoke_closure(vm, f, &taken)
+            } else {
+                Ok(heap_push(HeapVal::Derived(DerivedFn::Curried(
+                    f.clone(),
+                    *arity,
+                    taken,
+                ))))
+            }
+        }
     }
 }
 
@@ -3485,9 +3526,12 @@ fn invoke_derived(vm: &mut VM, d: &DerivedFn, args: &[Value]) -> Result<Value, S
 fn is_defined_at(vm: &mut VM, clo: &Value, arg: &Value) -> Result<bool, String> {
     if let Some(d) = as_derived(clo) {
         return match &d {
-            // `lift` is total; `andThen`/`compose` are defined wherever the
-            // function they feed from is.
-            DerivedFn::Lift(_) => Ok(true),
+            // `lift`, `tupled` and `curried` are total; `andThen`/`compose` are
+            // defined wherever the function they feed from is.
+            DerivedFn::Lift(_)
+            | DerivedFn::Tupled(_)
+            | DerivedFn::Curried(..)
+            | DerivedFn::ByName(_) => Ok(true),
             DerivedFn::AndThen(f, _) | DerivedFn::Compose(_, f) => is_defined_at(vm, f, arg),
             DerivedFn::OrElse(a, b) => Ok(is_defined_at(vm, a, arg)? || is_defined_at(vm, b, arg)?),
         };
@@ -4499,6 +4543,223 @@ fn scala_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+thread_local! {
+    /// Whether the running program defines an `equals` of its own, resolved
+    /// once per chunk. `None` until asked; cleared by [`reset_heap`].
+    static USER_EQUALS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the compiled program defines an `equals` on any of its types — the
+/// same one-scan test [`user_tostring_present`] makes for `toString`.
+fn user_equals_present(vm: &VM) -> bool {
+    USER_EQUALS.with(|c| match c.get() {
+        Some(known) => known,
+        None => {
+            let found = vm.chunk.names.iter().any(|n| n.ends_with("$equals"));
+            c.set(Some(found));
+            found
+        }
+    })
+}
+
+/// Scala `==`, able to run a user `equals` override.
+///
+/// `a == b` on a reference type is `a.equals(b)` (after the null test), so an
+/// instance whose class overrides `equals` answers through it, and so does a
+/// `List`/`Vector`/tuple/`Option` holding such instances, whose own `equals`
+/// compares element by element with `==`. Everything else is [`scala_eq`].
+fn eq_vm(vm: &mut VM, a: &Value, b: &Value) -> Result<bool, String> {
+    if !user_equals_present(vm) {
+        return Ok(scala_eq(a, b));
+    }
+    if let Some(r) = call_user_method(vm, a, "equals", std::slice::from_ref(b)) {
+        return r.map(|v| truthy(&v));
+    }
+    if let (Some(x), Some(y)) = (as_option(a), as_option(b)) {
+        return match (x, y) {
+            (Some(x), Some(y)) => eq_vm(vm, &x, &y),
+            (x, y) => Ok(x.is_none() && y.is_none()),
+        };
+    }
+    let ordered = |v: &Value| -> Option<Vec<Value>> {
+        HEAP.with(|h| match h.borrow().get(as_obj_id(v)?) {
+            Some(HeapVal::Tuple(t)) => Some(t.clone()),
+            Some(HeapVal::Seq(k, t)) if !matches!(k, SeqKind::Set(_)) => Some(t.clone()),
+            _ => None,
+        })
+    };
+    if let (Some(xs), Some(ys)) = (ordered(a), ordered(b)) {
+        if xs.len() != ys.len() {
+            return Ok(false);
+        }
+        for (x, y) in xs.iter().zip(&ys) {
+            if !eq_vm(vm, x, y)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    Ok(scala_eq(a, b))
+}
+
+/// What [`seq_user_eq_method`] answers: a derived sequence or a plain value.
+enum SeqEqAnswer {
+    Seq(Vec<Value>),
+    Value(Value),
+}
+
+/// `contains`/`indexOf`/`lastIndexOf`/`distinct` of an ordered sequence, with
+/// every comparison made by [`eq_vm`] so a user `equals` decides it.
+///
+/// Which side's `equals` runs, and over which elements, is observable through
+/// the override and follows the 2.13 collections exactly:
+///
+/// - `contains` is `element == target`, first to last, stopping at a hit.
+/// - `indexOf` is `target == element`, first to last, stopping at a hit.
+/// - `lastIndexOf` is `target == element` too. A `List` (a `LinearSeq`) walks
+///   the WHOLE list from the front and keeps the last hit; every other kind
+///   walks back from the end and stops at the first.
+/// - `distinct` adds to a `HashSet`, so `equals` runs only between elements
+///   whose `hashCode`s agree, as `newcomer == kept`.
+fn seq_user_eq_method(
+    vm: &mut VM,
+    kind: SeqKind,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Result<SeqEqAnswer, String> {
+    let index = |found: Option<usize>| Value::int(found.map_or(-1, |i| i as i64));
+    Ok(match name {
+        "contains" => {
+            let mut found = false;
+            for it in items {
+                if eq_vm(vm, it, &args[0])? {
+                    found = true;
+                    break;
+                }
+            }
+            SeqEqAnswer::Value(Value::bool(found))
+        }
+        "indexOf" => SeqEqAnswer::Value(index(first_eq(vm, items, 0..items.len(), &args[0])?)),
+        "lastIndexOf" if kind == SeqKind::List => {
+            let mut last = None;
+            for (i, it) in items.iter().enumerate() {
+                if eq_vm(vm, &args[0], it)? {
+                    last = Some(i);
+                }
+            }
+            SeqEqAnswer::Value(index(last))
+        }
+        "lastIndexOf" => SeqEqAnswer::Value(index(first_eq(
+            vm,
+            items,
+            (0..items.len()).rev(),
+            &args[0],
+        )?)),
+        _ => {
+            let mut kept: Vec<(i64, Value)> = Vec::with_capacity(items.len());
+            for it in items {
+                let h = hash_vm(vm, it)?;
+                let mut seen = false;
+                for (kh, k) in &kept {
+                    if *kh == h && eq_vm(vm, it, k)? {
+                        seen = true;
+                        break;
+                    }
+                }
+                if !seen {
+                    kept.push((h, it.clone()));
+                }
+            }
+            SeqEqAnswer::Seq(kept.into_iter().map(|(_, v)| v).collect())
+        }
+    })
+}
+
+/// The `hashCode` of `v`, running a user override when its class has one.
+fn hash_vm(vm: &mut VM, v: &Value) -> Result<i64, String> {
+    if let Some(r) = call_user_method(vm, v, "hashCode", &[]) {
+        return r.map(|h| h.to_int());
+    }
+    Ok(scala_hash(v).map_or_else(
+        || with_obj(v, |o| obj_hash(&o.class, o.is_case, &o.fields, v)).unwrap_or(0),
+        i64::from,
+    ))
+}
+
+/// The first index in `order` at which `target == element` under [`eq_vm`].
+fn first_eq(
+    vm: &mut VM,
+    items: &[Value],
+    order: impl Iterator<Item = usize>,
+    target: &Value,
+) -> Result<Option<usize>, String> {
+    for i in order {
+        if eq_vm(vm, target, &items[i])? {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
+/// `BYNAME` builtin — see [`BYNAME`].
+fn b_byname(vm: &mut VM, _argc: u8) -> Value {
+    let thunk = vm.stack.pop().unwrap_or(Value::Undef);
+    heap_push(HeapVal::Derived(DerivedFn::ByName(thunk)))
+}
+
+/// The thunk inside a [`BYNAME`] argument.
+fn as_by_name(v: &Value) -> Option<Value> {
+    match as_derived(v)? {
+        DerivedFn::ByName(thunk) => Some(thunk),
+        _ => None,
+    }
+}
+
+/// The answer of a by-name-taking method whose receiver already has one, so
+/// the argument is never evaluated: `Some(v).getOrElse(_)`, `Right(v).orElse(_)`,
+/// a `Map.getOrElse(k, _)` or `getOrElseUpdate(k, _)` whose key is present.
+/// `None` when the argument is needed.
+fn by_name_short_circuit(recv: &Value, name: &str, args: &[Value]) -> Option<Value> {
+    let present = || -> Option<Value> {
+        if let Some(o) = as_option(recv) {
+            return o;
+        }
+        if let Some(e) = as_either(recv) {
+            return e.ok();
+        }
+        as_try(recv)?.ok()
+    };
+    match (name, args.len()) {
+        ("getOrElse", 1) => present(),
+        ("orElse", 1) => present().map(|_| recv.clone()),
+        ("getOrElse" | "getOrElseUpdate", 2) => map_get(&as_map(recv)?, &args[0]),
+        _ => None,
+    }
+}
+
+/// `SEQ_VM` builtin — see [`SEQ_VM`].
+fn b_eq_vm(vm: &mut VM, _argc: u8) -> Value {
+    eq_builtin(vm, false)
+}
+
+/// `SNE_VM` builtin — see [`SNE_VM`].
+fn b_ne_vm(vm: &mut VM, _argc: u8) -> Value {
+    eq_builtin(vm, true)
+}
+
+fn eq_builtin(vm: &mut VM, negate: bool) -> Value {
+    let b = vm.stack.pop().unwrap_or(Value::Undef);
+    let a = vm.stack.pop().unwrap_or(Value::Undef);
+    if unwinding() {
+        return Value::Undef;
+    }
+    match eq_vm(vm, &a, &b) {
+        Ok(eq) => Value::bool(eq != negate),
+        Err(e) => fault(vm, e),
+    }
+}
+
 /// `SFORMAT` builtin: pop the format spec (top) and the value, and format the
 /// value per the Java-`Formatter` subset. A malformed/unsupported spec halts the
 /// VM with the message parked for the runner.
@@ -5174,6 +5435,26 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
     // stays balanced.
     if unwinding() {
         return Value::Undef;
+    }
+
+    // A by-name argument runs only when the method needs it: the default of
+    // a `getOrElse` whose receiver has a value is never evaluated. Every other
+    // method receives it evaluated, as a by-value argument.
+    if args.iter().any(|a| as_by_name(a).is_some()) {
+        if let Some(v) = by_name_short_circuit(&recv, &name, &args) {
+            return v;
+        }
+        for a in args.iter_mut() {
+            if let Some(thunk) = as_by_name(a) {
+                match invoke_closure(vm, &thunk, &[]) {
+                    Ok(v) => *a = v,
+                    Err(e) => return fault(vm, e),
+                }
+                if unwinding() {
+                    return Value::Undef;
+                }
+            }
+        }
     }
 
     // `java.lang.Throwable`'s observable surface. Handled before the collection
@@ -6442,6 +6723,21 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             return string_method(&text, name, args);
         }
     }
+    // A user `equals` decides membership: `contains`, `indexOf` and
+    // `lastIndexOf` compare with `==`, and `distinct` keeps the first of each
+    // run of equal elements.
+    if user_equals_present(vm)
+        && matches!(
+            (name, args.len()),
+            ("contains" | "indexOf" | "lastIndexOf", 1) | ("distinct", 0)
+        )
+        && !matches!(kind, SeqKind::Set(_))
+    {
+        return seq_user_eq_method(vm, kind, &items, name, args).map(|r| match r {
+            SeqEqAnswer::Seq(out) => same(out),
+            SeqEqAnswer::Value(v) => v,
+        });
+    }
     // The pure slice/reorder methods first — they share one body.
     if let Some(out) = seq_slice_method(&items, name, args) {
         return Ok(same(out));
@@ -7356,6 +7652,17 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(new_map(HashRep::Small, out))
         }
+        // `m.transform((k, v) => …)` — the same keys, in the same positions,
+        // each value replaced by `f(k, v)`. Only the immutable `Map`'s; the
+        // mutable one transforms in place.
+        ("transform", 1) if !matches!(rep, HashRep::Mutable(_) | HashRep::Linked) => {
+            let mut out = Vec::with_capacity(entries.len());
+            for (k, v) in &entries {
+                let nv = invoke_closure(vm, &args[0], &[k.clone(), v.clone()])?;
+                out.push((k.clone(), nv));
+            }
+            Ok(new_map(rep, out))
+        }
         ("filterKeys", 1) => {
             let mut out = Vec::new();
             for (k, v) in &entries {
@@ -7662,6 +7969,23 @@ fn closure_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Resu
             DerivedFn::Compose(recv.clone(), args[0].clone()),
             &args[1..],
         ),
+        // `f.tupled` / `f.curried` on a function of two or more parameters.
+        // A trailing application folded into the call applies the result.
+        ("tupled", _) => derived(vm, DerivedFn::Tupled(recv.clone()), args),
+        ("curried", _) => match as_closure(recv).map(|c| usize::from(c.params)) {
+            Some(arity) if arity >= 2 => {
+                let mut f = heap_push(HeapVal::Derived(DerivedFn::Curried(
+                    recv.clone(),
+                    arity,
+                    Vec::new(),
+                )));
+                for a in args {
+                    f = invoke_closure(vm, &f, std::slice::from_ref(a))?;
+                }
+                Ok(f)
+            }
+            _ => Err(no_such_method(recv, name)),
+        },
         _ => Err(no_such_method(recv, name)),
     }
 }
@@ -10004,6 +10328,24 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("stripTrailing", 0) => Ok(Value::str(
             s.trim_end_matches(java_is_whitespace).to_string(),
         )),
+        // `StringOps.linesIterator` — the lines without their terminators
+        // (`\n`, `\r\n` or a lone `\r`); a trailing terminator ends the last
+        // line rather than starting an empty one.
+        ("linesIterator", 0) => {
+            let mut lines = Vec::new();
+            let mut rest = s;
+            while !rest.is_empty() {
+                let end = rest.find(['\n', '\r']).unwrap_or(rest.len());
+                lines.push(Value::str(&rest[..end]));
+                let sep = if rest[end..].starts_with("\r\n") {
+                    2
+                } else {
+                    1
+                };
+                rest = &rest[(end + sep).min(rest.len())..];
+            }
+            Ok(new_seq(SeqKind::Iterator, lines))
+        }
         ("stripMargin", 0) => Ok(Value::str(strip_margin(s, '|'))),
         // The margin may arrive as a `Char` value or, from a one-character
         // string literal, as a `Str`.
