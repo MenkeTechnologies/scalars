@@ -311,15 +311,13 @@ reported as parse/compile errors, never silently mis-run.
   needed, so `memo.getOrElseUpdate(n, fib(n - 1) + fib(n - 2))` is a linear
   memo rather than an exponential recursion, and a `throw` or side effect in a
   default that is not taken never happens.
-- **A capitalized `val` binder.** `val Pat = "(\d+)".r` and `val Max: Int = 9`
+- **A capitalized `val` binder.** `val Pat = "(\\d+)".r` and `val Max: Int = 9`
   bind a value, as Scala reads a lone identifier in a `val` (only a following
   `(`, `@` or `::` makes it a pattern), so `case Pat(a) =>` and
   `val Pat(a) = s` use it as an extractor.
 - **`Array.ofDim[T](d1, …)`**, of any rank, each row its own array filled with
-  `T`'s zero; **`StringOps.linesIterator`** (terminators `
-`, `
-` and a lone
-  ``); immutable **`Map.transform((k, v) => …)`**; and **`f.tupled`** /
+  `T`'s zero; **`StringOps.linesIterator`** (terminators `\n`, `\r\n` and a lone
+  `\r`); immutable **`Map.transform((k, v) => …)`**; and **`f.tupled`** /
   **`f.curried`** on a function value of two or more parameters.
 - **`groupMap(key)(f)` and `groupMapReduce(key)(f)(op)`**, running `key` then
   `f` per element and printing in the order of the `mutable.HashMap` 2.13
