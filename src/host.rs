@@ -3606,6 +3606,8 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         // derived `unapply` and `toString`.
         ("productArity", 0) if is_case => Ok(Value::int(ctor_fields(&class, &fields).len() as i64)),
         ("productPrefix", 0) if is_case => Ok(Value::str(class.clone())),
+        // The derived `canEqual(that)` is `that.isInstanceOf[ThisClass]`.
+        ("canEqual", 1) if is_case => Ok(Value::bool(value_is_type(&args[0], &class))),
         ("productIterator" | "productElementNames", 0) if is_case => {
             let ctor = ctor_fields(&class, &fields);
             Ok(new_list(if name == "productIterator" {
@@ -4321,6 +4323,14 @@ fn mut_find_slot<T>(
         .position(|x| value_eq(&key(x), k))
         .map(|i| start + i);
     Some((end, found))
+}
+
+/// `entries` (distinct keys, in insertion order) in the order a default-sized
+/// `mutable.HashMap` they were added to one by one would iterate them.
+fn mut_table_order(entries: Vec<(Value, Value)>) -> Vec<(Value, Value)> {
+    let adds = vec![true; entries.len()];
+    let len = mut_grown(mut_table_size_for(MUT_INITIAL_CAPACITY), 0, &adds);
+    mut_ordered(&entries, len, |(k, _)| k.clone()).unwrap_or(entries)
 }
 
 /// The order a mutable hash table iterates `items`: bucket index ascending,
@@ -6946,6 +6956,14 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 None => Err(kind.index_fault(i, items.len())),
             }
         }
+        // `xs.lift(i)` — a `Seq` is a `PartialFunction` from its indices.
+        ("lift", 1) if !matches!(kind, SeqKind::Set(_)) => {
+            let i = args[0].to_int();
+            Ok(opt(usize::try_from(i)
+                .ok()
+                .and_then(|u| items.get(u))
+                .cloned()))
+        }
         ("toList", 0) => Ok(new_list(items)),
         ("map", 1) => {
             let mut out = Vec::with_capacity(items.len());
@@ -7347,6 +7365,42 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     .map(|(k, group)| (k, same(group)))
                     .collect(),
             ))
+        }
+        // `groupMap(key)(f)` — `groupBy` with each element mapped by `f` into
+        // its group. Per element the key runs first, then `f`, as 2.13 does;
+        // the groups are built in a `mutable.HashMap` and converted, so they
+        // arrive in that table's order, as `groupMapReduce`'s do.
+        ("groupMap", 2) => {
+            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            for it in &items {
+                let k = invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
+                let v = invoke_closure(vm, &args[1], std::slice::from_ref(it))?;
+                match groups.iter_mut().find(|(gk, _)| value_eq(gk, &k)) {
+                    Some(slot) => slot.1.push(v),
+                    None => groups.push((k, vec![v])),
+                }
+            }
+            let groups: Vec<(Value, Value)> =
+                groups.into_iter().map(|(k, g)| (k, same(g))).collect();
+            Ok(new_map(HashRep::Small, mut_table_order(groups)))
+        }
+        // `groupMapReduce(key)(f)(reduce)` — one value per key, folded as the
+        // elements arrive. 2.13 accumulates in a `mutable.HashMap` and converts
+        // it, so the result's entries arrive in that table's order.
+        ("groupMapReduce", 3) => {
+            let mut acc: Vec<(Value, Value)> = Vec::new();
+            for it in &items {
+                let k = invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
+                let v = invoke_closure(vm, &args[1], std::slice::from_ref(it))?;
+                match acc.iter().position(|(ak, _)| value_eq(ak, &k)) {
+                    Some(i) => {
+                        let prev = acc[i].1.clone();
+                        acc[i].1 = invoke_closure(vm, &args[2], &[prev, v])?;
+                    }
+                    None => acc.push((k, v)),
+                }
+            }
+            Ok(new_map(HashRep::Small, mut_table_order(acc)))
         }
         ("sortBy", 1) => {
             // Sorted by INDEX so `f` runs exactly once per element, as Scala's
@@ -9261,6 +9315,24 @@ fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
         ("acos", 1) => Ok(Value::float(f(0).acos())),
         ("atan", 1) => Ok(Value::float(f(0).atan())),
         ("atan2", 2) => Ok(Value::float(f(0).atan2(f(1)))),
+        // `floorDiv`/`floorMod` round the quotient toward negative infinity, so
+        // the remainder takes the DIVISOR's sign: `floorMod(-5, 3)` is `1`.
+        ("floorDiv" | "floorMod", 2) if ints => {
+            let (a, b) = (args[0].to_int(), args[1].to_int());
+            if b == 0 {
+                return Err("scalars: java.lang.ArithmeticException: / by zero".to_string());
+            }
+            // The Euclidean quotient keeps the remainder non-negative, which
+            // is the floor for a positive divisor and one too high for a
+            // negative one that leaves a remainder.
+            let q = a.div_euclid(b) - i64::from(b < 0 && a.rem_euclid(b) != 0);
+            Ok(Value::int(if name == "floorDiv" { q } else { a - q * b }))
+        }
+        ("sinh", 1) => Ok(Value::float(f(0).sinh())),
+        ("cosh", 1) => Ok(Value::float(f(0).cosh())),
+        ("tanh", 1) => Ok(Value::float(f(0).tanh())),
+        ("log1p", 1) => Ok(Value::float(f(0).ln_1p())),
+        ("expm1", 1) => Ok(Value::float(f(0).exp_m1())),
         ("toRadians", 1) => Ok(Value::float(f(0).to_radians())),
         ("toDegrees", 1) => Ok(Value::float(f(0).to_degrees())),
         _ => Err(format!(
@@ -10316,6 +10388,7 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
     let arity_err = || format!("scalars: String.{name}: wrong number of arguments");
     match (name, args.len()) {
         ("length" | "size", 0) => Ok(Value::int(s.chars().count() as i64)),
+        ("hashCode", 0) => Ok(Value::int(i64::from(string_hash(s)))),
         ("isEmpty", 0) => Ok(Value::bool(s.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!s.is_empty())),
         ("toUpperCase", 0) => Ok(Value::str(s.to_uppercase())),
@@ -12322,7 +12395,7 @@ fn b_lazylist_new(vm: &mut VM, argc: u8) -> Value {
         "iterate" => new_lazy(
             Vec::new(),
             LazySrc::Iter {
-                next: args.first().cloned().unwrap_or(Value::Undef),
+                seed: args.first().cloned().unwrap_or(Value::Undef),
                 f: args.get(1).cloned().unwrap_or(Value::Undef),
             },
         ),
@@ -12562,11 +12635,14 @@ fn lazy_force(vm: &mut VM, list: &Value, k: usize) -> Result<Vec<Value>, String>
                 l.forced.push(v.clone());
                 set_lazy(list, l);
             }
-            LazySrc::Iter { next, f } => {
-                l.forced.push(next.clone());
-                let after = invoke_closure(vm, &f, std::slice::from_ref(&next))?;
-                l.src = LazySrc::Iter { next: after, f };
-                set_lazy(list, l);
+            LazySrc::Iter { seed, f } => {
+                let next = match l.forced.last() {
+                    Some(prev) => invoke_closure(vm, &f, std::slice::from_ref(prev))?,
+                    None => seed,
+                };
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                l2.forced.push(next);
+                set_lazy(list, l2);
             }
             // Run the thunk ONCE, then continue from what it produced.
             LazySrc::Thunk { thunk, base } => {
@@ -12678,8 +12754,10 @@ enum LazySrc {
     End,
     /// The integers from `next` upward — `LazyList.from(n)`.
     Ints { next: i64 },
-    /// `LazyList.iterate(seed)(f)`: `next`, then `f(next)`, and so on.
-    Iter { next: Value, f: Value },
+    /// `LazyList.iterate(seed)(f)`: `seed`, then `f` of the element before.
+    /// Each application waits until its element is asked for, so `take(n)`
+    /// runs `f` exactly `n - 1` times.
+    Iter { seed: Value, f: Value },
     /// `LazyList.continually(v)` — the same element forever.
     Rep { v: Value },
     /// The continuation is behind a zero-argument thunk not yet run. This is

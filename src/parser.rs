@@ -2662,6 +2662,12 @@ impl Parser {
                 if bp < min_bp {
                     break;
                 }
+                // `f(xs*)` — Scala 3's spelling of the varargs spread. A `*`
+                // with nothing after it before the `)` is not a product; the
+                // argument list reads it (see [`Parser::spread_or`]).
+                if op == BinOp::Mul && matches!(self.peek_at(1), Tok::RParen) {
+                    break;
+                }
                 self.advance();
                 // The cons operators are right-associative: `1 :: 2 :: Nil`
                 // is `1 :: (2 :: Nil)`, and `0 #:: 1 #:: rest` likewise. Read
@@ -3547,20 +3553,24 @@ impl Parser {
     /// `name` must be a bare identifier followed by a single `=` — `a == b` and
     /// `a += b` are ordinary expressions, and the lexer already gives those
     /// their own tokens.
-    /// `e: _*` — a varargs SPREAD, which is legal in an argument position only.
+    /// `e: _*` (Scala 3 also `e*`) — a varargs SPREAD, legal in an argument
+    /// position only.
     /// It hands `e` itself to a repeated parameter instead of making it one
     /// element of one. Marked with the reserved [`SPREAD`] collection ctor so
     /// every generic expression walker still recurses into the operand, and
     /// stripped by `Compiler::adapt_args` at the call site that consumes it.
     fn spread_or(&mut self, e: Expr) -> Result<Expr, String> {
-        let spread = self.is(&Tok::Colon)
+        let ascribed = self.is(&Tok::Colon)
             && matches!(self.peek_at(1), Tok::Ident(w) if w == "_")
             && matches!(self.peek_at(2), Tok::Star);
-        if !spread {
+        // Scala 3 also spells it `xs*`, the `*` directly before the `)`.
+        let starred = self.is(&Tok::Star) && matches!(self.peek_at(1), Tok::RParen);
+        if ascribed {
+            self.advance(); // `:`
+            self.advance(); // `_`
+        } else if !starred {
             return Ok(e);
         }
-        self.advance(); // `:`
-        self.advance(); // `_`
         self.advance(); // `*`
         Ok(Expr::Collection {
             ctor: SPREAD.to_string(),

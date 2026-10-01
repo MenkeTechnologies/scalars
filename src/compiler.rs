@@ -6954,6 +6954,18 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
             vec![step.clone()],
         )),
         ("from", [xs]) => rebuild(xs.clone()),
+        // `List.iterate(start, len)(f)` — `start` and the next `len - 1`
+        // applications of `f`, which runs exactly that many times: the prefix
+        // of `LazyList.iterate(start)(f)` it is defined as.
+        ("iterate", [start, len, f]) => rebuild(m(
+            m(
+                Expr::Var("LazyList".to_string()),
+                "iterate",
+                vec![start.clone(), f.clone()],
+            ),
+            "take",
+            vec![len.clone()],
+        )),
         ("concat", [first, rest @ ..]) => rebuild(
             rest.iter()
                 .fold(first.clone(), |acc, x| m(acc, "++", vec![x.clone()])),
