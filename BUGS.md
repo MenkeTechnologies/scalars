@@ -321,6 +321,15 @@ reported as parse/compile errors, never silently mis-run.
 ` and a lone
   ``); immutable **`Map.transform((k, v) => …)`**; and **`f.tupled`** /
   **`f.curried`** on a function value of two or more parameters.
+- **`groupMap(key)(f)` and `groupMapReduce(key)(f)(op)`**, running `key` then
+  `f` per element and printing in the order of the `mutable.HashMap` 2.13
+  accumulates them in; **`List`/`Vector`/`Array`/`Seq.iterate(start, n)(f)`**;
+  **`xs.lift(i)`**; `String.hashCode`; `math`/`Math` **`floorDiv`/`floorMod`**
+  (raising `/ by zero`), `sinh`/`cosh`/`tanh`, `log1p`/`expm1`; a case class's
+  derived **`canEqual`**; and Scala 3's **`f(xs*)`** spread.
+- **`LazyList.iterate(seed)(f)` applies `f` only for elements asked for**:
+  `take(3).toList` runs it twice. It used to compute each element's successor
+  as soon as the element itself was produced, one application early.
 - **`override def toString`, honoured wherever a value is rendered.** Scala
   renders every value through its `toString`, so an override answers for
   `println(p)`, `s"$p"` / `f"$p%s"`, `"x" + p`, `String.valueOf(p)`,
