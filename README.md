@@ -375,7 +375,12 @@ Implemented and checked against the reference `scala`:
   singletons (static `def`s, `Name.val` members); and `case class` with an
   ordered-field `toString` (`Point(1,2)`), structural `equals`/`hashCode`,
   `copy(field = …)`, companion `apply` (no `new`) and `unapply` — all four over
-  the primary-constructor parameters only, as Scala derives them. Built-in
+  the primary-constructor parameters only, as Scala derives them. A
+  user-written companion `object` beside its class (its own members, an
+  `apply` factory for a plain class, an `unapply` extractor), symbolic methods
+  (`def +(o: V)`, `def <(o: V)`, `def unary_-`) used infix and through `+=`,
+  and member/statement annotations (`@tailrec`, `@inline`, `@deprecated(…)`),
+  which are accepted and have no runtime effect. Built-in
   `Option` (`Some(v)` / `None`). All of it rides a host-side object heap behind
   fusevm's `Value::Obj` handle (`src/host.rs`) — no fusevm changes, no JVM.
 - **`override def toString`, everywhere a value is rendered** — `println(p)`,
@@ -517,6 +522,11 @@ Implemented and checked against the reference `scala`:
   `java.lang.Math` spellings. Integral overloads stay integral, and the two
   namespaces are kept apart where the JDK lacks an overload (`Math.signum(5)` is
   `1.0`, `math.signum(5)` is `1`).
+- **`BigInt`** — arbitrary precision (`BigInt(n)`, `BigInt("…"[, radix])`),
+  mixed with `Int`/`Long` operands on either side, `pow`/`gcd`/`mod`/`modPow`/
+  `/%`/`isProbablePrime`/bitwise ops, `sum`/`product`/`sorted` over a
+  collection of them, and `val b: BigInt = 7` widening as Scala's `int2bigInt`
+  does. `BigDecimal` is not modelled (see `BUGS.md`).
 - **Method dispatch** — postfix `.` on core values: `String` (`length`,
   `toUpperCase`/`toLowerCase`, `trim`, `strip`, `stripMargin`, `reverse`,
   `substring`, `charAt`, `contains`/`startsWith`/`endsWith`,

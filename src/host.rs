@@ -22,6 +22,9 @@
 //!    answers with Scala's own rules (`Long` wraps; a mixed pair promotes).
 
 use fusevm::{Frame, NumOp, VMResult, Value, VM};
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
@@ -1235,6 +1238,8 @@ enum HeapVal {
     /// Handles are interned by [`make_char`], so this costs no arena growth in a
     /// per-character loop and makes handle identity match value equality.
     Char(char),
+    /// A `scala.math.BigInt` — see [`make_big`].
+    BigInt(BigInt),
 }
 
 /// Which representation an immutable `Set`/`Map` has. Scala's factories return
@@ -1797,6 +1802,286 @@ fn as_char(v: &Value) -> Option<char> {
 /// in (arithmetic, comparison, `toInt`).
 fn char_code(v: &Value) -> Option<i64> {
     as_char(v).map(|c| c as u32 as i64)
+}
+
+// ───────────────────────── scala.math.BigInt ──────────────────────────────
+//
+// `BigInt` wraps `java.math.BigInteger`: arbitrary precision, `/` and `%`
+// truncating toward zero, and the bitwise operators acting on an infinite
+// two's-complement representation — all of which `num_bigint::BigInt` shares.
+// Like `Char` it is a heap handle, so every operator on one reaches
+// [`numeric_hook`] (or [`b_div`]/[`b_mod`]), and its members reach
+// [`big_method`]. An integral operand on the other side is widened the way
+// Scala's implicit `int2bigInt`/`long2bigInt` widen it.
+
+/// A fresh `BigInt` handle.
+fn make_big(b: BigInt) -> Value {
+    heap_push(HeapVal::BigInt(b))
+}
+
+/// The value of a `BigInt` handle.
+fn as_big(v: &Value) -> Option<BigInt> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::BigInt(b)) => Some(b.clone()),
+        _ => None,
+    })
+}
+
+/// An operand of a `BigInt` operation: a `BigInt`, or an `Int`/`Long`/`Char`
+/// widened to one.
+fn big_operand(v: &Value) -> Option<BigInt> {
+    match v {
+        Value::Int(n) => Some(BigInt::from(*n)),
+        _ => as_big(v).or_else(|| char_code(v).map(BigInt::from)),
+    }
+}
+
+/// Both operands as `BigInt`s when at least one IS a `BigInt` and the other is
+/// one or an integral value; `None` leaves the pair to the other arms.
+fn big_pair(a: &Value, b: &Value) -> Option<(BigInt, BigInt)> {
+    if as_big(a).is_none() && as_big(b).is_none() {
+        return None;
+    }
+    Some((big_operand(a)?, big_operand(b)?))
+}
+
+const BIG_DIV_ZERO: &str = "scalars: java.lang.ArithmeticException: BigInteger divide by zero";
+
+/// `BigInt./` / `BigInt.%`: truncating, and a zero divisor throws.
+///
+/// Which exception message depends on the DIVIDEND, because Scala's `BigInt`
+/// keeps a value that fits a `Long` (other than `Long.MinValue`) as a bare
+/// `Long` and divides two of those with the JVM's `ldiv` — `/ by zero` — and
+/// only otherwise delegates to `BigInteger.divide`.
+fn big_div_rem(x: &BigInt, y: &BigInt, rem: bool) -> Result<Value, String> {
+    if y.is_zero() {
+        let long_encoded = x.to_i64().is_some_and(|n| n != i64::MIN);
+        return Err(if long_encoded {
+            "scalars: java.lang.ArithmeticException: / by zero".to_string()
+        } else {
+            BIG_DIV_ZERO.to_string()
+        });
+    }
+    Ok(make_big(if rem { x % y } else { x / y }))
+}
+
+/// An infix operator with a `BigInt` on either side; `None` when neither
+/// operand is one (or the other is not integral, e.g. a `String` to
+/// concatenate).
+fn big_binop(op: NumOp, a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    if op == NumOp::Neg {
+        return as_big(a).map(|x| Ok(make_big(-x)));
+    }
+    let (x, y) = big_pair(a, b)?;
+    Some(Ok(match op {
+        NumOp::Add => make_big(x + y),
+        NumOp::Sub => make_big(x - y),
+        NumOp::Mul => make_big(x * y),
+        NumOp::Div => return Some(big_div_rem(&x, &y, false)),
+        NumOp::Mod => return Some(big_div_rem(&x, &y, true)),
+        NumOp::Lt => Value::bool(x < y),
+        NumOp::Gt => Value::bool(x > y),
+        NumOp::Le => Value::bool(x <= y),
+        NumOp::Ge => Value::bool(x >= y),
+        NumOp::Eq => Value::bool(x == y),
+        NumOp::Ne => Value::bool(x != y),
+        NumOp::Pow | NumOp::Neg => return None,
+    }))
+}
+
+/// `BigInt.hashCode`: the `Int`/`Long` hash for a value that fits a `Long`
+/// (so `BigInt(3).## == 3.##`), else `BigInteger.hashCode` — the magnitude's
+/// big-endian 32-bit words folded by `31 * h + w`, times the sign.
+fn big_hash(b: &BigInt) -> i32 {
+    if let Some(n) = b.to_i64() {
+        return i32::try_from(n).unwrap_or_else(|_| long_hash(n));
+    }
+    let h = b
+        .magnitude()
+        .to_u32_digits()
+        .iter()
+        .rev()
+        .fold(0i32, |h, w| h.wrapping_mul(31).wrapping_add(*w as i32));
+    if b.is_negative() {
+        h.wrapping_neg()
+    } else {
+        h
+    }
+}
+
+/// `BigInt(x)` / `BigInt(s, radix)` — the companion's `apply`.
+fn big_apply(args: &[Value]) -> Result<Value, String> {
+    let parse = |s: &str, radix: u32| -> Result<Value, String> {
+        if s.is_empty() {
+            return Err("scalars: java.lang.NumberFormatException: Zero length BigInteger".into());
+        }
+        let digits = s.strip_prefix('+').unwrap_or(s);
+        // `num_bigint` also accepts `_` separators, which the JDK does not.
+        if digits.contains('_') || digits.starts_with('+') {
+            return Err(number_format(s));
+        }
+        BigInt::parse_bytes(digits.as_bytes(), radix)
+            .map(make_big)
+            .ok_or_else(|| number_format(s))
+    };
+    match args {
+        [Value::Str(s)] => parse(s, 10),
+        [Value::Str(s), r] => parse(s, r.to_int() as u32),
+        [v] => big_operand(v)
+            .map(make_big)
+            .ok_or_else(|| format!("scalars: BigInt.apply cannot take {}", scala_str(v))),
+        _ => Err("scalars: BigInt.apply takes one or two arguments".into()),
+    }
+}
+
+/// Miller–Rabin over the first twelve primes as bases, which is exact for
+/// every value below 3.3 * 10^24 and wrong with negligible probability above —
+/// the contract `BigInteger.isProbablePrime` itself makes.
+fn big_probable_prime(n: &BigInt) -> bool {
+    let two = BigInt::from(2);
+    if n < &two {
+        return false;
+    }
+    const BASES: [u32; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+    for p in BASES {
+        let p = BigInt::from(p);
+        if n == &p {
+            return true;
+        }
+        if (n % &p).is_zero() {
+            return false;
+        }
+    }
+    let one = BigInt::one();
+    let n1 = n - &one;
+    let s = n1.trailing_zeros().unwrap_or(0);
+    let d = &n1 >> s;
+    'bases: for a in BASES {
+        let mut x = BigInt::from(a).modpow(&d, n);
+        if x == one || x == n1 {
+            continue;
+        }
+        for _ in 1..s {
+            x = x.modpow(&two, n);
+            if x == n1 {
+                continue 'bases;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// `BigInt`'s members.
+fn big_method(b: &BigInt, name: &str, args: &[Value]) -> Result<Value, String> {
+    let arg = |k: usize| -> Result<BigInt, String> {
+        big_operand(&args[k])
+            .ok_or_else(|| format!("scalars: BigInt.{name} expects an integral argument"))
+    };
+    match (name, args.len()) {
+        ("toString", 0) => Ok(Value::str(b.to_string())),
+        ("toString", 1) => Ok(Value::str(b.to_str_radix(args[0].to_int() as u32))),
+        ("hashCode" | "##", 0) => Ok(Value::int(big_hash(b) as i64)),
+        // The narrowing conversions keep the low-order bits, as
+        // `BigInteger.intValue`/`longValue` do.
+        ("toInt", 0) => Ok(Value::int(i64::from(
+            (b & BigInt::from(u32::MAX)).to_u32().unwrap_or(0) as i32,
+        ))),
+        ("toLong", 0) => Ok(Value::int(
+            (b & BigInt::from(u64::MAX)).to_u64().unwrap_or(0) as i64,
+        )),
+        ("toDouble", 0) => Ok(Value::float(b.to_f64().unwrap_or(f64::NAN))),
+        ("isValidInt", 0) => Ok(Value::bool(b.to_i32().is_some())),
+        ("isValidLong", 0) => Ok(Value::bool(b.to_i64().is_some())),
+        ("abs", 0) => Ok(make_big(b.abs())),
+        ("unary_-", 0) => Ok(make_big(-b)),
+        ("signum", 0) => Ok(Value::int(b.signum().to_i64().unwrap_or(0))),
+        ("bitLength", 0) => Ok(Value::int(if b.is_negative() {
+            (-b - BigInt::one()).bits() as i64
+        } else {
+            b.bits() as i64
+        })),
+        ("bitCount", 0) => Ok(Value::int(if b.is_negative() {
+            (-b - BigInt::one()).magnitude().count_ones() as i64
+        } else {
+            b.magnitude().count_ones() as i64
+        })),
+        ("testBit", 1) => Ok(Value::bool(
+            ((b >> args[0].to_int() as usize) & BigInt::one()).is_one(),
+        )),
+        ("pow", 1) => match u32::try_from(args[0].to_int()) {
+            Ok(e) => Ok(make_big(b.pow(e))),
+            Err(_) => Err("scalars: java.lang.ArithmeticException: Negative exponent".into()),
+        },
+        ("gcd", 1) => Ok(make_big(b.gcd(&arg(0)?))),
+        ("min", 1) => Ok(make_big(b.clone().min(arg(0)?))),
+        ("max", 1) => Ok(make_big(b.clone().max(arg(0)?))),
+        ("compare" | "compareTo", 1) => Ok(Value::int(match b.cmp(&arg(0)?) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        })),
+        // `mod` is never negative, unlike `%`.
+        ("mod", 1) => {
+            let m = arg(0)?;
+            if !m.is_positive() {
+                return Err(
+                    "scalars: java.lang.ArithmeticException: BigInteger: modulus not positive"
+                        .into(),
+                );
+            }
+            Ok(make_big(b.mod_floor(&m)))
+        }
+        ("modPow", 2) => {
+            let m = arg(1)?;
+            if !m.is_positive() {
+                return Err(
+                    "scalars: java.lang.ArithmeticException: BigInteger: modulus not positive"
+                        .into(),
+                );
+            }
+            let e = arg(0)?;
+            if e.is_negative() {
+                return Err(
+                    "scalars: BigInt.modPow with a negative exponent is not supported".into(),
+                );
+            }
+            Ok(make_big(b.modpow(&e, &m)))
+        }
+        ("/%", 1) => {
+            let y = arg(0)?;
+            Ok(new_pair(
+                big_div_rem(b, &y, false)?,
+                big_div_rem(b, &y, true)?,
+            ))
+        }
+        ("isProbablePrime", 1) => Ok(Value::bool(big_probable_prime(b))),
+        ("<<", 1) => Ok(make_big(b << args[0].to_int() as usize)),
+        (">>", 1) => Ok(make_big(b >> args[0].to_int() as usize)),
+        ("&", 1) => Ok(make_big(b & arg(0)?)),
+        ("|", 1) => Ok(make_big(b | arg(0)?)),
+        ("^", 1) => Ok(make_big(b ^ arg(0)?)),
+        ("equals" | "==", 1) => Ok(Value::bool(big_operand(&args[0]).as_ref() == Some(b))),
+        ("!=", 1) => Ok(Value::bool(big_operand(&args[0]).as_ref() != Some(b))),
+        (op @ ("+" | "-" | "*" | "/" | "%" | "<" | ">" | "<=" | ">="), 1) => {
+            let nop = match op {
+                "+" => NumOp::Add,
+                "-" => NumOp::Sub,
+                "*" => NumOp::Mul,
+                "/" => NumOp::Div,
+                "%" => NumOp::Mod,
+                "<" => NumOp::Lt,
+                ">" => NumOp::Gt,
+                "<=" => NumOp::Le,
+                _ => NumOp::Ge,
+            };
+            big_binop(nop, &make_big(b.clone()), &args[0]).unwrap_or_else(|| {
+                Err(format!("scalars: BigInt.{op} expects an integral argument"))
+            })
+        }
+        _ => Err(format!("scalars: value {name} is not a member of BigInt")),
+    }
 }
 
 /// `Char` construction builtin ([`CHAR_NEW`]): pops a code point, pushes the
@@ -3381,6 +3666,9 @@ fn class_of(recv: &Value) -> Result<Value, String> {
         Value::Bool(_) => ("boolean".to_string(), "boolean".to_string(), true),
         Value::Undef => ("void".to_string(), "void".to_string(), true),
         Value::Obj(_) if as_char(recv).is_some() => ("char".to_string(), "char".to_string(), true),
+        Value::Obj(_) if as_big(recv).is_some() => {
+            ("scala.math.BigInt".to_string(), "BigInt".to_string(), false)
+        }
         // A built-in throwable knows its own fully-qualified JDK name.
         Value::Obj(_) if as_exc(recv).is_some() => {
             let n = as_exc(recv).expect("just matched").class.to_string();
@@ -3395,7 +3683,8 @@ fn class_of(recv: &Value) -> Result<Value, String> {
             else {
                 return Err(no_such_method(recv, "getClass"));
             };
-            let n = if is_object {
+            // A companion object is already stored under its `Pt$` name.
+            let n = if is_object && !class.ends_with('$') {
                 format!("{class}$")
             } else {
                 class
@@ -3566,6 +3855,7 @@ fn obj_to_string(v: &Value) -> String {
             // applies: `println`, `toString`, interpolation, and as a collection
             // element (`List('a')` is `List(a)`).
             Some(HeapVal::Char(c)) => c.to_string(),
+            Some(HeapVal::BigInt(b)) => b.to_string(),
             // A boxed `var` is compiler-internal — every access goes through
             // `CELL_GET`/`CELL_SET`, so a cell handle never reaches user code.
             // Rendering the value it holds keeps a diagnostic dump readable.
@@ -3747,6 +4037,7 @@ fn scala_hash(v: &Value) -> Option<i32> {
                 // `Char.hashCode` is the code point, as `java.lang.Character`'s
                 // is — so a `Char` and its `Int` code point hash alike.
                 HeapVal::Char(c) => Some(c as u32 as i32),
+                HeapVal::BigInt(b) => Some(big_hash(&b)),
                 HeapVal::Tuple(items) => product_hash(&format!("Tuple{}", items.len()), &items),
                 HeapVal::Record(o) if o.is_case => {
                     let n = ctor_arity(&o.class, o.fields.len());
@@ -4108,6 +4399,9 @@ fn obj_hash(class: &str, is_case: bool, fields: &[(Arc<str>, Value)], v: &Value)
 /// compares by reference identity (the handle). An object vs. a non-object, or
 /// two different classes, are unequal.
 fn obj_eq(a: &Value, b: &Value) -> bool {
+    if let Some((x, y)) = big_pair(a, b) {
+        return x == y;
+    }
     match (a, b) {
         (Value::Obj(ia), Value::Obj(ib)) => {
             if ia == ib {
@@ -4175,6 +4469,10 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
 
 /// Structural equality of two field values (recurses into nested objects).
 fn value_eq(a: &Value, b: &Value) -> bool {
+    // `BigInt(3) == 3` — a `BigInt` equals any integral value of its value.
+    if let Some((x, y)) = big_pair(a, b) {
+        return x == y;
+    }
     match (a, b) {
         (Value::Obj(_), Value::Obj(_)) => obj_eq(a, b),
         // A `Float` is a distinct VARIANT, so `a == b` would answer `false` for
@@ -4323,6 +4621,7 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Double" => matches!(v, Value::Float(_)),
         "Float" => matches!(v, Value::Status(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
+        "BigInt" => as_big(v).is_some(),
         "Any" | "AnyRef" | "AnyVal" | "Object" => true,
         // The sequence shapes a sequence pattern (`case List(a, b) =>`) and the
         // cons pattern (`case h :: t =>`) test against. `Seq`/`Iterable` accept
@@ -5081,6 +5380,8 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 // Likewise an `Ordering`, which `ordering_method` answers.
                 HeapVal::Ordering { .. } => 9,
                 HeapVal::Lazy(_) => 10,
+                // A `BigInt` is answered by `big_method`, like a `Char`.
+                HeapVal::BigInt(_) => 11,
             })
         })
     } else {
@@ -5091,6 +5392,9 @@ fn heap_kind(v: &Value) -> Option<u8> {
 /// Dispatch a method on a heap collection/tuple/closure. The closure-consuming
 /// operations re-enter the VM (via [`invoke_closure`]) to run their function arg.
 fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some(b) = as_big(recv) {
+        return big_method(&b, name, args);
+    }
     if name == "toString" && args.is_empty() {
         return Ok(Value::str(scala_str_vm(vm, recv)));
     }
@@ -5448,6 +5752,13 @@ fn mut_seq_method(
         ("enqueue" | "enqueueAll", 1) if kind == SeqKind::Queue => {
             let mut out = items.to_vec();
             out.extend(spread(&args[0], name == "enqueueAll"));
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
+        // `enqueue(e1, e2, es*)` — the varargs overload appends each element.
+        ("enqueue", _) if kind == SeqKind::Queue && args.len() >= 2 => {
+            let mut out = items.to_vec();
+            out.extend_from_slice(args);
             set_seq_items(recv, kind, out);
             Some(me())
         }
@@ -6583,6 +6894,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(acc)
         }
+        ("indices", 0) => Ok(indices_range(items.len())),
         ("zipWithIndex", 0) => Ok(same(
             items
                 .iter()
@@ -6937,6 +7249,13 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             out.extend(items);
             Ok(same(out))
         }
+        // `xs ::: ys` / `xs ++: ys` are `ys.prependedAll(xs)`: the receiver is
+        // the RIGHT operand, and its collection kind is the result's.
+        (":::" | "++:" | "prependedAll", 1) => {
+            let mut out = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            out.extend(items);
+            Ok(same(out))
+        }
         _ => Err(no_such_method(recv, name)),
     }
 }
@@ -6945,6 +7264,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
 ///
 /// The integral accumulator wraps, for the reason given on [`seq_sum`].
 fn seq_product(items: &[Value]) -> Value {
+    if items.iter().any(|v| as_big(v).is_some()) {
+        if let Some(xs) = items.iter().map(big_operand).collect::<Option<Vec<_>>>() {
+            return make_big(xs.into_iter().product());
+        }
+    }
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
         Value::int(
             items
@@ -7016,6 +7340,31 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     match (name, args.len()) {
         // `Iterable.toIterable` is `this`: a `Map` stays a `Map`.
         ("toIterable", 0) => Ok(recv.clone()),
+        // `m.view` — the strict map stands in for the `MapView`; every member
+        // a view is followed by here (`mapValues`, `filterKeys`, `toMap`)
+        // answers what the view would after forcing.
+        ("view", 0) => Ok(recv.clone()),
+        // `mapValues` / `filterKeys` (on a `Map` or its `view`): an immutable
+        // `Map` of the surviving keys, each in its original position.
+        ("mapValues", 1) => {
+            let mut out = Vec::with_capacity(entries.len());
+            for (k, v) in &entries {
+                out.push((
+                    k.clone(),
+                    invoke_closure(vm, &args[0], std::slice::from_ref(v))?,
+                ));
+            }
+            Ok(new_map(HashRep::Small, out))
+        }
+        ("filterKeys", 1) => {
+            let mut out = Vec::new();
+            for (k, v) in &entries {
+                if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(k))?) {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+            Ok(new_map(HashRep::Small, out))
+        }
         ("updated", 2) | ("+", 1) => {
             let mut out = entries.clone();
             match (name, as_seq_or_tuple(&args[0])) {
@@ -7340,6 +7689,9 @@ fn truthy(v: &Value) -> bool {
 /// (`Ordering.Tuple2`). Any other pairing compares equal, which leaves the sort
 /// — stable in both languages — holding the input order.
 fn value_cmp(a: &Value, b: &Value) -> Ordering {
+    if let Some((x, y)) = big_pair(a, b) {
+        return x.cmp(&y);
+    }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => java_str_cmp(x, y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
@@ -7850,6 +8202,12 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
 /// case; a `List[Int]` is narrowed to 32 bits by `member_width` on the compiler
 /// side, so both widths overflow where Scala does.
 fn seq_sum(items: &[Value]) -> Value {
+    // A `List[BigInt]` sums exactly.
+    if items.iter().any(|v| as_big(v).is_some()) {
+        if let Some(xs) = items.iter().map(big_operand).collect::<Option<Vec<_>>>() {
+            return make_big(xs.into_iter().sum());
+        }
+    }
     if items.iter().all(|v| matches!(v, Value::Int(_))) {
         Value::int(
             items
@@ -7891,6 +8249,21 @@ fn b_array_fill(vm: &mut VM, _argc: u8) -> Value {
         _ => Value::Undef,
     };
     new_seq(SeqKind::Array, vec![zero; n as usize])
+}
+
+/// `xs.indices` — `Range 0 until xs.length`, a real `Range` value (it prints
+/// as one: `Range 0 until 3`).
+fn indices_range(n: usize) -> Value {
+    let end = n as i64;
+    new_seq(
+        SeqKind::Range {
+            start: 0,
+            end,
+            inclusive: false,
+            step: 1,
+        },
+        (0..end).map(Value::int).collect(),
+    )
 }
 
 /// `MAKE_RANGE` builtin — pop the step, `inclusive`, end and start; return the
@@ -8367,6 +8740,19 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
             Ok(Value::str(format_double(num_f64(&args[0]))))
         }
         ("java.String", "valueOf", 1) => Ok(Value::str(scala_str(&args[0]))),
+        ("BigInt", "apply", _) => big_apply(args),
+        // `String.join(delim, a, b, …)`, or one `Array[String]` passed to the
+        // varargs parameter.
+        ("java.String", "join", n) if n >= 1 => {
+            let parts: Vec<Value> = match &args[1..] {
+                [one] => as_seq_or_tuple(one).unwrap_or_else(|| vec![one.clone()]),
+                rest => rest.to_vec(),
+            };
+            let delim = scala_str(&args[0]);
+            Ok(Value::str(
+                parts.iter().map(scala_str).collect::<Vec<_>>().join(&delim),
+            ))
+        }
         // ── Arithmetic statics ───────────────────────────────────────────────
         ("java.Integer" | "java.Long", "compare", 2) => Ok(Value::int(match i(0).cmp(&i(1)) {
             std::cmp::Ordering::Less => -1,
@@ -9180,6 +9566,9 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     if let Some(c) = as_char(recv) {
         return char_method(c, name, args);
     }
+    if let Some(b) = as_big(recv) {
+        return big_method(&b, name, args);
+    }
     // An `Ordering` handle is likewise not a record; `.reverse` on one must not
     // reach the sequence dispatcher, which would try to reverse a collection.
     // Its members can run a user closure, so they are answered on the VM-aware
@@ -9862,6 +10251,13 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             s.to_lowercase() == args[0].as_str_cow().to_lowercase(),
         )),
         ("*", 1) => Ok(Value::str(s.repeat(args[0].to_int().max(0) as usize))),
+        // `java.lang.String.repeat` — unlike `*`, a negative count throws.
+        ("repeat", 1) => match args[0].to_int() {
+            n if n < 0 => Err(format!(
+                "scalars: java.lang.IllegalArgumentException: count is negative: {n}"
+            )),
+            n => Ok(Value::str(s.repeat(n as usize))),
+        },
         ("take", 1) => Ok(Value::str(char_slice(s, 0, args[0].to_int()))),
         ("drop", 1) => Ok(Value::str(char_slice(
             s,
@@ -9962,6 +10358,7 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // string itself rather than as a sequence of `Char`s.
         ("toIndexedSeq", 0) => Ok(Value::str(s)),
         ("toCharArray", 0) => Ok(new_seq(SeqKind::Array, s.chars().map(make_char).collect())),
+        ("indices", 0) => Ok(indices_range(s.chars().count())),
         // `StringOps.zipWithIndex` answers an `IndexedSeq`, printed `Vector(…)`.
         ("zipWithIndex", 0) => Ok(new_seq(
             SeqKind::Vector,
@@ -11049,6 +11446,12 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
     if unwinding() {
         return Value::Undef;
     }
+    if let Some((x, y)) = big_pair(&a, &b) {
+        return match big_div_rem(&x, &y, false) {
+            Ok(v) => v,
+            Err(e) => fault(vm, e),
+        };
+    }
     // A `Char` divides as its code point, so `'a' / 2` is the `Int` 48 — integer
     // division, not the float fallback below.
     let (a, b) = match (num_of(&a), num_of(&b)) {
@@ -11091,6 +11494,12 @@ fn b_mod(vm: &mut VM, _argc: u8) -> Value {
     let a = vm.stack.pop().unwrap_or(Value::Undef);
     if unwinding() {
         return Value::Undef;
+    }
+    if let Some((x, y)) = big_pair(&a, &b) {
+        return match big_div_rem(&x, &y, true) {
+            Ok(v) => v,
+            Err(e) => fault(vm, e),
+        };
     }
     // A `Char` takes its remainder as a code point, matching `b_div`.
     let (a, b) = match (num_of(&a), num_of(&b)) {
@@ -12034,6 +12443,13 @@ fn conv_to_type(v: Value, ty: &str) -> Value {
     match ty {
         "Double" => return widen_f64(&v).unwrap_or(v),
         "Float" => return as_f32(&v).map(make_f32).unwrap_or(v),
+        // `val b: BigInt = 7` — Scala's implicit `int2bigInt`/`long2bigInt`.
+        "BigInt" | "scala.math.BigInt" | "math.BigInt" => {
+            return match (&v, as_big(&v)) {
+                (Value::Int(n), None) => make_big(BigInt::from(*n)),
+                _ => v,
+            };
+        }
         _ => {}
     }
     if let Some(inner) = ty.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
@@ -12445,6 +12861,10 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     // displacing the real exception (see `Exception unwinding`).
     if unwinding() {
         return Ok(Value::Undef);
+    }
+    // A `BigInt` on either side, against another or an integral value.
+    if let Some(r) = big_binop(op, a, b) {
+        return r;
     }
     // A `Char` operand. `Char` is a heap handle, so every operation on one
     // reaches this hook; it is numeric in all of them (`'a' + 1 == 98`) except

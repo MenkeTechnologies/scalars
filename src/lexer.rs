@@ -338,6 +338,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     break;
                 }
             }
+            // An identifier whose last character is `_` may continue with
+            // operator characters (SLS 1.1): `unary_-`, `unary_!`, `x_=`. A lone
+            // `_` is the wildcard and never absorbs one: `case _: Int`, `_+1`.
+            if i - start > 1 && bytes[i - 1] == b'_' {
+                while i < bytes.len() && b"+-*/%<>=!&|^~?:\\".contains(&bytes[i]) {
+                    i += 1;
+                }
+            }
             let word = &src[start..i];
             // Interpolator prefix: `s"…"` / `f"…"` / `raw"…"` — the ident is an
             // interpolator only when a `"` follows with no intervening whitespace
@@ -574,12 +582,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // `#::` — `LazyList`'s cons. Matched at three characters, before
             // the `::` below could take the last two and leave a stray `#`.
             "#::" => (Tok::HashColonColon, 3),
+            // `:::` and `++:` prepend a whole collection, `+=:` one element in
+            // place (a buffer's `prepend`). Each ends in `:`, so
+            // they are right-associative and the RIGHT operand is the receiver.
+            ":::" | "++:" | "+=:" => (Tok::Op(three.to_string()), 3),
             _ => match two {
                 "<-" => (Tok::LArrow, 2),
                 "=>" => (Tok::FatArrow, 2),
                 "->" => (Tok::RArrow, 2),
                 "::" => (Tok::ColonColon, 2),
-                "++" | "--" | ":+" | "+:" | "<<" | ">>" | "&~" => (Tok::Op(two.to_string()), 2),
+                // `/%` is `BigInt`'s quotient-and-remainder.
+                "++" | "--" | ":+" | "+:" | "<<" | ">>" | "&~" | "/%" => {
+                    (Tok::Op(two.to_string()), 2)
+                }
                 "+=" => (Tok::PlusAssign, 2),
                 "-=" => (Tok::MinusAssign, 2),
                 "*=" => (Tok::StarAssign, 2),
@@ -607,8 +622,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     // SLS precedence comes from this first character.
                     '&' | '|' | '^' => (Tok::Op(c.to_string()), 1),
                     '~' => (Tok::Tilde, 1),
-                    // `@` only ever introduces a pattern binder here — the
-                    // annotation syntax (`@tailrec`) is not modeled.
+                    // `@` — a pattern binder, or an annotation, which the
+                    // parser skips where a member or statement starts.
                     '@' => (Tok::At, 1),
                     '+' => (Tok::Plus, 1),
                     '-' => (Tok::Minus, 1),

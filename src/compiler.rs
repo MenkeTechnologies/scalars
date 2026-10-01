@@ -146,6 +146,8 @@ struct Compiler {
     /// Singleton `object` metadata (`name → members`), for static member
     /// dispatch (`Registry.greet(x)` / `Registry.name`).
     objects: HashMap<String, ObjMeta>,
+    /// Class name → its companion object's internal name (`Pt` → `Pt$`).
+    companions: HashMap<String, String>,
     /// Method name → `(runtime class tag, defining type)` pairs, for the runtime
     /// instance-method dispatch chain (`recv.m(...)`). The tag is the concrete
     /// class of the receiver; the defining type owns the `Owner$method`
@@ -473,6 +475,20 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     if !objects.iter().any(|o| o.name == "None") {
         objects.push(builtin_none());
     }
+    // A COMPANION — an `object` sharing its name with a `class`/`trait` — is
+    // a distinct singleton, and the JVM names it `Pt$`. So does this: every
+    // table here is keyed by type name, and left as `Pt` the singleton took
+    // over the class's runtime tag (its methods vanished — `value plus is not a
+    // member of Pt`) and their `Pt$m` subroutines collided. `Pt.m` and a bare
+    // `Pt(…)` that means the companion's `apply` are routed to `Pt$` through
+    // [`Compiler::companions`].
+    let mut companions: HashMap<String, String> = HashMap::new();
+    for o in objects.iter_mut() {
+        if classes.iter().any(|c| c.name == o.name) {
+            let renamed = format!("{}$", o.name);
+            companions.insert(std::mem::replace(&mut o.name, renamed.clone()), renamed);
+        }
+    }
 
     // Linearize the declared types, then index class shapes with their inherited
     // fields and the method → (runtime tag, defining type) dispatch table.
@@ -741,6 +757,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         global_binds: HashSet::new(),
         classes: class_meta,
         objects: obj_meta,
+        companions,
         method_index,
         overloads,
         member_arity,
@@ -1562,6 +1579,7 @@ impl Compiler {
                     "scalars: named argument `{name} = …` is only supported on a `def` call"
                 ))
             }
+            Expr::Unary { op, rhs } if self.user_unary(*op, rhs)? => {}
             Expr::Unary { op, rhs } => {
                 let w = self.num_ty(rhs);
                 self.expr(rhs)?;
@@ -2427,6 +2445,15 @@ impl Compiler {
         Ok(())
     }
 
+    /// The companion object a `Pt.m` selects: `Some("Pt$")` when `recv` is the
+    /// bare name of a class whose companion declares `m` as a `def` or `val`.
+    fn companion_member(&self, recv: &Expr, name: &str) -> Option<String> {
+        let Expr::Var(c) = recv else { return None };
+        let obj = self.companions.get(c)?;
+        let meta = self.objects.get(obj)?;
+        (meta.methods.contains(name) || meta.vals.contains(name)).then(|| obj.clone())
+    }
+
     /// The extractor method an `object` named `name` declares, if any.
     /// `unapplySeq` is preferred, as Scala prefers it, so an object declaring
     /// both binds a variable-length pattern.
@@ -2749,9 +2776,20 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::MAKE_LIST, 0), 0);
             return Ok(());
         }
+        // `Predef.identity` as a function value — `xs.map(identity)`,
+        // `e.fold(identity, _.toString)`. A user `def identity` is a
+        // `func_arity` entry and is answered below instead.
+        if name == "identity" && !self.func_arity.contains_key(name) {
+            let x = Expr::Var("$identity".to_string());
+            return self.lambda(&["$identity".to_string()], &x, false);
+        }
         // A bare reference to a singleton object (e.g. `None`) materializes it.
         if self.objects.contains_key(name) {
             return self.materialize_object(name);
+        }
+        // A class name used as a value is its companion object.
+        if let Some(obj) = self.companions.get(name).cloned() {
+            return self.materialize_object(&obj);
         }
         // A bare reference to a `def`. A zero-parameter `def` is a paren-less
         // call; a `def` with parameters used as a value is eta-expanded to a
@@ -3103,6 +3141,10 @@ impl Compiler {
             }
         }
         if !matches!(op, AssignOp::Add | AssignOp::Sub) {
+            if self.compound_user_op(op, value, w)? {
+                self.assign_result_is_unit();
+                return Ok(());
+            }
             self.expr(value)?;
             match op {
                 AssignOp::Div => self.b.emit(Op::CallBuiltin(crate::host::SDIV, 2), 0),
@@ -3150,6 +3192,9 @@ impl Compiler {
     /// the binary `+` takes, under the same [`Compiler::needs_render`] gate, so
     /// an ordinary `n += 1` keeps the two ops it always had.
     fn compound_arith(&mut self, op: AssignOp, value: &Expr, w: NumTy) -> Result<(), String> {
+        if self.compound_user_op(op, value, w)? {
+            return Ok(());
+        }
         self.expr(value)?;
         if op == AssignOp::Add && self.needs_render(value) {
             self.b.emit(Op::CallBuiltin(crate::host::SADD, 2), 0);
@@ -3158,6 +3203,27 @@ impl Compiler {
         }
         self.narrow(w, 0);
         Ok(())
+    }
+
+    /// `p += q` where `p` may hold an instance of a class declaring `+`: SLS
+    /// 6.12.4 expands it to `p = p + q`, so the arithmetic half goes through
+    /// [`Self::user_operator`] like the infix form. The current value is on the
+    /// stack; it is parked in a temporary that the binary lowering reads back.
+    /// Answers `false` (emitting nothing) for a statically numeric target or a
+    /// program whose classes declare no such operator.
+    fn compound_user_op(&mut self, op: AssignOp, value: &Expr, w: NumTy) -> Result<bool, String> {
+        let Some(bop) = compound_binop(op) else {
+            return Ok(false);
+        };
+        if w != NumTy::Unknown || !self.method_index.contains_key(user_operator_name(bop)) {
+            return Ok(false);
+        }
+        self.obj_counter += 1;
+        let tn = format!(" cop_l{}", self.obj_counter);
+        let t = self.declare_place(&tn);
+        self.emit_store(t);
+        self.binary(bop, &Expr::Var(tn), value)?;
+        Ok(true)
     }
 
     /// Record that the value of the compound assignment being lowered is the
@@ -4161,6 +4227,10 @@ impl Compiler {
         if let Some(call) = self.uncurry(recv, name, args, line) {
             return self.expr(&call);
         }
+        // `Pt.m(…)` — a member of the class's companion object.
+        if let Some(obj) = self.companion_member(recv, name) {
+            return self.method(&Expr::Var(obj), name, args, line);
+        }
         // The three methods that observe a receiver's TYPE rather than its
         // value, on a receiver the analysis proved is a `Float`. All three would
         // otherwise read the one runtime representation and answer for a
@@ -4715,6 +4785,129 @@ impl Compiler {
         Ok(())
     }
 
+    /// `a + b` where `a` may be an instance of a class that declares the
+    /// operator itself (`case class V(x: Int) { def +(o: V) = … }`).
+    ///
+    /// The infix spelling lowers to a native arithmetic op whose non-numeric
+    /// fallback cannot re-enter the VM to run a user method, so — as with
+    /// [`Self::ordered_relational`] — the choice is made here: both operands go
+    /// into temporaries (each evaluated once), and a runtime class-tag chain
+    /// calls `Class$+` for every class defining the operator. Any other receiver
+    /// falls through to the ordinary lowering of the same two temporaries.
+    ///
+    /// Emits nothing (answers `false`) when no class defines the operator, or
+    /// when the left operand is statically a number or a `String` — those keep
+    /// exactly the bytecode, and the `Int`/`Long` width analysis, they had.
+    fn user_operator(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<bool, String> {
+        let sym = user_operator_name(op);
+        if sym.is_empty() {
+            return Ok(false);
+        }
+        // The fallback below re-enters `binary` on the two temporaries; their
+        // `" uop_"` names (a space no source identifier can start with) stop
+        // the recursion there.
+        if matches!(lhs, Expr::Var(n) if n.starts_with(" uop_"))
+            || self.num_ty(lhs) != NumTy::Unknown
+            || yields_strings(lhs)
+        {
+            return Ok(false);
+        }
+        let Some(classes) = self.method_index.get(sym).cloned() else {
+            return Ok(false);
+        };
+        self.obj_counter += 1;
+        let n = self.obj_counter;
+        let (tn, un) = (format!(" uop_l{n}"), format!(" uop_r{n}"));
+        self.expr(lhs)?;
+        let t = self.declare_place(&tn);
+        self.emit_store(t);
+        self.expr(rhs)?;
+        let u = self.declare_place(&un);
+        self.emit_store(u);
+        self.emit_load(t);
+        self.b.emit(Op::CallBuiltin(crate::host::OBJ_CLASS, 1), 0);
+        let cls = self.declare_place(&format!(" uop_c{n}"));
+        self.emit_store(cls);
+
+        let mut end_jumps = Vec::new();
+        for (tag, owner) in &classes {
+            self.emit_load(cls);
+            let cc = self.b.add_constant(Value::str(tag.clone()));
+            self.b.emit(Op::LoadConst(cc), 0);
+            self.b.emit(Op::NumEq, 0);
+            let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+            self.emit_load(t);
+            self.emit_load(u);
+            let sub = self.sub_name(owner, sym, 1)?;
+            let nidx = self.b.add_name(&sub);
+            self.b.emit(Op::Call(nidx, 2), 0);
+            end_jumps.push(self.b.emit(Op::Jump(0), 0));
+            let next = self.b.current_pos();
+            self.b.patch_jump(jf, next);
+        }
+        self.binary(op, &Expr::Var(tn), &Expr::Var(un))?;
+        let end = self.b.current_pos();
+        for je in end_jumps {
+            self.b.patch_jump(je, end);
+        }
+        Ok(true)
+    }
+
+    /// `-p` / `!p` / `~p` where `p` may be an instance of a class declaring
+    /// `unary_-` / `unary_!` / `unary_~`. Same shape as [`Self::user_operator`]:
+    /// the operand goes into a temporary, a class-tag chain calls the user
+    /// method, and any other receiver falls through to the built-in operator.
+    /// Answers `false` (emitting nothing) for a statically numeric operand or a
+    /// program declaring no such method.
+    fn user_unary(&mut self, op: UnOp, rhs: &Expr) -> Result<bool, String> {
+        let sym = match op {
+            UnOp::Neg => "unary_-",
+            UnOp::Not => "unary_!",
+            UnOp::Complement => "unary_~",
+        };
+        if matches!(rhs, Expr::Var(n) if n.starts_with(" uun_"))
+            || self.num_ty(rhs) != NumTy::Unknown
+        {
+            return Ok(false);
+        }
+        let Some(classes) = self.method_index.get(sym).cloned() else {
+            return Ok(false);
+        };
+        self.obj_counter += 1;
+        let tn = format!(" uun_{}", self.obj_counter);
+        self.expr(rhs)?;
+        let t = self.declare_place(&tn);
+        self.emit_store(t);
+        self.emit_load(t);
+        self.b.emit(Op::CallBuiltin(crate::host::OBJ_CLASS, 1), 0);
+        let cls = self.declare_place(&format!("{tn}c"));
+        self.emit_store(cls);
+        let mut end_jumps = Vec::new();
+        for (tag, owner) in &classes {
+            self.emit_load(cls);
+            let cc = self.b.add_constant(Value::str(tag.clone()));
+            self.b.emit(Op::LoadConst(cc), 0);
+            self.b.emit(Op::NumEq, 0);
+            let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+            self.emit_load(t);
+            let sub = self.sub_name(owner, sym, 0)?;
+            let nidx = self.b.add_name(&sub);
+            self.b.emit(Op::Call(nidx, 1), 0);
+            end_jumps.push(self.b.emit(Op::Jump(0), 0));
+            let next = self.b.current_pos();
+            self.b.patch_jump(jf, next);
+        }
+        self.expr(&Expr::Unary {
+            op,
+            rhs: Box::new(Expr::Var(tn)),
+        })?;
+        let end = self.b.current_pos();
+        for je in end_jumps {
+            self.b.patch_jump(je, end);
+        }
+        Ok(true)
+    }
+
     /// `a < b` where `a` may be an instance of a class extending `Ordered`.
     ///
     /// Scala's `Ordered` derives `<`/`>`/`<=`/`>=` from the class's own
@@ -5225,8 +5418,33 @@ impl Compiler {
         // `Class(args)` — a `case class` companion `apply` (construct without
         // `new`) / built-in `Some(v)`. A plain class has no companion `apply`, so
         // it must be built with `new` (bare `PlainClass(args)` is not a call).
+        // `Pt(…)` where `Pt`'s companion declares `apply` is that `apply`: always
+        // for a plain class, and for a case class whenever the arity is not the
+        // constructor's (the synthesized `apply` keeps the constructor's).
+        if let Some(obj) = self.companions.get(name).cloned() {
+            let declares_apply = self
+                .objects
+                .get(&obj)
+                .is_some_and(|m| m.methods.contains("apply"));
+            let ctor_arity = self
+                .classes
+                .get(name)
+                .filter(|m| m.is_case)
+                .map(|m| m.arity);
+            if declares_apply && ctor_arity != Some(args.len()) {
+                return self.method(&Expr::Var(obj), "apply", args, line);
+            }
+        }
         if self.classes.get(name).is_some_and(|m| m.is_case) {
             return self.construct(name, args, line);
+        }
+        // `BigInt(x)` / `BigInt("…")` — `scala.math.BigInt.apply`, unless the
+        // program declares something of that name itself.
+        if name == "BigInt"
+            && !self.classes.contains_key(name)
+            && !self.func_arity.contains_key(name)
+        {
+            return self.method(&Expr::Var(name.to_string()), "apply", args, line);
         }
         // An unqualified method call inside a class method (`m(x)` == `this.m(x)`).
         if let Some((cname, _)) = self.current_class.clone() {
@@ -6093,6 +6311,9 @@ impl Compiler {
             }
             _ => {}
         }
+        if self.user_operator(op, lhs, rhs)? {
+            return Ok(());
+        }
         // `a < b` on a class that extends `Ordered` is that class's `compare`,
         // not a numeric comparison. Emitted before the operand code below
         // because the chain needs the receiver in a temporary.
@@ -6655,6 +6876,39 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
             rebuild(m(indices(n), "map", vec![f]))
         }
         ("tabulate", [n, f]) => rebuild(m(indices(n), "map", vec![f.clone()])),
+        // The two-dimensional forms, `Array.tabulate(r, c)((i, j) => …)` and
+        // `List.fill(r, c)(v)`: a collection of `r` rows, each itself built by
+        // the same factory over `c` columns.
+        ("tabulate" | "fill", [rows, cols, f]) => {
+            let (i, j) = ("_$row".to_string(), "_$col".to_string());
+            let cell = if name == "tabulate" {
+                m(
+                    f.clone(),
+                    "apply",
+                    vec![Expr::Var(i.clone()), Expr::Var(j.clone())],
+                )
+            } else {
+                f.clone()
+            };
+            let row = rebuild(m(
+                indices(cols),
+                "map",
+                vec![Expr::Lambda {
+                    params: vec![j],
+                    body: Box::new(cell),
+                    partial: false,
+                }],
+            ));
+            rebuild(m(
+                indices(rows),
+                "map",
+                vec![Expr::Lambda {
+                    params: vec![i],
+                    body: Box::new(row),
+                    partial: false,
+                }],
+            ))
+        }
         ("range", [a, b]) => rebuild(m(a.clone(), "until", vec![b.clone()])),
         ("range", [a, b, step]) => rebuild(m(
             m(a.clone(), "until", vec![b.clone()]),
@@ -7105,6 +7359,15 @@ fn declared_conv(ty: Option<&str>) -> Option<Conv> {
         "Double" => return Some(Conv::Width(crate::host::SF64)),
         _ => {}
     }
+    // `BigInt` anywhere in the type: an integral value assigned to one is
+    // widened by Scala's implicit `int2bigInt`, which the host performs.
+    if ty
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == "BigInt")
+        && !ty.contains("=>")
+    {
+        return Some(Conv::Shape(ty.to_string()));
+    }
     // A structured type with a floating width somewhere inside it. Scala widens
     // at every layer the expected type reaches: `val m: Map[String, Double] =
     // Map("a" -> 1)` holds `1.0`.
@@ -7265,9 +7528,9 @@ fn is_ordering_module(e: &Expr) -> bool {
 /// `Character` and anything under `java.lang` are the JDK boxes (which have
 /// `MAX_VALUE` and the statics). A `java.`-prefixed answer marks the latter.
 fn boxed_module(e: &Expr) -> Option<String> {
-    /// The Scala value-class companions.
+    /// The Scala value-class companions, and `BigInt`'s.
     const SCALA: &[&str] = &[
-        "Int", "Long", "Short", "Byte", "Char", "Double", "Float", "Boolean",
+        "Int", "Long", "Short", "Byte", "Char", "Double", "Float", "Boolean", "BigInt",
     ];
     /// The `java.lang` boxes, plus `String`.
     const JAVA: &[&str] = &[
@@ -8236,6 +8499,23 @@ fn operator_binop(name: &str) -> Option<BinOp> {
 /// The binary operator a compound assignment expands to, for the paths that
 /// lower `x op= e` as `x op e` rather than through [`compound_op`]. `None` for
 /// the plain `=`, which is not a compound assignment at all.
+/// The method a user class declares to take over an infix operator
+/// (`def +(o: V)`), or `""` for an operator a class cannot redefine here.
+fn user_operator_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::Le => "<=",
+        BinOp::Ge => ">=",
+        _ => "",
+    }
+}
+
 fn compound_binop(op: AssignOp) -> Option<BinOp> {
     match op {
         AssignOp::Add => Some(BinOp::Add),

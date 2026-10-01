@@ -880,6 +880,7 @@ impl Parser {
     /// the one modifier that changes what the member does.
     fn skip_member_modifiers(&mut self) -> bool {
         let mut lazy = false;
+        self.skip_annotations();
         while matches!(self.peek(), Tok::Ident(w)
             if w == "override"
                 || w == "private"
@@ -893,8 +894,35 @@ impl Parser {
         {
             lazy |= matches!(self.peek(), Tok::Ident(w) if w == "lazy");
             self.advance();
+            self.skip_annotations();
         }
         lazy
+    }
+
+    /// Skip the annotations heading a member or a block statement: `@tailrec`,
+    /// `@inline`, `@deprecated("gone", "3.0")`, `@annotation.tailrec`. None of
+    /// them changes what a program prints — `@tailrec` only asks the compiler
+    /// to REJECT a method that is not tail recursive, and a program the
+    /// reference accepts already is one — so each is consumed with its
+    /// qualified name, optional type arguments and argument lists. Only an `@`
+    /// followed by an identifier is an annotation; the pattern binder
+    /// `n @ Some(v)` never starts a member or a statement.
+    fn skip_annotations(&mut self) {
+        while self.is(&Tok::At) && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.advance();
+            self.advance();
+            while self.is(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
+                self.advance();
+                self.advance();
+            }
+            if self.is(&Tok::LBracket) {
+                self.skip_bracket_group();
+            }
+            while self.is(&Tok::LParen) {
+                self.skip_paren_group();
+            }
+            self.skip_seps();
+        }
     }
 
     /// Consume a `( … )` group, balancing nested parentheses. The cursor is on
@@ -981,7 +1009,22 @@ impl Parser {
 
     fn parse_def(&mut self) -> Result<Func, String> {
         self.eat(&Tok::Def)?;
-        let name = self.ident()?;
+        // A symbolic name — `def +(o: Pt)`, `def ++(o: V)`, `def <(o: Pt)` — is
+        // an ordinary method; the infix use `a + b` reaches it through the
+        // compiler's user-operator dispatch.
+        let name = match dotted_operator(self.peek()) {
+            Some(op) => {
+                self.advance();
+                op.to_string()
+            }
+            None => match self.peek().clone() {
+                Tok::Op(op) => {
+                    self.advance();
+                    op
+                }
+                _ => self.ident()?,
+            },
+        };
         // `[T, U]` / `[A: Ord]` — the type-parameter clause. The NAMES are kept
         // (implicit resolution substitutes them at a call site) and so are the
         // CONTEXT BOUNDS, which are a `using` parameter in disguise: `[A: Sh]`
@@ -1249,7 +1292,12 @@ impl Parser {
         let mut out = Vec::new();
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-            if self.at_nested_declaration() {
+            self.skip_annotations();
+            // A block-local `enum` joins the flat type namespace exactly as a
+            // block-local `case class` does.
+            if self.at_enum_start() {
+                self.enum_decl()?;
+            } else if self.at_nested_declaration() {
                 self.nested_declaration()?;
             } else {
                 out.push(self.statement()?);

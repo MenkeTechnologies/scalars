@@ -91,5 +91,12 @@ libc = "0.2"
 # behave as the JDK's do rather than fail to compile.
 fancy-regex = "0.18"
 
+# `scala.math.BigInt` is `java.math.BigInteger`: arbitrary precision, truncating
+# `/` and `%`. `num-bigint` has the same truncating division and two's-
+# complement bit semantics, so its answers are the JDK's.
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+
 [dev-dependencies]
 tempfile = "3"

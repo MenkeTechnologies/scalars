@@ -799,26 +799,25 @@ reported as parse/compile errors, never silently mis-run.
   which is what the `match` a program writes against them already checks;
   `opaque type`, `type` aliases and `inline def` behave as the reference does.
 
-- **`BigInt` and `BigDecimal`.** `BigInt(2).pow(70)` and
-  `BigDecimal("1.5") + BigDecimal("2.25")` are `not found: BigInt` /
-  `not found: BigDecimal`. Only the `scala.math.Ordering` companion knows the
-  two names, as element types it erases.
+- **`BigDecimal`.** `BigDecimal("1.5") + BigDecimal("2.25")` is
+  `not found: BigDecimal`. `BigInt` is supported (see below); `BigDecimal`
+  additionally needs `java.math.BigDecimal`'s scale and rounding rules, which
+  decide its `toString` and its `==`, and is left out rather than approximated
+  with a `Double`, which would silently answer a rounded number for the exact
+  case the type exists to serve.
 
-  The obstruction is the value model, not the arithmetic. Every number here is
-  one fusevm `Value` — an `i64` or an `f64` — and the whole numeric surface is
-  built on that: the 32-bit wrap analysis, `Double.toString`, the mixed
-  `Int`/`Double` dispatch, `%` and `/` by zero, the boxed companions. An
-  arbitrary-precision number is a HEAP value with none of those properties, so
-  it cannot be an operand of the existing arithmetic without a runtime type
-  test on the fast path of every `+`. Adding one is not a small change to the
-  frontend and it is not a change to the frontend at all where the arithmetic
-  ops live, which is the vendored VM this crate must not modify. What it would
-  take instead is host-side operands (`Value::Obj` carrying a bignum) plus an
-  arithmetic path that dispatches on them, and `BigDecimal` additionally needs
-  `java.math.BigDecimal`'s scale and rounding rules, which decide its
-  `toString` and its `==`. Left out rather than approximated with an `i64`,
-  which would silently answer a wrapped number for the exact case these types
-  exist to serve.
+  `BigInt` is a host-heap value (`Value::Obj` carrying a `num_bigint::BigInt`),
+  the same shape a `Char` has, so every operator on one reaches the numeric hook
+  and never the native fast path. Arithmetic, comparison, `==` against an
+  integral value, hashing (`BigInt(3).## == 3`), `sorted`/`max`/`sum`/`product`,
+  `pow`/`abs`/`signum`/`gcd`/`mod`/`modPow`/`/%`/`isProbablePrime`, the bitwise
+  operators and shifts, `toInt`/`toLong` (low-order bits), `toDouble`,
+  `toString(radix)`, `BigInt("…", radix)` and the typed pattern `case b:
+  BigInt` all answer as the reference does. A declared `BigInt` type widens an
+  integral value assigned to it (`val z: BigInt = 7`), as Scala's `int2bigInt`
+  does. Division by zero raises `/ by zero` while the dividend fits a `Long`
+  and `BigInteger divide by zero` past it, because Scala's `BigInt` keeps a
+  `Long`-range value as a bare `Long` and divides it with `ldiv`.
 
 - **A `LazyList` combinator that must see every element terminates only on a
   finite list**, as in Scala — `toList`, `sum`, `length`, `mkString`,
@@ -851,8 +850,24 @@ reported as parse/compile errors, never silently mis-run.
   the same `C$f$1` subroutine, and the runtime is dynamically typed, so the
   argument's static type — which is what Scala resolves on — is not available.
   Argument COUNT is modelled (see above); argument type is not.
-- **Symbolic operators beyond the wired set.** `/:`, `:\` and user-defined
-  symbolic method names.
+- **Symbolic operators beyond the wired set.** `/:` and `:\`. A user class's
+  own symbolic methods (`def +(o: V)`, `def <(o: V)`, `def unary_-`) are
+  supported: the infix use dispatches on the left operand's runtime class, so
+  `a + b` calls `V$+` for a `V` and stays plain arithmetic for a number, and
+  `p += q` expands to `p = p + q` as SLS 6.12.4 specifies.
+- **Anonymous classes.** `new Greeter { def greet(n: String) = … }` is
+  refused (`trait Greeter is abstract; it cannot be instantiated`). The body
+  would be a class declared inside an expression, and a class here cannot
+  capture the locals of the frame that declares it (see below), which is what
+  an anonymous class body reads most often.
+- **`scala.Enumeration`.** `object Color extends Enumeration { val Red, Green =
+  Value }` does not parse: neither the multi-name `val a, b = e` definition nor
+  `Enumeration#Value`'s auto-numbering is modelled. Scala 3 `enum` is supported.
+- **A companion `apply` overloaded by parameter TYPE on a `case class`.**
+  `case class Pt(x: Int); object Pt { def apply(s: String) = … }`: `Pt("41")`
+  has the constructor's arity, so it constructs, where Scala resolves the
+  `String` overload. A companion `apply` of a different arity — or any companion
+  `apply` of a plain class — is called.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
   namespace, and the many `String`/numeric methods beyond the wired subset
   above.
@@ -1198,7 +1213,10 @@ reported as parse/compile errors, never silently mis-run.
   second declaration would silently replace the first and every `Q` in the
   program would mean whichever won. That is refused
   (``type `Q` is already declared``) rather than run. A `class Q` beside an
-  `object Q` is the companion idiom, not a redeclaration, and still compiles.
+  `object Q` is the companion idiom, not a redeclaration, and still compiles:
+  the object is kept under the JVM's name for it, `Q$`, so its members and the
+  class's never share a subroutine, `Q.m` reaches the object, and a bare
+  `Q(…)` calls the companion's `apply` when it declares one.
 - **A type declared inside a `def` body cannot capture that frame's locals.**
   `def f(k: Int) = { class C(val n: Int) { def g = n + k }; new C(1).g }` is
   legal Scala and aborts here: the class is modelled as a top-level one, so `k`
