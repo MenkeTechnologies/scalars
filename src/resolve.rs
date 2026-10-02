@@ -35,9 +35,10 @@
 //!    parameter and every call site passes it. Capture sets propagate through
 //!    calls to a fixpoint (a local `def` that calls a sibling capturing `k`
 //!    must itself thread `k`). Captured values are read at each call, which
-//!    matches Scala for the `val`s and parameters that make up the common case;
-//!    *assigning* to a captured binding is not expressible this way and is
-//!    rejected with a diagnostic rather than silently lost.
+//!    matches Scala for the `val`s and parameters that make up the common case.
+//!    A capture the body ASSIGNS (directly or through a `def` it calls) is
+//!    passed by reference instead — the enclosing binding's heap cell, marked
+//!    `$ref(n)` at the call site — so the write reaches the enclosing frame.
 //!
 //! Class/object member `def`s are untouched: they already have their own
 //! `Class$method` namespace and an explicit `this`. A class BODY's `val`s are
@@ -72,6 +73,7 @@ pub fn resolve(prog: &mut Program) -> Result<(), String> {
                 name: name.clone(),
                 params: l.params.clone(),
                 captures: l.captures.clone(),
+                refs: l.refs.clone(),
             },
         );
         funcs.push(l.into_func(name));
@@ -143,19 +145,33 @@ struct Lifted {
     /// Index into [`Resolver::scopes`] of this `def`'s frame-root scope while it
     /// is being walked — the boundary that decides whether a name is a capture.
     scope_base: usize,
-    /// Names the body assigns to. Checked against `captures` after the fixpoint:
-    /// a by-value capture cannot carry a write back out.
+    /// Names the body assigns to. A capture among them travels BY REFERENCE —
+    /// see [`Self::refs`].
     assigns: HashSet<String>,
+    /// The captures that travel as the enclosing binding's heap cell rather
+    /// than its value: the ones this body assigns, and the ones it passes on
+    /// to a `def` that does. Computed by [`Resolver::fixpoint`].
+    refs: HashSet<String>,
 }
 
 impl Lifted {
     fn into_func(mut self, name: String) -> Func {
-        // The captures become trailing parameters. They are ordinary by-value
-        // parameters with no default, and `Func::captured` records how many so a
-        // call site can tell them apart from the ones the user wrote.
+        // The captures become trailing parameters with no default, and
+        // `Func::captured` records how many so a call site can tell them apart
+        // from the ones the user wrote. A by-reference one is marked so the
+        // body reads and writes it through its cell.
         let captured = self.captures.len();
+        let refs: Vec<bool> = self
+            .captures
+            .iter()
+            .map(|c| self.refs.contains(c))
+            .collect();
         self.params.extend(self.captures);
         self.sig.resize(self.params.len(), ParamSig::default());
+        let first = self.params.len() - captured;
+        for (sig, by_ref) in self.sig[first..].iter_mut().zip(refs) {
+            sig.by_ref = by_ref;
+        }
         Func {
             name,
             params: self.params,
@@ -186,6 +202,24 @@ struct Sig {
     name: String,
     params: Vec<String>,
     captures: Vec<String>,
+    /// The subset of `captures` passed by reference (see [`Lifted::refs`]).
+    refs: HashSet<String>,
+}
+
+impl Sig {
+    /// The trailing argument that supplies capture `c`: its value, or for a
+    /// by-reference capture the `$ref(c)` marker that passes its cell.
+    fn capture_arg(&self, c: &str) -> Expr {
+        let var = Expr::Var(c.to_string());
+        if self.refs.contains(c) {
+            Expr::Collection {
+                ctor: REF_CAPTURE.to_string(),
+                elems: vec![var],
+            }
+        } else {
+            var
+        }
+    }
 }
 
 struct Resolver {
@@ -527,6 +561,7 @@ impl Resolver {
                     captures: Vec::new(),
                     scope_base: 0,
                     assigns: HashSet::new(),
+                    refs: HashSet::new(),
                 });
                 self.lifted_idx.insert(tag.clone(), li);
                 if let Some(sc) = self.scopes.last_mut() {
@@ -560,6 +595,17 @@ impl Resolver {
             match &mut s.kind {
                 StmtKind::DefDecl(f) => {
                     let li = ids[&i];
+                    // A parameter default is spliced in at each call, which
+                    // sits in this block, so its names resolve here — a
+                    // default calling a sibling local `def` must reach that
+                    // `def`'s lifted name and capture arguments too.
+                    let mut sig = std::mem::take(&mut self.lifted[li].sig);
+                    for p in &mut sig {
+                        if let Some(d) = &mut p.default {
+                            self.walk_expr(d)?;
+                        }
+                    }
+                    self.lifted[li].sig = sig;
                     let mut body = std::mem::take(&mut f.body);
                     let params = f.params.clone();
                     self.push_frame(params);
@@ -847,17 +893,35 @@ impl Resolver {
                 break;
             }
         }
-        // A capture travels by value, one direction only. Writing to one inside
-        // the lifted body would be lost, so reject it instead of losing it.
-        for l in &self.lifted {
-            for c in &l.captures {
-                if l.assigns.contains(c) {
-                    return Err(format!(
-                        "scalars: local `def {}` assigns to `{c}` from the enclosing method \
-                         (a captured binding is read-only here)",
-                        l.base
-                    ));
+        // A capture the body ASSIGNS travels by reference: a by-value copy
+        // would take the write with it when the call returns. So does one it
+        // passes on to a `def` that needs it by reference, since only the cell
+        // it was handed can be handed on.
+        for l in &mut self.lifted {
+            l.refs = l
+                .captures
+                .iter()
+                .filter(|c| l.assigns.contains(*c))
+                .cloned()
+                .collect();
+        }
+        loop {
+            let mut changed = false;
+            for i in 0..self.edges.len() {
+                let (Some(caller), callee) = (self.edges[i].caller, self.edges[i].callee) else {
+                    continue;
+                };
+                let needed: Vec<String> = self.lifted[callee].refs.iter().cloned().collect();
+                for c in needed {
+                    if self.lifted[caller].captures.contains(&c)
+                        && self.lifted[caller].refs.insert(c)
+                    {
+                        changed = true;
+                    }
                 }
+            }
+            if !changed {
+                break;
             }
         }
         Ok(())
@@ -872,6 +936,11 @@ fn pass_calls(prog: &mut Program, sigs: &HashMap<String, Sig>) {
     cs_block(&mut prog.main, sigs);
     for f in &mut prog.functions {
         cs_block(&mut f.body, sigs);
+        for p in &mut f.sig {
+            if let Some(d) = &mut p.default {
+                cs_expr(d, sigs);
+            }
+        }
     }
     for c in &mut prog.classes {
         cs_block(&mut c.body, sigs);
@@ -930,7 +999,7 @@ fn cs_expr(e: &mut Expr, sigs: &HashMap<String, Sig>) {
             }
             if let Some(sig) = sigs.get(name) {
                 *name = sig.name.clone();
-                args.extend(sig.captures.iter().map(|c| Expr::Var(c.clone())));
+                args.extend(sig.captures.iter().map(|c| sig.capture_arg(c)));
             }
         }
         Expr::Var(name) => {
@@ -946,8 +1015,8 @@ fn cs_expr(e: &mut Expr, sigs: &HashMap<String, Sig>) {
                     args: sig
                         .params
                         .iter()
-                        .chain(sig.captures.iter())
                         .map(|p| Expr::Var(p.clone()))
+                        .chain(sig.captures.iter().map(|c| sig.capture_arg(c)))
                         .collect(),
                     line: 0,
                 };

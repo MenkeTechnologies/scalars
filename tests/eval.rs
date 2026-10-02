@@ -1391,18 +1391,29 @@ fn a_capturing_local_def_used_as_a_function_value_still_gets_its_capture() {
 }
 
 #[test]
-fn assigning_to_a_captured_binding_is_rejected_not_silently_lost() {
-    // A capture travels by value, so a write inside the lifted body could not
-    // reach the enclosing frame. Reject it rather than drop it.
-    let (out, err, ok) = run_full(&wrap(
-        "def f(): Int = { var k = 0; def bump(): Unit = { k += 1 }; bump(); k }\nprintln(f())",
+fn a_local_def_assigning_a_captured_var_writes_the_enclosing_binding() {
+    // The capture travels by reference (the `var`'s cell), so the write inside
+    // the lifted body reaches the enclosing frame — reference `scala` prints 1.
+    // It used to be refused at compile time. Through a second local `def`
+    // that only passes it on, the cell has to travel too.
+    let (out, ok) = run(&wrap(
+        "def f(): Int = { var k = 0; def bump(): Unit = { k += 1 }; bump(); k }\nprintln(f())\n\
+         def g(): Int = { var t = 0; def add(x: Int): Unit = t += x; def twice(x: Int): Unit = { add(x); add(x) }; twice(5); t }\nprintln(g())",
     ));
-    assert!(!ok);
-    assert_eq!(out, "");
-    assert!(
-        err.contains("local `def bump` assigns to `k` from the enclosing method"),
-        "the refusal must name the write it refused, not merely fail: {err:?}"
-    );
+    assert!(ok);
+    assert_eq!(out, "1\n10\n");
+}
+
+#[test]
+fn a_default_argument_calling_an_assigning_local_def_writes_through() {
+    // The default is spliced in at the call, outside the body the boxing scan
+    // walks; the scan still has to box `c` for the `$ref(c)` the default
+    // carries. Reference `scala` prints 2 (the default ran once, then `c`).
+    let (out, ok) = run(&wrap(
+        "def f(): Int = { var c = 0; def d(): Int = { c += 1; 1 }; def g(y: Int = d()): Int = y; g() + c }\nprintln(f())",
+    ));
+    assert!(ok);
+    assert_eq!(out, "2\n");
 }
 
 #[test]

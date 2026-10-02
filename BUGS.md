@@ -1157,20 +1157,19 @@ reported as parse/compile errors, never silently mis-run.
   so the readable form is emitted instead. This is the one place a supported
   construct deliberately diverges; the parity fuzzer therefore never prints a
   bare `Array`.
-- **A local `def` may not *assign* to a binding it captures.** A block-local
-  `def` is lambda-LIFTED (its captures become extra parameters), not closed over,
-  so a write inside the lifted body could not reach the enclosing frame. It is
-  rejected at compile time ("a captured binding is read-only here") rather than
-  silently lost. Reads see the value at call time, which matches Scala for the
-  `val`s and parameters that make up the common case. A *lambda* has no such
-  restriction — it captures a boxed cell and its writes are shared (see the
-  closure entry above); only the lifted-`def` path is affected.
-
-  It is also ENTRY-SHAPE dependent, which is why it is easy to miss: under
-  `object T extends App` the enclosing binding is a program global, so the write
-  lands and nothing is rejected. The restriction bites only when the whole thing
-  sits inside a `def` — a `@main` body, or a `def main` body — where the binding
-  is a frame slot.
+- **A local `def` that assigns a binding it captures, inside a `def` body.** A
+  block-local `def` is lambda-LIFTED (its captures become extra parameters), so
+  a capture it ASSIGNS — directly, or by passing it on to another local `def`
+  that does — is passed by REFERENCE: the call site hands over the enclosing
+  `var`'s heap cell (marked `$ref(n)` by `crate::resolve`) and the lifted body
+  reads and writes through it, as a lambda's capture already did. This covers
+  a parameter DEFAULT that calls such a `def` (`def f(y: Int = d())`), which is
+  spliced in at the call outside the body the boxing scan walks. Before, every
+  one of these was refused at compile time ("a captured binding is read-only
+  here") inside a `@main` or `def main` body, where the binding is a frame
+  slot; under `extends App` the binding is a program global and always worked.
+  A position the boxing scan still cannot see is refused with that message
+  rather than losing the write.
 - **`"abc".toSeq` is the string itself.** Scala's is a `WrappedString` view,
   which prints as `abc` and answers every `Seq` operation through `StringOps`;
   the string stands in for it. Observably identical except for an equality
@@ -1478,8 +1477,8 @@ that is what decides whether a compound assignment through one is a write at all
 the only reading that compiles is the growable **member** call (SLS 6.12.4), and
 that is what the compiler emits. Counting it as an assignment made a local `def`
 that merely appended to a captured `ListBuffer` fail with "a captured binding is
-read-only here", which refuses a program Scala runs. A compound assignment
-through a `var` is still a write and still propagates into the capture set.
+read-only here", which refused a program Scala runs. A compound assignment
+through a `var` is still a write: it makes the capture travel by reference.
 
 Final names are chosen only after the whole program is walked, and the first
 claimant of a name keeps it verbatim — a program with no collisions compiles to

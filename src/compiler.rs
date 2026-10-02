@@ -97,6 +97,11 @@ struct Compiler {
     /// `f({ c += 1; 2 })` inside a `def` left `c` at 0 where Scala answers 1.
     /// The set lets the walk recognise the position before the lambda exists.
     by_name_callees: HashSet<String>,
+    /// For each `def` whose parameter DEFAULTS pass a binding by reference
+    /// (`$ref(n)`, a lifted local `def` that assigns `n`), those names. A default
+    /// is spliced in at the call, outside the body the boxing scan walks, so
+    /// the scan consults this at every call of such a `def`.
+    default_refs: HashMap<String, Vec<String>>,
     /// The widths a lambda literal's parameters take if one is lowered right
     /// now, positionally — set by [`Compiler::method`] from the receiver being
     /// traversed (`xs.map(x => …)` types `x` as the element of `xs`) and
@@ -456,6 +461,19 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 .map(|c| c.name.clone()),
         )
         .collect();
+    let default_refs: HashMap<String, Vec<String>> = prog
+        .functions
+        .iter()
+        .filter_map(|f| {
+            let names: Vec<String> = f
+                .sig
+                .iter()
+                .filter_map(|p| p.default.as_ref())
+                .flat_map(ref_captures_in)
+                .collect();
+            (!names.is_empty()).then(|| (f.name.clone(), names))
+        })
+        .collect();
 
     // Classes to emit constructors/methods for: the user's, plus the built-in
     // `Option` support (`Some(value)`), unless the user redefined them.
@@ -751,6 +769,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         func_arity,
         func_sig,
         by_name_callees,
+        default_refs,
         by_name: HashSet::new(),
         vals: HashMap::new(),
         widths: HashMap::new(),
@@ -1717,8 +1736,30 @@ impl Compiler {
                     0,
                 );
             }
+            Expr::Collection { ctor, elems } if ctor == REF_CAPTURE => self.ref_capture(elems)?,
             Expr::Collection { ctor, elems } => self.collection(ctor, elems)?,
         }
+        Ok(())
+    }
+
+    /// `$ref(n)` — the by-reference capture argument of a lifted local `def`
+    /// (see [`ParamSig::by_ref`]): `n`'s heap cell itself, which the boxing
+    /// scan has given every binding passed this way.
+    fn ref_capture(&mut self, elems: &[Expr]) -> Result<(), String> {
+        let [Expr::Var(name)] = elems else {
+            return Err("scalars: malformed by-reference capture".to_string());
+        };
+        if !self.is_boxed(name) {
+            // The scan missed the write (a parameter DEFAULT spliced in here
+            // calls the assigning `def`, and defaults are not part of the body
+            // it walks). A copy would lose the write, so refuse instead.
+            return Err(format!(
+                "scalars: a local `def` assigns to `{name}` from a position this frontend \
+                 cannot pass it by reference (a captured binding is read-only here)"
+            ));
+        }
+        let place = self.resolve_place(name);
+        self.emit_load(place);
         Ok(())
     }
 
@@ -1913,7 +1954,11 @@ impl Compiler {
         // declares gets boxed for exactly the same reason the enclosing frame's
         // would: a lambda nested one level deeper assigns it.
         let mut boxed = pc.boxed.clone();
-        boxed.extend(boxed_vars_expr(&pc.body, &self.by_name_callees));
+        boxed.extend(boxed_vars_expr(
+            &pc.body,
+            &self.by_name_callees,
+            &self.default_refs,
+        ));
         let saved_scope = self.scope.replace(Scope {
             slots,
             next_slot: total as u16,
@@ -5175,7 +5220,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: cd.params.len() as u16,
-            boxed: boxed_vars(&cd.body, &self.by_name_callees),
+            boxed: boxed_vars(&cd.body, &self.by_name_callees, &self.default_refs),
         });
         for i in (0..cd.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
@@ -5359,7 +5404,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: (m.params.len() + 1) as u16,
-            boxed: boxed_vars(&m.body, &self.by_name_callees),
+            boxed: boxed_vars(&m.body, &self.by_name_callees, &self.default_refs),
         });
         // Prologue: args arrive as `[this, p0, …]` (deepest = this); pop reverse.
         for i in (0..=m.params.len()).rev() {
@@ -5418,7 +5463,7 @@ impl Compiler {
         self.scope = Some(Scope {
             slots,
             next_slot: m.params.len() as u16,
-            boxed: boxed_vars(&m.body, &self.by_name_callees),
+            boxed: boxed_vars(&m.body, &self.by_name_callees, &self.default_refs),
         });
         for i in (0..m.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), 0);
@@ -5844,7 +5889,11 @@ impl Compiler {
         for (i, p) in f.params.iter().enumerate() {
             slots.insert(p.clone(), i as u16);
             // Scala method parameters are `val`s — reassigning one is an error.
-            self.vals.insert(p.clone(), true);
+            // A by-reference capture is the enclosing frame's `var`, though.
+            let by_ref = f.sig.get(i).is_some_and(|s| s.by_ref);
+            if !by_ref {
+                self.vals.insert(p.clone(), true);
+            }
             // Scala requires a type on every `def` parameter, so this is the one
             // place inside a function body where numeric widths are always known.
             if let Some(t) = f.sig.get(i).and_then(|s| s.ty.as_deref()) {
@@ -5852,10 +5901,20 @@ impl Compiler {
                     .insert(p.clone(), self.binding_width(Some(t), None));
             }
         }
+        // A by-reference capture arrives as the enclosing binding's cell, so it
+        // is read and written through it like any boxed local.
+        let mut boxed = boxed_vars(&f.body, &self.by_name_callees, &self.default_refs);
+        boxed.extend(
+            f.params
+                .iter()
+                .zip(&f.sig)
+                .filter(|(_, s)| s.by_ref)
+                .map(|(p, _)| p.clone()),
+        );
         self.scope = Some(Scope {
             slots,
             next_slot: f.params.len() as u16,
-            boxed: boxed_vars(&f.body, &self.by_name_callees),
+            boxed,
         });
         // This body's by-name parameters hold thunks; every read forces one.
         let saved_by_name = std::mem::replace(
@@ -6695,6 +6754,20 @@ fn library_by_name_arg(name: &str, argc: usize) -> Option<usize> {
 //   * a `rust { … }` FFI block anywhere arms the `__rust_compile` prologue,
 //   * a `try` anywhere arms the per-statement unwind checks, and
 //   * a mutable-collection literal anywhere arms the `+=` growable test.
+
+/// The names `e` passes by reference (`$ref(n)` markers), in order.
+fn ref_captures_in(e: &Expr) -> Vec<String> {
+    let found = std::cell::RefCell::new(Vec::new());
+    expr_any(e, &|x| {
+        if let Expr::Collection { ctor, elems } = x {
+            if let (true, [Expr::Var(n)]) = (ctor == REF_CAPTURE, elems.as_slice()) {
+                found.borrow_mut().push(n.clone());
+            }
+        }
+        false
+    });
+    found.into_inner()
+}
 
 /// Whether any expression in `body` (recursively) satisfies `pred`.
 fn body_any(body: &[Stmt], pred: &impl Fn(&Expr) -> bool) -> bool {
@@ -8191,15 +8264,23 @@ fn method(recv: Expr, name: &str, args: Vec<Expr>) -> Expr {
 
 /// The locals of one frame that a closure inside it ASSIGNS: declared as a `var`
 /// directly in this frame, and written from inside a nested lambda.
-fn boxed_vars(body: &[Stmt], by_name_callees: &HashSet<String>) -> HashSet<String> {
-    let mut scan = BoxScan::new(by_name_callees);
+fn boxed_vars(
+    body: &[Stmt],
+    by_name_callees: &HashSet<String>,
+    default_refs: &HashMap<String, Vec<String>>,
+) -> HashSet<String> {
+    let mut scan = BoxScan::new(by_name_callees, default_refs);
     scan.block(body, false);
     scan.finish()
 }
 
 /// [`boxed_vars`] for a frame whose body is a single expression (a lambda body).
-fn boxed_vars_expr(body: &Expr, by_name_callees: &HashSet<String>) -> HashSet<String> {
-    let mut scan = BoxScan::new(by_name_callees);
+fn boxed_vars_expr(
+    body: &Expr,
+    by_name_callees: &HashSet<String>,
+    default_refs: &HashMap<String, Vec<String>>,
+) -> HashSet<String> {
+    let mut scan = BoxScan::new(by_name_callees, default_refs);
     scan.expr(body, false);
     scan.finish()
 }
@@ -8219,16 +8300,23 @@ struct BoxScan<'a> {
     /// See [`Compiler::by_name_callees`] — an argument in one of these calls is
     /// a thunk by the time it runs, so it is walked as a lambda body.
     by_name_callees: &'a HashSet<String>,
+    /// See [`Compiler::default_refs`] — a call to one of these may splice in a
+    /// default that passes a binding by reference.
+    default_refs: &'a HashMap<String, Vec<String>>,
 }
 
 impl<'a> BoxScan<'a> {
-    fn new(by_name_callees: &'a HashSet<String>) -> Self {
+    fn new(
+        by_name_callees: &'a HashSet<String>,
+        default_refs: &'a HashMap<String, Vec<String>>,
+    ) -> Self {
         Self {
             declared: HashSet::new(),
             assigned_in_lambda: HashSet::new(),
             read_in_lambda: HashSet::new(),
             assigned: HashSet::new(),
             by_name_callees,
+            default_refs,
         }
     }
 
@@ -8410,6 +8498,10 @@ impl<'a> BoxScan<'a> {
                 for a in args {
                     self.expr(a, thunk);
                 }
+                for n in self.default_refs.get(name).into_iter().flatten() {
+                    self.assigned.insert(n.clone());
+                    self.assigned_in_lambda.insert(n.clone());
+                }
             }
             Expr::New { name, args, .. } => {
                 // The same rule as a call: an argument to a BY-NAME constructor
@@ -8446,6 +8538,14 @@ impl<'a> BoxScan<'a> {
                 self.expr(then, in_lambda);
                 if let Some(x) = els {
                     self.expr(x, in_lambda);
+                }
+            }
+            // A by-reference capture: the lifted `def` it is passed to writes the
+            // binding, exactly as a closure assigning it would.
+            Expr::Collection { ctor, elems } if ctor == REF_CAPTURE => {
+                if let [Expr::Var(name)] = elems.as_slice() {
+                    self.assigned.insert(name.clone());
+                    self.assigned_in_lambda.insert(name.clone());
                 }
             }
             Expr::Tuple(elems) | Expr::Collection { elems, .. } => {

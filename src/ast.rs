@@ -8,6 +8,10 @@
 
 use std::collections::HashMap;
 
+/// The marker collection constructor wrapping a by-reference capture argument
+/// (see [`ParamSig::by_ref`]): `$ref(n)` passes `n`'s cell, not its value.
+pub const REF_CAPTURE: &str = "$ref";
+
 /// One implicit conversion: the type it converts FROM, the type it converts TO,
 /// and the name that performs it — a plain function for `implicit def`, or a
 /// `Conversion` instance whose `apply` is called.
@@ -195,6 +199,11 @@ pub struct ParamSig {
     /// (`def two(a: Int, b: Int)` called `two(10)` is "missing argument for
     /// parameter b"). Without this flag the two are indistinguishable.
     pub clause_start: bool,
+    /// `true` for a captured binding a lifted local `def` ASSIGNS (or passes on
+    /// to one that does): the caller hands over the binding's heap CELL rather
+    /// than its value, so the write lands in the enclosing frame. Set only by
+    /// `crate::resolve`, on the trailing capture parameters.
+    pub by_ref: bool,
     /// The parameter's declared type, verbatim (`"Int"`, `"Long"`, `"Double"`).
     /// Scala REQUIRES a type on every `def` parameter, which makes this the one
     /// place a nested body's numeric widths are always knowable — and so the

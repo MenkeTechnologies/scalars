@@ -304,7 +304,8 @@ Implemented and checked against the reference `scala`:
   callable paren-less. A `def` declared inside a block is scoped to that block:
   two blocks may each declare `def f`, an inner one shadows an outer one, and
   the enclosing-frame locals a local `def` reads are lambda-lifted into extra
-  parameters every call site passes (`src/resolve.rs`).
+  parameters every call site passes (`src/resolve.rs`) — by reference, as the
+  `var`'s heap cell, when the `def` assigns one.
 - **Block-scoped values** — a `val`/`var`, a pattern binder (`case Some(a)`, a
   `catch` arm, a destructuring `val (a, b)`) or a `for` generator that reuses an
   enclosing name shadows it for its own scope only, and the outer binding is
