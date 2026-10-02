@@ -62,9 +62,22 @@ fn main() -> ExitCode {
         };
     }
 
-    match scalars::run_str_with_args(&src, cli.argv) {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(e) => fail(&e),
+    // The program runs on a thread of its own with a large stack. A closure,
+    // a by-name argument or a user `toString`/`equals` re-enters the VM from a
+    // host builtin, so Scala-level recursion through one nests Rust frames,
+    // and the main thread's default stack overflowed at a depth of ~100 where
+    // the JVM goes thousands deep. The reservation is address space; only the
+    // pages a deep recursion actually touches are committed.
+    const RUN_STACK: usize = 1 << 30;
+    let argv = cli.argv;
+    let run = std::thread::Builder::new()
+        .stack_size(RUN_STACK)
+        .spawn(move || scalars::run_str_with_args(&src, argv).map(|_| ()));
+    match run.map(|h| h.join()) {
+        Ok(Ok(Ok(()))) => ExitCode::SUCCESS,
+        Ok(Ok(Err(e))) => fail(&e),
+        Ok(Err(_)) => ExitCode::FAILURE,
+        Err(e) => fail(&format!("cannot start the program thread: {e}")),
     }
 }
 

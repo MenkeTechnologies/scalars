@@ -345,6 +345,25 @@ reported as parse/compile errors, never silently mis-run.
   companions) as the conversion rather than a range; **`a.to(b, step)` /
   `a.until(b, step)`**; and **`String.split(regex, limit)`** with Java's
   positive/zero/negative limit rules.
+- **`Map.withDefaultValue(v)` / `withDefault(f)`.** `apply` and `default` answer
+  the default for an absent key; `get`, `getOrElse` and `contains` ignore it,
+  as in Scala. An immutable map's `+`/`updated`/`-`/`removed`/`++` keep the
+  default and its other combinators drop it, and a map with a default prints
+  as `Map(…)` whatever it wraps (Scala's `WithDefault` wrapper). A MUTABLE
+  map's default is attached to the map itself rather than to a separate
+  wrapper sharing its entries, so the ORIGINAL handle also answers through the
+  default and also prints as `Map(…)`; Scala's original still throws on an
+  absent key and prints as `HashMap(…)`.
+- **Scala 3 parameter untupling.** A lambda of `n` parameters handed one
+  `n`-tuple receives its components: `m.map((k, v) => …)`,
+  `pairs.foreach((a, b) => …)`.
+- **A `Seq`, `Set` or `Map` where a function is expected** is applied:
+  `(0 to n).filter(isPrime)` with `isPrime: Array[Boolean]`, `keys.map(m)`.
+- **Deep recursion through a closure or a by-name argument.** The program runs
+  on a thread with a 1 GiB stack reservation; Scala-level recursion that passes
+  through a lambda, a by-name argument or a user `toString`/`equals` re-enters
+  the VM from a builtin, and the default thread stack overflowed at a depth of
+  about 100 (`memo.getOrElseUpdate(n, fib(n - 1) + fib(n - 2))` at `n = 90`).
 - **`override def toString`, honoured wherever a value is rendered.** Scala
   renders every value through its `toString`, so an override answers for
   `println(p)`, `s"$p"` / `f"$p%s"`, `"x" + p`, `String.valueOf(p)`,
@@ -751,9 +770,6 @@ reported as parse/compile errors, never silently mis-run.
   `Iterator.iterate(x)(f)` are not provided: an `Iterator` here is a consumed,
   materialized sequence. Their `LazyList` counterparts are, and `Iterator(…)`,
   `Iterator.range` and `xs.iterator` work.
-- **`Map.withDefaultValue` / `withDefault`.** A default would have to travel
-  with the map value through every combinator, and the map representation has
-  no slot for one.
 - **A qualified extractor in a pattern.** `case Obj.Re(a) =>` does not parse;
   bind the extractor to a local first.
 - **`enum` with constructor parameters.** `enum Planet(mass: Double)` and a

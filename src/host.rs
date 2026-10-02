@@ -1752,6 +1752,7 @@ pub fn reset_heap() {
     // The table-order ledger is keyed by arena index, which the clear above
     // invalidates; a stale id would claim a fresh collection is already sorted.
     MUT_SORTED.with(|t| t.borrow_mut().clear());
+    MAP_DEFAULTS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -3394,8 +3395,11 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
                 });
             }
             Some(2) => {
-                let m = as_map(recv).unwrap_or_default();
                 let key = args.first().cloned().unwrap_or(Value::Undef);
+                if let Some(r) = map_apply_default(vm, recv, &key) {
+                    return r;
+                }
+                let m = as_map(recv).unwrap_or_default();
                 return map_get(&m, &key).ok_or_else(|| {
                     format!(
                         "scalars: java.util.NoSuchElementException: key not found: {}",
@@ -3472,7 +3476,15 @@ fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Result<Value, Str
     if let Some(d) = as_derived(clo) {
         return invoke_derived(vm, &d, args);
     }
-    let meta = as_closure(clo).ok_or_else(|| "scalars: value is not a function".to_string())?;
+    let Some(meta) = as_closure(clo) else {
+        // A `Seq`, `Set` or `Map` passed where a function is expected IS one —
+        // `(0 to n).filter(isPrime)` with `isPrime: Array[Boolean]`, or
+        // `keys.map(m)` — and applying it is its `apply`.
+        if seq_kind(clo).is_some() || is_map(clo) {
+            return apply_value(vm, clo, args);
+        }
+        return Err("scalars: value is not a function".to_string());
+    };
     invoke_body(vm, &meta, meta.name_idx, args)
 }
 
@@ -3571,10 +3583,21 @@ fn invoke_body(
     // `FunctionN` a two-argument caller like `foldLeft` wants by tupling the
     // arguments. Do the same when a caller passes more values than the closure
     // declares.
+    //
+    // The converse is Scala 3's parameter UNTUPLING: a lambda of `n`
+    // parameters handed one `n`-tuple (`pairs.map((k, v) => …)`) receives its
+    // components.
     let tupled;
+    let untupled;
     let args = if want == 1 && args.len() > 1 {
         tupled = [heap_push(HeapVal::Tuple(args.to_vec()))];
         &tupled[..]
+    } else if want > 1 && args.len() == 1 {
+        untupled = HEAP.with(|h| match h.borrow().get(as_obj_id(&args[0])?) {
+            Some(HeapVal::Tuple(t)) if t.len() == want => Some(t.clone()),
+            _ => None,
+        });
+        untupled.as_deref().unwrap_or(args)
     } else {
         args
     };
@@ -3877,11 +3900,7 @@ fn obj_to_string(v: &Value) -> String {
                     .map(|(k, val)| format!("{} -> {}", scala_str(k), scala_str(val)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let label = match rep {
-                    HashRep::Hashed | HashRep::Mutable(_) => "HashMap",
-                    HashRep::Linked => "LinkedHashMap",
-                    HashRep::Small => "Map",
-                };
+                let label = map_label(id as usize, *rep);
                 format!("{label}({inner})")
             }
             Some(HeapVal::Tuple(items)) => {
@@ -5710,10 +5729,121 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
     }
     match heap_kind(recv) {
         Some(0) => seq_method(vm, recv, name, args),
-        Some(1) => map_method(vm, recv, name, args),
+        Some(1) => {
+            if let Some(r) = map_default_method(vm, recv, name, args) {
+                return r;
+            }
+            let out = map_method(vm, recv, name, args)?;
+            inherit_map_default(recv, name, &out);
+            Ok(out)
+        }
         Some(2) => tuple_method(recv, name, args),
         Some(3) => closure_method(vm, recv, name, args),
         _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// The class name a `Map` prints under. A map with a default is Scala's
+/// `Map.WithDefault` wrapper, which prints as `Map` whatever it wraps.
+fn map_label(id: usize, rep: HashRep) -> &'static str {
+    if MAP_DEFAULTS.with(|t| t.borrow().contains_key(&id)) {
+        return "Map";
+    }
+    match rep {
+        HashRep::Hashed | HashRep::Mutable(_) => "HashMap",
+        HashRep::Linked => "LinkedHashMap",
+        HashRep::Small => "Map",
+    }
+}
+
+/// What a `Map` built by `withDefaultValue`/`withDefault` answers for a key it
+/// does not hold.
+#[derive(Clone)]
+enum MapDefault {
+    /// `withDefaultValue(v)`.
+    Value(Value),
+    /// `withDefault(f)` — `f(key)`.
+    Fn(Value),
+}
+
+thread_local! {
+    /// The default of each `Map` that has one, keyed by its arena index.
+    /// Cleared by [`reset_heap`], whose arena clear invalidates the keys.
+    static MAP_DEFAULTS: RefCell<HashMap<usize, MapDefault>> = RefCell::new(HashMap::new());
+}
+
+fn map_default(v: &Value) -> Option<MapDefault> {
+    let id = as_obj_id(v)?;
+    MAP_DEFAULTS.with(|t| t.borrow().get(&id).cloned())
+}
+
+fn set_map_default(v: &Value, d: MapDefault) {
+    if let Some(id) = as_obj_id(v) {
+        MAP_DEFAULTS.with(|t| t.borrow_mut().insert(id, d));
+    }
+}
+
+/// `apply(k)` on a `Map` with a default: the entry, or the default when `k`
+/// is absent. `None` when the map has no default.
+fn map_apply_default(vm: &mut VM, recv: &Value, key: &Value) -> Option<Result<Value, String>> {
+    let d = map_default(recv)?;
+    if let Some(v) = map_get(&as_map(recv)?, key) {
+        return Some(Ok(v));
+    }
+    Some(match d {
+        MapDefault::Value(v) => Ok(v),
+        MapDefault::Fn(f) => invoke_closure(vm, &f, std::slice::from_ref(key)),
+    })
+}
+
+/// `withDefaultValue`/`withDefault`, and the reads a default changes (`apply`
+/// and `default`). `get`, `getOrElse` and `contains` ignore a default, as in
+/// Scala, so they never reach here.
+///
+/// An immutable map's default lives on a new map; a mutable one's is attached
+/// to the map itself, so the original handle answers through it too — Scala
+/// returns a wrapper there that shares the entries but not the default.
+fn map_default_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let d = match (name, args.len()) {
+        ("withDefaultValue", 1) => MapDefault::Value(args[0].clone()),
+        ("withDefault", 1) => MapDefault::Fn(args[0].clone()),
+        ("apply", 1) => return map_apply_default(vm, recv, &args[0]),
+        ("default", 1) => {
+            return Some(match map_default(recv) {
+                Some(MapDefault::Value(v)) => Ok(v),
+                Some(MapDefault::Fn(f)) => invoke_closure(vm, &f, &args[..1]),
+                None => Err(format!(
+                    "scalars: java.util.NoSuchElementException: key not found: {}",
+                    scala_str(&args[0])
+                )),
+            })
+        }
+        _ => return None,
+    };
+    let (rep, entries) = map_rep_entries(recv)?;
+    let target = if matches!(rep, HashRep::Mutable(_) | HashRep::Linked) {
+        recv.clone()
+    } else {
+        heap_push(HeapVal::Map(rep, entries))
+    };
+    set_map_default(&target, d);
+    Some(Ok(target))
+}
+
+/// Carry a default from an immutable `Map` to the map an update of it built:
+/// `+`, `updated`, `-`, `removed` and `++` of a `withDefault` map keep the
+/// default; every other combinator answers a plain map.
+fn inherit_map_default(recv: &Value, name: &str, out: &Value) {
+    let keeps = matches!(name, "+" | "updated" | "-" | "removed" | "++" | "concat");
+    if keeps && is_map(out) && as_obj_id(out) != as_obj_id(recv) {
+        if let Some(d) = map_default(recv) {
+            set_map_default(out, d);
+        }
     }
 }
 
@@ -12223,11 +12353,7 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
             Some(HeapVal::Seq(SeqKind::Range { .. } | SeqKind::StrBuf, _)) => Renderable::Leaf,
             Some(HeapVal::Seq(kind, items)) => Renderable::Seq(kind.label(), items.clone()),
             Some(HeapVal::Map(rep, entries)) => {
-                let label = match rep {
-                    HashRep::Hashed | HashRep::Mutable(_) => "HashMap",
-                    HashRep::Linked => "LinkedHashMap",
-                    HashRep::Small => "Map",
-                };
+                let label = map_label(id as usize, *rep);
                 Renderable::Map(label, entries.clone())
             }
             Some(HeapVal::Tuple(items)) => Renderable::Tuple(items.clone()),
@@ -13547,7 +13673,9 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
                 match as_seq_or_tuple(b) {
                     Some(t) if t.len() == 2 => {
                         map_put(&mut entries, t[0].clone(), t[1].clone());
-                        Ok(new_map(rep, entries))
+                        let out = new_map(rep, entries);
+                        inherit_map_default(a, "+", &out);
+                        Ok(out)
                     }
                     _ => Err("scalars: Map `+` expects a `key -> value` pair".to_string()),
                 }
@@ -13574,13 +13702,13 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         NumOp::Sub if is_set(a) => Ok(set_incl(a, b.clone(), false)),
         NumOp::Sub if is_map(a) => {
             let (rep, entries) = map_rep_entries(a).unwrap();
-            Ok(new_map(
-                rep,
-                entries
-                    .into_iter()
-                    .filter(|(k, _)| !value_eq(k, b))
-                    .collect(),
-            ))
+            let kept = entries
+                .into_iter()
+                .filter(|(k, _)| !value_eq(k, b))
+                .collect();
+            let out = new_map(rep, kept);
+            inherit_map_default(a, "-", &out);
+            Ok(out)
         }
         // `s * n` — `StringOps.*`, the only non-numeric `*` Scala defines. The
         // infix form reaches the arithmetic hook (the method form `s.*(n)` goes
