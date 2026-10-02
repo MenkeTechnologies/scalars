@@ -364,6 +364,11 @@ reported as parse/compile errors, never silently mis-run.
   through a lambda, a by-name argument or a user `toString`/`equals` re-enters
   the VM from a builtin, and the default thread stack overflowed at a depth of
   about 100 (`memo.getOrElseUpdate(n, fib(n - 1) + fib(n - 2))` at `n = 90`).
+- **The standard `Ordering[T]` for an implicit parameter.** `def maxOf[T](xs:
+  List[T])(implicit ord: Ordering[T])`, its `using` spelling and a `[T:
+  Ordering]` context bound, called with no given `Ordering` in the program,
+  receive the natural ordering, as Scala finds it in `Ordering`'s companion. A
+  given the program declares still wins. (`Numeric[T]` has no such fallback.)
 - **Anonymous classes.** `new T { def m = … }`, `new C(args) { … }` and
   `new C(args) with M1 with M2` declare a fresh class extending the named
   parents and construct it. Like a named class, its body sees top-level and
@@ -784,6 +789,11 @@ reported as parse/compile errors, never silently mis-run.
   `Iterator.iterate(x)(f)` are not provided: an `Iterator` here is a consumed,
   materialized sequence. Their `LazyList` counterparts are, and `Iterator(…)`,
   `Iterator.range` and `xs.iterator` work.
+- **`scala.Enumeration`.** `object Color extends Enumeration { val Red, Green =
+  Value }` parses, but `Value`, `values`, `withName` and `id` are not
+  provided. Scala 3's `enum` is.
+- **`implicit class`.** An implicit wrapper class adding methods to an existing
+  type is not modelled; Scala 3's `extension` methods are.
 - **A qualified extractor in a pattern.** `case Obj.Re(a) =>` does not parse;
   bind the extractor to a local first.
 - **`enum` with constructor parameters.** `enum Planet(mass: Double)` and a

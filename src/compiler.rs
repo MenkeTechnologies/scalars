@@ -4064,7 +4064,11 @@ impl Compiler {
             // A clause this frontend cannot resolve is left for the ordinary
             // arity path to report, so an unresolved implicit never becomes a
             // guess. An AMBIGUOUS one is different and is raised by the caller.
-            out.push(self.resolve_implicit(&ty, 0).ok()?);
+            let found = self
+                .resolve_implicit(&ty, 0)
+                .ok()
+                .or_else(|| natural_ordering(&ty));
+            out.push(found?);
         }
         Some(out)
     }
@@ -6594,6 +6598,25 @@ impl Compiler {
                 Expr::Int(_) | Expr::Long(_) | Expr::Float(_) | Expr::Char(_) | Expr::Bool(_)
             )
     }
+}
+
+/// The standard library's own instance for an implicit of type `Ordering[T]`
+/// that no given in the program supplies: the natural ordering (`Ordering.Int`
+/// stands for it here, as for `Ordering[T]` written out; it compares any two
+/// values the way `sorted` does). Scala finds it in `Ordering`'s companion,
+/// which is in the implicit scope of every `Ordering[T]`.
+fn natural_ordering(ty: &str) -> Option<Expr> {
+    let ty = ty.trim();
+    let ty = ty
+        .strip_prefix("scala.math.")
+        .or_else(|| ty.strip_prefix("math."))
+        .unwrap_or(ty);
+    ty.starts_with("Ordering[").then(|| Expr::Method {
+        recv: Box::new(Expr::Var("Ordering".to_string())),
+        name: "Int".to_string(),
+        args: Vec::new(),
+        line: 0,
+    })
 }
 
 /// The `scala.Option` companion members, as the expressions they are:
