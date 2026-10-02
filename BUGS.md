@@ -369,6 +369,11 @@ reported as parse/compile errors, never silently mis-run.
   Ordering]` context bound, called with no given `Ordering` in the program,
   receive the natural ordering, as Scala finds it in `Ordering`'s companion. A
   given the program declares still wins. (`Numeric[T]` has no such fallback.)
+- **`implicit class`.** `implicit class Rich(n: Int) { def squared = n * n }`
+  registers each method as the Scala 3 extension `extension (n: Int)` it is
+  equivalent to, so `4.squared` resolves; the class stays declared for an
+  explicit `new Rich(4)`. A method that calls a SIBLING method of the class
+  without a receiver is not rewritten to the extension form.
 - **Anonymous classes.** `new T { def m = … }`, `new C(args) { … }` and
   `new C(args) with M1 with M2` declare a fresh class extending the named
   parents and construct it. Like a named class, its body sees top-level and
@@ -792,8 +797,6 @@ reported as parse/compile errors, never silently mis-run.
 - **`scala.Enumeration`.** `object Color extends Enumeration { val Red, Green =
   Value }` parses, but `Value`, `values`, `withName` and `id` are not
   provided. Scala 3's `enum` is.
-- **`implicit class`.** An implicit wrapper class adding methods to an existing
-  type is not modelled; Scala 3's `extension` methods are.
 - **A qualified extractor in a pattern.** `case Obj.Re(a) =>` does not parse;
   bind the extractor to a local first.
 - **`enum` with constructor parameters.** `enum Planet(mass: Double)` and a

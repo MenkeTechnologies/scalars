@@ -550,6 +550,57 @@ impl Parser {
     /// body's `val`/`var` declarations become further fields (initialized by the
     /// constructor) and its `def`s become methods.
     fn class_decl(&mut self, is_case: bool, is_trait: bool) -> Result<ClassDecl, String> {
+        let start = self.pos;
+        let decl = self.class_decl_inner(is_case, is_trait)?;
+        if self.preceded_by_implicit(start) {
+            self.implicit_class_extensions(&decl);
+        }
+        Ok(decl)
+    }
+
+    /// Whether the modifiers before the `class` at token `start` include
+    /// `implicit`. Every caller has already stepped over them, so they are read
+    /// back from the token stream.
+    fn preceded_by_implicit(&self, start: usize) -> bool {
+        self.toks[..start]
+            .iter()
+            .rev()
+            .take_while(|t| {
+                matches!(&t.kind, Tok::Ident(w) if matches!(w.as_str(),
+                    "implicit" | "final" | "private" | "protected" | "sealed" | "open"))
+            })
+            .any(|t| matches!(&t.kind, Tok::Ident(w) if w == "implicit"))
+    }
+
+    /// `implicit class Rich(n: Int) { def m = … }` — Scala 2's way of adding
+    /// methods to an existing type, which is what an `extension (n: Int)`
+    /// declares in Scala 3. Each method is registered as that extension, with
+    /// the constructor parameter as its receiver; the class itself stays
+    /// declared, so `new Rich(4).m` works too.
+    fn implicit_class_extensions(&mut self, decl: &ClassDecl) {
+        let ([recv_name], [Some(recv_ty)]) = (decl.params.as_slice(), decl.param_tys.as_slice())
+        else {
+            return;
+        };
+        for m in &decl.methods {
+            let mut f = m.clone();
+            let hoisted = format!("extension${}${}", base_type_name(recv_ty), f.name);
+            self.extensions
+                .push((recv_ty.clone(), f.name.clone(), hoisted.clone()));
+            f.params.insert(0, recv_name.clone());
+            f.sig.insert(
+                0,
+                ParamSig {
+                    ty: Some(recv_ty.clone()),
+                    ..ParamSig::default()
+                },
+            );
+            f.name = hoisted;
+            self.funcs.push(f);
+        }
+    }
+
+    fn class_decl_inner(&mut self, is_case: bool, is_trait: bool) -> Result<ClassDecl, String> {
         self.advance(); // `class` / `trait`
         let name = self.ident()?;
         // Optional `[T, …]` type-parameter clause.
