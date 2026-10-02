@@ -5278,11 +5278,27 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             ))
         }
         'c' => {
-            let ch = match v {
-                Value::Str(s) => s.chars().next().unwrap_or('\0'),
+            // A `Char` is a heap value, so its own character is read first; an
+            // integral argument is a code point.
+            let ch = match (v, as_char(v)) {
+                (_, Some(c)) => c,
+                (Value::Str(s), None) => s.chars().next().unwrap_or('\0'),
                 _ => char::from_u32(v.to_int() as u32).unwrap_or('\u{fffd}'),
             };
             Ok(pad_str(ch.to_string(), left, width))
+        }
+        // `%h` — the argument's `hashCode` in hex, `null` for a null argument.
+        'h' | 'H' => {
+            let text = match v {
+                Value::Undef => "null".to_string(),
+                _ => format!("{:x}", scala_hash(v).unwrap_or(0) as u32),
+            };
+            let text = if conv == 'H' {
+                text.to_uppercase()
+            } else {
+                text
+            };
+            Ok(pad_str(text, left, width))
         }
         // `java.util.Formatter` rejects an unknown conversion character with a
         // catchable exception naming just that character — the same one the
@@ -10891,6 +10907,15 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         }
         ("contains", 1) => Ok(Value::bool(s.contains(&*args[0].as_str_cow()))),
         ("startsWith", 1) => Ok(Value::bool(s.starts_with(&*args[0].as_str_cow()))),
+        // `startsWith(prefix, offset)` — false for an offset outside the string.
+        ("startsWith", 2) => {
+            let at = args[1].to_int();
+            let len = s.chars().count() as i64;
+            Ok(Value::bool(
+                (0..=len).contains(&at)
+                    && s[char_offset(s, at)..].starts_with(&*args[0].as_str_cow()),
+            ))
+        }
         ("endsWith", 1) => Ok(Value::bool(s.ends_with(&*args[0].as_str_cow()))),
         ("substring", 1) => substring(s, args[0].to_int(), s.chars().count() as i64),
         ("substring", 2) => substring(s, args[0].to_int(), args[1].to_int()),

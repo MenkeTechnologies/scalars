@@ -364,6 +364,22 @@ reported as parse/compile errors, never silently mis-run.
   through a lambda, a by-name argument or a user `toString`/`equals` re-enters
   the VM from a builtin, and the default thread stack overflowed at a depth of
   about 100 (`memo.getOrElseUpdate(n, fib(n - 1) + fib(n - 2))` at `n = 90`).
+- **Inside a `def` body (a `@main` or `def main` entry), as at the top level.**
+  These differed only when the bindings were frame slots rather than program
+  globals, which is why the `--entry main` fuzz shape found them:
+  - a pattern variable sharing its name with a `var` that a closure captures
+    elsewhere in the same body (`case (i, j) => i * j` beside `var i` read by
+    a lambda) read a non-existent cell and answered `null`; and a lambda's own
+    parameter of that name (`(i: Int) => -i`) no longer counts as a capture of
+    the `var`;
+  - a `lazy val` read from inside a closure or another lazy initializer
+    (`lazy val q = p + 1`) is forced rather than loaded as its unforced cell;
+  - an extractor or stable identifier bound to a LOCAL `val` (`val p =
+    "…".r; xs.collect { case p(a) => a }`, `val Lim = 3; case Lim =>`) is
+    captured by the closure the pattern sits in;
+  - the second clause of a curried by-name call (`rep(i < 3) { t += i }`)
+    shares the cells of the `var`s it assigns.
+- **`%c` of a `Char`, `%h`/`%H`, and `startsWith(prefix, offset)`.**
 - **The standard `Ordering[T]` for an implicit parameter.** `def maxOf[T](xs:
   List[T])(implicit ord: Ordering[T])`, its `using` spelling and a `[T:
   Ordering]` context bound, called with no given `Ordering` in the program,
@@ -1155,11 +1171,6 @@ reported as parse/compile errors, never silently mis-run.
   lands and nothing is rejected. The restriction bites only when the whole thing
   sits inside a `def` — a `@main` body, or a `def main` body — where the binding
   is a frame slot.
-- **A constructor pattern naming a LOCAL extractor.** `case p(a)` resolves `p`
-  against the globals, so `val p = "([0-9]+)".r; xs.collect { case p(a) => a }`
-  works at the top level of an `extends App` body and is rejected ("not found:
-  constructor pattern `p`") when the same two lines sit inside a `def` — i.e.
-  inside a `@main` body. Bind the extractor outside the entry point.
 - **`"abc".toSeq` is the string itself.** Scala's is a `WrappedString` view,
   which prints as `abc` and answers every `Seq` operation through `StringOps`;
   the string stands in for it. Observably identical except for an equality

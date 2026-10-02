@@ -274,6 +274,9 @@ struct PendingClosure {
     /// with the queued body instead of being read from the compiler's cursor
     /// (which has long since moved on by the time the body is emitted).
     by_name: HashSet<String>,
+    /// The enclosing body's `lazy val`s, for the same reason: a closure that
+    /// reads one captures its cell, and the read must force it.
+    lazies: HashSet<String>,
     /// The enclosing scope's numeric widths, captured when the body was queued.
     /// A lambda body compiles with a fresh scope, so without this an enclosing
     /// `var n = 0` would lose its `Int` width the moment a closure touched it and
@@ -1838,6 +1841,7 @@ impl Compiler {
                     current_class: self.current_class.clone(),
                     current_object: self.current_object.clone(),
                     by_name: self.by_name.clone(),
+                    lazies: self.lazies.clone(),
                     widths: self.widths.clone(),
                     param_widths: self.lambda_param_widths.clone(),
                 });
@@ -1875,6 +1879,7 @@ impl Compiler {
             current_class: self.current_class.clone(),
             current_object: self.current_object.clone(),
             by_name: self.by_name.clone(),
+            lazies: self.lazies.clone(),
             widths: self.widths.clone(),
             param_widths: self.lambda_param_widths.clone(),
         });
@@ -1915,7 +1920,11 @@ impl Compiler {
             boxed,
         });
         let saved_vals = std::mem::take(&mut self.vals);
-        let saved_lazies = self.shadow_lazies(&pc.params);
+        let mut lazies = pc.lazies;
+        for p in &pc.params {
+            lazies.remove(p);
+        }
+        let saved_lazies = std::mem::replace(&mut self.lazies, lazies);
         // The enclosing scope's widths travel into the body, so a captured
         // `var n = 0` is still known to be an `Int` here.
         let saved_widths = std::mem::replace(&mut self.widths, pc.widths);
@@ -2232,11 +2241,7 @@ impl Compiler {
     ) -> Result<(), String> {
         match pat {
             Pattern::Wildcard => {}
-            Pattern::Bind(name) => {
-                let p = self.declare_place(name);
-                self.emit_load(vplace);
-                self.emit_store(p);
-            }
+            Pattern::Bind(name) => self.bind_pattern_name(name, vplace),
             Pattern::Literal(lit) => {
                 self.emit_load(vplace);
                 self.expr(lit)?;
@@ -2250,9 +2255,7 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(crate::host::SISTYPE, 2), 0);
                 fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
                 if name != "_" {
-                    let p = self.declare_place(name);
-                    self.emit_load(vplace);
-                    self.emit_store(p);
+                    self.bind_pattern_name(name, vplace);
                 }
             }
             Pattern::Stable(name) => {
@@ -2263,8 +2266,20 @@ impl Compiler {
                     self.emit_type_test(vplace, "Nil", fail_jumps);
                 } else {
                     // `case None =>` / a stable-identifier pattern: `scrut == <value>`.
+                    // The value is a singleton object or, for a capitalized
+                    // `val Lim = 3`, that binding.
                     self.emit_load(vplace);
-                    self.materialize_object(name)?;
+                    let is_bound = self.vals.contains_key(name)
+                        || self
+                            .scope
+                            .as_ref()
+                            .is_some_and(|s| s.slots.contains_key(name))
+                        || self.global_binds.contains(name);
+                    if is_bound && !self.objects.contains_key(name) {
+                        self.var_ref(name)?;
+                    } else {
+                        self.materialize_object(name)?;
+                    }
                     self.b.emit(Op::NumEq, 0);
                     fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
                 }
@@ -2273,9 +2288,7 @@ impl Compiler {
             // binding is emitted first; it is only ever *read* from the arm body,
             // which runs solely when `p` matched too, so the order is unobservable.
             Pattern::At { name, pat } => {
-                let p = self.declare_place(name);
-                self.emit_load(vplace);
-                self.emit_store(p);
+                self.bind_pattern_name(name, vplace);
                 self.match_pattern(pat, vplace, fail_jumps)?;
             }
             // `case a | b | c =>` — the first branch that matches wins. Each
@@ -2383,6 +2396,19 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Bind a pattern variable `name` to the value at `vplace`. A frame holds
+    /// one slot per NAME, so when a `var` of the same name elsewhere in the
+    /// frame lives in a heap cell (see [`boxed_vars`]), every read of the name
+    /// goes through `CELL_GET` and this binding has to be a cell too.
+    fn bind_pattern_name(&mut self, name: &str, vplace: Place) {
+        let p = self.declare_place(name);
+        self.emit_load(vplace);
+        if self.is_boxed(name) {
+            self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
+        }
+        self.emit_store(p);
     }
 
     /// A constructor pattern whose name is a value rather than a type — Scala's
@@ -8297,7 +8323,28 @@ impl<'a> BoxScan<'a> {
                 self.expr(target, in_lambda);
                 self.expr(value, in_lambda);
             }
-            Expr::Lambda { body, .. } => self.expr(body, true),
+            // A lambda's own parameters SHADOW the frame's bindings of the same
+            // name: `(i: Int) => -i` reads its parameter, not a `var i` of the
+            // enclosing frame, so its uses are not captures of that `var`.
+            Expr::Lambda { params, body, .. } => {
+                let before = (
+                    self.read_in_lambda.clone(),
+                    self.assigned_in_lambda.clone(),
+                    self.assigned.clone(),
+                );
+                self.expr(body, true);
+                for p in params {
+                    if !before.0.contains(p) {
+                        self.read_in_lambda.remove(p);
+                    }
+                    if !before.1.contains(p) {
+                        self.assigned_in_lambda.remove(p);
+                    }
+                    if !before.2.contains(p) {
+                        self.assigned.remove(p);
+                    }
+                }
+            }
             Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
                 let desugars = enums.iter().any(is_coll_gen);
                 for en in enums {
@@ -8379,7 +8426,11 @@ impl<'a> BoxScan<'a> {
                 recv, args, name, ..
             } => {
                 self.expr(recv, in_lambda);
-                let thunk = in_lambda || self.by_name_callees.contains(name);
+                // `f(a)(b)` parses as `f(a).apply(b)`: the second clause of a
+                // curried `def` whose parameters may be by-name.
+                let curried = name == "apply"
+                    && matches!(&**recv, Expr::Call { name: f, .. } if self.by_name_callees.contains(f));
+                let thunk = in_lambda || curried || self.by_name_callees.contains(name);
                 for a in args {
                     self.expr(a, thunk);
                 }
@@ -8467,6 +8518,7 @@ fn fv_block(
             }
             StmtKind::Destructure { pat, init } => {
                 fv_expr(init, &b, out, seen);
+                fv_pattern(pat, &b, out, seen);
                 pattern_binds(pat, &mut b);
             }
             StmtKind::Assign { name, value, .. } => {
@@ -8521,6 +8573,7 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
             for a in catches {
                 // The caught exception's binding is local to its arm.
                 let mut b = bound.clone();
+                fv_pattern(&a.pat, bound, out, seen);
                 pattern_binds(&a.pat, &mut b);
                 if let Some(g) = &a.guard {
                     fv_expr(g, &b, out, seen);
@@ -8580,6 +8633,7 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
             fv_expr(scrut, bound, out, seen);
             for arm in arms {
                 let mut b = bound.clone();
+                fv_pattern(&arm.pat, bound, out, seen);
                 pattern_binds(&arm.pat, &mut b);
                 if let Some(g) = &arm.guard {
                     fv_expr(g, &b, out, seen);
@@ -8610,6 +8664,7 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
                     }
                     ForEnum::GenColl { pat, coll, .. } => {
                         fv_expr(coll, &b, out, seen);
+                        fv_pattern(pat, &b, out, seen);
                         pattern_binds(pat, &mut b);
                     }
                     ForEnum::Guard(g) => fv_expr(g, &b, out, seen),
@@ -8646,6 +8701,38 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
         | Expr::MainArg { .. }
         | Expr::MainArgv
         | Expr::Placeholder => {}
+    }
+}
+
+/// The names a pattern READS: a value used as an extractor (`case p(a)` with
+/// `val p = "…".r`) or as a stable identifier, which a lambda containing the
+/// pattern has to capture like any other free name. Names that turn out to be
+/// types or globals are dropped by the caller, which keeps only frame locals.
+fn fv_pattern(
+    p: &Pattern,
+    bound: &HashSet<String>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match p {
+        Pattern::Constructor { name, elems } => {
+            fv_note(name, bound, out, seen);
+            for e in elems {
+                fv_pattern(e, bound, out, seen);
+            }
+        }
+        Pattern::Stable(name) => fv_note(name, bound, out, seen),
+        Pattern::Tuple(elems) | Pattern::Alt(elems) => {
+            for e in elems {
+                fv_pattern(e, bound, out, seen);
+            }
+        }
+        Pattern::At { pat, .. } => fv_pattern(pat, bound, out, seen),
+        Pattern::Cons(h, t) => {
+            fv_pattern(h, bound, out, seen);
+            fv_pattern(t, bound, out, seen);
+        }
+        _ => {}
     }
 }
 
