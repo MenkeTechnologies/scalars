@@ -380,7 +380,11 @@ Implemented and checked against the reference `scala`:
   `apply` factory for a plain class, an `unapply` extractor), symbolic methods
   (`def +(o: V)`, `def <(o: V)`, `def unary_-`) used infix and through `+=`,
   and member/statement annotations (`@tailrec`, `@inline`, `@deprecated(…)`),
-  which are accepted and have no runtime effect. Built-in
+  which are accepted and have no runtime effect. Auxiliary constructors
+  (`def this(n: Int) = this(n, n)`), chosen by argument count; a class
+  declaring `apply` makes its instances applicable (`m(i, j)`); an
+  `override def equals` answers `==`/`!=` and the `contains`/`indexOf`/
+  `distinct` lookups, with the receiver and traversal order Scala uses. Built-in
   `Option` (`Some(v)` / `None`). All of it rides a host-side object heap behind
   fusevm's `Value::Obj` handle (`src/host.rs`) — no fusevm changes, no JVM.
 - **`override def toString`, everywhere a value is rendered** — `println(p)`,
