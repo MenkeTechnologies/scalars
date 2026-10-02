@@ -5832,6 +5832,15 @@ fn map_default_method(
     name: &str,
     args: &[Value],
 ) -> Option<Result<Value, String>> {
+    // `m.withDefaultValue(0)(k)` arrives as one call with the application
+    // folded in: build the defaulted map, then apply it.
+    if let ("withDefaultValue" | "withDefault", [d, key]) = (name, args) {
+        let built = match map_default_method(vm, recv, name, std::slice::from_ref(d))? {
+            Ok(m) => m,
+            Err(e) => return Some(Err(e)),
+        };
+        return map_apply_default(vm, &built, key);
+    }
     let d = match (name, args.len()) {
         ("withDefaultValue", 1) => MapDefault::Value(args[0].clone()),
         ("withDefault", 1) => MapDefault::Fn(args[0].clone()),

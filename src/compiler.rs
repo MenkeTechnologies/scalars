@@ -2838,6 +2838,11 @@ impl Compiler {
                     0,
                 );
             }
+            // `getClass` is a member of every instance, so a bare one inside a
+            // method is `this.getClass` (`s"${getClass.getSimpleName}"`).
+            if name == "getClass" {
+                return self.emit_smethod(&Expr::Var("this".to_string()), name, &[], 0);
+            }
         }
         // Inside an object method / val-init: a bare `val` is the `Name.val`
         // global; a bare (zero-arg) method is `Name$method`.

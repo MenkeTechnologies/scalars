@@ -582,7 +582,10 @@ reported as parse/compile errors, never silently mis-run.
   name (`int`, `double`, `boolean`, `char`). Modeled for a `String`, the
   primitives, a user `class`/`case class`/`object` (whose JVM class takes the
   `$` suffix Scala appends to an object) and a throwable — which is the usual
-  reason to call it, `e.getClass.getSimpleName`.
+  reason to call it, `e.getClass.getSimpleName`. A bare `getClass` inside a
+  class's method is `this.getClass`, so a base class's `toString` can name the
+  runtime subclass (`s"${getClass.getSimpleName}(…)"`). A collection's
+  `getClass` (`$colon$colon` for a non-empty `List`) is not modelled.
 
   A primitive reached through an `Any`-typed position reports the PRIMITIVE
   class where Scala reports the BOXED one: `val a: Any = 1; a.getClass` is
