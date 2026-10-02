@@ -367,11 +367,12 @@ reported as parse/compile errors, never silently mis-run.
 - **Inside a `def` body (a `@main` or `def main` entry), as at the top level.**
   These differed only when the bindings were frame slots rather than program
   globals, which is why the `--entry main` fuzz shape found them:
-  - a pattern variable sharing its name with a `var` that a closure captures
-    elsewhere in the same body (`case (i, j) => i * j` beside `var i` read by
-    a lambda) read a non-existent cell and answered `null`; and a lambda's own
-    parameter of that name (`(i: Int) => -i`) no longer counts as a capture of
-    the `var`;
+  - a pattern variable or `for` counter sharing its name with a `var` that a
+    closure captures elsewhere in the same body (`case (i, j) => i * j` or
+    `for (i <- 2 until 7)` beside a captured `var i`) read a non-existent cell
+    and answered `null`; and a lambda's own parameter or a `case` arm's
+    pattern variable of that name (`(i: Int) => -i`, `case i: Int => i * 2`)
+    no longer counts as a capture of the `var`;
   - a `lazy val` read from inside a closure or another lazy initializer
     (`lazy val q = p + 1`) is forced rather than loaded as its unforced cell;
   - an extractor or stable identifier bound to a LOCAL `val` (`val p =

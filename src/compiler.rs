@@ -1398,6 +1398,9 @@ impl Compiler {
             // body. No closure is built, so the loop stays trace-eligible.
             ForEnum::Val { name, value } => {
                 self.expr(value)?;
+                if self.is_boxed(name) {
+                    self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
+                }
                 let place = self.declare_place(name);
                 self.emit_store(place);
                 self.lower_for(enums, idx + 1, body, yield_into)?;
@@ -1411,7 +1414,19 @@ impl Compiler {
             } => {
                 Self::reject_char_range(start, end)?;
                 self.expr(start)?;
-                let vplace = self.declare_place(name);
+                // The counter is a raw slot the loop increments in place. When
+                // the frame keeps a `var` of the same name in a heap cell (see
+                // [`boxed_vars`]), every read of the name goes through the cell,
+                // so the counter moves to a hidden slot and each iteration binds
+                // the name to a fresh cell holding it.
+                let boxed_name = self.is_boxed(name).then(|| self.declare_place(name));
+                let vplace = match boxed_name {
+                    Some(_) => {
+                        self.for_counter += 1;
+                        self.declare_place(&format!(" for_ctr_{}", self.for_counter))
+                    }
+                    None => self.declare_place(name),
+                };
                 self.emit_store(vplace);
                 self.for_counter += 1;
                 let bound = format!(" for_end_{}", self.for_counter);
@@ -1464,6 +1479,11 @@ impl Compiler {
                 // As in `while_stmt`: a raise in the body exits the loop rather
                 // than iterating on garbage.
                 self.push_unwind(UnwindKind::Loop);
+                if let Some(named) = boxed_name {
+                    self.emit_load(vplace);
+                    self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
+                    self.emit_store(named);
+                }
                 self.lower_for(enums, idx + 1, body, yield_into)?;
                 // The innermost `lower_for` ends in an *expression* (the body
                 // value), not a statement, so nothing above emitted a check for
@@ -8320,6 +8340,32 @@ impl<'a> BoxScan<'a> {
         }
     }
 
+    /// Walk with `own` bound by the construct being entered — a lambda's
+    /// parameters, a `case` arm's pattern variables. Those SHADOW the frame's
+    /// bindings of the same names, so a use of one inside is not a capture of
+    /// the frame's: `(i: Int) => -i` and `case i: Int => i * 2` read their own
+    /// `i`, not a `var i` the frame declares. Only what the walk ADDS is
+    /// undone; a name already recorded outside stays recorded.
+    fn shadowing(&mut self, own: &HashSet<String>, walk: impl FnOnce(&mut Self)) {
+        let before = (
+            self.read_in_lambda.clone(),
+            self.assigned_in_lambda.clone(),
+            self.assigned.clone(),
+        );
+        walk(self);
+        for n in own {
+            if !before.0.contains(n) {
+                self.read_in_lambda.remove(n);
+            }
+            if !before.1.contains(n) {
+                self.assigned_in_lambda.remove(n);
+            }
+            if !before.2.contains(n) {
+                self.assigned.remove(n);
+            }
+        }
+    }
+
     fn finish(self) -> HashSet<String> {
         // A local needs a cell when it is declared here as a `var`, it is
         // ASSIGNED at all (a name that never changes cannot drift), and a closure
@@ -8415,23 +8461,8 @@ impl<'a> BoxScan<'a> {
             // name: `(i: Int) => -i` reads its parameter, not a `var i` of the
             // enclosing frame, so its uses are not captures of that `var`.
             Expr::Lambda { params, body, .. } => {
-                let before = (
-                    self.read_in_lambda.clone(),
-                    self.assigned_in_lambda.clone(),
-                    self.assigned.clone(),
-                );
-                self.expr(body, true);
-                for p in params {
-                    if !before.0.contains(p) {
-                        self.read_in_lambda.remove(p);
-                    }
-                    if !before.1.contains(p) {
-                        self.assigned_in_lambda.remove(p);
-                    }
-                    if !before.2.contains(p) {
-                        self.assigned.remove(p);
-                    }
-                }
+                let own: HashSet<String> = params.iter().cloned().collect();
+                self.shadowing(&own, |s| s.expr(body, true));
             }
             Expr::ForYield { enums, body } | Expr::ForEach { enums, body } => {
                 let desugars = enums.iter().any(is_coll_gen);
@@ -8461,22 +8492,32 @@ impl<'a> BoxScan<'a> {
             } => {
                 self.block(body, in_lambda);
                 for a in catches {
-                    if let Some(g) = &a.guard {
-                        self.expr(g, in_lambda);
-                    }
-                    self.block(&a.body, in_lambda);
+                    let mut own = HashSet::new();
+                    pattern_binds(&a.pat, &mut own);
+                    self.shadowing(&own, |s| {
+                        if let Some(g) = &a.guard {
+                            s.expr(g, in_lambda);
+                        }
+                        s.block(&a.body, in_lambda);
+                    });
                 }
                 if let Some(f) = finalizer {
                     self.block(f, in_lambda);
                 }
             }
+            // A pattern variable shadows the frame's binding of its name for
+            // the arm, exactly as a lambda parameter does.
             Expr::Match { scrut, arms } => {
                 self.expr(scrut, in_lambda);
                 for a in arms {
-                    if let Some(g) = &a.guard {
-                        self.expr(g, in_lambda);
-                    }
-                    self.block(&a.body, in_lambda);
+                    let mut own = HashSet::new();
+                    pattern_binds(&a.pat, &mut own);
+                    self.shadowing(&own, |s| {
+                        if let Some(g) = &a.guard {
+                            s.expr(g, in_lambda);
+                        }
+                        s.block(&a.body, in_lambda);
+                    });
                 }
             }
             Expr::Throw { value, .. }
