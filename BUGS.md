@@ -364,6 +364,16 @@ reported as parse/compile errors, never silently mis-run.
   through a lambda, a by-name argument or a user `toString`/`equals` re-enters
   the VM from a builtin, and the default thread stack overflowed at a depth of
   about 100 (`memo.getOrElseUpdate(n, fib(n - 1) + fib(n - 2))` at `n = 90`).
+- **Anonymous classes.** `new T { def m = … }`, `new C(args) { … }` and
+  `new C(args) with M1 with M2` declare a fresh class extending the named
+  parents and construct it. Like a named class, its body sees top-level and
+  entry-object bindings but does NOT capture a local of an enclosing `def`.
+  Structural `new { … }` (no parent) is not modelled.
+- **`Option.empty`, `Option.when(c)(v)`, `Option.unless(c)(v)`** (the value by
+  name), **`opt.zip(other)`**; **`Try { … }`** with a block, qualified or not;
+  **`val a, b = e`** (one evaluation of `e` per name);
+  **`d.floor`/`d.ceil`/`d.toRadians`/`d.toDegrees`/`d.isWhole`**; and
+  **`mutable.ArrayBuffer.empty[T]`** and the other mutable factories' `empty`.
 - **`override def toString`, honoured wherever a value is rendered.** Scala
   renders every value through its `toString`, so an override answers for
   `println(p)`, `s"$p"` / `f"$p%s"`, `"x" + p`, `String.valueOf(p)`,
@@ -411,8 +421,12 @@ reported as parse/compile errors, never silently mis-run.
   object` ADTs under a `sealed trait` match by constructor pattern and by
   stable identifier. `x.isInstanceOf[T]` and `case x: T =>` consult the
   registered hierarchy, so a subtype instance matches its supertypes.
-  Resolution order for `extends P with T1 with T2` is `C, T2, T1, P` (Scala's
-  linearization for every non-diamond hierarchy).
+  Resolution order is Scala's class linearization (SLS 5.1.2), diamonds
+  included: `class C extends B with T1 with T2`, both traits extending `B`, is
+  `C, T2, T1, B`. `super.m` inside a TRAIT is the next implementation in the
+  linearization of the class the trait is mixed into, so stackable traits
+  (`abstract override def put(x: Int) = super.put(2 * x)`) compose in mixin
+  order.
 - **`Array`.** `Array(a, b, c)`, `new Array[T](n)` (filled with `T`'s zero
   value), `a(i)` reads, `a(i) = v` writes (Scala's `update` sugar), and the
   sequence operations (`length`, `map`, `filter`, `sum`, `mkString`, `toList`,
@@ -1144,9 +1158,6 @@ reported as parse/compile errors, never silently mis-run.
   parameter unchanged — `class D(n: String) extends A(n)`, the idiom — this is
   exactly Scala; when it transforms it, the subclass body reads the transformed
   value.
-- **Linearization is "self, then parents right-to-left".** This is Scala's order
-  for every hierarchy without a diamond; the full C3 rule differs only when one
-  supertype is reachable by two paths.
 - **`==` on non-numbers compares by value** (structural), which matches Scala's
   `==`/`equals` for the strings and booleans this frontend handles. Reference
   identity (`eq`) is not modeled.

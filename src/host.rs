@@ -449,6 +449,12 @@ pub const SNE_VM: u16 = 788;
 /// answers it wrapped, so [`b_method`] can tell it from a function VALUE and run
 /// it only when the method needs it (`opt.getOrElse(expensive)`).
 pub const BYNAME: u16 = 789;
+/// Builtin id for `super.m(args)` inside a TRAIT method. Which implementation
+/// that reaches depends on the class the trait is mixed into — the next type
+/// after the trait in the RUNTIME class's linearization — so it cannot be
+/// bound statically. The stack holds `this`, the args, the trait name and the
+/// method name (top); `argc` counts all of them.
+pub const SUPER_DYN: u16 = 790;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -727,6 +733,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SEQ_VM, b_eq_vm);
     vm.register_builtin(SNE_VM, b_ne_vm);
     vm.register_builtin(BYNAME, b_byname);
+    vm.register_builtin(SUPER_DYN, b_super_dyn);
     vm.register_builtin(MAKE_OPTION, b_make_option);
     vm.register_builtin(NLR_RAISE, b_nlr_raise);
     vm.register_builtin(NLR_TAKE, b_nlr_take);
@@ -8534,6 +8541,66 @@ fn call_user_method(
     Some(run_sub(vm, entry, stack_base))
 }
 
+/// `SUPER_DYN` builtin — see [`SUPER_DYN`].
+///
+/// `class C extends Base with A with B`, where `B.m` calls `super.m`, reaches
+/// `A.m`: the linearization is `C, B, A, Base`, and `super` inside a trait
+/// means the next type in it that implements `m`. The same trait mixed into a
+/// different class reaches a different method, which is the stackable-trait
+/// pattern.
+fn b_super_dyn(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().as_str_cow().into_owned();
+    let from = vm.pop().as_str_cow().into_owned();
+    let n = (argc as usize).saturating_sub(3);
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let this = vm.pop();
+    if unwinding() {
+        return Value::Undef;
+    }
+    let Some(class) = with_obj(&this, |o| o.class.to_string()) else {
+        return fault(
+            vm,
+            format!("scalars: `super.{name}` on a value that is not an instance"),
+        );
+    };
+    let mut linearization = vec![class.clone()];
+    linearization.extend(TYPES.with(|t| {
+        t.borrow()
+            .get(&class)
+            .map(|i| i.supers.clone())
+            .unwrap_or_default()
+    }));
+    let find = |vm: &VM, want: &str| {
+        vm.chunk
+            .names
+            .iter()
+            .position(|n| n == want)
+            .and_then(|idx| vm.chunk.find_sub(idx as u16))
+    };
+    let after = linearization.iter().skip_while(|t| **t != from).skip(1);
+    let entry = after.into_iter().find_map(|owner| {
+        let plain = format!("{owner}${name}");
+        find(vm, &plain).or_else(|| find(vm, &format!("{plain}${n}")))
+    });
+    let Some(entry) = entry else {
+        return fault(
+            vm,
+            format!("scalars: no supertype after {from} defines `{name}`"),
+        );
+    };
+    let stack_base = vm.stack.len();
+    vm.stack.push(this);
+    vm.stack.extend(args);
+    match run_sub(vm, entry, stack_base) {
+        Ok(v) => v,
+        Err(e) => fault(vm, e),
+    }
+}
+
 /// `a compare b` when `a`'s class defines it — `class V extends Ordered[V]` or
 /// `implements Comparable[V]`. Scala's `Ordered`/`Comparable` are ordinary
 /// traits whose single abstract member is the user's, and the implicit
@@ -10041,6 +10108,11 @@ fn option_method(
         };
     }
     Some(match (name, args.len()) {
+        // `a.zip(b)` — `Some((x, y))` when both are defined.
+        ("zip", 1) => Ok(match (inner, as_option(&args[0]).flatten()) {
+            (Some(x), Some(y)) => make_some(new_pair(x, y)),
+            _ => make_none(),
+        }),
         ("get", 0) => match inner {
             Some(v) => Ok(v),
             None => Err("scalars: java.util.NoSuchElementException: None.get".into()),
@@ -11941,6 +12013,10 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("isNaN", 0) => Ok(Value::bool(f.is_nan())),
         ("isInfinity" | "isInfinite", 0) => Ok(Value::bool(f.is_infinite())),
         ("round", 0) => Ok(Value::int(java_round(f))),
+        // `RichDouble.floor`/`ceil` and the angle conversions — the
+        // `math` functions of the same names.
+        ("floor" | "ceil" | "toRadians" | "toDegrees", 0) => math_member(name, &[Value::float(f)]),
+        ("isWhole", 0) => Ok(Value::bool(f.is_finite() && f.fract() == 0.0)),
         // `RichDouble`'s `max`/`min` are `math.max`/`math.min`, so they PROPAGATE
         // a NaN operand rather than ignoring it.
         ("max", 1) => Ok(Value::float(java_double_max(f, num_f64(&args[0])))),

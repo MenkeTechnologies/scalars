@@ -353,28 +353,31 @@ struct ObjMeta {
     member_widths: HashMap<String, NumTy>,
 }
 
-/// Scala-style linearization of `name`: the type itself, then its supertypes
-/// right-to-left, each recursively, keeping the first occurrence of a repeat.
-/// This is the resolution order for `extends P with T1 with T2` (`T2`, `T1`,
-/// `P`) — the full C3 rule differs only for diamond hierarchies, which this
-/// frontend does not model.
+/// Scala's class linearization of `name` (SLS 5.1.2): the type itself, then
+/// `L(Pn) +: … +: L(P1)` over its parents `P1 with … with Pn`, where `a +: b`
+/// is the elements of `a` not in `b`, followed by `b`. A type shared by
+/// several parents therefore lands AFTER all of them — `class C extends B with
+/// T1 with T2`, both traits extending `B`, is `C, T2, T1, B` — which is the
+/// order `super` walks in a stack of traits.
 fn linearize(name: &str, parents: &HashMap<&str, &[String]>) -> Vec<String> {
-    fn go(name: &str, parents: &HashMap<&str, &[String]>, out: &mut Vec<String>, depth: u32) {
+    fn go(name: &str, parents: &HashMap<&str, &[String]>, depth: u32) -> Vec<String> {
         // A cyclic `extends` would otherwise recurse forever; the depth cap
         // makes a malformed hierarchy terminate instead of blowing the stack.
-        if depth > 64 || out.iter().any(|x| x == name) {
-            return;
-        }
-        out.push(name.to_string());
-        if let Some(ps) = parents.get(name) {
-            for p in ps.iter().rev() {
-                go(p, parents, out, depth + 1);
+        let mut tail: Vec<String> = Vec::new();
+        if depth <= 64 {
+            for p in parents.get(name).copied().unwrap_or_default() {
+                let lp = go(p, parents, depth + 1);
+                let mut next: Vec<String> = lp.into_iter().filter(|t| !tail.contains(t)).collect();
+                next.extend(tail);
+                tail = next;
             }
         }
+        tail.retain(|t| t != name);
+        let mut out = vec![name.to_string()];
+        out.extend(tail);
+        out
     }
-    let mut out = Vec::new();
-    go(name, parents, &mut out, 0);
-    out
+    go(name, parents, 0)
 }
 
 /// A function body's local slot map (see [`Compiler::scope`]).
@@ -3062,6 +3065,25 @@ impl Compiler {
         let Some((cname, _)) = self.current_class.clone() else {
             return Err(format!("scalars: `super` outside a class (line {line})"));
         };
+        // Inside a TRAIT, `super` is the next implementation in the
+        // linearization of whatever class the trait is mixed into, which only
+        // the runtime receiver knows.
+        if self.classes.get(&cname).is_some_and(|m| m.is_trait) {
+            let this = self.resolve_place("this");
+            self.emit_load(this);
+            for a in args {
+                self.expr(a)?;
+            }
+            for s in [cname.as_str(), name] {
+                let c = self.b.add_constant(Value::str(s.to_string()));
+                self.b.emit(Op::LoadConst(c), line);
+            }
+            self.b.emit(
+                Op::CallBuiltin(crate::host::SUPER_DYN, args.len() as u8 + 3),
+                line,
+            );
+            return Ok(());
+        }
         let supers = match self.classes.get(&cname) {
             Some(m) => m.supers.clone(),
             None => Vec::new(),
@@ -4248,6 +4270,13 @@ impl Compiler {
         if let Some(obj) = self.companion_member(recv, name) {
             return self.method(&Expr::Var(obj), name, args, line);
         }
+        // `Option.empty` / `Option.when(c)(v)` / `Option.unless(c)(v)`, unless
+        // the program binds `Option` itself.
+        if !self.classes.contains_key("Option") && !self.objects.contains_key("Option") {
+            if let Some(e) = option_companion(recv, name, args, line) {
+                return self.expr(&e);
+            }
+        }
         // The three methods that observe a receiver's TYPE rather than its
         // value, on a receiver the analysis proved is a `Float`. All three would
         // otherwise read the one runtime representation and answer for a
@@ -4596,6 +4625,24 @@ impl Compiler {
         if mutable_module(recv) {
             if let Some(ctor) = mutable_ctor(name) {
                 return self.collection(ctor, args);
+            }
+        }
+        // `mutable.ArrayBuffer.empty[Int]` — the factory's empty instance.
+        if let (
+            Expr::Method {
+                recv: pkg,
+                name: kind,
+                args: none,
+                ..
+            },
+            "empty",
+            [],
+        ) = (recv, name, args)
+        {
+            if none.is_empty() && mutable_module(pkg) {
+                if let Some(ctor) = mutable_ctor(kind) {
+                    return self.collection(ctor, &[]);
+                }
             }
         }
         // `String.format(fmt, args…)` — the JDK static, which is a namespace
@@ -6547,6 +6594,34 @@ impl Compiler {
                 Expr::Int(_) | Expr::Long(_) | Expr::Float(_) | Expr::Char(_) | Expr::Bool(_)
             )
     }
+}
+
+/// The `scala.Option` companion members, as the expressions they are:
+/// `Option.empty` is `None`, `Option.when(c)(v)` is `if (c) Some(v) else None`
+/// and `Option.unless(c)(v)` its converse.
+fn option_companion(recv: &Expr, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+    if !matches!(recv, Expr::Var(o) if o == "Option") {
+        return None;
+    }
+    let none = || Expr::Var("None".to_string());
+    let some = |v: &Expr| Expr::Call {
+        name: "Some".to_string(),
+        args: vec![v.clone()],
+        line,
+    };
+    // `when`/`unless` take the value BY NAME: it is evaluated only on the
+    // branch that builds the `Some`, which the `if` reproduces.
+    let branch = |c: &Expr, then: Expr, els: Expr| Expr::If {
+        cond: Box::new(c.clone()),
+        then: Box::new(then),
+        els: Some(Box::new(els)),
+    };
+    Some(match (name, args) {
+        ("empty", []) => none(),
+        ("when", [c, v]) => branch(c, some(v), none()),
+        ("unless", [c, v]) => branch(c, none(), some(v)),
+        _ => return None,
+    })
 }
 
 /// The position of the BY-NAME parameter of a library method, by name and

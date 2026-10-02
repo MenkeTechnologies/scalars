@@ -65,6 +65,9 @@ struct Parser {
     /// be named by the program (`given Int = 5`), but it still has to be a
     /// binding for a call site to reference, so one is synthesized.
     givens: usize,
+    /// How many anonymous classes (`new T { … }`, `new C with M`) have been
+    /// synthesized so far; each is declared under a fresh `$anon` name.
+    anon_classes: usize,
     /// Every `enum` in the unit, mapped to its case names in declaration
     /// order — collected by [`scan_enums`] before parsing starts, so a
     /// qualified `Color.Red` resolves even where it is written above the `enum`.
@@ -86,6 +89,7 @@ impl Parser {
             extensions: Vec::new(),
             conversions: Vec::new(),
             givens: 0,
+            anon_classes: 0,
             enums,
         }
     }
@@ -142,6 +146,13 @@ fn scan_enums(toks: &[Token]) -> HashMap<String, Vec<String>> {
         i = j;
     }
     enums
+}
+
+/// What a class or trait body declares — see [`Parser::class_body`].
+struct ClassBody {
+    body: Vec<Stmt>,
+    methods: Vec<Func>,
+    field_names: Vec<String>,
 }
 
 /// A primary constructor's parameters — see [`Parser::ctor_params`] and the
@@ -554,11 +565,40 @@ impl Parser {
         } = self.ctor_params()?;
         // `extends Parent[(args)] [with T]*`.
         let (parents, super_args) = self.parents_clause()?;
-        // Class body (optional). `def`s → methods; `val`/`var` → fields + ctor
-        // statements; anything else → a constructor side-effect statement.
+        let ClassBody {
+            body,
+            methods,
+            field_names,
+        } = self.class_body(&name, is_trait, &params)?;
+        Ok(ClassDecl {
+            name,
+            is_case,
+            is_trait,
+            parents,
+            super_args,
+            params,
+            param_by_name,
+            param_tys,
+            param_defaults,
+            body,
+            field_names,
+            methods,
+        })
+    }
+
+    /// A class or trait body, when the cursor is on its `{` (empty otherwise):
+    /// `def`s become methods, `val`/`var`s fields plus constructor statements,
+    /// anything else a constructor side-effect statement. Answers the body,
+    /// the methods and every field name, constructor `params` first.
+    fn class_body(
+        &mut self,
+        name: &str,
+        is_trait: bool,
+        params: &[String],
+    ) -> Result<ClassBody, String> {
         let mut body = Vec::new();
         let mut methods = Vec::new();
-        let mut field_names = params.clone();
+        let mut field_names = params.to_vec();
         if self.is(&Tok::LBrace) {
             self.advance();
             self.skip_seps();
@@ -567,7 +607,7 @@ impl Parser {
                 if self.is(&Tok::Def) && matches!(self.peek_at(1), Tok::Ident(w) if w == "this") {
                     let line = self.line();
                     let aux = self.parse_def()?;
-                    self.auxiliary_ctor(&name, aux, &mut methods, line)?;
+                    self.auxiliary_ctor(name, aux, &mut methods, line)?;
                 } else if self.is(&Tok::Def) {
                     methods.push(self.parse_def()?);
                 } else {
@@ -591,19 +631,10 @@ impl Parser {
             }
             self.eat(&Tok::RBrace)?;
         }
-        Ok(ClassDecl {
-            name,
-            is_case,
-            is_trait,
-            parents,
-            super_args,
-            params,
-            param_by_name,
-            param_tys,
-            param_defaults,
+        Ok(ClassBody {
             body,
-            field_names,
             methods,
+            field_names,
         })
     }
 
@@ -1937,6 +1968,25 @@ impl Parser {
             return Ok(StmtKind::Destructure { pat, init });
         }
         let name = self.ident()?;
+        // `val a, b = e` — each name gets its OWN evaluation of `e`, in order,
+        // which is exactly `val (a, b) = (e, e)`.
+        if self.is(&Tok::Comma) && !is_lazy {
+            let mut names = vec![name];
+            while self.is(&Tok::Comma) {
+                self.advance();
+                names.push(self.ident()?);
+            }
+            if self.is(&Tok::Colon) {
+                self.advance();
+                self.type_ref()?;
+            }
+            self.eat(&Tok::Assign)?;
+            let init = self.expression()?;
+            return Ok(StmtKind::Destructure {
+                pat: Pattern::Tuple(names.iter().cloned().map(Pattern::Bind).collect()),
+                init: Expr::Tuple(vec![init; names.len()]),
+            });
+        }
         let ty = if self.is(&Tok::Colon) {
             self.advance();
             Some(self.type_ref()?)
@@ -1972,7 +2022,7 @@ impl Parser {
         match self.peek() {
             Tok::LParen => true,
             Tok::Ident(n) => {
-                let binder = matches!(self.peek_at(1), Tok::Assign | Tok::Colon);
+                let binder = matches!(self.peek_at(1), Tok::Assign | Tok::Colon | Tok::Comma);
                 (n.chars().next().is_some_and(char::is_uppercase) && !binder)
                     || matches!(self.peek_at(1), Tok::ColonColon)
             }
@@ -3022,6 +3072,8 @@ impl Parser {
             if is_plain_member(&e, &name) {
                 e = if self.is(&Tok::LParen) {
                     self.bare_application(name, line)?
+                } else if name == "Try" && self.is(&Tok::LBrace) {
+                    try_factory(&self.brace_arg()?, line)
                 } else {
                     Expr::Var(name)
                 };
@@ -3497,6 +3549,10 @@ impl Parser {
                 // statements.
                 if self.is(&Tok::LBrace) {
                     let arg = self.brace_arg()?;
+                    // `Try { … }` is the factory too (see `bare_application`).
+                    if name == "Try" {
+                        return Ok(try_factory(&arg, line));
+                    }
                     return Ok(Expr::Call {
                         name,
                         args: vec![arg],
@@ -3627,7 +3683,59 @@ impl Parser {
                 elems: args,
             });
         }
+        let mixes_in = matches!(self.peek(), Tok::Ident(w) if w == "with");
+        if mixes_in || self.is(&Tok::LBrace) {
+            return self.anonymous_class(name, args, line);
+        }
         Ok(eta_bare_args(Expr::New { name, args, line }))
+    }
+
+    /// `new C(args) with M1 with M2 { body }` — an instance of an ANONYMOUS
+    /// class, declared here as `class $anonN($a0, …) extends C($a0, …) with M1
+    /// with M2 { body }` and constructed with `args`. The constructor arguments
+    /// travel as parameters because they are evaluated where the `new` is
+    /// written, not in the class.
+    ///
+    /// The body sees the program's top-level and entry-object bindings, as any
+    /// class does; a local of an enclosing `def` is not captured.
+    fn anonymous_class(
+        &mut self,
+        parent: String,
+        args: Vec<Expr>,
+        line: u32,
+    ) -> Result<Expr, String> {
+        let mut parents = vec![parent];
+        while matches!(self.peek(), Tok::Ident(w) if w == "with") {
+            self.advance();
+            parents.push(self.ident()?);
+            if self.is(&Tok::LBracket) {
+                self.skip_bracket_group();
+            }
+        }
+        self.anon_classes += 1;
+        let name = format!("$anon{}", self.anon_classes);
+        let params: Vec<String> = (0..args.len()).map(|i| format!("$a{i}")).collect();
+        let ClassBody {
+            body,
+            methods,
+            field_names,
+        } = self.class_body(&name, false, &params)?;
+        let decl = ClassDecl {
+            name: name.clone(),
+            is_case: false,
+            is_trait: false,
+            parents,
+            super_args: params.iter().cloned().map(Expr::Var).collect(),
+            param_by_name: vec![false; params.len()],
+            param_tys: vec![None; params.len()],
+            param_defaults: vec![None; params.len()],
+            params,
+            body,
+            field_names,
+            methods,
+        };
+        self.declare_class(decl, line)?;
+        Ok(Expr::New { name, args, line })
     }
 
     /// Parse a parenthesized, comma-separated argument list (cursor on `(`);
