@@ -328,6 +328,23 @@ reported as parse/compile errors, never silently mis-run.
 - **`LazyList.iterate(seed)(f)` applies `f` only for elements asked for**:
   `take(3).toList` runs it twice. It used to compute each element's successor
   as soon as the element itself was produced, one application early.
+- **Auxiliary constructors.** `def this(n: Int) = this(n, n)` and
+  `def this() = { this(7); note = "x" }` — the self-invocation (primary or
+  another auxiliary constructor) builds the instance, then the rest of the body
+  runs on it as `this`. `new C(…)` picks the constructor by ARGUMENT COUNT, so
+  two constructors of the same arity told apart only by parameter types are
+  not distinguished: the primary one wins.
+- **Applying a field or an object `val` by its bare name.** Inside a method,
+  `data(i)` on a field holding an `Array`/`List`/`Map`/function is
+  `this.data.apply(i)` (it used to be `not found: data`), and inside an
+  object's method its own `val`s apply the same way. An instance of a class
+  declaring `apply` is applicable too: `m(0, 1)` calls it.
+- **`reduceOption`/`reduceLeftOption`/`reduceRightOption`,
+  `minOption`/`maxOption`/`minByOption`/`maxByOption`, `sameElements`,
+  `distinctBy`, `patch`, `unzip3`**; **`xs.to(Vector)`** (and the other
+  companions) as the conversion rather than a range; **`a.to(b, step)` /
+  `a.until(b, step)`**; and **`String.split(regex, limit)`** with Java's
+  positive/zero/negative limit rules.
 - **`override def toString`, honoured wherever a value is rendered.** Scala
   renders every value through its `toString`, so an override answers for
   `println(p)`, `s"$p"` / `f"$p%s"`, `"x" + p`, `String.valueOf(p)`,

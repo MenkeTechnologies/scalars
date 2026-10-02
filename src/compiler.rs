@@ -3674,6 +3674,15 @@ impl Compiler {
             Some(meta) => meta.arity,
             None => return Err(format!("scalars: not found: type {name} (line {line})")),
         };
+        // An auxiliary constructor (`def this(…)`) taking this many arguments.
+        let aux = crate::parser::aux_ctor_name(name, args.len());
+        if args.len() != arity && self.func_arity.contains_key(&aux) {
+            return self.expr(&Expr::Call {
+                name: aux,
+                args: args.to_vec(),
+                line,
+            });
+        }
         let args = self.adapt_ctor_args(name, args, line)?;
         if args.len() != arity {
             return Err(format!(
@@ -4676,6 +4685,30 @@ impl Compiler {
         // `a to b` / `a until b` — build a first-class `Range`. A `by` step then
         // rebuilds it through the host (see `crate::host`), so `(1 to 9 by 2)`
         // is one range value rather than a chain of collections.
+        // `xs.to(Vector)` — a conversion named by the target's companion, the
+        // same one `xs.toVector` makes; not a range.
+        if let ("to", [Expr::Var(target)]) = (name, args) {
+            if !self.classes.contains_key(target) && !self.objects.contains_key(target) {
+                if let Some(conv) = factory_conversion(target) {
+                    return self.emit_smethod(recv, conv, &[], line);
+                }
+            }
+        }
+        // `a.to(b, step)` / `a.until(b, step)` — the method spelling of `by`.
+        if (name == "to" || name == "until") && args.len() == 2 {
+            let range = Expr::Method {
+                recv: Box::new(recv.clone()),
+                name: name.to_string(),
+                args: vec![args[0].clone()],
+                line,
+            };
+            return self.expr(&Expr::Method {
+                recv: Box::new(range),
+                name: "by".to_string(),
+                args: vec![args[1].clone()],
+                line,
+            });
+        }
         if (name == "to" || name == "until") && args.len() == 1 {
             Self::reject_char_range(recv, &args[0])?;
             self.expr(recv)?;
@@ -5527,6 +5560,37 @@ impl Compiler {
         if is_bound {
             let place = self.resolve_place(name);
             self.emit_load(place);
+            for a in args {
+                self.expr(a)?;
+            }
+            self.b
+                .emit(Op::CallBuiltin(crate::host::APPLY, args.len() as u8), line);
+            return Ok(());
+        }
+        // A FIELD applied inside its class's method — `data(i)` is
+        // `this.data.apply(i)` — or an object's `val` inside the object's own.
+        let class_field = self
+            .current_class
+            .as_ref()
+            .is_some_and(|(_, fields)| fields.contains(name));
+        let object_val = self
+            .current_object
+            .as_ref()
+            .and_then(|o| {
+                self.objects
+                    .get(o)
+                    .map(|m| (o.clone(), m.vals.contains(name)))
+            })
+            .filter(|(_, has)| *has)
+            .map(|(o, _)| o);
+        if class_field || object_val.is_some() {
+            match object_val {
+                Some(obj) if !class_field => {
+                    let g = self.b.add_name(&object_field_global(&obj, name));
+                    self.b.emit(Op::GetVar(g), line);
+                }
+                _ => self.emit_field_get_this(name),
+            }
             for a in args {
                 self.expr(a)?;
             }

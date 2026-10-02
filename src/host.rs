@@ -3326,6 +3326,10 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
     if is_function(recv) {
         return invoke_closure(vm, recv, args);
     }
+    // `m(i, j)` on an instance of a class that declares `apply`.
+    if let Some(r) = call_user_method(vm, recv, "apply", args) {
+        return r;
+    }
     // `s(i)` is `StringOps.apply`, i.e. `charAt` — the same method the named
     // spelling `s.apply(i)` already reaches through `string_method`. It has to be
     // here too: a string receiver that is a *binding* rather than a literal
@@ -6733,6 +6737,23 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             return string_method(&text, name, args);
         }
     }
+    // `reduceOption`/`minOption`/`maxByOption`/… — `None` for an empty
+    // receiver, otherwise `Some` of the method they wrap.
+    let wrapped = match name {
+        "reduceOption" | "reduceLeftOption" => Some("reduceLeft"),
+        "reduceRightOption" => Some("reduceRight"),
+        "minOption" => Some("min"),
+        "maxOption" => Some("max"),
+        "minByOption" => Some("minBy"),
+        "maxByOption" => Some("maxBy"),
+        _ => None,
+    };
+    if let Some(base) = wrapped {
+        if items.is_empty() {
+            return Ok(make_none());
+        }
+        return seq_method(vm, recv, base, args).map(make_some);
+    }
     // A user `equals` decides membership: `contains`, `indexOf` and
     // `lastIndexOf` compare with `==`, and `distinct` keeps the first of each
     // run of equal elements.
@@ -7229,6 +7250,52 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 }
             }
             Ok(new_pair(same(ls), same(rs)))
+        }
+        ("unzip3", 0) => {
+            let mut cols: [Vec<Value>; 3] = Default::default();
+            for it in &items {
+                match as_seq_or_tuple(it) {
+                    Some(t) if t.len() == 3 => {
+                        for (col, v) in cols.iter_mut().zip(t) {
+                            col.push(v);
+                        }
+                    }
+                    _ => return Err("scalars: unzip3 expects a collection of triples".into()),
+                }
+            }
+            let [a, b, c] = cols;
+            Ok(heap_push(HeapVal::Tuple(vec![same(a), same(b), same(c)])))
+        }
+        // `xs.sameElements(ys)` — the same elements in the same order, for any
+        // two iterables (an `Array` against a `List` included).
+        ("sameElements", 1) => {
+            let other = as_iterable_once(&args[0]).unwrap_or_default();
+            Ok(Value::bool(
+                items.len() == other.len() && items.iter().zip(&other).all(|(x, y)| value_eq(x, y)),
+            ))
+        }
+        // `distinctBy(f)` — the first element of each run of equal keys.
+        ("distinctBy", 1) => {
+            let ks = keys_of(vm, &args[0], &items)?;
+            let mut seen: Vec<Value> = Vec::new();
+            let mut out = Vec::new();
+            for (k, it) in ks.into_iter().zip(&items) {
+                if !seen.iter().any(|s| value_eq(s, &k)) {
+                    seen.push(k);
+                    out.push(it.clone());
+                }
+            }
+            Ok(same(out))
+        }
+        // `xs.patch(from, other, replaced)` — `replaced` elements from `from`
+        // swapped for `other`'s; both indices clamp to the receiver.
+        ("patch", 3) => {
+            let from = clamp(args[0].to_int(), items.len());
+            let end = from + clamp(args[2].to_int(), items.len() - from);
+            let mut out = items[..from].to_vec();
+            out.extend(as_iterable_once(&args[1]).unwrap_or_default());
+            out.extend_from_slice(&items[end..]);
+            Ok(same(out))
         }
         ("splitAt", 1) => {
             let at = clamp(args[0].to_int(), items.len());
@@ -10431,8 +10498,12 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("concat", 1) => Ok(Value::str(format!("{s}{}", args[0].as_str_cow()))),
         // `String.split` answers an `Array[String]`, and its separator is a
         // REGEX (`java.lang.String.split`), not a literal — see [`java_split`].
-        ("split", 1) => java_split(s, &args[0].as_str_cow())
-            .map(|parts| new_seq(SeqKind::Array, parts.into_iter().map(Value::str).collect())),
+        ("split", 1 | 2) => java_split(
+            s,
+            &args[0].as_str_cow(),
+            args.get(1).map_or(0, Value::to_int),
+        )
+        .map(|parts| new_seq(SeqKind::Array, parts.into_iter().map(Value::str).collect())),
         // The `java.util.regex` surface of `String`.
         ("matches", 1) => regex_full_match(&args[0].as_str_cow(), s),
         ("replaceAll", 2) => regex_replace(s, &args[0].as_str_cow(), &args[1].as_str_cow(), false),
@@ -10962,19 +11033,24 @@ fn regex_replace(s: &str, pat: &str, repl: &str, first_only: bool) -> Result<Val
     Ok(Value::str(out))
 }
 
-/// `java.util.regex.Pattern.split` with the default limit of 0, ported: split on
-/// every match, drop the empty leading substring a zero-width match at position
-/// 0 would produce, and then drop every TRAILING empty substring.
+/// `java.util.regex.Pattern.split(input, limit)`, ported: split on every match,
+/// dropping the empty leading substring a zero-width match at position 0 would
+/// produce. A positive `limit` stops after `limit - 1` splits and leaves the
+/// rest of the input as the last field; `0` (the one-argument `split`) then
+/// drops every TRAILING empty substring; a negative `limit` keeps them.
 ///
 /// `String.split` is regex-based in Java (and so in Scala), which is why
 /// `"a.b".split(".")` answers an empty array rather than `[a, b]`.
-fn java_split(s: &str, pat: &str) -> Result<Vec<String>, String> {
+fn java_split(s: &str, pat: &str, limit: i64) -> Result<Vec<String>, String> {
     let re = regex_compile(pat)?;
     let mut parts: Vec<String> = Vec::new();
     let mut index = 0;
     for (start, end) in regex_matches(&re, s) {
         if index == 0 && start == 0 && end == 0 {
             continue;
+        }
+        if limit > 0 && parts.len() as i64 == limit - 1 {
+            break;
         }
         parts.push(s[index..start].to_string());
         index = end;
@@ -10984,7 +11060,7 @@ fn java_split(s: &str, pat: &str) -> Result<Vec<String>, String> {
         return Ok(vec![s.to_string()]);
     }
     parts.push(s[index..].to_string());
-    while parts.last().is_some_and(String::is_empty) {
+    while limit == 0 && parts.last().is_some_and(String::is_empty) {
         parts.pop();
     }
     Ok(parts)
@@ -11133,7 +11209,7 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
         }
         ("replaceAllIn", 2) => regex_replace(&target(), &pat, &args[1].as_str_cow(), false),
         ("replaceFirstIn", 2) => regex_replace(&target(), &pat, &args[1].as_str_cow(), true),
-        ("split", 1) => java_split(&target(), &pat)
+        ("split", 1) => java_split(&target(), &pat, 0)
             .map(|parts| new_seq(SeqKind::Array, parts.into_iter().map(Value::str).collect())),
         ("unanchored", 0) => Ok(recv.clone()),
         _ => Err(no_such_obj_member("Regex", name)),

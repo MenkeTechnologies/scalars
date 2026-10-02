@@ -18,6 +18,12 @@ use std::collections::HashMap;
 /// [`crate::compiler`] to the zero-filling array builtin.
 pub const NEW_ARRAY: &str = "$new_array";
 
+/// The function an auxiliary constructor `def this(…)` of `class` with `arity`
+/// parameters lowers to (see `Parser::auxiliary_ctor`).
+pub fn aux_ctor_name(class: &str, arity: usize) -> String {
+    format!("{class}$this${arity}")
+}
+
 /// The reserved collection constructor that marks a varargs SPREAD argument
 /// (`f(xs: _*)`). It holds the one spread operand. `Compiler::adapt_args`
 /// strips it at a call site whose parameter is repeated; anywhere else it
@@ -558,7 +564,11 @@ impl Parser {
             self.skip_seps();
             while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
                 self.skip_member_modifiers();
-                if self.is(&Tok::Def) {
+                if self.is(&Tok::Def) && matches!(self.peek_at(1), Tok::Ident(w) if w == "this") {
+                    let line = self.line();
+                    let aux = self.parse_def()?;
+                    self.auxiliary_ctor(&name, aux, &mut methods, line)?;
+                } else if self.is(&Tok::Def) {
                     methods.push(self.parse_def()?);
                 } else {
                     let st = self.statement()?;
@@ -595,6 +605,79 @@ impl Parser {
             field_names,
             methods,
         })
+    }
+
+    /// An AUXILIARY constructor, `def this(ps) = { this(args); rest }`, lowered
+    /// to a function and a method:
+    ///
+    /// - `Class$this$N(ps)` (`N` the parameter count) builds the instance with
+    ///   `new Class(args)` — the primary constructor, or another auxiliary one
+    ///   chosen the same way by argument count — then runs `rest` on it and
+    ///   answers it. `new Class(…)` reaches this function whenever its argument
+    ///   count is not the primary constructor's.
+    /// - `$auxinit$N(ps)` holds `rest` as a method of the class, so it reads
+    ///   and assigns the new instance's fields as `this`. Omitted when `rest` is
+    ///   empty, as in the common `def this(n: Int) = this(n, n)`.
+    ///
+    /// Scala requires the self-invocation to come first, which is what makes
+    /// this split exact: nothing of the body can run before the instance exists.
+    fn auxiliary_ctor(
+        &mut self,
+        class: &str,
+        aux: Func,
+        methods: &mut Vec<Func>,
+        line: u32,
+    ) -> Result<(), String> {
+        let (first, rest) = aux.body.split_first().ok_or_else(|| {
+            format!("scalars: an auxiliary constructor must start with `this(…)` (line {line})")
+        })?;
+        let StmtKind::Expr(Expr::Call { name, args, .. }) = &first.kind else {
+            return Err(format!(
+                "scalars: an auxiliary constructor must start with `this(…)` (line {line})"
+            ));
+        };
+        if name != "this" {
+            return Err(format!(
+                "scalars: an auxiliary constructor must start with `this(…)` (line {line})"
+            ));
+        }
+        let arity = aux.params.len();
+        let instance = "$aux_self".to_string();
+        let stmt = |kind: StmtKind| Stmt { line, kind };
+        let mut body = vec![stmt(StmtKind::Local {
+            is_val: true,
+            is_lazy: false,
+            ty: None,
+            name: instance.clone(),
+            init: Some(Expr::New {
+                name: class.to_string(),
+                args: args.clone(),
+                line,
+            }),
+        })];
+        if !rest.is_empty() {
+            let init = format!("$auxinit${arity}");
+            methods.push(Func {
+                name: init.clone(),
+                body: rest.to_vec(),
+                ret_ty: None,
+                ..aux.clone()
+            });
+            body.push(stmt(StmtKind::Expr(Expr::Method {
+                recv: Box::new(Expr::Var(instance.clone())),
+                name: init,
+                args: aux.params.iter().cloned().map(Expr::Var).collect(),
+                line,
+            })));
+        }
+        body.push(stmt(StmtKind::Expr(Expr::Var(instance))));
+        self.funcs.push(Func {
+            name: aux_ctor_name(class, arity),
+            body,
+            ret_ty: None,
+            ..aux
+        });
+        Ok(())
     }
 
     /// A primary constructor's `( … )` clause, when the cursor is on one; empty
