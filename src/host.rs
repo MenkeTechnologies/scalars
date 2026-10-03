@@ -438,7 +438,7 @@ pub const NONFATAL: u16 = 785;
 /// `Option`'s or `Either`'s content, a tuple's slots and nested collections.
 pub const SCONV_SHAPE: u16 = 786;
 /// Builtin id for Scala `==` in a program whose classes override `equals`:
-/// pops two values and answers [`eq_vm`], which runs the override. `Op::NumEq`
+/// pops two values and answers `eq_vm`, which runs the override. `Op::NumEq`
 /// reaches [`numeric_hook`], a plain `Fn(NumOp, &Value, &Value)` that cannot
 /// re-enter the VM, so a program without an override keeps that op.
 pub const SEQ_VM: u16 = 787;
@@ -446,7 +446,7 @@ pub const SEQ_VM: u16 = 787;
 pub const SNE_VM: u16 = 788;
 /// Builtin id that marks a library method's BY-NAME argument: pops the
 /// zero-parameter closure the compiler built around the argument expression and
-/// answers it wrapped, so [`b_method`] can tell it from a function VALUE and run
+/// answers it wrapped, so `b_method` can tell it from a function VALUE and run
 /// it only when the method needs it (`opt.getOrElse(expensive)`).
 pub const BYNAME: u16 = 789;
 /// Builtin id for `super.m(args)` inside a TRAIT method. Which implementation
