@@ -4955,6 +4955,25 @@ impl Compiler {
         // `scala.math.<member>` / `math.<member>` / `Math.<member>` — the JDK
         // math module, which is a value namespace rather than a receiver.
         if let Some(java) = math_module(recv) {
+            // A math METHOD named without arguments is a function value —
+            // `xs.map(math.sqrt)`, `xs.reduce(math.max)` — which Scala
+            // eta-expands into a lambda over the method's parameters.
+            if args.is_empty() {
+                if let Some(arity) = math_method_arity(name) {
+                    let params: Vec<String> = (0..arity).map(|i| format!("$ph{i}")).collect();
+                    let eta = Expr::Lambda {
+                        body: Box::new(Expr::Method {
+                            recv: Box::new(recv.clone()),
+                            name: name.to_string(),
+                            args: params.iter().cloned().map(Expr::Var).collect(),
+                            line,
+                        }),
+                        params,
+                        partial: false,
+                    };
+                    return self.expr(&eta);
+                }
+            }
             for a in args {
                 self.expr(a)?;
             }
@@ -7933,6 +7952,20 @@ const WIDTH_COMBINING_METHODS: &[&str] = &["+", "-", "*", "/", "%", "max", "min"
 /// collection that accumulate — `sum` and `product` overflow on a long enough
 /// `List[Int]` however small its elements are.
 const NARROW_AFTER_METHODS: &[&str] = &["toInt", "abs", "+", "-", "*", "/", "%", "sum", "product"];
+
+/// The parameter count of a `scala.math`/`java.lang.Math` METHOD, `None` for a
+/// constant (`Pi`, `E`) or a name that is not one — what decides whether an
+/// argument-less selection is eta-expanded into a function value.
+fn math_method_arity(name: &str) -> Option<usize> {
+    match name {
+        "abs" | "signum" | "sqrt" | "cbrt" | "exp" | "expm1" | "log" | "log10" | "log1p"
+        | "floor" | "ceil" | "rint" | "round" | "sin" | "cos" | "tan" | "asin" | "acos"
+        | "atan" | "sinh" | "cosh" | "tanh" | "toRadians" | "toDegrees" | "ulp" => Some(1),
+        "max" | "min" | "pow" | "hypot" | "atan2" | "floorDiv" | "floorMod"
+        | "IEEEremainder" => Some(2),
+        _ => None,
+    }
+}
 
 /// Whether `e` names a math module — `math`/`scala.math` or `Math`/
 /// `java.lang.Math` — and which of the two. These are namespaces, not values, so

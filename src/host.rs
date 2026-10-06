@@ -6687,6 +6687,29 @@ fn mut_seq_method(
         ("result", 0) if strbuf => Some(Ok(Value::str(
             items.iter().map(scala_str).collect::<String>(),
         ))),
+        // `replace(start, end, str)` / `delete(start, end)` — the JDK's
+        // `AbstractStringBuilder` bodies: `end` is clamped to the length, then
+        // `0 <= start <= end` is checked (`Preconditions.checkFromToIndex`).
+        ("replace", 3) | ("delete", 2) if strbuf => {
+            let n = items.len() as i64;
+            let start = args[0].to_int();
+            let end = args[1].to_int().min(n);
+            if start < 0 || start > end {
+                return Some(Err(format!(
+                    "scalars: java.lang.StringIndexOutOfBoundsException: \
+                     Range [{start}, {end}) out of bounds for length {n}"
+                )));
+            }
+            let mut out = items.to_vec();
+            let with = if name == "replace" {
+                str_chars(&args[2])
+            } else {
+                Vec::new()
+            };
+            out.splice(start as usize..end as usize, with);
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
         ("insert", 2) if strbuf => {
             let i = args[0].to_int();
             if i < 0 || i as usize > items.len() {

@@ -524,7 +524,7 @@ reported as parse/compile errors, never silently mis-run.
   CONTENTS with no wrapper, so `println(b)` prints the text. `append` takes
   `String.valueOf` of any value (`b.append(7)` appends `'7'`), `+=` takes a
   `Char` and `++=` a `String` or a `Char` sequence; `insert`, `setCharAt`,
-  `deleteCharAt`, `setLength`, `clear` and `result()` mutate or freeze it, and
+  `deleteCharAt`, `replace(start, end, s)`, `delete(start, end)`, `setLength`, `clear` and `result()` mutate or freeze it, and
   the `CharSequence` members `substring`/`indexOf`/`lastIndexOf`/`charAt` work
   alongside every sequence one. A SELECTING op (`take`, `filter`, `reverse`)
   answers another `StringBuilder` through `fromSpecific`; `map`, whose element
@@ -801,7 +801,9 @@ reported as parse/compile errors, never silently mis-run.
   the `math`, `scala.math`, `Math` and `java.lang.Math` spellings. The `Int`
   overloads stay integral (`math.abs(-4)` is `4`, not `4.0`), and the two
   namespaces are kept apart where the JDK lacks an overload
-  (`Math.signum(5)` is `1.0`, `math.signum(5)` is `1`).
+  (`Math.signum(5)` is `1.0`, `math.signum(5)` is `1`). A method named without
+  arguments is eta-expanded into a function value, as Scala does:
+  `xs.map(math.sqrt)`, `xs.reduce(math.max)`, `math.hypot.tupled`.
 
 - **`scala.collection.mutable.PriorityQueue`.** `enqueue`/`+=`/`++=`, `dequeue`,
   `dequeueAll`, `head`/`max`, `clone`, `clear`, and the shared read-only
