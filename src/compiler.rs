@@ -503,9 +503,31 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         ("Right", "value"),
         ("Success", "value"),
         ("Failure", "exception"),
+        // `scala.collection.Searching`'s two results, which `xs.search(e)`
+        // answers.
+        ("Found", "foundIndex"),
+        ("InsertionPoint", "insertionPoint"),
     ] {
         if !classes.iter().any(|c| c.name == name) {
-            classes.push(builtin_case1(name, field));
+            let mut cd = builtin_case1(name, field);
+            // `SearchResult.insertionPoint` is abstract; a `Found` answers its
+            // own index.
+            if name == "Found" {
+                cd.methods.push(Func {
+                    name: "insertionPoint".to_string(),
+                    params: Vec::new(),
+                    sig: Vec::new(),
+                    type_params: Vec::new(),
+                    ret_ty: None,
+                    captured: 0,
+                    body: vec![Stmt {
+                        line: 0,
+                        kind: StmtKind::Expr(Expr::Var(field.to_string())),
+                    }],
+                    is_abstract: false,
+                });
+            }
+            classes.push(cd);
         }
     }
     // Built-in `None` case object, unless redefined.

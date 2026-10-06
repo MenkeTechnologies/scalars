@@ -8275,6 +8275,49 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(new_pair(same(yes), same(no)))
         }
+        // `search(elem)` under the implicit `Ordering`, answering
+        // `Searching.Found(i)` or `InsertionPoint(i)`. A `LinearSeq` scans
+        // (`SeqOps.linearSearch`: stop at the first element equal to, or
+        // greater than, `elem`); an indexed one bisects
+        // (`IndexedSeqOps.binarySearch`). On unsorted input the two disagree,
+        // which is why the kind decides.
+        ("search", 1) => {
+            let result = |found: bool, i: usize| {
+                let (class, field) = if found {
+                    ("Found", "foundIndex")
+                } else {
+                    ("InsertionPoint", "insertionPoint")
+                };
+                heap_alloc(ScalaObj {
+                    class: Arc::from(class),
+                    is_case: true,
+                    is_object: false,
+                    fields: vec![(Arc::from(field), Value::int(i as i64))],
+                })
+            };
+            let elem = &args[0];
+            if matches!(kind, SeqKind::List | SeqKind::ListBuffer | SeqKind::ImmQueue) {
+                for (i, cur) in items.iter().enumerate() {
+                    if eq_vm(vm, elem, cur)? {
+                        return Ok(result(true, i));
+                    }
+                    if cmp_vm(vm, elem, cur)? == Ordering::Less {
+                        return Ok(result(false, i));
+                    }
+                }
+                return Ok(result(false, items.len()));
+            }
+            let (mut from, mut to) = (0, items.len());
+            while from < to {
+                let idx = from + (to - from - 1) / 2;
+                match cmp_vm(vm, elem, &items[idx])? {
+                    Ordering::Less => to = idx,
+                    Ordering::Greater => from = idx + 1,
+                    Ordering::Equal => return Ok(result(true, idx)),
+                }
+            }
+            Ok(result(false, from))
+        }
         // `immutable.Queue`'s own members. `enqueue` is one element (its
         // `Iterable` overload is deprecated in favour of `enqueueAll`), and the
         // removals answer the front together with the queue that is left.

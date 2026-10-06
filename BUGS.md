@@ -711,6 +711,12 @@ reported as parse/compile errors, never silently mis-run.
   `take`/`drop`/`splitAt`/`reverse`/`++`/`toList`/`toArray` (each positional
   one answering a tuple of the arity left), and `TupleN(…)` as both a factory
   and a pattern (`val Tuple2(a, b) = …`).
+- **`search` and `scala.collection.Searching`.** `xs.search(e)` answers
+  `Found(i)` or `InsertionPoint(i)` (both also answer `insertionPoint`, and
+  both work as patterns). A `List`/`ListBuffer`/immutable `Queue` scans as
+  `SeqOps.linearSearch` does and every indexed kind bisects as
+  `IndexedSeqOps.binarySearch` does, so an unsorted receiver gives the
+  reference's answer for its kind.
 - **`partitionMap`, in-place sorting, wildcard type arguments.**
   `partitionMap(f)` on a sequence, `Set` or `Map` splits `f`'s `Left`/`Right`
   payloads. `sortInPlace()`/`sortInPlaceBy(f)`/`sortInPlaceWith(lt)` sort an
