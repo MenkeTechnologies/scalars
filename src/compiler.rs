@@ -4921,6 +4921,25 @@ impl Compiler {
         // like `math` is a namespace rather than a receiver. The module name
         // travels with the member so the host can keep `scala.Int`'s members
         // apart from `java.lang.Integer`'s.
+        // `scala.util.Sorting.quickSort(a)` / `stableSort(a)` — sort an array in
+        // place under its implicit `Ordering` and answer `Unit`. Both orders
+        // agree on the result, so both are the stable `sortInPlace`.
+        if matches!(recv, Expr::Var(m) if m == "Sorting")
+            && !self.objects.contains_key("Sorting")
+            && !self.vals.contains_key("Sorting")
+            && matches!(name, "quickSort" | "stableSort")
+            && args.len() == 1
+        {
+            let sort = Expr::Method {
+                recv: Box::new(args[0].clone()),
+                name: "sortInPlace".to_string(),
+                args: Vec::new(),
+                line,
+            };
+            self.expr(&sort)?;
+            self.b.emit(Op::Pop, line);
+            return self.expr(&Expr::Tuple(Vec::new()));
+        }
         if let Some(module) = boxed_module(recv) {
             for a in args {
                 self.expr(a)?;
@@ -5880,6 +5899,15 @@ impl Compiler {
         // to shadow it.
         if name == "identity" && args.len() == 1 {
             return self.expr(&args[0]);
+        }
+        // `Tuple2(a, b)` … `Tuple22(…)` — the case-class `apply` of `scala.TupleN`,
+        // which builds the same value as the literal `(a, b)`.
+        if name
+            .strip_prefix("Tuple")
+            .and_then(|n| n.parse::<usize>().ok())
+            .is_some_and(|n| (2..=22).contains(&n) && n == args.len())
+        {
+            return self.expr(&Expr::Tuple(args.to_vec()));
         }
         if !self.has_ffi {
             return Err(format!("scalars: not found: {name} (line {line})"));
@@ -7664,6 +7692,7 @@ const ELEMENT_TRAVERSALS: &[&str] = &[
     "minBy",
     "groupBy",
     "partition",
+    "partitionMap",
     "span",
     "indexWhere",
     "lastIndexWhere",

@@ -697,6 +697,18 @@ reported as parse/compile errors, never silently mis-run.
   `productIterator` and `productElementNames`, all over the
   primary-constructor prefix (a body `val` is a field but not a product
   element). `Tuple2.swap` and `iterator`/`reverseIterator` on a sequence.
+  Scala 3's generic tuple operations `size`/`head`/`last`/`tail`/`init`/
+  `take`/`drop`/`splitAt`/`reverse`/`++`/`toList`/`toArray` (each positional
+  one answering a tuple of the arity left), and `TupleN(…)` as both a factory
+  and a pattern (`val Tuple2(a, b) = …`).
+- **`partitionMap`, in-place sorting, wildcard type arguments.**
+  `partitionMap(f)` on a sequence, `Set` or `Map` splits `f`'s `Left`/`Right`
+  payloads. `sortInPlace()`/`sortInPlaceBy(f)`/`sortInPlaceWith(lt)` sort an
+  `Array`, `ArrayBuffer` or `ArrayDeque` in place and answer it, and
+  `scala.util.Sorting.quickSort(a)`/`stableSort(a)` sort an array in place and
+  answer `()`. Scala 3's `?` wildcard type argument (`List[?]`, `case _: (?, ?)`)
+  is read wherever a type is. A `Map` also answers `zip`/`zipAll` as the
+  `List` of its pairs.
 - **Non-local `return`, and `finally` on the way out.** A `return` inside a
   lambda — including the `foreach`/`map` closures a `for` comprehension
   desugars to — leaves the *method* that lexically contains it, not just the

@@ -452,8 +452,9 @@ Implemented and checked against the reference `scala`:
   (`exists`/`forall`/`find`/`indexOf`/`indexWhere`/`contains`), ordering
   (`sorted` — with or without an explicit `Ordering` — `sortBy`/`sortWith`/
   `reverse`/`distinct`), slicing
-  (`take`/`drop`/`slice`/`splitAt`/`span`/`partition`/`takeWhile`/`dropWhile`/
-  `init`/`tail`/`headOption`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
+  (`take`/`drop`/`slice`/`splitAt`/`span`/`partition`/`partitionMap`/
+  `takeWhile`/`dropWhile`/`init`/`tail`/`headOption`), in-place sorting
+  (`sortInPlace`/`sortInPlaceBy`/`sortInPlaceWith`, `scala.util.Sorting.quickSort`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
   `grouped`/`sliding`), arrangement (`permutations`/`combinations`/`updated`),
   lockstep comparison (`corresponds`), the sequential `aggregate(z)(seqop,
   combop)`, prefix tests (`startsWith`/`endsWith`), slice search

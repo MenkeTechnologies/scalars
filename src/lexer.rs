@@ -628,6 +628,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     // `@` — a pattern binder, or an annotation, which the
                     // parser skips where a member or statement starts.
                     '@' => (Tok::At, 1),
+                    // `?` — Scala 3's wildcard type argument (`List[?]`), an
+                    // identifier wherever a type is read.
+                    '?' => (Tok::Ident("?".to_string()), 1),
                     '+' => (Tok::Plus, 1),
                     '-' => (Tok::Minus, 1),
                     '*' => (Tok::Star, 1),

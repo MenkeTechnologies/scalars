@@ -4316,6 +4316,14 @@ impl Parser {
                         }
                     }
                     self.eat(&Tok::RParen)?;
+                    // `Tuple2(a, b)` is `scala.Tuple2.unapply` — the same match
+                    // as the tuple pattern `(a, b)`.
+                    let tuple_arity = name
+                        .strip_prefix("Tuple")
+                        .and_then(|n| n.parse::<usize>().ok());
+                    if tuple_arity.is_some_and(|n| n >= 2 && n == elems.len()) {
+                        return Ok(Pattern::Tuple(elems));
+                    }
                     return Ok(Pattern::Constructor { name, elems });
                 }
                 if self.is(&Tok::Colon) {

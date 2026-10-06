@@ -3477,6 +3477,14 @@ fn as_seq_or_tuple(v: &Value) -> Option<Vec<Value>> {
     }
 }
 
+/// The elements of a tuple value, `None` for anything else.
+fn as_tuple_items(v: &Value) -> Option<Vec<Value>> {
+    HEAP.with(|h| match h.borrow().get(as_obj_id(v)?) {
+        Some(HeapVal::Tuple(t)) => Some(t.clone()),
+        _ => None,
+    })
+}
+
 /// Insert/update `(k, v)` in an ordered entry list: update in place if `k` is
 /// already present (keeping its position), else append.
 fn map_put(entries: &mut Vec<(Value, Value)>, k: Value, v: Value) {
@@ -7206,6 +7214,25 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     if let Some(r) = seq_read_fast(recv, name, args) {
         return r;
     }
+    // `mutable.IndexedSeqOps.sortInPlace`/`sortInPlaceBy`/`sortInPlaceWith` on an
+    // `Array` (through its `ArraySeq` wrapper), `ArrayBuffer` or `ArrayDeque`:
+    // the stable sort `sorted`/`sortBy`/`sortWith` perform, written back into
+    // the receiver, which is also the result.
+    let in_place = match (name, args.len()) {
+        ("sortInPlace", 0) => Some("sorted"),
+        ("sortInPlaceBy", 1) => Some("sortBy"),
+        ("sortInPlaceWith", 1) => Some("sortWith"),
+        _ => None,
+    };
+    if let Some(base) = in_place {
+        let kind = seq_kind_items(recv).map(|(k, _)| k);
+        if let Some(kind @ (SeqKind::Array | SeqKind::ArrayBuffer | SeqKind::ArrayDeque)) = kind {
+            let sorted = seq_method(vm, recv, base, args)?;
+            let items = as_seq_or_tuple(&sorted).unwrap_or_default();
+            set_seq_items(recv, kind, items);
+            return Ok(recv.clone());
+        }
+    }
     // `items` is OWNED: `seq_kind_items` already copied the receiver's elements
     // out of the heap. An arm that builds its result from all of them therefore
     // MOVES it (`let mut out = items;`) and never clones it a second time — a
@@ -8198,6 +8225,23 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(new_pair(same(yes), same(no)))
         }
+        // `partitionMap(f)` — `f` answers an `Either`; the `Left` payloads and
+        // the `Right` payloads are each built by `iterableFactory`, since the
+        // element types change.
+        ("partitionMap", 1) => {
+            let mut lefts = Vec::new();
+            let mut rights = Vec::new();
+            for it in &items {
+                let r = invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
+                match as_either(&r) {
+                    Some(Ok(v)) => rights.push(v),
+                    Some(Err(v)) => lefts.push(v),
+                    // Scala rejects such an `f` at compile time.
+                    None => return Err("scalars: type mismatch: partitionMap needs an Either".into()),
+                }
+            }
+            Ok(new_pair(mapped(lefts), mapped(rights)))
+        }
         // Set algebra. `+`/`-` also reach here through the numeric hook.
         ("union" | "++" | "concat" | "|", 1) => {
             let mut out = items;
@@ -8637,7 +8681,8 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         (
             "exists" | "forall" | "count" | "find" | "collectFirst" | "foldLeft" | "foldRight"
             | "fold" | "reduce" | "maxBy" | "minBy" | "toList" | "toSeq" | "toVector" | "toArray"
-            | "toSet" | "sortBy" | "unzip" | "zipWithIndex" | "iterator",
+            | "toSet" | "sortBy" | "unzip" | "zipWithIndex" | "iterator" | "zip" | "zipAll"
+            | "partitionMap",
             _,
         ) => {
             let seq = new_list(pairs());
@@ -8763,6 +8808,32 @@ fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
     }
     if name == "apply" && args.len() == 1 {
         return list_index(&items, args[0].to_int());
+    }
+    // Scala 3's generic `Tuple` operations (`scala.Tuple` / `NonEmptyTuple`):
+    // the positional ones answer another tuple, of whatever arity is left.
+    let tuple = |xs: &[Value]| heap_push(HeapVal::Tuple(xs.to_vec()));
+    let n = items.len();
+    let k = || args[0].to_int().clamp(0, n as i64) as usize;
+    match (name, args.len()) {
+        ("toList", 0) => return Ok(new_list(items)),
+        ("toArray", 0) => return Ok(new_seq(SeqKind::Array, items)),
+        ("size", 0) => return Ok(Value::int(n as i64)),
+        ("head", 0) if n > 0 => return Ok(items[0].clone()),
+        ("last", 0) if n > 0 => return Ok(items[n - 1].clone()),
+        ("tail", 0) if n > 0 => return Ok(tuple(&items[1..])),
+        ("init", 0) if n > 0 => return Ok(tuple(&items[..n - 1])),
+        ("take", 1) => return Ok(tuple(&items[..k()])),
+        ("drop", 1) => return Ok(tuple(&items[k()..])),
+        ("splitAt", 1) => return Ok(new_pair(tuple(&items[..k()]), tuple(&items[k()..]))),
+        ("reverse", 0) => {
+            return Ok(tuple(&items.iter().rev().cloned().collect::<Vec<_>>()));
+        }
+        ("++", 1) => {
+            if let Some(more) = as_tuple_items(&args[0]) {
+                return Ok(tuple(&[items, more].concat()));
+            }
+        }
+        _ => {}
     }
     Err(no_such_method(recv, name))
 }
