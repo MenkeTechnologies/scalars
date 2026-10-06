@@ -1290,13 +1290,16 @@ reported as parse/compile errors, never silently mis-run.
   the private name `getClass` also refuses.
 - **Widening to a declared `Double` covers the sites that carry a declared
   type, not a type the checker would infer.** `val`/`var`, parameters,
-  constructor fields, a `def`'s result and field assignments convert an `Int`
+  constructor fields, a `def`'s result, field assignments and `copy` arguments
+  convert an `Int`
   (or `Long`/`Char`) to `Double` as Scala does. Two expected types are not
   seen: a function type's result (`val f: Int => Double = x => x; f(2)` is `2`
   here, `2.0` in Scala), and a `return` from inside a LAMBDA in a `def` declared
   `Double` (the lambda is compiled apart from the `def`, so the value is returned
   unconverted: `def g(xs: List[Int]): Double = { xs.foreach(x => if (x > 1)
-  return x); 0 }` answers `5` for `List(1, 5)` where Scala answers `5.0`).
+  return x); 0 }` answers `5` for `List(1, 5)` where Scala answers `5.0`). A
+  `copy` on a receiver whose class is not known statically converts only when
+  every `case class` declaring that parameter name agrees on its type.
 - **`Map.view`, `mapValues` and `filterKeys` answer a strict `Map`, not a
   `MapView`.** Every member a program follows them with (`toMap`, `get`,
   `foreach`) answers what the forced view would, but PRINTING one directly

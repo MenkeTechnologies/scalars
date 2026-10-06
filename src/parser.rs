@@ -4681,6 +4681,14 @@ fn replace_placeholders(e: &mut Expr, n: &mut usize) {
         }
         Expr::Println { arg: Some(a), .. } => replace_placeholders(a, n),
         Expr::Format { value, .. } => replace_placeholders(value, n),
+        // `_.copy(sal = 0)` — the receiver of a `copy` is an operand like any
+        // method receiver.
+        Expr::Copy { recv, updates, .. } => {
+            replace_placeholders(recv, n);
+            for (_, v) in updates {
+                replace_placeholders(v, n);
+            }
+        }
         Expr::If { cond, then, els } => {
             replace_placeholders(cond, n);
             replace_placeholders(then, n);

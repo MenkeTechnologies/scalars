@@ -10719,7 +10719,9 @@ fn option_method(
             Some(v) => Ok(call!(&args[0], &v)),
             None => Ok(make_none()),
         },
-        ("filter" | "filterNot" | "withFilter", 1) => match inner {
+        // `find` comes through `option2Iterable`; on at most one element it
+        // answers exactly what `filter` does.
+        ("filter" | "filterNot" | "withFilter" | "find", 1) => match inner {
             Some(v) => {
                 let keep = truthy(&call!(&args[0], &v)) == (name != "filterNot");
                 Ok(if keep { make_some(v) } else { make_none() })
@@ -11276,6 +11278,14 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("length" | "size", 0) => Ok(Value::int(s.chars().count() as i64)),
         ("hashCode", 0) => Ok(Value::int(i64::from(string_hash(s)))),
         ("isEmpty", 0) => Ok(Value::bool(s.is_empty())),
+        // `String.isBlank` (JDK 11): empty or only `Character.isWhitespace`.
+        ("isBlank", 0) => Ok(Value::bool(s.chars().all(java_is_whitespace))),
+        // `String.getBytes()` in the platform charset, which the reference
+        // runs pinned to UTF-8: an `Array[Byte]` of signed bytes.
+        ("getBytes", 0) => Ok(new_seq(
+            SeqKind::Array,
+            s.bytes().map(|b| Value::int(i64::from(b as i8))).collect(),
+        )),
         ("nonEmpty", 0) => Ok(Value::bool(!s.is_empty())),
         ("toUpperCase", 0) => Ok(Value::str(s.to_uppercase())),
         ("toLowerCase", 0) => Ok(Value::str(s.to_lowercase())),

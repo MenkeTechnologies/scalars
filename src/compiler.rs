@@ -4417,6 +4417,37 @@ impl Compiler {
         self.b.emit(Op::Pop, 0);
     }
 
+    /// The declared-type conversion of a `copy` argument: the named (or, for a
+    /// statically known class, positional) constructor parameter's.
+    ///
+    /// When the receiver's class is not known statically (`es.map(_.copy(sal =
+    /// 0))`), the name alone decides it only when it is unambiguous: every
+    /// `case class` declaring a parameter of that name agrees on its conversion.
+    /// Otherwise the value goes as is — the one case left unconverted.
+    fn copy_param_conv(&self, class: Option<&str>, named: Option<&str>, pos: usize) -> Option<Conv> {
+        if let Some(meta) = class.and_then(|c| self.classes.get(c)) {
+            let field = match named {
+                Some(n) => n.to_string(),
+                None => meta.field_names.get(pos)?.clone(),
+            };
+            return meta.field_convs.get(&field).cloned();
+        }
+        let field = named?;
+        let mut found: Option<Option<Conv>> = None;
+        for meta in self.classes.values().filter(|m| m.is_case) {
+            if !meta.field_names.iter().any(|f| f == field) {
+                continue;
+            }
+            let c = meta.field_convs.get(field).cloned();
+            match &found {
+                None => found = Some(c),
+                Some(prev) if *prev == c => {}
+                Some(_) => return None,
+            }
+        }
+        found.flatten()
+    }
+
     /// Lower `recv.copy(updates)` — clone `recv`'s record with the named
     /// (`field = e`) or positional updates applied, via the [`OBJ_COPY`] builtin.
     fn copy_expr(
@@ -4435,8 +4466,15 @@ impl Compiler {
             .join(",");
         let sc = self.b.add_constant(Value::str(spec));
         self.b.emit(Op::LoadConst(sc), line);
-        for (_, val) in updates {
+        let known = self.class_of(recv);
+        for (i, (named, val)) in updates.iter().enumerate() {
             self.expr(val)?;
+            // A `copy` argument converts to its parameter's declared type, as
+            // the constructor's does: `e.copy(sal = 0)` on `sal: Double` holds
+            // `0.0`.
+            if let Some(c) = self.copy_param_conv(known.as_deref(), named.as_deref(), i) {
+                self.emit_conv(&c, line);
+            }
         }
         self.b.emit(
             Op::CallBuiltin(crate::host::OBJ_COPY, updates.len() as u8 + 2),

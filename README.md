@@ -79,7 +79,7 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   (at its code point) becomes a
   `Double` wherever the declared type says so: a parameter (`def sq(n: Double)`
   called `sq(3)` is `9.0`), a `val`/`var`, a `def`'s result, an assignment to a
-  class's `var` field, a typed lambda
+  class's `var` field, a `copy` argument, a typed lambda
   parameter, and an ascription. A structured declared type widens at every layer it
   reaches: `Map[String, Double]` values, `Option[Double]`, `Either[Double, _]`,
   a tuple's `Double` slot and nested collections (`List[List[Double]]`).
