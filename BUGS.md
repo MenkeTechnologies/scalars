@@ -148,7 +148,9 @@ reported as parse/compile errors, never silently mis-run.
   `String.split`; `"…".r` and `new Regex(…)` building a `Regex` that answers
   `findFirstIn`, `findAllIn`, `findFirstMatchIn`, `findAllMatchIn`,
   `replaceAllIn`, `replaceFirstIn`, `matches`, `split` and `regex`; and
-  `Regex.Match` with `group`/`subgroups`/`matched` — `group` by number or by the
+  `Regex.Match` with `group`/`subgroups`/`matched`/`source` and the offsets
+  `start`/`end`/`before`/`after` (of the whole match or of group `i`, -1 or
+  `null` for a group that did not take part) — `group` by number or by the
   NAME of a `(?<name>…)` group (`null` when it did not take part, Java's
   `IllegalArgumentException: No group with name <x>` when the pattern declares
   none). A `Regex` also works in
@@ -775,8 +777,10 @@ reported as parse/compile errors, never silently mis-run.
   runtime is dynamically typed, exactly as the other fusevm frontends are.
 - **`Range` as a first-class value.** `1 to 5`, `1 until 5`, `1 to 10 by 3` are
   values, with Scala's `Range.toString` including the `empty `/`inexact `
-  prefixes. `map`/`filter` over one yield a `Vector`, `reverse` yields a
-  `Range`, and `sum`/`length`/`head`/`last`/`toList`/`mkString`/`contains`/
+  prefixes. `map`/`filter` over one yield a `Vector`; `reverse` and the
+  positional slices `take`/`drop`/`takeRight`/`dropRight`/`tail`/`init`/
+  `slice`/`splitAt` yield a `Range` with the bounds `Range.scala` computes
+  (`(1 to 5).take(2)` is `Range 1 to 2`, an empty slice `empty Range 3 until 3`), and `sum`/`length`/`head`/`last`/`toList`/`mkString`/`contains`/
   `min`/`max` all work. Used as a `for` generator it still compiles to the
   counted loop (no materialization).
 - **`scala.math`.** `abs`, `signum`, `min`, `max`, `round`, `floor`, `ceil`,

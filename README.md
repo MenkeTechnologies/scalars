@@ -566,7 +566,8 @@ Implemented and checked against the reference `scala`:
   replacement) and the regex-based `String.split`; `"…".r` building a
   `scala.util.matching.Regex` with `findFirstIn`/`findAllIn`/`findFirstMatchIn`/
   `findAllMatchIn`/`replaceAllIn`/`replaceFirstIn`/`matches`/`split`/`regex`;
-  and `Regex.Match` with `group`/`subgroups`/`matched`. The match scan follows
+  and `Regex.Match` with `group`/`subgroups`/`matched`/`source`/`start`/`end`/
+  `before`/`after`. The match scan follows
   `java.util.regex.Matcher.find`'s rule rather than the Rust iterator's, which is
   what makes `"xx9".split("x*")` answer `["", "", "9"]` and `"abc".split("")`
   answer `["a", "b", "c"]`.

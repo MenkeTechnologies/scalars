@@ -1319,6 +1319,11 @@ enum HeapVal {
         /// The source of the pattern that produced the match, which is where a
         /// named group's number is read from (`group("y")`).
         pattern: Arc<str>,
+        /// The searched input and the byte spans of the whole match and of each
+        /// group, which `start`/`end`/`before`/`after` report as char indices.
+        source: Arc<str>,
+        span: (usize, usize),
+        group_spans: Vec<Option<(usize, usize)>>,
     },
     /// A boxed `var` — one mutable slot shared by the frame that declared it and
     /// every closure that captured it (see [`CELL_NEW`]). Never user-visible: the
@@ -7328,6 +7333,13 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             SeqEqAnswer::Value(v) => v,
         });
     }
+    // A `Range` sliced by position is another `Range` (`(1 to 5).take(2)` is
+    // `Range 1 to 2`), not the `Vector` a generic `IndexedSeq` slice builds.
+    if let SeqKind::Range { .. } = kind {
+        if let Some(out) = range_slice_method(kind, &items, name, args) {
+            return out;
+        }
+    }
     // The pure slice/reorder methods first — they share one body.
     if let Some(out) = seq_slice_method(&items, name, args) {
         return Ok(same(out));
@@ -9363,6 +9375,91 @@ fn keys_of(vm: &mut VM, f: &Value, items: &[Value]) -> Result<Vec<Value>, String
 /// The sequence methods that need no closure and produce a plain slice of the
 /// receiver: `take`/`drop`/`slice`/`init`/… Returns `None` for an unknown name so
 /// the caller can go on to the closure-taking methods.
+/// The positional slices `scala.collection.immutable.Range` overrides to answer
+/// another `Range` — `take`, `drop`, `takeRight`, `dropRight`, `tail`, `init`,
+/// `slice` and `splitAt` — ported from `Range.scala`, so the result prints with
+/// the bounds and the `to`/`until` form the reference's arithmetic produces: a
+/// prefix is `Inclusive` up to its last element, a suffix keeps the receiver's
+/// end and form, and an empty result is `Exclusive(v, v, step)` at the boundary
+/// value. `None` for any other member; an empty receiver's `tail`/`init` fault
+/// is left to the generic arm, whose wording is already per-kind.
+fn range_slice_method(
+    kind: SeqKind,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let SeqKind::Range {
+        start,
+        end,
+        inclusive,
+        step,
+    } = kind
+    else {
+        return None;
+    };
+    let len = items.len() as i64;
+    let make = |start: i64, end: i64, inclusive: bool| {
+        range_items(start, end, inclusive, step).map(|items| {
+            new_seq(
+                SeqKind::Range {
+                    start,
+                    end,
+                    inclusive,
+                    step,
+                },
+                items,
+            )
+        })
+    };
+    // `locationAfterN(n)` — the value `n` steps past `start`.
+    let at = |n: i64| start + step * n;
+    let take = |n: i64| {
+        if n <= 0 || len == 0 {
+            make(start, start, false)
+        } else if n >= len {
+            make(start, end, inclusive)
+        } else {
+            make(start, at(n - 1), true)
+        }
+    };
+    let drop = |n: i64| {
+        if n <= 0 || len == 0 {
+            make(start, end, inclusive)
+        } else if n >= len {
+            make(end, end, false)
+        } else {
+            make(at(n), end, inclusive)
+        }
+    };
+    let arg = |i: usize| args[i].to_int();
+    Some(match (name, args.len()) {
+        ("take", 1) => take(arg(0)),
+        ("drop", 1) => drop(arg(0)),
+        ("takeRight", 1) if arg(0) <= 0 => make(start, start, false),
+        ("takeRight", 1) => drop(len - arg(0)),
+        ("dropRight", 1) if arg(0) <= 0 => make(start, end, inclusive),
+        ("dropRight", 1) => take(len - arg(0)),
+        ("tail", 0) if len == 1 => make(end, end, false),
+        ("tail", 0) if len > 1 => make(start + step, end, inclusive),
+        ("init", 0) if len > 0 => take(len - 1),
+        ("slice", 2) => {
+            let (from, until) = (arg(0), arg(1));
+            if from <= 0 {
+                take(until)
+            } else if until >= len {
+                drop(from)
+            } else if from >= until {
+                make(at(from), at(from), false)
+            } else {
+                make(at(from), at(until - 1), true)
+            }
+        }
+        ("splitAt", 1) => take(arg(0)).and_then(|a| Ok(new_pair(a, drop(arg(0))?))),
+        _ => return None,
+    })
+}
+
 fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<Value>> {
     let len = items.len();
     Some(match (name, args.len()) {
@@ -11962,10 +12059,17 @@ fn make_match(re: &fancy_regex::Regex, s: &str, start: usize) -> Value {
         .map(|i| caps.get(i).map(|g| Arc::from(g.as_str())))
         .collect();
     let pattern = Arc::from(re.as_str());
+    let span = caps.get(0).map_or((start, start), |m| (m.start(), m.end()));
+    let group_spans = (1..caps.len())
+        .map(|i| caps.get(i).map(|g| (g.start(), g.end())))
+        .collect();
     heap_push(HeapVal::Match {
         matched,
         groups,
         pattern,
+        source: Arc::from(s),
+        span,
+        group_spans,
     })
 }
 
@@ -11980,14 +12084,52 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
             matched,
             groups,
             pattern,
-        }) => Some(Err((matched.clone(), groups.clone(), pattern.clone()))),
+            source,
+            span,
+            group_spans,
+        }) => Some(Err((
+            matched.clone(),
+            groups.clone(),
+            pattern.clone(),
+            (source.clone(), *span, group_spans.clone()),
+        ))),
         _ => None,
     })?;
     let pat = match held {
         Ok(p) => p,
         // A `Match`: its groups are 1-based, and group 0 is the whole match.
-        Err((matched, groups, pattern)) => {
+        Err((matched, groups, pattern, (source, span, group_spans))) => {
+            // `start`/`end`/`before`/`after` of the whole match or of group `i`
+            // (`MatchData`). A group that did not participate answers -1 for
+            // its offsets and `null` for its context, as `Matcher` does; an
+            // out-of-range group is the same array fault `group(i)` raises.
+            if matches!((name, args.len()), ("start" | "end" | "before" | "after", 0 | 1)) {
+                let i = args.first().map_or(0, Value::to_int);
+                let sp = if i == 0 {
+                    Some(span)
+                } else {
+                    match usize::try_from(i).ok().and_then(|i| group_spans.get(i - 1)) {
+                        Some(sp) => *sp,
+                        None => {
+                            return Some(Err(format!(
+                                "scalars: java.lang.ArrayIndexOutOfBoundsException: \
+                                 Index {i} out of bounds for length {}",
+                                group_spans.len() + 1
+                            )));
+                        }
+                    }
+                };
+                return Some(Ok(match (name, sp) {
+                    ("start", Some((a, _))) => Value::int(char_index(&source, Some(a))),
+                    ("end", Some((_, b))) => Value::int(char_index(&source, Some(b))),
+                    ("start" | "end", None) => Value::int(-1),
+                    ("before", Some((a, _))) => Value::str(&source[..a]),
+                    ("after", Some((_, b))) => Value::str(&source[b..]),
+                    _ => Value::Undef,
+                }));
+            }
             return Some(match (name, args.len()) {
+                ("source", 0) => Ok(Value::str(source.to_string())),
                 ("matched" | "toString", 0) => Ok(Value::str(matched.to_string())),
                 ("groupCount", 0) => Ok(Value::int(groups.len() as i64)),
                 ("group", 1) => {
