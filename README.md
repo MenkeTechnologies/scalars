@@ -460,6 +460,7 @@ Implemented and checked against the reference `scala`:
   combop)`, prefix tests (`startsWith`/`endsWith`), slice search
   (`indexOfSlice`/`containsSlice`/`lastIndexOfSlice`), `groupBy`/`groupMap`/
   `groupMapReduce`, `transpose`, `patch`, `distinctBy`, `scan`, `indices`,
+  `search` (`Found`/`InsertionPoint`),
   `lift`/`isDefinedAt`, the `Option`-valued `minOption`/`maxOption`/
   `minByOption`/`maxByOption`, `sizeCompare`/`lengthCompare`, `tapEach`,
   `mkString`, the `to*` conversions, the set
