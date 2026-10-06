@@ -913,13 +913,12 @@ reported as parse/compile errors, never silently mis-run.
   MUTABLE `Map`/`Set` do not have this shape: their inserts are amortized
   `O(1)` (see the entry above), and so are the growable sequences.
 
-- **`Future`/`ExecutionContext`, and a string-interpolator PATTERN.** `Future {
+- **`Future`/`ExecutionContext`.** `Future {
   … }` with `Await.result` is not modeled — there is no scheduler here, and a
   synchronous stand-in would answer correctly for the programs that only await
   and wrongly for every program that observes concurrency, which is the whole
-  reason to reach for one. `case s"x${n}y" =>` — matching by taking a string
-  interpolation apart — is a parse error; the ordinary `Regex` extractor
-  (`case r(a, b) =>`) works and is the spelling to use.
+  reason to reach for one. An `s"…"` PATTERN binds names or `_` only
+  (`case s"$k=$v"`); a nested pattern inside `${…}` is a parse error.
 
   Not gaps: `unapply` and `unapplySeq` on a user `object` both bind, including
   the length check that keeps `case P(x, y)` from matching three elements;

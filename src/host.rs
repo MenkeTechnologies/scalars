@@ -2363,6 +2363,71 @@ fn char_of_code(code: i64) -> char {
     char::from_u32(code as u32 & 0xFFFF).unwrap_or('\u{FFFD}')
 }
 
+/// `scala.StringContext.glob` (2.13 library, which Scala 3 runs on): match
+/// `input` against the literal `parts` with a zero-or-more wildcard between
+/// each two, answering the text each wildcard covered. A port of its loop,
+/// including the single-point backtracking (only the most recent wildcard is
+/// retried one character further on) and the min/max bookkeeping of each
+/// wildcard's span.
+fn string_context_glob(parts: &[Vec<char>], input: &[char]) -> Option<Vec<Vec<char>>> {
+    // The pattern as one sequence: `Some(c)` a literal character, `None` a
+    // wildcard.
+    let mut pattern: Vec<Option<char>> = parts[0].iter().copied().map(Some).collect();
+    for p in &parts[1..] {
+        pattern.push(None);
+        pattern.extend(p.iter().copied().map(Some));
+    }
+    let num_wildcards = parts.len() - 1;
+    let pattern_len = pattern.len();
+    // Which wildcard each pattern position is, if any.
+    let mut match_indices = vec![None; pattern_len + 1];
+    let mut total = 0;
+    for (i, chunk) in parts[..num_wildcards].iter().enumerate() {
+        total += chunk.len();
+        match_indices[total] = Some(i);
+        total += 1;
+    }
+    let mut starts: Vec<Option<usize>> = vec![None; num_wildcards];
+    let mut ends: Vec<Option<usize>> = vec![None; num_wildcards];
+    let (mut pi, mut ii, mut next_pi, mut next_ii) = (0usize, 0usize, 0usize, 0usize);
+    while pi < pattern_len || ii < input.len() {
+        if let Some(n) = match_indices[pi] {
+            starts[n] = Some(starts[n].map_or(ii, |s| s.min(ii)));
+            ends[n] = Some(ends[n].map_or(ii, |e| e.max(ii)));
+        }
+        let advanced = match pattern.get(pi) {
+            Some(None) => {
+                next_pi = pi;
+                next_ii = ii + 1;
+                pi += 1;
+                true
+            }
+            Some(Some(c)) if input.get(ii) == Some(c) => {
+                pi += 1;
+                ii += 1;
+                true
+            }
+            _ => false,
+        };
+        if !advanced {
+            if 0 < next_ii && next_ii <= input.len() {
+                pi = next_pi;
+                ii = next_ii;
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(
+        (0..num_wildcards)
+            .map(|n| {
+                let (s, e) = (starts[n].unwrap_or(0), ends[n].unwrap_or(0));
+                input[s.min(e)..e].to_vec()
+            })
+            .collect(),
+    )
+}
+
 /// [`UNAPPLY_SEQ`] — apply a value-position extractor to the scrutinee.
 ///
 /// Only `Regex` is one today: `Regex.unapplySeq` succeeds when the pattern
@@ -2379,6 +2444,17 @@ fn b_unapply_seq(vm: &mut VM, _argc: u8) -> Value {
     let want = vm.pop().to_int();
     let scrutinee = vm.pop();
     let extractor = vm.pop();
+    // An `s"…"` pattern: the extractor is its literal parts.
+    if let Value::Array(parts) = &extractor {
+        let parts: Vec<Vec<char>> = parts.iter().map(|p| scala_str(p).chars().collect()).collect();
+        let input: Vec<char> = scala_str(&scrutinee).chars().collect();
+        return match string_context_glob(&parts, &input) {
+            Some(caps) => heap_push(HeapVal::Tuple(
+                caps.into_iter().map(|c| Value::str(c.into_iter().collect::<String>())).collect(),
+            )),
+            None => Value::Undef,
+        };
+    }
     let Some(pat) = (match &extractor {
         Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
             Some(HeapVal::Regex(p)) => Some(p.clone()),
@@ -8556,6 +8632,33 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             seq_method(vm, &seq, name, args)
         }
         ("toMap", 0) => Ok(recv.clone()),
+        // The positional slices, over the map's iteration order, each rebuilt
+        // as a map of the survivors (`IterableOps.drop`/`take`/… via
+        // `fromSpecific`). `tail`/`init` of an empty map throw, as
+        // `IterableOps` does, with no message.
+        ("tail" | "init", 0) if entries.is_empty() => {
+            Err("scalars: java.lang.UnsupportedOperationException".into())
+        }
+        ("tail" | "init", 0)
+        | ("drop" | "take" | "dropRight" | "takeRight" | "splitAt", 1)
+        | ("slice", 2) => {
+            let n = entries.len() as i64;
+            let k = || args.first().map_or(1, Value::to_int).clamp(0, n) as usize;
+            let len = entries.len();
+            let part = |from: usize, until: usize| new_map(rep, entries[from..until.max(from)].to_vec());
+            Ok(match name {
+                "tail" | "drop" => part(k(), len),
+                "init" | "dropRight" => part(0, len - k()),
+                "take" => part(0, k()),
+                "takeRight" => part(len - k(), len),
+                "slice" => {
+                    let lo = args[0].to_int().clamp(0, n) as usize;
+                    let hi = args[1].to_int().clamp(0, n) as usize;
+                    part(lo, hi)
+                }
+                _ => new_pair(part(0, k()), part(k(), len)),
+            })
+        }
         ("foreach", 1) => {
             for p in &pairs() {
                 invoke_closure(vm, &args[0], std::slice::from_ref(p))?;
@@ -11393,6 +11496,8 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 ))
             }
         }
+        // `String.intern` — the canonical instance; the value is the same string.
+        ("intern", 0) => Ok(Value::str(s.to_string())),
         ("charAt", 1) => {
             let i = args[0].to_int();
             let chars: Vec<char> = s.chars().collect();
@@ -11405,6 +11510,12 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             } else {
                 Ok(make_char(chars[i as usize]))
             }
+        }
+        // `String.codePointAt(i)` — the code point at `i`, as an `Int`; the
+        // same bounds check and message as `charAt`.
+        ("codePointAt", 1) => {
+            let c = string_method(s, "charAt", args)?;
+            Ok(Value::int(char_code(&c).unwrap_or(0)))
         }
         ("contains", 1) => Ok(Value::bool(s.contains(&*args[0].as_str_cow()))),
         ("startsWith", 1) => Ok(Value::bool(s.starts_with(&*args[0].as_str_cow()))),

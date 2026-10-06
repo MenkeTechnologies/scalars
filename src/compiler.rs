@@ -2569,7 +2569,15 @@ impl Compiler {
             fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
             return self.match_pattern(inner, vplace, fail_jumps);
         }
-        self.var_ref(name)?;
+        match name.strip_prefix(crate::parser::SGLOB_PATTERN) {
+            // An `s"…"` pattern: the extractor is the list of literal parts.
+            Some(parts) => {
+                let parts: Vec<Value> = parts.split('\u{1}').map(|p| Value::str(p.to_string())).collect();
+                let c = self.b.add_constant(Value::Array(parts.into()));
+                self.b.emit(Op::LoadConst(c), 0);
+            }
+            None => self.var_ref(name)?,
+        }
         self.emit_load(vplace);
         self.b.emit(Op::LoadInt(elems.len() as i64), 0);
         // The source name, so a non-extractor reports the identifier written.

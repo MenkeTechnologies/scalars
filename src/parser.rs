@@ -30,6 +30,13 @@ pub fn aux_ctor_name(class: &str, arity: usize) -> String {
 /// reaches `Compiler::collection`, which rejects it by name.
 pub const SPREAD: &str = "$spread";
 
+/// The name prefix of an `s"…"` interpolated PATTERN (`case s"a$x" =>`): the
+/// literal parts follow it, joined by U+0001, so the pattern travels as an
+/// ordinary value-position extractor and `Compiler` lowers it to the glob
+/// `StringContext.s.unapplySeq` performs. The name is reserved: an extractor
+/// a program itself names `$sglob$…` is not supported.
+pub const SGLOB_PATTERN: &str = "$sglob$";
+
 /// Parse Scala `src` into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
     let mut p = Parser::new(crate::lexer::lex(src)?);
@@ -2049,7 +2056,11 @@ impl Parser {
         if self.starts_pattern_decl() {
             let pat = self.pattern()?;
             self.eat(&Tok::Assign)?;
-            let init = self.expression()?;
+            let line = self.line();
+            let e = self.expression()?;
+            // `val Some(x) = opt: @unchecked` — the ascription Scala 3 asks for
+            // on a refutable pattern definition.
+            let init = self.ascription_tail(e, line)?;
             return Ok(StmtKind::Destructure { pat, init });
         }
         let name = self.ident()?;
@@ -2109,7 +2120,7 @@ impl Parser {
             Tok::Ident(n) => {
                 let binder = matches!(self.peek_at(1), Tok::Assign | Tok::Colon | Tok::Comma);
                 (n.chars().next().is_some_and(char::is_uppercase) && !binder)
-                    || matches!(self.peek_at(1), Tok::ColonColon)
+                    || matches!(self.peek_at(1), Tok::ColonColon | Tok::At)
             }
             _ => false,
         }
@@ -2616,7 +2627,10 @@ impl Parser {
         // generator source is recognized by *shape*: a literal range over a plain
         // binder keeps the counted-loop lowering, anything else is a collection
         // generator desugared to `.map`/`.flatMap`.
+        let src_line = self.line();
         let src = self.expression()?;
+        // `x <- (expr): T` — an ascribed generator source.
+        let src = self.ascription_tail(src, src_line)?;
         match (&pat, as_range(&src)) {
             (Pattern::Bind(name), Some((start, end, inclusive, step))) if !filtering => {
                 Ok(ForEnum::Gen {
@@ -3707,6 +3721,12 @@ impl Parser {
             return Ok(e);
         }
         self.advance();
+        // An annotation ascription — `e: @unchecked`, `e: @nowarn("…")` —
+        // silences a checker and changes nothing at runtime.
+        if self.is(&Tok::At) {
+            self.skip_annotations();
+            return Ok(e);
+        }
         let ty = self.type_ref()?;
         Ok(match ty.as_str() {
             "Double" | "Float" => Expr::Method {
@@ -4348,6 +4368,39 @@ impl Parser {
                 } else {
                     Ok(Pattern::Tuple(elems))
                 }
+            }
+            // `case s"key=$v" =>` — the `s` interpolator's extractor,
+            // `StringContext.s.unapplySeq`, a glob over the literal parts. Each
+            // spliced name binds the text its wildcard matched. Carried as a
+            // value-position extractor whose name holds the parts (see
+            // [`SGLOB_PATTERN`]); `$_` binds nothing.
+            Tok::InterpStr {
+                raw: false,
+                is_f: false,
+                parts,
+                exprs,
+                ..
+            } => {
+                let line = self.line();
+                self.advance();
+                let mut elems = Vec::with_capacity(exprs.len());
+                for e in &exprs {
+                    let e = e.trim();
+                    let is_ident = e.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                        && e.chars().all(|c| c.is_alphanumeric() || c == '_');
+                    elems.push(match e {
+                        "_" => Pattern::Wildcard,
+                        _ if is_ident => Pattern::Bind(e.to_string()),
+                        _ => {
+                            return Err(format!(
+                                "scalars: unsupported pattern `${{{e}}}` in an interpolated pattern on line {line}"
+                            ))
+                        }
+                    });
+                }
+                let mut name = SGLOB_PATTERN.to_string();
+                name.push_str(&parts.join("\u{1}"));
+                Ok(Pattern::Constructor { name, elems })
             }
             other => Err(format!(
                 "scalars: unsupported pattern {other} on line {}",
