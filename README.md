@@ -507,6 +507,8 @@ Implemented and checked against the reference `scala`:
   as `apply`, which is what `collect`/`collectFirst` need to skip a
   non-matching element; `applyOrElse`, `lift`, `orElse`, `andThen` and
   `compose` compose function values.
+- **`scala.collection.immutable.Queue`** — `enqueue`/`enqueueAll`/`dequeue`/
+  `dequeueOption`/`front`, persistent (each answers a new queue).
 - **`scala.collection.mutable`** — `ListBuffer`, `ArrayBuffer`, `Queue`,
   `PriorityQueue` (a binary max-heap whose `toString` and iteration expose the
   raw heap array, ported from the library's own `fixUp`/`fixDown`/`heapify`),

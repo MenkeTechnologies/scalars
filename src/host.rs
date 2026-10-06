@@ -456,6 +456,9 @@ pub const BYNAME: u16 = 789;
 /// bound statically. The stack holds `this`, the args, the trait name and the
 /// method name (top); `argc` counts all of them.
 pub const SUPER_DYN: u16 = 790;
+/// Builtin id for a `scala.collection.immutable.Queue(...)` literal: pops `argc`
+/// elements, front first.
+pub const MAKE_IMMQUEUE: u16 = 791;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -725,6 +728,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_QUEUE, b_make_queue);
     vm.register_builtin(MAKE_STACK, b_make_stack);
     vm.register_builtin(MAKE_ARRAYDEQUE, b_make_arraydeque);
+    vm.register_builtin(MAKE_IMMQUEUE, b_make_immqueue);
     vm.register_builtin(MAKE_STRINGBUILDER, b_make_stringbuilder);
     vm.register_builtin(MAKE_LINKEDSET, b_make_linkedset);
     vm.register_builtin(MAKE_LINKEDMAP, b_make_linkedmap);
@@ -1424,6 +1428,10 @@ enum SeqKind {
     /// `scala.collection.mutable.ArrayBuffer` (also `Buffer`/`Seq` under the
     /// mutable namespace) — a growable indexed sequence.
     ArrayBuffer,
+    /// `scala.collection.immutable.Queue` — a persistent FIFO. `enqueue` answers
+    /// a new queue with the element at the back and `dequeue` the pair of the
+    /// front element and the rest; the stored order is front-to-back.
+    ImmQueue,
     /// `scala.collection.mutable.Queue` — a growable FIFO. `enqueue` appends and
     /// `dequeue` takes from the head, so the stored order is front-to-back.
     Queue,
@@ -1497,6 +1505,7 @@ impl SeqKind {
             SeqKind::ListBuffer => "ListBuffer",
             SeqKind::ArrayBuffer => "ArrayBuffer",
             SeqKind::Queue => "Queue",
+            SeqKind::ImmQueue => "Queue",
             SeqKind::Stack => "Stack",
             SeqKind::ArrayDeque => "ArrayDeque",
             SeqKind::PriorityQueue => "PriorityQueue",
@@ -1532,7 +1541,12 @@ impl SeqKind {
             // it exposes neither `apply` nor `head`/`last`/`tail`/`init`, so
             // Scala rejects those at compile time and neither message is
             // reachable from a valid program.
-            SeqKind::List | SeqKind::Iterable | SeqKind::Iterator | SeqKind::ListBuffer => {
+            // An immutable `Queue` overrides `apply` to throw the bare index too.
+            SeqKind::List
+            | SeqKind::Iterable
+            | SeqKind::Iterator
+            | SeqKind::ListBuffer
+            | SeqKind::ImmQueue => {
                 format!("scalars: java.lang.IndexOutOfBoundsException: {i}")
             }
             // Every indexed sequence formats the legal span.
@@ -1570,13 +1584,20 @@ impl SeqKind {
         let exc = match (self, op) {
             // `Range` raises `NoSuchElementException` even for `tail`/`init`,
             // where every other kind raises `UnsupportedOperationException`.
-            (SeqKind::Range { .. }, _) | (_, EmptyOp::Head | EmptyOp::Last) => {
-                "java.util.NoSuchElementException"
-            }
+            // So does an immutable `Queue` for `tail` (`Queue.tail` is its own).
+            (SeqKind::Range { .. }, _)
+            | (_, EmptyOp::Head | EmptyOp::Last)
+            | (SeqKind::ImmQueue, EmptyOp::Tail) => "java.util.NoSuchElementException",
             _ => "java.lang.UnsupportedOperationException",
         };
         let text: Option<String> = match self {
             SeqKind::Range { .. } => Some(format!("{} on empty Range", op.word())),
+            // `Queue.head`/`last`/`tail` are overridden with their own wording;
+            // `init` is the generic one, which has none.
+            SeqKind::ImmQueue => match op {
+                EmptyOp::Init => None,
+                _ => Some(format!("{} on empty queue", op.word())),
+            },
             SeqKind::List | SeqKind::Iterable | SeqKind::Iterator => {
                 Some(format!("{} of empty list", op.word()))
             }
@@ -2886,6 +2907,7 @@ fn b_from_seq(vm: &mut VM, _argc: u8) -> Value {
         "ListBuffer" => new_seq(SeqKind::ListBuffer, items),
         "ArrayBuffer" => new_seq(SeqKind::ArrayBuffer, items),
         "Queue" => new_seq(SeqKind::Queue, items),
+        "immutable.Queue" => new_seq(SeqKind::ImmQueue, items),
         "Stack" => new_seq(SeqKind::Stack, items),
         "ArrayDeque" => new_seq(SeqKind::ArrayDeque, items),
         "PriorityQueue" => new_priority_queue(items),
@@ -2916,6 +2938,11 @@ fn b_from_seq(vm: &mut VM, _argc: u8) -> Value {
 /// elements into the matching `scala.collection.mutable` buffer.
 fn b_make_queue(vm: &mut VM, argc: u8) -> Value {
     new_seq(SeqKind::Queue, pop_n(vm, argc))
+}
+
+/// `MAKE_IMMQUEUE` builtin — pop `argc` elements into an immutable `Queue`.
+fn b_make_immqueue(vm: &mut VM, argc: u8) -> Value {
+    new_seq(SeqKind::ImmQueue, pop_n(vm, argc))
 }
 
 fn b_make_stack(vm: &mut VM, argc: u8) -> Value {
@@ -8248,6 +8275,37 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(new_pair(same(yes), same(no)))
         }
+        // `immutable.Queue`'s own members. `enqueue` is one element (its
+        // `Iterable` overload is deprecated in favour of `enqueueAll`), and the
+        // removals answer the front together with the queue that is left.
+        ("enqueue", 1) if kind == SeqKind::ImmQueue => {
+            let mut out = items;
+            out.push(args[0].clone());
+            Ok(same(out))
+        }
+        ("enqueueAll", 1) if kind == SeqKind::ImmQueue => {
+            let mut out = items;
+            out.extend(as_iterable_once(&args[0]).unwrap_or_default());
+            Ok(same(out))
+        }
+        ("dequeue" | "dequeueOption", 0) if kind == SeqKind::ImmQueue => {
+            let taken = (!items.is_empty()).then(|| {
+                let mut rest = items;
+                let front = rest.remove(0);
+                new_pair(front, same(rest))
+            });
+            match (name, taken) {
+                ("dequeue", Some(p)) => Ok(p),
+                ("dequeue", None) => Err(
+                    "scalars: java.util.NoSuchElementException: dequeue on empty queue".into(),
+                ),
+                (_, p) => Ok(opt(p)),
+            }
+        }
+        ("front", 0) if kind == SeqKind::ImmQueue => items
+            .first()
+            .cloned()
+            .ok_or_else(|| kind.empty_fault(EmptyOp::Head)),
         // `partitionMap(f)` — `f` answers an `Either`; the `Left` payloads and
         // the `Right` payloads are each built by `iterableFactory`, since the
         // element types change.

@@ -514,6 +514,16 @@ reported as parse/compile errors, never silently mis-run.
   `Stack(1, 2, 3, 8)` where `push(8)` is `Stack(8, 1, 2, 3)`. A removal from an
   empty one raises `java.util.NoSuchElementException: empty collection`; an empty
   `top`/`front` raises `head of empty Stack`/`head of empty Queue`.
+- **`scala.collection.immutable.Queue`, the persistent FIFO.** Reached as
+  `immutable.Queue(…)`/`scala.collection.immutable.Queue(…)` or, after
+  `import scala.collection.immutable.Queue` (or a wildcard over that package), as
+  a bare `Queue(…)`/`Queue.empty` — unqualified and unimported, `Queue` is the
+  mutable one. `enqueue(x)`/`enqueueAll(xs)` answer a NEW queue, `dequeue` the
+  pair of the front and the rest (`dequeue on empty queue` when there is none),
+  `dequeueOption` that pair as an `Option`, and `front`/`head`/`last`/`tail`
+  raise the class's own `… on empty queue` faults. Every other sequence
+  operation keeps the kind and prints `Queue(…)`. Before this the qualified
+  spelling silently built the MUTABLE queue, so `q.enqueue(3)` changed `q`.
 - **`LinkedHashSet`/`LinkedHashMap` keep INSERTION order.** They are their own
   representation, never an alias for the table-ordered ones: the stored order is
   the linked list Scala threads through the table, so an add appends, a re-added

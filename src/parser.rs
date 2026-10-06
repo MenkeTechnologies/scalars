@@ -37,6 +37,10 @@ pub const SPREAD: &str = "$spread";
 /// a program itself names `$sglob$…` is not supported.
 pub const SGLOB_PATTERN: &str = "$sglob$";
 
+/// The collection-constructor name of `scala.collection.immutable.Queue`, which
+/// a bare `Queue` (the mutable one) cannot spell.
+pub const IMMUTABLE_QUEUE: &str = "immutable.Queue";
+
 /// Parse Scala `src` into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
     let mut p = Parser::new(crate::lexer::lex(src)?);
@@ -1674,6 +1678,23 @@ impl Parser {
         }
     }
 
+    /// Whether an `import` brings `scala.collection.immutable.Queue` into scope
+    /// as `Queue` — by its own selector or by a wildcard over the package.
+    fn immutable_queue_imported(&self) -> bool {
+        let immutable = |p: &[String]| {
+            matches!(
+                p.iter().map(String::as_str).collect::<Vec<_>>().as_slice(),
+                ["immutable"] | ["collection", "immutable"] | ["scala", "collection", "immutable"]
+            )
+        };
+        match self.imports.get("Queue") {
+            Some(path) => path
+                .split_last()
+                .is_some_and(|(member, prefix)| member == "Queue" && immutable(prefix)),
+            None => self.wildcards.iter().any(|w| immutable(w)),
+        }
+    }
+
     /// The collection constructor a bare `name` selects when an `import` bound
     /// it to a `scala.collection.mutable` factory, else `None`.
     ///
@@ -3169,6 +3190,13 @@ impl Parser {
             // `try`/`catch` expansion and `List` its collection literal, neither
             // of which the receiver-dispatch path can produce.
             if is_plain_member(&e, &name) {
+                // `immutable.Queue` is the one member of these packages whose
+                // bare spelling means something else (the mutable `Queue`).
+                let name = if name == "Queue" && path_segments(&e).is_some_and(|s| s.last() == Some(&"immutable")) {
+                    IMMUTABLE_QUEUE.to_string()
+                } else {
+                    name
+                };
                 e = if self.is(&Tok::LParen) {
                     self.bare_application(name, line)?
                 } else if name == "Try" && self.is(&Tok::LBrace) {
@@ -3221,6 +3249,10 @@ impl Parser {
         if let Some(ctor) = self.imported_mutable_ctor(&name) {
             let elems = self.arg_list()?;
             return Ok(eta_bare_args(Expr::Collection { ctor, elems }));
+        }
+        if name == IMMUTABLE_QUEUE {
+            let elems = self.arg_list()?;
+            return Ok(eta_bare_args(Expr::Collection { ctor: name, elems }));
         }
         // `ListBuffer`/`ArrayBuffer`/`Buffer` are the mutable names
         // that can only mean the mutable collection, so they work
@@ -3634,6 +3666,13 @@ impl Parser {
                 }
                 let line = self.line();
                 self.advance();
+                // `import scala.collection.immutable.Queue` makes a bare `Queue`
+                // the persistent one (unqualified, it is the mutable one).
+                let name = if name == "Queue" && self.immutable_queue_imported() {
+                    IMMUTABLE_QUEUE.to_string()
+                } else {
+                    name
+                };
                 // `summon[T]` — the one place a type application is not erased,
                 // because the type IS the argument: it names which given to
                 // fetch from the implicit scope.

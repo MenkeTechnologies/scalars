@@ -1855,6 +1855,7 @@ impl Compiler {
             "mutable.Set" => crate::host::MAKE_MUTSET,
             "mutable.Map" => crate::host::MAKE_MUTMAP,
             "Queue" => crate::host::MAKE_QUEUE,
+            "immutable.Queue" => crate::host::MAKE_IMMQUEUE,
             "PriorityQueue" => crate::host::MAKE_PRIORITYQUEUE,
             "Stack" => crate::host::MAKE_STACK,
             "ArrayDeque" => crate::host::MAKE_ARRAYDEQUE,
@@ -7344,7 +7345,9 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
     // `X.empty` is that collection's empty literal. It is answered before the
     // element-wise members so `Map.empty` works too, where `Map.fill` would need
     // pairs and is left alone.
-    if name == "empty" && (factory_conversion(owner).is_some() || owner == "Map") {
+    if name == "empty"
+        && (factory_conversion(owner).is_some() || owner == "Map" || owner == "immutable.Queue")
+    {
         let empty = Expr::Collection {
             ctor: owner.to_string(),
             elems: Vec::new(),
