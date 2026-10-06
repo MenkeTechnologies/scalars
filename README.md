@@ -78,7 +78,8 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
 - **Numeric widening to a declared `Double`** — an `Int`/`Long` or a `Char`
   (at its code point) becomes a
   `Double` wherever the declared type says so: a parameter (`def sq(n: Double)`
-  called `sq(3)` is `9.0`), a `val`/`var`, a `def`'s result, a typed lambda
+  called `sq(3)` is `9.0`), a `val`/`var`, a `def`'s result, an assignment to a
+  class's `var` field, a typed lambda
   parameter, and an ascription. A structured declared type widens at every layer it
   reaches: `Map[String, Double]` values, `Option[Double]`, `Either[Double, _]`,
   a tuple's `Double` slot and nested collections (`List[List[Double]]`).
@@ -335,8 +336,11 @@ Implemented and checked against the reference `scala`:
   and `*` string repetition; the `java.util.Formatter` conversions behind the
   `f"…"` interpolator, `"…".format(…)`, `String.format(…)`, `x.formatted(…)` and
   `printf(…)`
-  (`%s %d %f %e %E %x %X %o %b %c`, with the flags, width and precision, rounded
-  HALF_UP off the shortest round-tripping decimal exactly as Java rounds);
+  (`%s %S %d %f %e %E %g %G %x %X %o %b %B %c %C %h %H %n`, with the `- 0 + , ( #`
+  and space flags, width, precision and the `n$`/`<` argument indices, rounded
+  HALF_UP off the shortest round-tripping decimal exactly as Java rounds;
+  `format` also checks each argument's class the way `Formatter` does, so
+  `"%f".format(3)` raises `IllegalFormatConversionException`);
   `Int`-vs-`Double` division dispatch (integer `/ 0`
   throws `ArithmeticException`, floating `/ 0.0` is `Infinity`); `if`/`else` in
   value position (`val r = if (c) a else b`, including block branches). Every
@@ -445,16 +449,22 @@ Implemented and checked against the reference `scala`:
   `init`/`tail`/`headOption`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
   `grouped`/`sliding`), arrangement (`permutations`/`combinations`/`updated`),
   lockstep comparison (`corresponds`), the sequential `aggregate(z)(seqop,
-  combop)`, prefix tests (`startsWith`/`endsWith`), `groupBy`, `mkString`, the `to*`
-  conversions, the set
-  algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`), and
-  `Map`'s `apply`/`get`/`getOrElse`/`keys`/`values`/`updated`, and the
+  combop)`, prefix tests (`startsWith`/`endsWith`), slice search
+  (`indexOfSlice`/`containsSlice`/`lastIndexOfSlice`), `groupBy`/`groupMap`/
+  `groupMapReduce`, `transpose`, `patch`, `distinctBy`, `scan`, `indices`,
+  `lift`/`isDefinedAt`, the `Option`-valued `minOption`/`maxOption`/
+  `minByOption`/`maxByOption`, `sizeCompare`/`lengthCompare`, `tapEach`,
+  `mkString`, the `to*` conversions, the set
+  algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`), `:::`
+  and `++:`, and
+  `Map`'s `apply`/`get`/`getOrElse`/`keys`/`values`/`updated`/`transform`, and the
   companions' `IterableFactory` members — `List.empty` (including the applied
   `List.empty[Int](0)` and `Map.empty[String, Int]("k")`, which are an
   application of the empty collection rather than a factory taking arguments),
   `List.fill(n)(v)` (whose
   fill expression is by-name and re-evaluated per element),
-  `Vector.tabulate(n)(f)`, `List.range(a, b[, step])`, `List.concat(…)`,
+  `Vector.tabulate(n)(f)`, `List.iterate(start, n)(f)`, `List.range(a, b[, step])`,
+  `List.concat(…)`,
   `List.from(xs)` and the `Range` companion (`Range(a, b[, step])`,
   `Range.inclusive(…)`). `toString` is
   byte-faithful, which for `Set`/`Map` means reproducing Scala's representation

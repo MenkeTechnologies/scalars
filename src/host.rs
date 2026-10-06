@@ -939,6 +939,21 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("UnsupportedOperationException", "RuntimeException"),
     ("NoSuchElementException", "RuntimeException"),
     ("MatchError", "RuntimeException"),
+    // The `java.util.Formatter` faults all share `IllegalFormatException`, an
+    // `IllegalArgumentException`; without these links a `catch { case e:
+    // Exception => }` let a bad `format` call abort the program instead.
+    ("IllegalFormatException", "IllegalArgumentException"),
+    ("MissingFormatArgumentException", "IllegalFormatException"),
+    ("UnknownFormatConversionException", "IllegalFormatException"),
+    (
+        "FormatFlagsConversionMismatchException",
+        "IllegalFormatException",
+    ),
+    ("IllegalFormatConversionException", "IllegalFormatException"),
+    ("PatternSyntaxException", "IllegalArgumentException"),
+    ("NegativeArraySizeException", "RuntimeException"),
+    ("VirtualMachineError", "Error"),
+    ("OutOfMemoryError", "VirtualMachineError"),
     ("AssertionError", "Error"),
     // Deliberately hangs off `Throwable`, not `Exception`: Scala's
     // `ControlThrowable` is a direct `Throwable` so control-flow signals are not
@@ -5063,6 +5078,7 @@ fn format_all(fmt: &str, args: &[Value], mut vm: Option<&mut VM>) -> Result<Stri
     let b = fmt.as_bytes();
     let mut out = String::with_capacity(fmt.len());
     let (mut i, mut next) = (0usize, 0usize);
+    let mut last: Option<usize> = None;
     while i < b.len() {
         if b[i] != b'%' {
             let start = i;
@@ -5090,14 +5106,31 @@ fn format_all(fmt: &str, args: &[Value], mut vm: Option<&mut VM>) -> Result<Stri
             '%' => out.push('%'),
             'n' => out.push('\n'),
             _ => {
-                let Some(v) = args.get(next) else {
+                // The argument index, `java.util.Formatter`'s three ways: `%n$`
+                // names argument n (1-based), `%<` reuses the previous
+                // specifier's argument, and anything else takes the next
+                // ORDINARY argument — a counter the explicit forms do not move.
+                let inner = &fmt[start + 1..i - 1];
+                let digits = inner.bytes().take_while(u8::is_ascii_digit).count();
+                let (slot, inner) = if let Some(rest) = inner.strip_prefix('<') {
+                    (last, rest)
+                } else if digits > 0 && inner.as_bytes().get(digits) == Some(&b'$') {
+                    let n: usize = inner[..digits].parse().unwrap_or(0);
+                    (n.checked_sub(1), &inner[digits + 1..])
+                } else {
+                    next += 1;
+                    (Some(next - 1), inner)
+                };
+                let Some(v) = slot.and_then(|k| args.get(k)) else {
                     return Err(format!(
                         "scalars: java.util.MissingFormatArgumentException: Format specifier '{}'",
                         &fmt[start..i]
                     ));
                 };
-                next += 1;
-                out.push_str(&format_one(&fmt[start..i], v, vm.as_deref_mut())?);
+                last = slot;
+                format_arg_check(conv, v)?;
+                let spec = format!("%{inner}{conv}");
+                out.push_str(&format_one(&spec, v, vm.as_deref_mut())?);
             }
         }
     }
@@ -5113,9 +5146,12 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
     let mid = &sb[1..sb.len() - 1];
 
     let (mut left, mut zero, mut plus, mut space, mut group) = (false, false, false, false, false);
+    let (mut paren, mut alt) = (false, false);
     let mut j = 0;
-    while j < mid.len() && matches!(mid[j], b'-' | b'0' | b'+' | b' ' | b'#' | b',') {
+    while j < mid.len() && matches!(mid[j], b'-' | b'0' | b'+' | b' ' | b'#' | b',' | b'(') {
         match mid[j] {
+            b'(' => paren = true,
+            b'#' => alt = true,
             b'-' => left = true,
             b'0' => zero = true,
             b'+' => plus = true,
@@ -5144,10 +5180,48 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
     // Java accepts `,` only on the conversions that HAVE a grouped decimal form
     // — `d`, `f` and the general `g` — and raises on the rest rather than
     // ignoring it, so `%,e` and `%,s` are errors, not silent passes.
-    if group && !matches!(conv, 'd' | 'f' | 'F') {
+    if group && !matches!(conv, 'd' | 'f' | 'F' | 'g' | 'G') {
         return Err(format!(
             "scalars: java.util.FormatFlagsConversionMismatchException: Conversion = {conv}, Flags = ,"
         ));
+    }
+    // A signed numeric body, padded. Under the `(` flag a NEGATIVE value is
+    // wrapped in parentheses instead of signed; a zero pad goes inside them
+    // (`%(08d` of -42 is `(000042)`), a space pad outside.
+    let num = |digits: String, neg: bool| -> String {
+        if !(paren && neg) {
+            return pad_num(digits, neg, left, zero, plus, space, width);
+        }
+        if zero && !left {
+            format!(
+                "({})",
+                pad_num(
+                    digits,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    width.saturating_sub(2)
+                )
+            )
+        } else {
+            pad_str(format!("({digits})"), left, width)
+        }
+    };
+
+    // A `null` argument prints `null` under every conversion.
+    if matches!(
+        conv,
+        'd' | 'o' | 'x' | 'X' | 'e' | 'E' | 'f' | 'g' | 'G' | 'c' | 'C'
+    ) && matches!(v, Value::Undef)
+    {
+        let null = if conv.is_ascii_uppercase() {
+            "NULL"
+        } else {
+            "null"
+        };
+        return Ok(pad_str(null.to_string(), left, width));
     }
 
     match conv {
@@ -5168,12 +5242,14 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             Ok(pad_str(s, left, width))
         }
         'd' => {
-            let n = v.to_int();
+            // Only the `f` interpolator gets a `Char` this far (`format` refuses
+            // it), and it formats the code point.
+            let n = format_int_arg(v);
             let mut digits = (n as i128).unsigned_abs().to_string();
             if group {
                 digits = group_digits(&digits);
             }
-            Ok(pad_num(digits, n < 0, left, zero, plus, space, width))
+            Ok(num(digits, n < 0))
         }
         'f' | 'F' => {
             let x = num_f64(v);
@@ -5193,15 +5269,7 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
                 }
                 digits = g;
             }
-            Ok(pad_num(
-                digits,
-                x.is_sign_negative(),
-                left,
-                zero,
-                plus,
-                space,
-                width,
-            ))
+            Ok(num(digits, x.is_sign_negative()))
         }
         // Radix conversions. Java formats the two's-complement bit pattern with
         // no sign, at the WIDTH OF THE STATIC TYPE: `Int` is 32 bits
@@ -5213,7 +5281,7 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
         // a literal like `-1` has. A `Long` variable holding a small negative
         // number is the residual gap (see `BUGS.md`); it renders 32-bit.
         'x' | 'X' | 'o' => {
-            let n = v.to_int();
+            let n = format_int_arg(v);
             let bits = match i32::try_from(n) {
                 Ok(narrow) => narrow as u32 as u64,
                 Err(_) => n as u64,
@@ -5223,7 +5291,31 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
                 'X' => format!("{bits:X}"),
                 _ => format!("{bits:o}"),
             };
-            Ok(pad_num(body, false, left, zero, false, false, width))
+            // The `#` flag prefixes the radix (`0x`, `0X`, `0`), and a zero
+            // pad goes BETWEEN the prefix and the digits (`%#08x` of 255 is
+            // `0x0000ff`).
+            let prefix = match (alt, conv) {
+                (false, _) => "",
+                (true, 'x') => "0x",
+                (true, 'X') => "0X",
+                (true, _) => "0",
+            };
+            Ok(if zero && !left {
+                format!(
+                    "{prefix}{}",
+                    pad_num(
+                        body,
+                        false,
+                        false,
+                        true,
+                        false,
+                        false,
+                        width.saturating_sub(prefix.len())
+                    )
+                )
+            } else {
+                pad_str(format!("{prefix}{body}"), left, width)
+            })
         }
         'b' | 'B' => {
             let truthy = match v {
@@ -5237,68 +5329,105 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             }
             Ok(pad_str(s, left, width))
         }
-        // Scientific notation. Java always writes a sign and AT LEAST two
-        // exponent digits (`1.000000e+00`), where Rust's `{:e}` writes neither.
-        // The mantissa is rounded off the value's shortest round-tripping
-        // digits (see `round_half_up`) rather than off `a / 10^exp`, because
-        // that division is itself inexact and moves the tie: `1234.5` at
-        // `%.3e` is `1.235e+03`, not `1.234e+03`.
+        // Scientific notation — see [`sci_parts`] and [`sci_body`].
         'e' | 'E' => {
             let x = num_f64(v);
             let p = prec.unwrap_or(6);
             if let Some(t) = nonfinite(x, conv, plus, space) {
                 return Ok(pad_str(t, left, width));
             }
-            let full = format!("{:e}", x.abs());
-            let (mant, exp_s) = full.split_once('e').unwrap_or((full.as_str(), "0"));
-            let mut exp: i32 = exp_s.parse().unwrap_or(0);
-            let mut mantissa = round_half_up_str(mant, p);
-            // A carry out of the leading digit (`9.99` at `%.1e`) is one more
-            // power of ten, renormalized back to a single leading digit.
-            if mantissa.starts_with("10") {
-                exp += 1;
-                mantissa = round_half_up_str("1", p);
-            }
-            let body = format!(
-                "{mantissa}{}{}{:02}",
-                if conv == 'E' { "E" } else { "e" },
-                if exp < 0 { "-" } else { "+" },
-                exp.abs()
-            );
+            let (mantissa, exp) = sci_parts(x.abs(), p);
+            let body = sci_body(&mantissa, exp, conv == 'E');
             // `-0.0` keeps its sign through `%f`/`%e` (Java prints `-0.00`), so
             // the test is the sign BIT, not `x < 0.0`.
-            Ok(pad_num(
-                body,
-                x.is_sign_negative(),
-                left,
-                zero,
-                plus,
-                space,
-                width,
-            ))
+            Ok(num(body, x.is_sign_negative()))
         }
-        'c' => {
-            // A `Char` is a heap value, so its own character is read first; an
-            // integral argument is a code point.
-            let ch = match (v, as_char(v)) {
-                (_, Some(c)) => c,
-                (Value::Str(s), None) => s.chars().next().unwrap_or('\0'),
-                _ => char::from_u32(v.to_int() as u32).unwrap_or('\u{fffd}'),
+        // `%g` — Java's GENERAL conversion. The value is first rounded to
+        // `precision` significant digits (6 by default, and 0 means 1); a
+        // rounded magnitude in `[10^-4, 10^precision)` is then written as `%f`
+        // with just enough fraction digits to show them, anything else as `%e`
+        // with `precision - 1`. Zero is the fixed form. Unlike C, Java keeps
+        // trailing zeros (`%g` of 1234.5 is `1234.50`).
+        'g' | 'G' => {
+            let x = num_f64(v);
+            if let Some(t) = nonfinite(x, conv, plus, space) {
+                return Ok(pad_str(t, left, width));
+            }
+            let p = match prec {
+                None => 6,
+                Some(0) => 1,
+                Some(p) => p,
             };
-            Ok(pad_str(ch.to_string(), left, width))
-        }
-        // `%h` — the argument's `hashCode` in hex, `null` for a null argument.
-        'h' | 'H' => {
-            let text = match v {
-                Value::Undef => "null".to_string(),
-                _ => format!("{:x}", scala_hash(v).unwrap_or(0) as u32),
-            };
-            let text = if conv == 'H' {
-                text.to_uppercase()
+            let (mantissa, exp) = sci_parts(x.abs(), p - 1);
+            let body = if x != 0.0 && (exp < -4 || exp >= p as i32) {
+                sci_body(&mantissa, exp, conv == 'G')
             } else {
-                text
+                let fixed = round_half_up(
+                    x.abs(),
+                    (p as i32 - 1 - if x == 0.0 { 0 } else { exp }).max(0) as usize,
+                );
+                if group {
+                    let (int, frac) = fixed.split_once('.').unwrap_or((fixed.as_str(), ""));
+                    let mut g = group_digits(int);
+                    if !frac.is_empty() {
+                        g.push('.');
+                        g.push_str(frac);
+                    }
+                    g
+                } else {
+                    fixed
+                }
             };
-            Ok(pad_str(text, left, width))
+            Ok(num(body, x.is_sign_negative()))
+        }
+        // `%h` — `Integer.toHexString(arg.hashCode())`, `null` for `null`. That
+        // is the JAVA `hashCode`, not `##`: they differ for a fractional
+        // `Double` (`3.5` is `400c0000` by `Double.hashCode`, `40600000` by
+        // `##`, which folds it to its `Float` hash) and for a `Float`.
+        // Refused for a value whose JVM hash is not reproducible here (an
+        // identity hash), rather than printing a made-up one.
+        'h' | 'H' => {
+            let mut s = match v {
+                Value::Undef => "null".to_string(),
+                Value::Float(d) => {
+                    let bits = double_to_long_bits(*d);
+                    format!("{:x}", (bits ^ (bits >> 32)) as i32 as u32)
+                }
+                Value::Status(_) if f32_of(v).is_some() => {
+                    format!(
+                        "{:x}",
+                        float_to_int_bits(f32_of(v).unwrap_or_default()) as u32
+                    )
+                }
+                _ => match scala_hash(v) {
+                    Some(h) => format!("{:x}", h as u32),
+                    None => {
+                        return Err(
+                            "scalars: `%h` of a value with a JVM identity hash is not modeled"
+                                .to_string(),
+                        )
+                    }
+                },
+            };
+            if conv == 'H' {
+                s = s.to_uppercase();
+            }
+            Ok(pad_str(s, left, width))
+        }
+        'c' | 'C' => {
+            // A `Char` is a heap value here, so it is asked for before the
+            // code-point read — `to_int` on it is not its code point.
+            let ch = match v {
+                Value::Str(s) => s.chars().next().unwrap_or('\0'),
+                _ => as_char(v)
+                    .unwrap_or_else(|| char::from_u32(v.to_int() as u32).unwrap_or('\u{fffd}')),
+            };
+            let s = if conv == 'C' {
+                ch.to_uppercase().collect()
+            } else {
+                ch.to_string()
+            };
+            Ok(pad_str(s, left, width))
         }
         // `java.util.Formatter` rejects an unknown conversion character with a
         // catchable exception naming just that character — the same one the
@@ -5308,6 +5437,103 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             "scalars: java.util.UnknownFormatConversionException: Conversion = '{other}'"
         )),
     }
+}
+
+/// The integer an integral conversion formats: the value, or a `Char`'s code
+/// point (`to_int` reads a `Char` handle as 0).
+fn format_int_arg(v: &Value) -> i64 {
+    as_char(v).map_or_else(|| v.to_int(), |c| i64::from(c as u32))
+}
+
+/// `java.util.Formatter`'s argument check for `"…".format(…)`: the integral
+/// conversions take only `Byte`/`Short`/`Integer`/`Long`, the floating ones only
+/// `Float`/`Double`, `%c` a `Character` or an integral code point. Scala hands
+/// `format` boxed values with no implicit conversion, so `"%f".format(3)` and
+/// `"%d".format(3.0)` throw rather than converting.
+///
+/// NOT applied to the `f` interpolator, which converts at compile time instead
+/// — `f"$i%.2f"` of an `Int` is `3.00` and `f"$c%d"` of a `Char` its code.
+fn format_arg_check(conv: char, v: &Value) -> Result<(), String> {
+    let integral = matches!(v, Value::Int(_));
+    let accepts = match conv {
+        'd' | 'o' | 'x' | 'X' => integral,
+        'e' | 'E' | 'f' | 'g' | 'G' => matches!(v, Value::Float(_)) || f32_of(v).is_some(),
+        'c' | 'C' => integral || as_char(v).is_some(),
+        _ => true,
+    };
+    if accepts || matches!(v, Value::Undef) {
+        return Ok(());
+    }
+    Err(match format_arg_class(v) {
+        Some(class) => {
+            format!("scalars: java.util.IllegalFormatConversionException: {conv} != {class}")
+        }
+        None => format!(
+            "scalars: `%{conv}` of this argument is an IllegalFormatConversionException \
+             naming its runtime class, which is not modeled"
+        ),
+    })
+}
+
+/// The boxed JVM class `java.util.Formatter` sees for a format argument, as
+/// its `IllegalFormatConversionException` names it. `None` where the runtime
+/// class is not reproducible here (a collection, a function).
+///
+/// An integer that fits 32 bits is named `Integer`: the value model does not
+/// keep a `Long`'s static type, the same residual `%x` documents.
+fn format_arg_class(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::Str(_) => "java.lang.String".to_string(),
+        Value::Int(i) if i32::try_from(*i).is_ok() => "java.lang.Integer".to_string(),
+        Value::Int(_) => "java.lang.Long".to_string(),
+        Value::Float(_) => "java.lang.Double".to_string(),
+        Value::Bool(_) => "java.lang.Boolean".to_string(),
+        _ if f32_of(v).is_some() => "java.lang.Float".to_string(),
+        _ if as_char(v).is_some() => "java.lang.Character".to_string(),
+        _ => {
+            if let Some(e) = as_exc(v) {
+                return Some(e.class.to_string());
+            }
+            let (class, is_object) = with_obj(v, |o| (o.class.to_string(), o.is_object))?;
+            if is_object {
+                format!("{class}$")
+            } else {
+                class
+            }
+        }
+    })
+}
+
+/// `a` (non-negative, finite) in scientific form with `p` mantissa fraction
+/// digits: the rounded mantissa and its decimal exponent. The mantissa is
+/// rounded off the value's shortest round-tripping digits (see
+/// [`round_half_up`]) rather than off `a / 10^exp`, because that division is
+/// itself inexact and moves the tie: `1234.5` at `%.3e` is `1.235e+03`, not
+/// `1.234e+03`.
+fn sci_parts(a: f64, p: usize) -> (String, i32) {
+    let full = format!("{a:e}");
+    let (mant, exp_s) = full.split_once('e').unwrap_or((full.as_str(), "0"));
+    let mut exp: i32 = exp_s.parse().unwrap_or(0);
+    let mut mantissa = round_half_up_str(mant, p);
+    // A carry out of the leading digit (`9.99` at `%.1e`) is one more power of
+    // ten, renormalized back to a single leading digit.
+    if mantissa.starts_with("10") {
+        exp += 1;
+        mantissa = round_half_up_str("1", p);
+    }
+    (mantissa, exp)
+}
+
+/// Java's scientific body: the mantissa, then `e`/`E`, a sign that is always
+/// written, and AT LEAST two exponent digits (`1.000000e+00`) — Rust's `{:e}`
+/// writes neither.
+fn sci_body(mantissa: &str, exp: i32, upper: bool) -> String {
+    format!(
+        "{mantissa}{}{}{:02}",
+        if upper { "E" } else { "e" },
+        if exp < 0 { "-" } else { "+" },
+        exp.abs()
+    )
 }
 
 /// Java's rendering of a non-finite double under a float conversion, or `None`
@@ -7251,14 +7477,16 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // accumulator, so the result is one longer than the receiver and always
         // starts (`scanLeft`) or ends (`scanRight`) with the seed — an empty
         // receiver still answers the one-element `List(seed)`.
-        ("scanLeft", 2) => {
+        // Their element type may change, so they build through the receiver's
+        // `iterableFactory`: a `Range` scans into a `Vector`.
+        ("scanLeft" | "scan", 2) => {
             let mut acc = args[0].clone();
             let mut out = vec![acc.clone()];
             for it in &items {
                 acc = invoke_closure(vm, &args[1], &[acc, it.clone()])?;
                 out.push(acc.clone());
             }
-            Ok(new_seq(kind, out))
+            Ok(mapped(out))
         }
         ("scanRight", 2) => {
             let mut acc = args[0].clone();
@@ -7268,7 +7496,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 out.push(acc.clone());
             }
             out.reverse();
-            Ok(new_seq(kind, out))
+            Ok(mapped(out))
         }
         ("reduce" | "reduceLeft", 1) => {
             if items.is_empty() {
@@ -7835,6 +8063,105 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             out.extend(items);
             Ok(same(out))
         }
+        // `xs.transpose` — the rows' columns. Both levels are built by the
+        // OUTER collection's factory (`CC[CC[B]]`), so a `List` of `Vector`s
+        // transposes into a `List` of `List`s. Ragged rows are Scala's
+        // `IllegalArgumentException`.
+        ("transpose", 0) => {
+            let mut rows = Vec::with_capacity(items.len());
+            for it in &items {
+                rows.push(as_iterable_once(it).ok_or_else(|| no_such_method(recv, name))?);
+            }
+            let width = rows.first().map_or(0, Vec::len);
+            if rows.iter().any(|r| r.len() != width) {
+                return Err("scalars: java.lang.IllegalArgumentException: \
+                            transpose requires all collections have the same size"
+                    .to_string());
+            }
+            Ok(same(
+                (0..width)
+                    .map(|c| same(rows.iter().map(|r| r[c].clone()).collect()))
+                    .collect(),
+            ))
+        }
+        // `sizeCompare`/`lengthCompare` — the sign of `size - n` (or of the
+        // difference against another collection's size), as `Integer.compare`.
+        ("sizeCompare" | "lengthCompare", 1) => {
+            let other = match as_iterable_once(&args[0]) {
+                Some(o) if name == "sizeCompare" => o.len() as i64,
+                _ => args[0].to_int(),
+            };
+            Ok(Value::int((items.len() as i64).cmp(&other) as i64))
+        }
+        // `tapEach(f)` runs `f` for its effect and answers the elements
+        // unchanged. Only the STRICT kinds: on an `Iterator` or a view it is
+        // lazy in Scala, and running it here would print at the wrong time.
+        ("tapEach", 1)
+            if !matches!(
+                kind,
+                SeqKind::Iterator | SeqKind::View(_) | SeqKind::ArrayView
+            ) =>
+        {
+            for it in &items {
+                invoke_closure(vm, &args[0], std::slice::from_ref(it))?;
+            }
+            Ok(same(items))
+        }
+        ("indexOfSlice" | "containsSlice" | "lastIndexOfSlice", 1) => {
+            let Some(pat) = as_iterable_once(&args[0]) else {
+                return Err(no_such_method(recv, name));
+            };
+            let hit = |i: &usize| {
+                pat.iter()
+                    .enumerate()
+                    .all(|(j, p)| value_eq(&items[i + j], p))
+            };
+            let starts = 0..(items.len() + 1).saturating_sub(pat.len());
+            let at = if name == "lastIndexOfSlice" {
+                starts.rev().find(hit)
+            } else {
+                starts.into_iter().find(hit)
+            };
+            Ok(if name == "containsSlice" {
+                Value::bool(at.is_some())
+            } else {
+                Value::int(at.map_or(-1, |i| i as i64))
+            })
+        }
+        // `indexOf(elem, from)` searches from `from` (clamped at 0);
+        // `lastIndexOf(elem, end)` searches back from `end` inclusive.
+        ("indexOf", 2) => {
+            let from = clamp(args[1].to_int(), items.len());
+            Ok(Value::int(
+                items[from..]
+                    .iter()
+                    .position(|x| value_eq(x, &args[0]))
+                    .map_or(-1, |i| (i + from) as i64),
+            ))
+        }
+        ("lastIndexOf", 2) => {
+            let end = args[1].to_int();
+            if end < 0 {
+                return Ok(Value::int(-1));
+            }
+            let upto = (end as usize).min(items.len().saturating_sub(1));
+            Ok(Value::int(
+                items
+                    .iter()
+                    .take(upto + 1)
+                    .rposition(|x| value_eq(x, &args[0]))
+                    .map_or(-1, |i| i as i64),
+            ))
+        }
+        // `toBuffer` copies into a fresh `ArrayBuffer`.
+        ("toBuffer", 0) => Ok(new_seq(SeqKind::ArrayBuffer, items)),
+        // A `Seq` is a `PartialFunction[Int, A]` over its indices (see `lift`
+        // above): `isDefinedAt(i)` is the bounds test. A `Set` is a predicate
+        // instead, and does not answer it.
+        ("isDefinedAt", 1) if !matches!(kind, SeqKind::Set(_)) => {
+            let i = args[0].to_int();
+            Ok(Value::bool(i >= 0 && (i as usize) < items.len()))
+        }
         _ => Err(no_such_method(recv, name)),
     }
 }
@@ -8143,14 +8470,16 @@ fn map_read_method(
         ("size", 0) => Ok(Value::int(entries.len() as i64)),
         ("isEmpty", 0) => Ok(Value::bool(entries.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!entries.is_empty())),
-        ("contains", 1) => Ok(Value::bool(map_get(entries, &args[0]).is_some())),
+        // A `Map` is a `PartialFunction[K, V]`: `isDefinedAt` is `contains` and
+        // `lift` is `get`.
+        ("contains" | "isDefinedAt", 1) => Ok(Value::bool(map_get(entries, &args[0]).is_some())),
         ("apply", 1) => map_get(entries, &args[0]).ok_or_else(|| {
             format!(
                 "scalars: java.util.NoSuchElementException: key not found: {}",
                 scala_str(&args[0])
             )
         }),
-        ("get", 1) => Ok(match map_get(entries, &args[0]) {
+        ("get" | "lift", 1) => Ok(match map_get(entries, &args[0]) {
             Some(v) => make_some(v),
             None => make_none(),
         }),
@@ -10662,6 +10991,52 @@ fn combinations_of(items: &[Value], n: i64) -> Vec<Vec<Value>> {
 }
 
 fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
+    // `StringOps.split(separator: Char)` is LITERAL: it escapes the character
+    // (`StringOps.escape`) before handing it to the regex `split`, so
+    // `"a.b".split('.')` is `[a, b]` where `"a.b".split(".")` is empty. It must
+    // be answered before the `Char` → `String` coercion below erases which
+    // overload was called.
+    if let ("split", [sep]) = (name, args) {
+        if let Some(c) = as_char(sep) {
+            let pat = if c.is_ascii_alphanumeric() {
+                c.to_string()
+            } else {
+                format!("\\{c}")
+            };
+            return java_split(s, &pat, 0)
+                .map(|parts| new_seq(SeqKind::Array, parts.into_iter().map(Value::str).collect()));
+        }
+    }
+    // `StringOps.appended`/`prepended` with a `Char` rebuild a `String`
+    // (`"abc" :+ 'd'` is `abcd`); `appendedAll`/`prependedAll` with a `String`
+    // likewise. Only those overloads are modeled — any other element type
+    // widens the result to an `IndexedSeq`, which is left to fail loudly.
+    match (name, args) {
+        (":+" | "appended", [c]) | ("+:" | "prepended", [c]) if as_char(c).is_some() => {
+            let c = as_char(c).unwrap_or_default();
+            return Ok(Value::str(if name.starts_with(':') || name == "appended" {
+                format!("{s}{c}")
+            } else {
+                format!("{c}{s}")
+            }));
+        }
+        ("appendedAll" | "prependedAll", [Value::Str(t)]) => {
+            return Ok(Value::str(if name == "appendedAll" {
+                format!("{s}{t}")
+            } else {
+                format!("{t}{s}")
+            }));
+        }
+        // `lift(i)` — the character at `i` as an `Option`, `None` out of range.
+        ("lift", [i]) => {
+            let i = i.to_int();
+            return Ok(opt(usize::try_from(i)
+                .ok()
+                .and_then(|i| s.chars().nth(i))
+                .map(make_char)));
+        }
+        _ => {}
+    }
     // Every `String` method that accepts a `Char` (`indexOf`, `contains`,
     // `split`, `replace`, …) uses it as text, and Scala overloads them for both,
     // so a `Char` argument becomes its one-character `String` once here rather
@@ -10697,19 +11072,22 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         )),
         // `StringOps.linesIterator` — the lines without their terminators
         // (`\n`, `\r\n` or a lone `\r`); a trailing terminator ends the last
-        // line rather than starting an empty one.
-        ("linesIterator", 0) => {
+        // line rather than starting an empty one. `linesWithSeparators` is the
+        // same walk with each terminator kept on its line.
+        ("linesIterator" | "linesWithSeparators", 0) => {
+            let keep = name == "linesWithSeparators";
             let mut lines = Vec::new();
             let mut rest = s;
             while !rest.is_empty() {
                 let end = rest.find(['\n', '\r']).unwrap_or(rest.len());
-                lines.push(Value::str(&rest[..end]));
                 let sep = if rest[end..].starts_with("\r\n") {
                     2
                 } else {
                     1
                 };
-                rest = &rest[(end + sep).min(rest.len())..];
+                let next = (end + sep).min(rest.len());
+                lines.push(Value::str(&rest[..if keep { next } else { end }]));
+                rest = &rest[next..];
             }
             Ok(new_seq(SeqKind::Iterator, lines))
         }
@@ -10924,6 +11302,38 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 (0..=len).contains(&at)
                     && s[char_offset(s, at)..].starts_with(&*args[0].as_str_cow()),
             ))
+        }
+        // `StringOps.patch(from, other, replaced)`, ported. `from` is clamped
+        // into the string but `replaced` is NOT: the builder is sized
+        // `length + other.length - replaced` up front, so over-replacing is the
+        // JVM's `NegativeArraySizeException`, and a negative `replaced` re-copies
+        // the tail (`"hi".patch(3, "", -1)` is `hii`). An `IterableOnce[Char]`
+        // operand is its characters' `mkString`.
+        ("patch", 3) => {
+            let chars: Vec<char> = s.chars().collect();
+            let other: String = match &args[1] {
+                Value::Str(t) => t.to_string(),
+                v => as_iterable_once(v)
+                    .ok_or_else(|| no_such_method(&Value::str(s), name))?
+                    .iter()
+                    .map(scala_str)
+                    .collect(),
+            };
+            let (len, from, replaced) = (chars.len() as i64, args[0].to_int(), args[2].to_int());
+            let cap = len + other.chars().count() as i64 - replaced;
+            if cap < 0 {
+                return Err(format!(
+                    "scalars: java.lang.NegativeArraySizeException: {cap}"
+                ));
+            }
+            let chunk1 = from.clamp(0, len);
+            let mut out: String = chars[..chunk1 as usize].iter().collect();
+            out.push_str(&other);
+            let remaining = len - chunk1 - replaced;
+            if remaining > 0 {
+                out.extend(&chars[(len - remaining) as usize..]);
+            }
+            Ok(Value::str(out))
         }
         ("endsWith", 1) => Ok(Value::bool(s.ends_with(&*args[0].as_str_cow()))),
         ("substring", 1) => substring(s, args[0].to_int(), s.chars().count() as i64),

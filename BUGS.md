@@ -998,7 +998,10 @@ reported as parse/compile errors, never silently mis-run.
   `apply` of a plain class — is called.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
   namespace, and the many `String`/numeric methods beyond the wired subset
-  above.
+  above. Members a differential sweep reached and found missing (each an
+  honest `not a member` error, never a wrong answer): `Map.foreachEntry`,
+  `empty`/`applyOrElse`/`unzip(f)`/`prefixLength` on a sequence instance, and
+  the infinite `Iterator.iterate`/`continually`/`from` (`LazyList` has them).
 - **`getClass` on a collection, a tuple, a function or an `Array`.** Those
   runtime classes are private implementation details — `List(1).getClass.getName`
   is `scala.collection.immutable.$colon$colon`, a one-element `Vector` is
@@ -1269,6 +1272,28 @@ reported as parse/compile errors, never silently mis-run.
   narrowest width that holds the value, which is right for every `Int` and for
   any `Long` outside `Int` range. A `Long` variable holding a small negative
   number is the residual gap: it renders 32-bit where Scala renders 64.
+  The same missing static type names the class in `format`'s argument check:
+  `"%.2f".format(2L)` raises `IllegalFormatConversionException: f !=
+  java.lang.Integer` where Scala names `java.lang.Long` (the exception and its
+  catchability are right; only the class in the message differs). A collection
+  or function argument to a numeric conversion is refused outright rather than
+  named, since its runtime class (`scala.collection.immutable.$colon$colon`) is
+  the private name `getClass` also refuses.
+- **Widening to a declared `Double` covers the sites that carry a declared
+  type, not a type the checker would infer.** `val`/`var`, parameters,
+  constructor fields, a `def`'s result and field assignments convert an `Int`
+  (or `Long`/`Char`) to `Double` as Scala does. Two expected types are not
+  seen: a function type's result (`val f: Int => Double = x => x; f(2)` is `2`
+  here, `2.0` in Scala), and a `return` from inside a LAMBDA in a `def` declared
+  `Double` (the lambda is compiled apart from the `def`, so the value is returned
+  unconverted: `def g(xs: List[Int]): Double = { xs.foreach(x => if (x > 1)
+  return x); 0 }` answers `5` for `List(1, 5)` where Scala answers `5.0`).
+- **`Map.view`, `mapValues` and `filterKeys` answer a strict `Map`, not a
+  `MapView`.** Every member a program follows them with (`toMap`, `get`,
+  `foreach`) answers what the forced view would, but PRINTING one directly
+  diverges: `Map(1 -> 2).mapValues(_ + 1)` prints `Map(1 -> 3)` where Scala 3.9
+  prints `MapView(<not computed>)`. A `MapView` needs a lazy map representation
+  the heap model does not have.
 - **`break`/`breakable` are recognized without their import.** Scala requires
   `import scala.util.control.Breaks._` (or the qualified spelling) before either
   name resolves; this frontend recognizes them in the parser, so a program that

@@ -982,425 +982,551 @@ println(List(1, 2, 3).scanLeft(0)((a, b) =&gt; a + b))   // =&gt; List(0, 1, 3, 
 println(List(1, 2, 3).scanRight(0)((a, b) =&gt; a + b))   // =&gt; List(6, 5, 3, 0)</code></pre>
         </article>
         <article class="doc-entry" id="doc-sequence-methods-51">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-51">#</a> <code>reduce</code></h3>
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-51">#</a> <code>scan</code></h3>
+          <p>`scanLeft` under its `IterableOnceOps` name: every intermediate accumulator, seed first. Like the other scans it builds through the receiver's `iterableFactory`, so a `Range` scans into a `Vector`.</p>
+          <pre><code class="lang-scala">xs.scan(z: B)(op: (B, B) =&gt; B): Repr[B]
+println(List(5, 3, 8).scan(0)(_ max _))   // =&gt; List(0, 5, 5, 8)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-52">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-52">#</a> <code>transpose</code></h3>
+          <p>The columns of a sequence of equal-length rows. Both levels are built by the OUTER collection's factory, so a `List` of `Vector`s transposes into a `List` of `List`s; ragged rows raise `IllegalArgumentException`.</p>
+          <pre><code class="lang-scala">xss.transpose: Repr[Repr[A]]
+println(List(List(1, 2, 3), List(4, 5, 6)).transpose)   // =&gt; List(List(1, 4), List(2, 5), List(3, 6))</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-53">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-53">#</a> <code>patch</code></h3>
+          <p>Splice `other` in at `from` (clamped into the receiver), overwriting up to `replaced` elements.</p>
+          <pre><code class="lang-scala">xs.patch(from: Int, other: IterableOnce[A], replaced: Int): Repr[A]
+println(List(5, 3, 8, 1).patch(1, List(7, 7), 2))   // =&gt; List(5, 7, 7, 1)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-54">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-54">#</a> <code>distinctBy</code></h3>
+          <p>The first element of each distinct key, in order.</p>
+          <pre><code class="lang-scala">xs.distinctBy(f: A =&gt; K): Repr[A]
+println(List(5, 3, 8, 1, 9, 2).distinctBy(_ % 3))   // =&gt; List(5, 3, 1)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-55">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-55">#</a> <code>groupMap</code></h3>
+          <p>`groupBy` with each element mapped on the way in. Collected through a `mutable.HashMap` and then built into an ordinary immutable `Map` — so up to four keys come out in that table's order as a `Map1`..`Map4`, where `groupBy` is a `HashMap` at every size.</p>
+          <pre><code class="lang-scala">xs.groupMap(key: A =&gt; K)(f: A =&gt; B): Map[K, Repr[B]]
+println(List(5, 3, 8, 1, 9, 2).groupMap(_ % 3)(_ * 10))   // =&gt; Map(0 -&gt; List(30, 90), 1 -&gt; List(10), 2 -&gt; List(50, 80, 20))</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-56">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-56">#</a> <code>groupMapReduce</code></h3>
+          <p>`groupMap` with each group reduced to one value by `op`, built into a `Map` the same way.</p>
+          <pre><code class="lang-scala">xs.groupMapReduce(key: A =&gt; K)(f: A =&gt; B)(op: (B, B) =&gt; B): Map[K, B]
+println(List(5, 3, 8, 1, 9, 2).groupMapReduce(_ % 2)(identity)(_ + _))   // =&gt; Map(0 -&gt; 10, 1 -&gt; 18)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-57">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-57">#</a> <code>indices</code></h3>
+          <p>The valid indices, as the `Range 0 until length`.</p>
+          <pre><code class="lang-scala">xs.indices: Range
+println(List(5, 3, 8).indices)   // =&gt; Range 0 until 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-58">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-58">#</a> <code>sameElements</code></h3>
+          <p>Whether the other collection yields the same elements in the same order, whatever its kind.</p>
+          <pre><code class="lang-scala">xs.sameElements(that: IterableOnce[A]): Boolean
+println(List(1, 2).sameElements(Vector(1, 2)))   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-59">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-59">#</a> <code>minOption</code></h3>
+          <p>`min` as an `Option`: `None` for an empty receiver instead of `UnsupportedOperationException`.</p>
+          <pre><code class="lang-scala">xs.minOption: Option[A]
+println(List(5, 3, 8).minOption)   // =&gt; Some(3)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-60">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-60">#</a> <code>maxOption</code></h3>
+          <p>`max` as an `Option`: `None` for an empty receiver.</p>
+          <pre><code class="lang-scala">xs.maxOption: Option[A]
+println(List.empty[Int].maxOption)   // =&gt; None</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-61">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-61">#</a> <code>minByOption</code></h3>
+          <p>`minBy` as an `Option`: `None` for an empty receiver.</p>
+          <pre><code class="lang-scala">xs.minByOption(f: A =&gt; B): Option[A]
+println(List("bb", "a").minByOption(_.length))   // =&gt; Some(a)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-62">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-62">#</a> <code>maxByOption</code></h3>
+          <p>`maxBy` as an `Option`: `None` for an empty receiver.</p>
+          <pre><code class="lang-scala">xs.maxByOption(f: A =&gt; B): Option[A]
+println(List(5, 3, 8).maxByOption(x =&gt; -x))   // =&gt; Some(3)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-63">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-63">#</a> <code>sizeCompare</code></h3>
+          <p>The sign of `size - n` as `-1`/`0`/`1`; given a collection instead of a number, compares against its size.</p>
+          <pre><code class="lang-scala">xs.sizeCompare(n: Int): Int
+println(List(1, 2, 3).sizeCompare(2))   // =&gt; 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-64">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-64">#</a> <code>lengthCompare</code></h3>
+          <p>The sign of `length - n` as `-1`/`0`/`1`.</p>
+          <pre><code class="lang-scala">xs.lengthCompare(n: Int): Int
+println(List(1, 2, 3).lengthCompare(5))   // =&gt; -1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-65">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-65">#</a> <code>tapEach</code></h3>
+          <p>Run `f` on every element for its effect and answer the receiver's elements unchanged. Strict collections only — on an `Iterator` or a view Scala's `tapEach` is lazy and is not modeled.</p>
+          <pre><code class="lang-scala">xs.tapEach(f: A =&gt; U): Repr[A]
+println(List(1, 2).tapEach(x =&gt; print(x)).size)   // =&gt; 122</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-66">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-66">#</a> <code>indexOfSlice</code></h3>
+          <p>The first index at which `that` occurs as a contiguous run, or `-1`. An empty slice occurs at 0.</p>
+          <pre><code class="lang-scala">xs.indexOfSlice(that: Seq[A]): Int
+println(List(5, 3, 8, 1).indexOfSlice(List(8, 1)))   // =&gt; 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-67">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-67">#</a> <code>lastIndexOfSlice</code></h3>
+          <p>The last index at which `that` occurs as a contiguous run, or `-1`.</p>
+          <pre><code class="lang-scala">xs.lastIndexOfSlice(that: Seq[A]): Int
+println(List(1, 2, 1, 2).lastIndexOfSlice(List(1, 2)))   // =&gt; 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-68">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-68">#</a> <code>containsSlice</code></h3>
+          <p>Whether `that` occurs as a contiguous run.</p>
+          <pre><code class="lang-scala">xs.containsSlice(that: Seq[A]): Boolean
+println(List(5, 3, 8).containsSlice(List(3, 8)))   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-69">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-69">#</a> <code>toBuffer</code></h3>
+          <p>A fresh `ArrayBuffer` holding the elements.</p>
+          <pre><code class="lang-scala">xs.toBuffer: ArrayBuffer[A]
+println(List(1, 2).toBuffer)   // =&gt; ArrayBuffer(1, 2)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-70">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-70">#</a> <code>lift</code></h3>
+          <p>A `Seq` is a partial function over its indices: the element at `i` as `Some`, or `None` out of range.</p>
+          <pre><code class="lang-scala">xs.lift(i: Int): Option[A]
+println(List(5, 3, 8).lift(3))   // =&gt; None</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-71">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-71">#</a> <code>isDefinedAt</code></h3>
+          <p>Whether `i` is a valid index.</p>
+          <pre><code class="lang-scala">xs.isDefinedAt(i: Int): Boolean
+println(List(5, 3, 8).isDefinedAt(2))   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-sequence-methods-72">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-72">#</a> <code>reduce</code></h3>
           <p>Combine the elements pairwise with no initial value, left to right. An empty receiver raises `UnsupportedOperationException: empty.reduceLeft`.</p>
           <pre><code class="lang-scala">xs.reduce(op: (A, A) =&gt; A): A
 println(List(1, 2, 3).reduce((a, b) =&gt; a + b))   // =&gt; 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-52">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-52">#</a> <code>reduceLeft</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-73">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-73">#</a> <code>reduceLeft</code></h3>
           <p>The explicit left-to-right `reduce`; the same implementation.</p>
           <pre><code class="lang-scala">xs.reduceLeft(op: (A, A) =&gt; A): A
 println(List(1, 2, 3).reduceLeft((a, b) =&gt; a - b))   // =&gt; -4</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-53">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-53">#</a> <code>reduceRight</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-74">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-74">#</a> <code>reduceRight</code></h3>
           <p>Combine pairwise from the right, the operator receiving `(element, accumulator)`. An empty receiver raises `UnsupportedOperationException: empty.reduceRight`.</p>
           <pre><code class="lang-scala">xs.reduceRight(op: (A, A) =&gt; A): A
 println(List(1, 2, 3).reduceRight((a, b) =&gt; a - b))   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-54">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-54">#</a> <code>sum</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-75">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-75">#</a> <code>sum</code></h3>
           <p>Add the elements. The result is an `Int` when every element is an `Int`, otherwise a `Double`. An empty receiver answers `0`.</p>
           <pre><code class="lang-scala">xs.sum: A
 println(List(1, 2, 3).sum)   // =&gt; 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-55">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-55">#</a> <code>product</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-76">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-76">#</a> <code>product</code></h3>
           <p>Multiply the elements, with the same `Int`/`Double` result rule as `sum`. An empty receiver answers `1`.</p>
           <pre><code class="lang-scala">xs.product: A
 println(List(1, 2, 3).product)   // =&gt; 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-56">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-56">#</a> <code>min</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-77">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-77">#</a> <code>min</code></h3>
           <p>The smallest element under the `sorted` ordering. An empty receiver raises `UnsupportedOperationException: empty.min`.</p>
           <pre><code class="lang-scala">xs.min: A
 println(List(3, 1, 2).min)   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-57">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-57">#</a> <code>max</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-78">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-78">#</a> <code>max</code></h3>
           <p>The largest element under the `sorted` ordering. An empty receiver raises `UnsupportedOperationException: empty.max`.</p>
           <pre><code class="lang-scala">xs.max: A
 println(List(3, 1, 2).max)   // =&gt; 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-58">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-58">#</a> <code>minBy</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-79">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-79">#</a> <code>minBy</code></h3>
           <p>The element whose computed key is smallest; ties keep the earliest. An empty receiver raises `UnsupportedOperationException: empty.minBy`.</p>
           <pre><code class="lang-scala">xs.minBy(f: A =&gt; K): A
 println(List("bbb", "a").minBy(_.length))   // =&gt; a</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-59">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-59">#</a> <code>maxBy</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-80">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-80">#</a> <code>maxBy</code></h3>
           <p>The element whose computed key is largest; ties keep the earliest.</p>
           <pre><code class="lang-scala">xs.maxBy(f: A =&gt; K): A
 println(List("bbb", "a").maxBy(_.length))   // =&gt; bbb</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-60">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-60">#</a> <code>count</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-81">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-81">#</a> <code>count</code></h3>
           <p>How many elements satisfy the predicate. It tests every element.</p>
           <pre><code class="lang-scala">xs.count(p: A =&gt; Boolean): Int
 println(List(1, 2, 3).count(_ &gt; 1))   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-61">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-61">#</a> <code>exists</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-82">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-82">#</a> <code>exists</code></h3>
           <p>Whether any element satisfies the predicate, short-circuiting on the first hit.</p>
           <pre><code class="lang-scala">xs.exists(p: A =&gt; Boolean): Boolean
 println(List(1, 2).exists(_ &gt; 1))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-62">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-62">#</a> <code>forall</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-83">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-83">#</a> <code>forall</code></h3>
           <p>Whether every element satisfies the predicate, short-circuiting on the first failure. An empty receiver answers true.</p>
           <pre><code class="lang-scala">xs.forall(p: A =&gt; Boolean): Boolean
 println(List(1, 2).forall(_ &gt; 0))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-63">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-63">#</a> <code>find</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-84">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-84">#</a> <code>find</code></h3>
           <p>The first element satisfying the predicate as `Some(x)`, or `None`. It stops at the first hit.</p>
           <pre><code class="lang-scala">xs.find(p: A =&gt; Boolean): Option[A]
 println(List(1, 2, 3).find(_ &gt; 1))   // =&gt; Some(2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-64">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-64">#</a> <code>mkString</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-85">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-85">#</a> <code>mkString</code></h3>
           <p>Render the elements as one string. With no argument they are concatenated; with one they are separator-joined; with three the join is wrapped in a prefix and a suffix.</p>
           <pre><code class="lang-scala">xs.mkString[(sep)|(pre, sep, post)]: String
 println(List(1, 2, 3).mkString(","))            // =&gt; 1,2,3
 println(List(1, 2, 3).mkString("[", ",", "]"))   // =&gt; [1,2,3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-65">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-65">#</a> <code>toList</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-86">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-86">#</a> <code>toList</code></h3>
           <p>The elements as a `List`, whatever the receiver's kind was.</p>
           <pre><code class="lang-scala">xs.toList: List[A]
 println(Set(1, 2).toList)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-66">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-66">#</a> <code>toSeq</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-87">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-87">#</a> <code>toSeq</code></h3>
           <p>The elements as a `Seq`, which is a `List` here.</p>
           <pre><code class="lang-scala">xs.toSeq: List[A]
 println(Array(1, 2).toSeq)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-67">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-67">#</a> <code>toIterable</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-88">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-88">#</a> <code>toIterable</code></h3>
           <p>The elements as an `Iterable`, which is also a `List` here — `immutable.Iterable`'s own factory is `List`.</p>
           <pre><code class="lang-scala">xs.toIterable: List[A]
 println(List(1, 2).toIterable)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-68">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-68">#</a> <code>toVector</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-89">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-89">#</a> <code>toVector</code></h3>
           <p>The elements as a `Vector`.</p>
           <pre><code class="lang-scala">xs.toVector: Vector[A]
 println(List(1, 2).toVector)   // =&gt; Vector(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-69">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-69">#</a> <code>toArray</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-90">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-90">#</a> <code>toArray</code></h3>
           <p>The elements as a mutable `Array`, copied out of the receiver.</p>
           <pre><code class="lang-scala">xs.toArray: Array[A]
 println(List(1, 2).toArray)   // =&gt; Array(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-70">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-70">#</a> <code>toSet</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-91">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-91">#</a> <code>toSet</code></h3>
           <p>The elements as an immutable `Set`, duplicates dropped and the representation chosen by size as for any `Set`.</p>
           <pre><code class="lang-scala">xs.toSet: Set[A]
 println(List(1, 2, 2).toSet)   // =&gt; Set(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-71">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-71">#</a> <code>toMap</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-92">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-92">#</a> <code>toMap</code></h3>
           <p>A sequence of pairs as a `Map`, later duplicates of a key overwriting earlier ones. A non-pair element is an error.</p>
           <pre><code class="lang-scala">xs.toMap: Map[K, V]
 println(List((1, 2), (3, 4)).toMap)   // =&gt; Map(1 -&gt; 2, 3 -&gt; 4)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-72">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-72">#</a> <code>union</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-93">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-93">#</a> <code>union</code></h3>
           <p>The receiver's elements followed by the argument's. On a `Set` the result is re-deduplicated; on a sequence it is a plain concatenation.</p>
           <pre><code class="lang-scala">xs.union(ys: Seq[A]): Repr
 println(Set(1, 2).union(Set(2, 3)))   // =&gt; Set(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-73">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-73">#</a> <code>intersect</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-94">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-94">#</a> <code>intersect</code></h3>
           <p>The receiver's elements that also occur in the argument, in the receiver's order.</p>
           <pre><code class="lang-scala">xs.intersect(ys: Seq[A]): Repr
 println(Set(1, 2, 3).intersect(Set(2, 3, 4)))   // =&gt; Set(2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-74">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-74">#</a> <code>diff</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-95">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-95">#</a> <code>diff</code></h3>
           <p>The receiver's elements that do not occur in the argument. Unlike a buffer's `-=`, it removes every occurrence.</p>
           <pre><code class="lang-scala">xs.diff(ys: Seq[A]): Repr
 println(List(1, 2, 3).diff(List(2)))   // =&gt; List(1, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-75">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-75">#</a> <code>subsetOf</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-96">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-96">#</a> <code>subsetOf</code></h3>
           <p>Whether every element of the receiver occurs in the argument.</p>
           <pre><code class="lang-scala">xs.subsetOf(ys: Set[A]): Boolean
 println(Set(1, 2).subsetOf(Set(1, 2, 3)))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-76">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-76">#</a> <code>incl</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-97">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-97">#</a> <code>incl</code></h3>
           <p>A `Set` with one element added — the method `set + e` calls. The result re-deduplicates and may change representation.</p>
           <pre><code class="lang-scala">set.incl(e: A): Set[A]
 println(Set(1, 2).incl(5))   // =&gt; Set(1, 2, 5)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-77">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-77">#</a> <code>excl</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-98">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-98">#</a> <code>excl</code></h3>
           <p>A `Set` with one element removed — the method `set - e` calls.</p>
           <pre><code class="lang-scala">set.excl(e: A): Set[A]
 println(Set(1, 2).excl(1))   // =&gt; Set(2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-78">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-78">#</a> <code>removedAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-99">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-99">#</a> <code>removedAll</code></h3>
           <p>Every element of the argument removed — the same implementation as `diff` and `--`.</p>
           <pre><code class="lang-scala">xs.removedAll(ys: Seq[A]): Repr
 println(Set(1, 2, 3).removedAll(Set(2)))   // =&gt; Set(1, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-79">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-79">#</a> <code>concat</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-100">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-100">#</a> <code>concat</code></h3>
           <p>The receiver's elements followed by the argument's — the named form of `++`.</p>
           <pre><code class="lang-scala">xs.concat(ys: Seq[A]): Repr
 println(List(1, 2).concat(List(3)))   // =&gt; List(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-80">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-80">#</a> <code>appended</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-101">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-101">#</a> <code>appended</code></h3>
           <p>A copy with one element added at the end — the named form of `:+`.</p>
           <pre><code class="lang-scala">xs.appended(e: A): Repr
 println(List(1, 2).appended(3))   // =&gt; List(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-81">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-81">#</a> <code>prepended</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-102">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-102">#</a> <code>prepended</code></h3>
           <p>A copy with one element added at the front — the named form of `+:`.</p>
           <pre><code class="lang-scala">xs.prepended(e: A): Repr
 println(List(1, 2).prepended(0))   // =&gt; List(0, 1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-82">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-82">#</a> <code>by (Range)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-103">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-103">#</a> <code>by (Range)</code></h3>
           <p>Rebuild a `Range` with a new step. Only a `Range` receiver answers it; a zero step raises `IllegalArgumentException: step cannot be 0.`.</p>
           <pre><code class="lang-scala">(a to b).by(step: Int): Range
 println((1 to 10 by 3).toList)   // =&gt; List(1, 4, 7, 10)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-83">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-83">#</a> <code>update</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-104">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-104">#</a> <code>update</code></h3>
           <p>In-place element assignment — the desugar target of `xs(i) = v`. Only an `Array`, `ListBuffer` or `ArrayBuffer` accepts it; an out-of-range index raises `ArrayIndexOutOfBoundsException`.</p>
           <pre><code class="lang-scala">xs.update(i: Int, v: A): Unit
 val a = Array(1, 2, 3)
 a(0) = 9
 println(a.mkString(","))   // =&gt; 9,2,3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-84">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-84">#</a> <code>+= (mutable)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-105">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-105">#</a> <code>+= (mutable)</code></h3>
           <p>Add one element in place to a buffer or a `mutable.Set` and answer the receiver, so calls chain. On an immutable receiver `+` builds a new collection instead.</p>
           <pre><code class="lang-scala">xs += (e: A): xs.type
 val b = mutable.ListBuffer(1, 2)
 b += 3
 println(b)   // =&gt; ListBuffer(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-85">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-85">#</a> <code>++= (mutable)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-106">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-106">#</a> <code>++= (mutable)</code></h3>
           <p>Add every element of the argument in place and answer the receiver.</p>
           <pre><code class="lang-scala">xs ++= (ys: Seq[A]): xs.type
 val a = mutable.ArrayBuffer(1, 2)
 a ++= List(3, 4)
 println(a)   // =&gt; ArrayBuffer(1, 2, 3, 4)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-86">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-86">#</a> <code>-= (mutable)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-107">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-107">#</a> <code>-= (mutable)</code></h3>
           <p>Remove one element in place. A buffer drops only the first occurrence; a `mutable.Set` drops the element outright.</p>
           <pre><code class="lang-scala">xs -= (e: A): xs.type
 val b = mutable.ArrayBuffer(1, 2, 1)
 b -= 1
 println(b)   // =&gt; ArrayBuffer(2, 1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-87">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-87">#</a> <code>--= (mutable)</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-108">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-108">#</a> <code>--= (mutable)</code></h3>
           <p>Remove every element of the argument in place, one occurrence each for a buffer.</p>
           <pre><code class="lang-scala">xs --= (ys: Seq[A]): xs.type
 val b = mutable.ListBuffer(1, 2, 3)
 b --= List(1, 3)
 println(b)   // =&gt; ListBuffer(2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-88">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-88">#</a> <code>+=:</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-109">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-109">#</a> <code>+=:</code></h3>
           <p>Prepend in place, the right-associative operator form of `prepend`. It is implemented but unreachable from source: the lexer reads `+=` as its own token, so `0 +=: b` does not parse. Use `b.prepend(0)`.</p>
           <pre><code class="lang-scala">b.prepend(e: A): b.type   // the reachable spelling
 val b = mutable.ListBuffer(1, 2)
 b.prepend(0)
 println(b)   // =&gt; ListBuffer(0, 1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-89">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-89">#</a> <code>add</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-110">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-110">#</a> <code>add</code></h3>
           <p>Add one element to a `mutable.Set` and answer whether it was absent — unlike `+=`, which answers the set.</p>
           <pre><code class="lang-scala">s.add(e: A): Boolean
 val s = mutable.Set(1, 2)
 println(s.add(3))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-90">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-90">#</a> <code>addOne</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-111">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-111">#</a> <code>addOne</code></h3>
           <p>The named form of `+=`: add one element in place and answer the receiver.</p>
           <pre><code class="lang-scala">xs.addOne(e: A): xs.type
 val b = mutable.ListBuffer(1)
 b.addOne(2)
 println(b)   // =&gt; ListBuffer(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-91">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-91">#</a> <code>addAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-112">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-112">#</a> <code>addAll</code></h3>
           <p>The named form of `++=`: add every element of the argument in place.</p>
           <pre><code class="lang-scala">xs.addAll(ys: Seq[A]): xs.type
 val b = mutable.ListBuffer(1)
 b.addAll(List(2, 3))
 println(b)   // =&gt; ListBuffer(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-92">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-92">#</a> <code>append</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-113">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-113">#</a> <code>append</code></h3>
           <p>Add one element at the end of a buffer in place.</p>
           <pre><code class="lang-scala">b.append(e: A): b.type
 val b = mutable.ListBuffer(1)
 b.append(2)
 println(b)   // =&gt; ListBuffer(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-93">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-93">#</a> <code>appendAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-114">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-114">#</a> <code>appendAll</code></h3>
           <p>Add every element of the argument at the end of a buffer in place.</p>
           <pre><code class="lang-scala">b.appendAll(ys: Seq[A]): b.type
 val b = mutable.ListBuffer(1, 2)
 b.appendAll(List(3))
 println(b)   // =&gt; ListBuffer(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-94">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-94">#</a> <code>prepend</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-115">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-115">#</a> <code>prepend</code></h3>
           <p>Add one element at the front of a buffer in place. This is the reachable spelling of `+=:`.</p>
           <pre><code class="lang-scala">b.prepend(e: A): b.type
 val b = mutable.ArrayBuffer(1, 2)
 b.prepend(0)
 println(b)   // =&gt; ArrayBuffer(0, 1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-95">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-95">#</a> <code>prependAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-116">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-116">#</a> <code>prependAll</code></h3>
           <p>Add every element of the argument at the front of a buffer in place, keeping their order.</p>
           <pre><code class="lang-scala">b.prependAll(ys: Seq[A]): b.type
 val b = mutable.ListBuffer(3)
 b.prependAll(List(1, 2))
 println(b)   // =&gt; ListBuffer(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-96">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-96">#</a> <code>insert</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-117">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-117">#</a> <code>insert</code></h3>
           <p>Insert one element at an index, shifting the rest right. An index past the end raises `IndexOutOfBoundsException`; an index equal to the length appends.</p>
           <pre><code class="lang-scala">b.insert(i: Int, e: A): Unit
 val b = mutable.ListBuffer(1, 2)
 b.insert(1, 9)
 println(b)   // =&gt; ListBuffer(1, 9, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-97">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-97">#</a> <code>insertAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-118">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-118">#</a> <code>insertAll</code></h3>
           <p>Insert every element of the argument at an index, keeping their order.</p>
           <pre><code class="lang-scala">b.insertAll(i: Int, ys: Seq[A]): Unit
 val b = mutable.ListBuffer(1, 2)
 b.insertAll(1, List(7, 8))
 println(b)   // =&gt; ListBuffer(1, 7, 8, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-98">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-98">#</a> <code>remove</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-119">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-119">#</a> <code>remove</code></h3>
           <p>On a buffer, remove the element at an index and answer it. On a `mutable.Set`, remove the element and answer whether it was present.</p>
           <pre><code class="lang-scala">b.remove(i: Int): A   |   s.remove(e: A): Boolean
 val b = mutable.ListBuffer(1, 2)
 println(b.remove(0))   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-99">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-99">#</a> <code>subtractOne</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-120">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-120">#</a> <code>subtractOne</code></h3>
           <p>The named form of `-=`: remove one element (one occurrence, on a buffer) in place.</p>
           <pre><code class="lang-scala">xs.subtractOne(e: A): xs.type
 val b = mutable.ListBuffer(1, 2)
 b.subtractOne(1)
 println(b)   // =&gt; ListBuffer(2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-100">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-100">#</a> <code>subtractAll</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-121">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-121">#</a> <code>subtractAll</code></h3>
           <p>The named form of `--=`: remove every element of the argument in place.</p>
           <pre><code class="lang-scala">xs.subtractAll(ys: Seq[A]): xs.type
 val b = mutable.ListBuffer(1, 2, 3)
 b.subtractAll(List(1, 2))
 println(b)   // =&gt; ListBuffer(3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-101">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-101">#</a> <code>clear</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-122">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-122">#</a> <code>clear</code></h3>
           <p>Drop every element in place. A `mutable.Set` keeps the hash-table length it had grown to, matching the JVM's `Arrays.fill`, so later insertion order is unaffected by the clear.</p>
           <pre><code class="lang-scala">xs.clear(): Unit
 val b = mutable.ListBuffer(1, 2)
 b.clear()
 println(b)   // =&gt; ListBuffer()</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-102">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-102">#</a> <code>enqueue</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-123">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-123">#</a> <code>enqueue</code></h3>
           <p>Append to a `mutable.Queue` and answer it. `enqueueAll` appends a whole collection.</p>
           <pre><code class="lang-scala">q.enqueue(e: A): q.type
 val q = mutable.Queue(1)
 q.enqueue(2)
 println(q)   // =&gt; Queue(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-103">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-103">#</a> <code>dequeue</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-124">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-124">#</a> <code>dequeue</code></h3>
           <p>Remove a `mutable.Queue`'s head and answer it. Raises `java.util.NoSuchElementException: empty collection` on an empty queue.</p>
           <pre><code class="lang-scala">q.dequeue(): A
 val q = mutable.Queue(1, 2)
 println(q.dequeue())   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-104">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-104">#</a> <code>push</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-125">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-125">#</a> <code>push</code></h3>
           <p>PREPEND to a `mutable.Stack` and answer it — a `Stack`'s head is its top, which is why this is not the same as `+=`.</p>
           <pre><code class="lang-scala">s.push(e: A): s.type
 val s = mutable.Stack(1)
 s.push(2)
 println(s)   // =&gt; Stack(2, 1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-105">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-105">#</a> <code>pop</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-126">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-126">#</a> <code>pop</code></h3>
           <p>Remove a `mutable.Stack`'s head (its top) and answer it. Raises `java.util.NoSuchElementException: empty collection` on an empty stack.</p>
           <pre><code class="lang-scala">s.pop(): A
 val s = mutable.Stack(1, 2)
 println(s.pop())   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-106">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-106">#</a> <code>top</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-127">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-127">#</a> <code>top</code></h3>
           <p>Peek at a `mutable.Stack`'s top without removing it; `front` is the `mutable.Queue` spelling. Raises `head of empty Stack`/`head of empty Queue` when there is nothing to peek at.</p>
           <pre><code class="lang-scala">s.top: A
 println(mutable.Stack(1, 2).top)   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-107">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-107">#</a> <code>removeHead</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-128">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-128">#</a> <code>removeHead</code></h3>
           <p>Remove a `mutable.ArrayDeque`'s first element and answer it; `removeLast` takes the last one instead.</p>
           <pre><code class="lang-scala">d.removeHead(): A
 val d = mutable.ArrayDeque(1, 2)
 println(d.removeLast())   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-108">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-108">#</a> <code>result</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-129">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-129">#</a> <code>result</code></h3>
           <p>Freeze a `StringBuilder`'s contents into a `String`.</p>
           <pre><code class="lang-scala">b.result(): String
 println(new StringBuilder("ab").result())   // =&gt; ab</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-109">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-109">#</a> <code>setCharAt</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-130">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-130">#</a> <code>setCharAt</code></h3>
           <p>Replace one character of a `StringBuilder` and answer the builder; `deleteCharAt` removes one and `setLength` truncates (or pads with NUL). An out-of-range index raises `java.lang.StringIndexOutOfBoundsException: index i, length n`.</p>
           <pre><code class="lang-scala">b.setCharAt(i: Int, c: Char): b.type
 val b = new StringBuilder("abc")
 b.setCharAt(0, 'Q')
 println(b)   // =&gt; Qbc</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-110">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-110">#</a> <code>getClass</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-131">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-131">#</a> <code>getClass</code></h3>
           <p>The receiver's runtime class, answering `getName` and `getSimpleName`. Modeled for the receivers whose JVM class can be named faithfully — `String`, the primitives, a user `class`/`case class`/`object`, and a throwable (the usual reason to call it). A collection's runtime class is a private implementation detail, so it stays an error rather than a plausible-looking guess.</p>
           <pre><code class="lang-scala">x.getClass: Class[_]
 try { 1 / 0 } catch { case e: Throwable =&gt; println(e.getClass.getSimpleName) }   // =&gt; ArithmeticException</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-111">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-111">#</a> <code>toString</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-132">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-132">#</a> <code>toString</code></h3>
           <p>The Scala rendering of the collection, which is what `println` prints: `List(1, 2)`, `Set(…)`/`HashSet(…)` by representation, `Range a to b by s` for a range, `(a,b)` for a tuple.</p>
           <pre><code class="lang-scala">xs.toString: String
 println(List(1, 2).toString)   // =&gt; List(1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-112">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-112">#</a> <code>equals</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-133">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-133">#</a> <code>equals</code></h3>
           <p>Structural equality — the method `==` calls. Two collections are equal when their elements are pairwise equal; a plain (non-case) class instance compares by identity instead.</p>
           <pre><code class="lang-scala">xs.equals(other: Any): Boolean
 println(List(1, 2) == List(1, 2))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-sequence-methods-113">
-          <h3><a class="doc-anchor" href="#doc-sequence-methods-113">#</a> <code>hashCode</code></h3>
+        <article class="doc-entry" id="doc-sequence-methods-134">
+          <h3><a class="doc-anchor" href="#doc-sequence-methods-134">#</a> <code>hashCode</code></h3>
           <p>The MurmurHash3 sequence, set or map hash Scala computes — the same value that decides a `HashSet`'s print order. An `Array` and a function value keep an identity hash instead, which is not reproducible across runs.</p>
           <pre><code class="lang-scala">xs.hashCode: Int
 println(List(1, 2).hashCode == List(1, 2).hashCode)   // =&gt; true</code></pre>
@@ -1592,233 +1718,251 @@ println(Map("a" -&gt; 1, "b" -&gt; 2).dropWhile { case (k, v) =&gt; v &lt; 2 }) 
 println(Map("a" -&gt; 1, "b" -&gt; 2).partition { case (k, v) =&gt; v &gt; 1 })   // =&gt; (Map(b -&gt; 2),Map(a -&gt; 1))</code></pre>
         </article>
         <article class="doc-entry" id="doc-map-methods-31">
-          <h3><a class="doc-anchor" href="#doc-map-methods-31">#</a> <code>foreach</code></h3>
+          <h3><a class="doc-anchor" href="#doc-map-methods-31">#</a> <code>transform</code></h3>
+          <p>Every value replaced by `f(key, value)`; the keys, and so the iteration order, are unchanged. Immutable maps only — the mutable spelling is the deprecated in-place alias.</p>
+          <pre><code class="lang-scala">m.transform(f: (K, V) =&gt; W): Map[K, W]
+println(Map("a" -&gt; 1, "b" -&gt; 2).transform((k, v) =&gt; k + v))   // =&gt; Map(a -&gt; a1, b -&gt; b2)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-32">
+          <h3><a class="doc-anchor" href="#doc-map-methods-32">#</a> <code>lift</code></h3>
+          <p>A `Map` is a partial function over its keys: `lift(k)` is `get(k)`.</p>
+          <pre><code class="lang-scala">m.lift(k: K): Option[V]
+println(Map("a" -&gt; 1).lift("z"))   // =&gt; None</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-33">
+          <h3><a class="doc-anchor" href="#doc-map-methods-33">#</a> <code>isDefinedAt</code></h3>
+          <p>`contains`, under its `PartialFunction` name.</p>
+          <pre><code class="lang-scala">m.isDefinedAt(k: K): Boolean
+println(Map("a" -&gt; 1).isDefinedAt("a"))   // =&gt; true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-34">
+          <h3><a class="doc-anchor" href="#doc-map-methods-34">#</a> <code>foreach</code></h3>
           <p>Run the function on every entry for its effect and answer Unit.</p>
           <pre><code class="lang-scala">m.foreach(f: ((K, V)) =&gt; Unit): Unit
 Map("a" -&gt; 1).foreach { case (k, v) =&gt; print(k + v) }   // =&gt; a1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-32">
-          <h3><a class="doc-anchor" href="#doc-map-methods-32">#</a> <code>exists</code></h3>
+        <article class="doc-entry" id="doc-map-methods-35">
+          <h3><a class="doc-anchor" href="#doc-map-methods-35">#</a> <code>exists</code></h3>
           <p>Whether any entry satisfies the predicate.</p>
           <pre><code class="lang-scala">m.exists(p: ((K, V)) =&gt; Boolean): Boolean
 println(Map("a" -&gt; 1).exists { case (k, v) =&gt; v == 1 })   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-33">
-          <h3><a class="doc-anchor" href="#doc-map-methods-33">#</a> <code>forall</code></h3>
+        <article class="doc-entry" id="doc-map-methods-36">
+          <h3><a class="doc-anchor" href="#doc-map-methods-36">#</a> <code>forall</code></h3>
           <p>Whether every entry satisfies the predicate.</p>
           <pre><code class="lang-scala">m.forall(p: ((K, V)) =&gt; Boolean): Boolean
 println(Map("a" -&gt; 1).forall { case (k, v) =&gt; v &gt; 0 })   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-34">
-          <h3><a class="doc-anchor" href="#doc-map-methods-34">#</a> <code>count</code></h3>
+        <article class="doc-entry" id="doc-map-methods-37">
+          <h3><a class="doc-anchor" href="#doc-map-methods-37">#</a> <code>count</code></h3>
           <p>How many entries satisfy the predicate.</p>
           <pre><code class="lang-scala">m.count(p: ((K, V)) =&gt; Boolean): Int
 println(Map("a" -&gt; 1, "b" -&gt; 2).count { case (k, v) =&gt; v &gt; 1 })   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-35">
-          <h3><a class="doc-anchor" href="#doc-map-methods-35">#</a> <code>find</code></h3>
+        <article class="doc-entry" id="doc-map-methods-38">
+          <h3><a class="doc-anchor" href="#doc-map-methods-38">#</a> <code>find</code></h3>
           <p>The first entry satisfying the predicate as `Some((k, v))`, or `None`.</p>
           <pre><code class="lang-scala">m.find(p: ((K, V)) =&gt; Boolean): Option[(K, V)]
 println(Map("a" -&gt; 1).find { case (k, v) =&gt; v == 1 })   // =&gt; Some((a,1))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-36">
-          <h3><a class="doc-anchor" href="#doc-map-methods-36">#</a> <code>foldLeft</code></h3>
+        <article class="doc-entry" id="doc-map-methods-39">
+          <h3><a class="doc-anchor" href="#doc-map-methods-39">#</a> <code>foldLeft</code></h3>
           <p>Fold the entries left to right from an initial accumulator; the operator receives `(acc, (k, v))`.</p>
           <pre><code class="lang-scala">m.foldLeft(z: B)(op: (B, (K, V)) =&gt; B): B
 println(Map("a" -&gt; 1, "b" -&gt; 2).foldLeft(0) { (acc, kv) =&gt; acc + kv._2 })   // =&gt; 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-37">
-          <h3><a class="doc-anchor" href="#doc-map-methods-37">#</a> <code>foldRight</code></h3>
+        <article class="doc-entry" id="doc-map-methods-40">
+          <h3><a class="doc-anchor" href="#doc-map-methods-40">#</a> <code>foldRight</code></h3>
           <p>Fold the entries right to left; the operator receives `((k, v), acc)`.</p>
           <pre><code class="lang-scala">m.foldRight(z: B)(op: ((K, V), B) =&gt; B): B
 println(Map("a" -&gt; 1).foldRight(0) { (kv, acc) =&gt; acc + kv._2 })   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-38">
-          <h3><a class="doc-anchor" href="#doc-map-methods-38">#</a> <code>fold</code></h3>
+        <article class="doc-entry" id="doc-map-methods-41">
+          <h3><a class="doc-anchor" href="#doc-map-methods-41">#</a> <code>fold</code></h3>
           <p>Fold the entries from an initial accumulator, in the `foldLeft` order.</p>
           <pre><code class="lang-scala">m.fold(z: B)(op: (B, (K, V)) =&gt; B): B
 println(Map("a" -&gt; 1).fold(0) { (acc, kv) =&gt; acc + kv._2 })   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-39">
-          <h3><a class="doc-anchor" href="#doc-map-methods-39">#</a> <code>reduce</code></h3>
+        <article class="doc-entry" id="doc-map-methods-42">
+          <h3><a class="doc-anchor" href="#doc-map-methods-42">#</a> <code>reduce</code></h3>
           <p>Combine the entries pairwise with no initial value. An empty map raises `UnsupportedOperationException: empty.reduceLeft`.</p>
           <pre><code class="lang-scala">m.reduce(op: ((K, V), (K, V)) =&gt; (K, V)): (K, V)
 println(Map("a" -&gt; 1, "b" -&gt; 2).reduce { (x, y) =&gt; (x._1 + y._1, x._2 + y._2) })   // =&gt; (ab,3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-40">
-          <h3><a class="doc-anchor" href="#doc-map-methods-40">#</a> <code>maxBy</code></h3>
+        <article class="doc-entry" id="doc-map-methods-43">
+          <h3><a class="doc-anchor" href="#doc-map-methods-43">#</a> <code>maxBy</code></h3>
           <p>The entry whose computed key is largest, as a `(k, v)` tuple.</p>
           <pre><code class="lang-scala">m.maxBy(f: ((K, V)) =&gt; C): (K, V)
 println(Map("a" -&gt; 1, "b" -&gt; 2).maxBy { case (k, v) =&gt; v })   // =&gt; (b,2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-41">
-          <h3><a class="doc-anchor" href="#doc-map-methods-41">#</a> <code>minBy</code></h3>
+        <article class="doc-entry" id="doc-map-methods-44">
+          <h3><a class="doc-anchor" href="#doc-map-methods-44">#</a> <code>minBy</code></h3>
           <p>The entry whose computed key is smallest, as a `(k, v)` tuple.</p>
           <pre><code class="lang-scala">m.minBy(f: ((K, V)) =&gt; C): (K, V)
 println(Map("a" -&gt; 1, "b" -&gt; 2).minBy { case (k, v) =&gt; v })   // =&gt; (a,1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-42">
-          <h3><a class="doc-anchor" href="#doc-map-methods-42">#</a> <code>groupBy</code></h3>
+        <article class="doc-entry" id="doc-map-methods-45">
+          <h3><a class="doc-anchor" href="#doc-map-methods-45">#</a> <code>groupBy</code></h3>
           <p>Group the entries by a computed key. As on a sequence the result is a `HashMap`, and each group is a `List` of entry tuples.</p>
           <pre><code class="lang-scala">m.groupBy(f: ((K, V)) =&gt; C): HashMap[C, List[(K, V)]]
 println(Map("a" -&gt; 1, "b" -&gt; 2).groupBy { case (k, v) =&gt; v % 2 })   // =&gt; HashMap(0 -&gt; List((b,2)), 1 -&gt; List((a,1)))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-43">
-          <h3><a class="doc-anchor" href="#doc-map-methods-43">#</a> <code>sortBy</code></h3>
+        <article class="doc-entry" id="doc-map-methods-46">
+          <h3><a class="doc-anchor" href="#doc-map-methods-46">#</a> <code>sortBy</code></h3>
           <p>Sort the entries by a computed key. It answers a `List` of tuples, not a map — a map has no element order to impose.</p>
           <pre><code class="lang-scala">m.sortBy(f: ((K, V)) =&gt; C): List[(K, V)]
 println(Map("a" -&gt; 2, "b" -&gt; 1).sortBy { case (k, v) =&gt; v })   // =&gt; List((b,1), (a,2))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-44">
-          <h3><a class="doc-anchor" href="#doc-map-methods-44">#</a> <code>unzip</code></h3>
+        <article class="doc-entry" id="doc-map-methods-47">
+          <h3><a class="doc-anchor" href="#doc-map-methods-47">#</a> <code>unzip</code></h3>
           <p>Split the entries into the pair `(keys, values)`, both as `List`s.</p>
           <pre><code class="lang-scala">m.unzip: (List[K], List[V])
 println(Map("a" -&gt; 1, "b" -&gt; 2).unzip)   // =&gt; (List(a, b),List(1, 2))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-45">
-          <h3><a class="doc-anchor" href="#doc-map-methods-45">#</a> <code>zipWithIndex</code></h3>
+        <article class="doc-entry" id="doc-map-methods-48">
+          <h3><a class="doc-anchor" href="#doc-map-methods-48">#</a> <code>zipWithIndex</code></h3>
           <p>Pair each entry with its position in the map's own order.</p>
           <pre><code class="lang-scala">m.zipWithIndex: List[((K, V), Int)]
 println(Map("a" -&gt; 1).zipWithIndex)   // =&gt; List(((a,1),0))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-46">
-          <h3><a class="doc-anchor" href="#doc-map-methods-46">#</a> <code>mkString</code></h3>
+        <article class="doc-entry" id="doc-map-methods-49">
+          <h3><a class="doc-anchor" href="#doc-map-methods-49">#</a> <code>mkString</code></h3>
           <p>Render the entries as one string. Each entry renders as its tuple, `(k,v)` — not as `k -&gt; v`, which is the map's own `toString` form.</p>
           <pre><code class="lang-scala">m.mkString[(sep)|(pre, sep, post)]: String
 println(Map("a" -&gt; 1, "b" -&gt; 2).mkString(";"))   // =&gt; (a,1);(b,2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-47">
-          <h3><a class="doc-anchor" href="#doc-map-methods-47">#</a> <code>toList</code></h3>
+        <article class="doc-entry" id="doc-map-methods-50">
+          <h3><a class="doc-anchor" href="#doc-map-methods-50">#</a> <code>toList</code></h3>
           <p>The entries as a `List` of `(k, v)` tuples.</p>
           <pre><code class="lang-scala">m.toList: List[(K, V)]
 println(Map("a" -&gt; 1).toList)   // =&gt; List((a,1))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-48">
-          <h3><a class="doc-anchor" href="#doc-map-methods-48">#</a> <code>toSeq</code></h3>
+        <article class="doc-entry" id="doc-map-methods-51">
+          <h3><a class="doc-anchor" href="#doc-map-methods-51">#</a> <code>toSeq</code></h3>
           <p>The entries as a `Seq` of tuples, which is a `List` here.</p>
           <pre><code class="lang-scala">m.toSeq: List[(K, V)]
 println(Map("a" -&gt; 1).toSeq)   // =&gt; List((a,1))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-49">
-          <h3><a class="doc-anchor" href="#doc-map-methods-49">#</a> <code>toVector</code></h3>
+        <article class="doc-entry" id="doc-map-methods-52">
+          <h3><a class="doc-anchor" href="#doc-map-methods-52">#</a> <code>toVector</code></h3>
           <p>The entries as a `Vector` of tuples.</p>
           <pre><code class="lang-scala">m.toVector: Vector[(K, V)]
 println(Map("a" -&gt; 1).toVector)   // =&gt; Vector((a,1))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-50">
-          <h3><a class="doc-anchor" href="#doc-map-methods-50">#</a> <code>toArray</code></h3>
+        <article class="doc-entry" id="doc-map-methods-53">
+          <h3><a class="doc-anchor" href="#doc-map-methods-53">#</a> <code>toArray</code></h3>
           <p>The entries as an `Array` of tuples.</p>
           <pre><code class="lang-scala">m.toArray: Array[(K, V)]
 println(Map("a" -&gt; 1).toArray)   // =&gt; Array((a,1))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-51">
-          <h3><a class="doc-anchor" href="#doc-map-methods-51">#</a> <code>toSet</code></h3>
+        <article class="doc-entry" id="doc-map-methods-54">
+          <h3><a class="doc-anchor" href="#doc-map-methods-54">#</a> <code>toSet</code></h3>
           <p>The entries as a `Set` of tuples.</p>
           <pre><code class="lang-scala">m.toSet: Set[(K, V)]
 println(Map("a" -&gt; 1).toSet)   // =&gt; Set((a,1))</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-52">
-          <h3><a class="doc-anchor" href="#doc-map-methods-52">#</a> <code>toMap</code></h3>
+        <article class="doc-entry" id="doc-map-methods-55">
+          <h3><a class="doc-anchor" href="#doc-map-methods-55">#</a> <code>toMap</code></h3>
           <p>The receiver itself — a map is already a map, so this is the identity.</p>
           <pre><code class="lang-scala">m.toMap: Map[K, V]
 println(Map("a" -&gt; 1).toMap)   // =&gt; Map(a -&gt; 1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-53">
-          <h3><a class="doc-anchor" href="#doc-map-methods-53">#</a> <code>+=</code></h3>
+        <article class="doc-entry" id="doc-map-methods-56">
+          <h3><a class="doc-anchor" href="#doc-map-methods-56">#</a> <code>+=</code></h3>
           <p>Add one `k -&gt; v` pair to a `mutable.Map` in place and answer the receiver. On an immutable map `+` builds a copy instead.</p>
           <pre><code class="lang-scala">m += (kv: (K, V)): m.type
 val m = mutable.Map("a" -&gt; 1)
 m += ("b" -&gt; 2)
 println(m)   // =&gt; HashMap(a -&gt; 1, b -&gt; 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-54">
-          <h3><a class="doc-anchor" href="#doc-map-methods-54">#</a> <code>++=</code></h3>
+        <article class="doc-entry" id="doc-map-methods-57">
+          <h3><a class="doc-anchor" href="#doc-map-methods-57">#</a> <code>++=</code></h3>
           <p>Add every pair of the argument to a `mutable.Map` in place; the argument may be a map or a sequence of pairs.</p>
           <pre><code class="lang-scala">m ++= (other: Map[K, V] | Seq[(K, V)]): m.type
 val m = mutable.Map("a" -&gt; 1)
 m ++= Map("b" -&gt; 2)
 println(m)   // =&gt; HashMap(a -&gt; 1, b -&gt; 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-55">
-          <h3><a class="doc-anchor" href="#doc-map-methods-55">#</a> <code>-=</code></h3>
+        <article class="doc-entry" id="doc-map-methods-58">
+          <h3><a class="doc-anchor" href="#doc-map-methods-58">#</a> <code>-=</code></h3>
           <p>Remove one key from a `mutable.Map` in place. The hash table keeps the length it had grown to, so the surviving entries keep their order.</p>
           <pre><code class="lang-scala">m -= (k: K): m.type
 val m = mutable.Map("a" -&gt; 1, "b" -&gt; 2)
 m -= "a"
 println(m)   // =&gt; HashMap(b -&gt; 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-56">
-          <h3><a class="doc-anchor" href="#doc-map-methods-56">#</a> <code>--=</code></h3>
+        <article class="doc-entry" id="doc-map-methods-59">
+          <h3><a class="doc-anchor" href="#doc-map-methods-59">#</a> <code>--=</code></h3>
           <p>Remove every key of the argument from a `mutable.Map` in place.</p>
           <pre><code class="lang-scala">m --= (ks: Seq[K]): m.type
 val m = mutable.Map("a" -&gt; 1, "b" -&gt; 2)
 m --= List("a", "b")
 println(m)   // =&gt; HashMap()</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-57">
-          <h3><a class="doc-anchor" href="#doc-map-methods-57">#</a> <code>addOne</code></h3>
+        <article class="doc-entry" id="doc-map-methods-60">
+          <h3><a class="doc-anchor" href="#doc-map-methods-60">#</a> <code>addOne</code></h3>
           <p>The named form of `+=`.</p>
           <pre><code class="lang-scala">m.addOne(kv: (K, V)): m.type
 val m = mutable.Map("a" -&gt; 1)
 m.addOne("b" -&gt; 2)
 println(m)   // =&gt; HashMap(a -&gt; 1, b -&gt; 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-58">
-          <h3><a class="doc-anchor" href="#doc-map-methods-58">#</a> <code>addAll</code></h3>
+        <article class="doc-entry" id="doc-map-methods-61">
+          <h3><a class="doc-anchor" href="#doc-map-methods-61">#</a> <code>addAll</code></h3>
           <p>The named form of `++=`.</p>
           <pre><code class="lang-scala">m.addAll(other: Seq[(K, V)]): m.type
 val m = mutable.Map("a" -&gt; 1)
 m.addAll(List("b" -&gt; 2))
 println(m)   // =&gt; HashMap(a -&gt; 1, b -&gt; 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-59">
-          <h3><a class="doc-anchor" href="#doc-map-methods-59">#</a> <code>subtractOne</code></h3>
+        <article class="doc-entry" id="doc-map-methods-62">
+          <h3><a class="doc-anchor" href="#doc-map-methods-62">#</a> <code>subtractOne</code></h3>
           <p>The named form of `-=`.</p>
           <pre><code class="lang-scala">m.subtractOne(k: K): m.type
 val m = mutable.Map("a" -&gt; 1, "b" -&gt; 2)
 m.subtractOne("a")
 println(m)   // =&gt; HashMap(b -&gt; 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-60">
-          <h3><a class="doc-anchor" href="#doc-map-methods-60">#</a> <code>subtractAll</code></h3>
+        <article class="doc-entry" id="doc-map-methods-63">
+          <h3><a class="doc-anchor" href="#doc-map-methods-63">#</a> <code>subtractAll</code></h3>
           <p>The named form of `--=`.</p>
           <pre><code class="lang-scala">m.subtractAll(ks: Seq[K]): m.type
 val m = mutable.Map("a" -&gt; 1, "b" -&gt; 2)
 m.subtractAll(List("a"))
 println(m)   // =&gt; HashMap(b -&gt; 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-61">
-          <h3><a class="doc-anchor" href="#doc-map-methods-61">#</a> <code>put</code></h3>
+        <article class="doc-entry" id="doc-map-methods-64">
+          <h3><a class="doc-anchor" href="#doc-map-methods-64">#</a> <code>put</code></h3>
           <p>Set a key in a `mutable.Map` and answer the value it displaced as `Some(old)`, or `None` when the key was absent.</p>
           <pre><code class="lang-scala">m.put(k: K, v: V): Option[V]
 val m = mutable.Map("a" -&gt; 1)
 println(m.put("a", 2))   // =&gt; Some(1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-62">
-          <h3><a class="doc-anchor" href="#doc-map-methods-62">#</a> <code>update</code></h3>
+        <article class="doc-entry" id="doc-map-methods-65">
+          <h3><a class="doc-anchor" href="#doc-map-methods-65">#</a> <code>update</code></h3>
           <p>Set a key in a `mutable.Map`, discarding any displaced value — the desugar target of `m(k) = v`.</p>
           <pre><code class="lang-scala">m.update(k: K, v: V): Unit
 val m = mutable.Map("a" -&gt; 1)
 m("b") = 2
 println(m)   // =&gt; HashMap(a -&gt; 1, b -&gt; 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-63">
-          <h3><a class="doc-anchor" href="#doc-map-methods-63">#</a> <code>getOrElseUpdate</code></h3>
+        <article class="doc-entry" id="doc-map-methods-66">
+          <h3><a class="doc-anchor" href="#doc-map-methods-66">#</a> <code>getOrElseUpdate</code></h3>
           <p>The value for a key, inserting the supplied default first when the key is absent. The default is evaluated eagerly, so it is computed even for a present key.</p>
           <pre><code class="lang-scala">m.getOrElseUpdate(k: K, default: V): V
 val m = mutable.Map("a" -&gt; 1)
 println(m.getOrElseUpdate("b", 5))   // =&gt; 5
 println(m)                          // =&gt; HashMap(a -&gt; 1, b -&gt; 5)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-64">
-          <h3><a class="doc-anchor" href="#doc-map-methods-64">#</a> <code>remove</code></h3>
+        <article class="doc-entry" id="doc-map-methods-67">
+          <h3><a class="doc-anchor" href="#doc-map-methods-67">#</a> <code>remove</code></h3>
           <p>Remove a key from a `mutable.Map` and answer the value it held as `Some(old)`, or `None`.</p>
           <pre><code class="lang-scala">m.remove(k: K): Option[V]
 val m = mutable.Map("a" -&gt; 1)
 println(m.remove("a"))   // =&gt; Some(1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-65">
-          <h3><a class="doc-anchor" href="#doc-map-methods-65">#</a> <code>clear</code></h3>
+        <article class="doc-entry" id="doc-map-methods-68">
+          <h3><a class="doc-anchor" href="#doc-map-methods-68">#</a> <code>clear</code></h3>
           <p>Drop every entry of a `mutable.Map` in place, keeping the hash table's grown length.</p>
           <pre><code class="lang-scala">m.clear(): Unit
 val m = mutable.Map("a" -&gt; 1)
@@ -1879,8 +2023,8 @@ println("abc".concat("d"))   // =&gt; abcd</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-9">
           <h3><a class="doc-anchor" href="#doc-string-methods-9">#</a> <code>split</code></h3>
-          <p>Split on a REGULAR EXPRESSION, answering an `Array[String]`. `java.lang.String.split`'s rule exactly: trailing empty fields are dropped, and a zero-width match at position 0 produces no leading empty field.</p>
-          <pre><code class="lang-scala">s.split(regex: String): Array[String]
+          <p>Split on a REGULAR EXPRESSION, answering an `Array[String]`. `java.lang.String.split`'s rule exactly: trailing empty fields are dropped, and a zero-width match at position 0 produces no leading empty field. A positive `limit` yields at most `limit` fields (the last holds the rest), and a negative one keeps the trailing empties. A `Char` separator is LITERAL (`StringOps.split(Char)` escapes it), so `"a.b".split('.')` is `[a, b]`.</p>
+          <pre><code class="lang-scala">s.split(regex: String[, limit: Int]): Array[String]
 println("a1b22c".split("[0-9]+").mkString("/"))   // =&gt; a/b/c</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-10">
@@ -1970,18 +2114,54 @@ println("abc".contains("bc"))   // =&gt; true</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-24">
           <h3><a class="doc-anchor" href="#doc-string-methods-24">#</a> <code>startsWith</code></h3>
-          <p>Whether the string begins with the argument.</p>
-          <pre><code class="lang-scala">s.startsWith(prefix: String): Boolean
+          <p>Whether the string begins with the argument — or, given an offset, whether it occurs there (an offset outside the string is `false`).</p>
+          <pre><code class="lang-scala">s.startsWith(prefix: String[, offset: Int]): Boolean
 println("abc".startsWith("a"))   // =&gt; true</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-25">
-          <h3><a class="doc-anchor" href="#doc-string-methods-25">#</a> <code>endsWith</code></h3>
+          <h3><a class="doc-anchor" href="#doc-string-methods-25">#</a> <code>linesIterator</code></h3>
+          <p>The lines as a consumable `Iterator`, terminators dropped. A line ends at `\n` or `\r`, `\r\n` is one terminator, and a trailing terminator does not start an empty last line.</p>
+          <pre><code class="lang-scala">s.linesIterator: Iterator[String]
+println("a\r\nb\n".linesIterator.toList)   // =&gt; List(a, b)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-26">
+          <h3><a class="doc-anchor" href="#doc-string-methods-26">#</a> <code>linesWithSeparators</code></h3>
+          <p>`linesIterator` with each line's terminator kept on it.</p>
+          <pre><code class="lang-scala">s.linesWithSeparators: Iterator[String]
+println("a\nb".linesWithSeparators.map(_.length).toList)   // =&gt; List(2, 1)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-27">
+          <h3><a class="doc-anchor" href="#doc-string-methods-27">#</a> <code>repeat</code></h3>
+          <p>`java.lang.String.repeat`: the string `n` times; a negative count raises `IllegalArgumentException: count is negative`.</p>
+          <pre><code class="lang-scala">s.repeat(n: Int): String
+println("ab".repeat(3))   // =&gt; ababab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-28">
+          <h3><a class="doc-anchor" href="#doc-string-methods-28">#</a> <code>patch</code></h3>
+          <p>`StringOps.patch`: `other` spliced in at `from` (clamped), overwriting `replaced` characters. `replaced` is NOT clamped — the builder is sized `length + other.length - replaced`, so over-replacing raises `NegativeArraySizeException`, and a negative count re-copies the tail.</p>
+          <pre><code class="lang-scala">s.patch(from: Int, other: String, replaced: Int): String
+println("hello".patch(1, "EY", 2))   // =&gt; hEYlo</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-29">
+          <h3><a class="doc-anchor" href="#doc-string-methods-29">#</a> <code>lift</code></h3>
+          <p>The character at `i` as `Some`, or `None` out of range.</p>
+          <pre><code class="lang-scala">s.lift(i: Int): Option[Char]
+println("abc".lift(1))   // =&gt; Some(b)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-30">
+          <h3><a class="doc-anchor" href="#doc-string-methods-30">#</a> <code>appendedAll</code></h3>
+          <p>The string with another string's characters appended; `prependedAll` puts them in front.</p>
+          <pre><code class="lang-scala">s.appendedAll(t: String): String
+println("abc".appendedAll("de"))   // =&gt; abcde</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-31">
+          <h3><a class="doc-anchor" href="#doc-string-methods-31">#</a> <code>endsWith</code></h3>
           <p>Whether the string ends with the argument.</p>
           <pre><code class="lang-scala">s.endsWith(suffix: String): Boolean
 println("abc".endsWith("c"))   // =&gt; true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-26">
-          <h3><a class="doc-anchor" href="#doc-string-methods-26">#</a> <code>substring</code></h3>
+        <article class="doc-entry" id="doc-string-methods-32">
+          <h3><a class="doc-anchor" href="#doc-string-methods-32">#</a> <code>substring</code></h3>
           <p>The characters in the half-open range `[begin, end)`, or from `begin` to the end with one argument. An out-of-range or inverted range raises `StringIndexOutOfBoundsException`.</p>
           <pre><code class="lang-scala">s.substring(begin: Int[, end: Int]): String
 println("abc".substring(1))      // =&gt; bc
@@ -2859,85 +3039,97 @@ println(1 :: 2 :: Nil)   // =&gt; List(1, 2)</code></pre>
 println(List(1, 2) :+ 3)   // =&gt; List(1, 2, 3)</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-24">
-          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>+:</code></h3>
+          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>:::</code></h3>
+          <p>Concatenate two lists. Right-associative like `::`, so `xs ::: ys` is `ys.:::(xs)` and the result is the right operand's kind.</p>
+          <pre><code class="lang-scala">xs ::: ys
+println(List(1) ::: List(2, 3))   // =&gt; List(1, 2, 3)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-25">
+          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>++:</code></h3>
+          <p>Prepend every element of the left operand. Right-associative, so the RIGHT operand's kind is the result's: `Vector(1) ++: List(2)` is a `List`.</p>
+          <pre><code class="lang-scala">xs ++: ys
+println(Vector(1) ++: List(2))   // =&gt; List(1, 2)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-26">
+          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>+:</code></h3>
           <p>Prepend one element to a sequence. Its name ends in `:`, so it is right-associative and dispatches on the sequence.</p>
           <pre><code class="lang-scala">e +: xs
 println(0 +: List(1, 2))   // =&gt; List(0, 1, 2)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-25">
-          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>++</code></h3>
+        <article class="doc-entry" id="doc-operators-27">
+          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>++</code></h3>
           <p>Concatenate two collections, keeping the receiver's kind. On a `Set` the result is re-deduplicated; on a `Map` it merges the entries.</p>
           <pre><code class="lang-scala">xs ++ ys
 println(List(1, 2) ++ List(3))   // =&gt; List(1, 2, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-26">
-          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>--</code></h3>
+        <article class="doc-entry" id="doc-operators-28">
+          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>--</code></h3>
           <p>Remove every element of the argument — the operator form of `diff`.</p>
           <pre><code class="lang-scala">xs -- ys
 println(List(1, 2, 3) -- List(2))   // =&gt; List(1, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-27">
-          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>&amp;~</code></h3>
+        <article class="doc-entry" id="doc-operators-29">
+          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>&amp;~</code></h3>
           <p>Set difference: the receiver's elements that are not in the argument. It binds at `&amp;`'s level, since the first character decides precedence.</p>
           <pre><code class="lang-scala">s &amp;~ t
 println(Set(1, 2, 3) &amp;~ Set(2))   // =&gt; Set(1, 3)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-28">
-          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>-&gt;</code></h3>
+        <article class="doc-entry" id="doc-operators-30">
+          <h3><a class="doc-anchor" href="#doc-operators-30">#</a> <code>-&gt;</code></h3>
           <p>Build a two-element tuple. It is what a `Map` literal's entries are made of, and it binds looser than every symbolic operator and than alphanumeric infix.</p>
           <pre><code class="lang-scala">k -&gt; v
 println("a" -&gt; 1)   // =&gt; (a,1)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-29">
-          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>=</code></h3>
+        <article class="doc-entry" id="doc-operators-31">
+          <h3><a class="doc-anchor" href="#doc-operators-31">#</a> <code>=</code></h3>
           <p>Assignment to a `var`, or an element write through `xs(i) = v` (which calls `update`). Assigning to a `val` is rejected at compile time.</p>
           <pre><code class="lang-scala">name = expr   |   xs(i) = v
 var n = 1
 n = 2
 println(n)   // =&gt; 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-30">
-          <h3><a class="doc-anchor" href="#doc-operators-30">#</a> <code>+=</code></h3>
+        <article class="doc-entry" id="doc-operators-32">
+          <h3><a class="doc-anchor" href="#doc-operators-32">#</a> <code>+=</code></h3>
           <p>Compound add-assign on a `var`, and in-place addition on a mutable collection.</p>
           <pre><code class="lang-scala">n += e
 var n = 0
 n += 5
 println(n)   // =&gt; 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-31">
-          <h3><a class="doc-anchor" href="#doc-operators-31">#</a> <code>-=</code></h3>
+        <article class="doc-entry" id="doc-operators-33">
+          <h3><a class="doc-anchor" href="#doc-operators-33">#</a> <code>-=</code></h3>
           <p>Compound subtract-assign on a `var`, and in-place removal on a mutable collection.</p>
           <pre><code class="lang-scala">n -= e
 var n = 5
 n -= 2
 println(n)   // =&gt; 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-32">
-          <h3><a class="doc-anchor" href="#doc-operators-32">#</a> <code>*=</code></h3>
+        <article class="doc-entry" id="doc-operators-34">
+          <h3><a class="doc-anchor" href="#doc-operators-34">#</a> <code>*=</code></h3>
           <p>Compound multiply-assign on a `var`.</p>
           <pre><code class="lang-scala">n *= e
 var n = 3
 n *= 4
 println(n)   // =&gt; 12</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-33">
-          <h3><a class="doc-anchor" href="#doc-operators-33">#</a> <code>/=</code></h3>
+        <article class="doc-entry" id="doc-operators-35">
+          <h3><a class="doc-anchor" href="#doc-operators-35">#</a> <code>/=</code></h3>
           <p>Compound divide-assign on a `var`, truncating for two `Int`s.</p>
           <pre><code class="lang-scala">n /= e
 var n = 12
 n /= 4
 println(n)   // =&gt; 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-34">
-          <h3><a class="doc-anchor" href="#doc-operators-34">#</a> <code>%=</code></h3>
+        <article class="doc-entry" id="doc-operators-36">
+          <h3><a class="doc-anchor" href="#doc-operators-36">#</a> <code>%=</code></h3>
           <p>Compound remainder-assign on a `var`.</p>
           <pre><code class="lang-scala">n %= e
 var n = 7
 n %= 3
 println(n)   // =&gt; 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-35">
-          <h3><a class="doc-anchor" href="#doc-operators-35">#</a> <code>alphanumeric infix</code></h3>
+        <article class="doc-entry" id="doc-operators-37">
+          <h3><a class="doc-anchor" href="#doc-operators-37">#</a> <code>alphanumeric infix</code></h3>
           <p>A one-argument method may be written without a dot: `a m b` is `a.m(b)`. It binds looser than every symbolic operator and is left-associative, so `xs map f filter g` is `(xs.map(f)).filter(g)`. A line break between receiver and name rules the infix reading out, and Scala's soft keywords are excluded from it.</p>
           <pre><code class="lang-scala">a method b
 println(List(1, 2) map (_ * 2))   // =&gt; List(2, 4)</code></pre>
@@ -2983,13 +3175,19 @@ println(f"${3.14159}%.2f")   // =&gt; 3.14</code></pre>
 println(raw"a\nb")   // =&gt; a\nb</code></pre>
         </article>
         <article class="doc-entry" id="doc-predef-and-interpolation-7">
-          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-7">#</a> <code>format specs</code></h3>
-          <p>The conversions an `f"…"` splice accepts: `%d` integer, `%f` fixed-point (default six decimals), `%e` scientific, `%s` string, `%x`/`%o` radix, `%%` a literal percent — with the usual width, `-` left-justify, `0` zero-pad and `.n` precision flags. Note that `String.format` as a method is not implemented; use an `f` interpolator.</p>
+          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-7">#</a> <code>identity</code></h3>
+          <p>`Predef.identity`: answers its argument. As a value it is the function `x =&gt; x` (`xs.groupBy(identity)`). A program binding of the same name shadows it.</p>
+          <pre><code class="lang-scala">identity(x: A): A
+println(List(3, 1, 3).groupBy(identity))   // =&gt; HashMap(1 -&gt; List(1), 3 -&gt; List(3, 3))</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-predef-and-interpolation-8">
+          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-8">#</a> <code>format specs</code></h3>
+          <p>The `java.util.Formatter` conversions behind an `f"…"` splice and `"…".format(…)`: `%d` integer, `%f` fixed-point (default six decimals), `%e`/`%E` scientific, `%g`/`%G` general, `%s`/`%S` string, `%x`/`%X`/`%o` radix, `%c`/`%C` character, `%b`/`%B` boolean, `%h`/`%H` hash code, `%n` newline, `%%` a literal percent — with width, `.n` precision, the `-` `0` `+` space `,` `(` `#` flags, and the `n$` and `&lt;` argument indices. `format` checks each argument's class as Java does (`"%f".format(3)` raises `IllegalFormatConversionException`); the `f` interpolator converts at compile time instead, so `f"${3}%.2f"` is `3.00`.</p>
           <pre><code class="lang-scala">f"${x}%[flags][width][.prec]conv"
 println(f"${7}%05d")   // =&gt; 00007</code></pre>
         </article>
-        <article class="doc-entry" id="doc-predef-and-interpolation-8">
-          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-8">#</a> <code>rust { … }</code></h3>
+        <article class="doc-entry" id="doc-predef-and-interpolation-9">
+          <h3><a class="doc-anchor" href="#doc-predef-and-interpolation-9">#</a> <code>rust { … }</code></h3>
           <p>An inline Rust block: its body is compiled to a cdylib and its `extern "C"` functions become callable from Scala code. The compile result is cached, so only the first run pays for it.</p>
           <pre><code class="lang-scala">rust { pub extern "C" fn name(x: i64) -&gt; i64 { … } }
 rust { pub extern "C" fn triple(x: i64) -&gt; i64 { x * 3 } }

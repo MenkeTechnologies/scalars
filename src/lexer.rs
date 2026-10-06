@@ -1188,6 +1188,9 @@ fn unescape(c: char) -> char {
         'n' => '\n',
         't' => '\t',
         'r' => '\r',
+        // Backspace and form feed — Scala's other two letter escapes.
+        'b' => '\u{8}',
+        'f' => '\u{c}',
         '0' => '\0',
         '\\' => '\\',
         '"' => '"',

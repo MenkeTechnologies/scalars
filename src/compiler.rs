@@ -340,6 +340,10 @@ struct ClassMeta {
     /// from being typed by the stdlib's rule. A member present here with
     /// [`NumTy::Unknown`] is a member whose type is declared but is not integer.
     member_widths: HashMap<String, NumTy>,
+    /// The declared-type conversion of every FIELD whose type has one (see
+    /// [`declared_conv`]), own and inherited — what an assignment to
+    /// `var w: Double` applies, as its declaration did.
+    field_convs: HashMap<String, Conv>,
 }
 
 /// Compile-time singleton-object shape.
@@ -569,13 +573,20 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         // Member widths, base-most first so a subclass override wins. These are
         // read whenever the receiver's class is known — at a use site (`c.n * 2`)
         // and for the bare field references inside the class's own methods.
+        let mut field_convs = HashMap::new();
         let mut member_widths = HashMap::new();
         for anc in mro.iter().rev().filter_map(|a| by_name.get(a.as_str())) {
             for (p, ty) in anc.params.iter().zip(&anc.param_tys) {
                 member_widths.insert(p.clone(), declared_width(ty.as_deref().unwrap_or("")));
+                if let Some(c) = declared_conv(ty.as_deref()) {
+                    field_convs.insert(p.clone(), c);
+                }
             }
             for s in &anc.body {
                 if let StmtKind::Local { name, ty, init, .. } = &s.kind {
+                    if let Some(c) = declared_conv(ty.as_deref()) {
+                        field_convs.insert(name.clone(), c);
+                    }
                     // A field's own initializer types it when no annotation
                     // does, exactly as `val n = 0` types a local.
                     let w = match ty {
@@ -610,6 +621,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 supers: mro[1..].to_vec(),
                 responds,
                 member_widths,
+                field_convs,
                 own_methods: cd
                     .methods
                     .iter()
@@ -1219,7 +1231,15 @@ impl Compiler {
                 // free form — pop the frame with the value on the stack.
                 if self.in_lambda || self.unwind.iter().any(|f| f.kind == UnwindKind::Try) {
                     match val {
-                        Some(e) => self.expr(e)?,
+                        Some(e) => {
+                            self.expr(e)?;
+                            // Out of a `try` in the def itself, the declared
+                            // return type is this body's; out of a lambda it
+                            // is not known here, and the value goes as is.
+                            if !self.in_lambda {
+                                self.emit_ret_conv(s.line);
+                            }
+                        }
                         None => {
                             self.emit_unit(s.line);
                         }
@@ -3646,11 +3666,20 @@ impl Compiler {
                 return self.object_val_assign(&obj, field, op, value);
             }
         }
+        // The field's declared-type conversion, when the receiver's class is
+        // known statically — `c.w = 4` on a `var w: Double` stores `4.0`.
+        let conv = self
+            .class_of(recv)
+            .and_then(|c| self.classes.get(&c))
+            .and_then(|m| m.field_convs.get(field).cloned());
         if op == AssignOp::Assign {
             self.expr(recv)?;
             let fc = self.b.add_constant(Value::str(field.to_string()));
             self.b.emit(Op::LoadConst(fc), line);
             self.expr(value)?;
+            if let Some(c) = &conv {
+                self.emit_conv(c, line);
+            }
             self.b.emit(Op::CallBuiltin(crate::host::OBJ_SET, 3), line);
             self.assign_result_is_unit();
             self.b.emit(Op::Pop, 0); // discard the `Unit` result
@@ -3681,12 +3710,12 @@ impl Compiler {
             let to_end = self.b.emit(Op::Jump(0), 0);
             let arith = self.b.current_pos();
             self.b.patch_jump(to_arith, arith);
-            self.emit_place_store(r, field, op, value, line)?;
+            self.emit_place_store(r, field, op, value, conv.as_ref(), line)?;
             let end = self.b.current_pos();
             self.b.patch_jump(to_end, end);
             return Ok(());
         }
-        self.emit_place_store(r, field, op, value, line)
+        self.emit_place_store(r, field, op, value, conv.as_ref(), line)
     }
 
     /// The arithmetic half of [`Compiler::select_assign`]: the field's current
@@ -3698,9 +3727,13 @@ impl Compiler {
         field: &str,
         op: AssignOp,
         value: &Expr,
+        conv: Option<&Conv>,
         line: u32,
     ) -> Result<(), String> {
         self.compound_tail(op, value, NumTy::Unknown)?;
+        if let Some(c) = conv {
+            self.emit_conv(c, line);
+        }
         // OBJ_SET pops `[recv, name, value]`, so the computed value is parked in
         // a temporary while the receiver and name are pushed under it.
         self.obj_counter += 1;
@@ -3734,6 +3767,16 @@ impl Compiler {
         } else {
             self.emit_field_get_this(field);
             self.compound_tail(op, value, NumTy::Unknown)?;
+        }
+        // The field's declared type converts what is stored, as its declaration
+        // did: `var z: Double = 0` then `z = n` holds `n.toDouble`.
+        let conv = self
+            .current_class
+            .as_ref()
+            .and_then(|(c, _)| self.classes.get(c))
+            .and_then(|m| m.field_convs.get(field).cloned());
+        if let Some(c) = conv {
+            self.emit_conv(&c, line);
         }
         self.b.emit(Op::CallBuiltin(crate::host::OBJ_SET, 3), line);
         self.b.emit(Op::Pop, 0); // discard the `Unit` result
@@ -5749,6 +5792,11 @@ impl Compiler {
         // its chance to shadow.
         if let Some(q) = self.imported(name, args, line) {
             return self.expr(&q);
+        }
+        // `Predef.identity(e)` is `e`; every binding above has had its chance
+        // to shadow it.
+        if name == "identity" && args.len() == 1 {
+            return self.expr(&args[0]);
         }
         if !self.has_ffi {
             return Err(format!("scalars: not found: {name} (line {line})"));
