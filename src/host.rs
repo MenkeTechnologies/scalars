@@ -129,7 +129,8 @@ pub const RANGE_LIST: u16 = 720;
 
 /// Builtin id for constructing a built-in throwable (`new RuntimeException(m)`).
 /// The stack holds the fully-qualified class name (deepest) and the message
-/// (top; `Undef` for the no-arg constructor); `argc` is 2.
+/// (`Undef` for the no-arg constructor); `argc` is 2. With `argc` 3 a cause
+/// sits on top of the message — the `(String, Throwable)` constructor.
 pub const EXC_NEW: u16 = 721;
 /// Builtin id for `throw e`. Pops the thrown value and makes it the in-flight
 /// exception; halts the run when no `try` is dynamically active.
@@ -826,9 +827,31 @@ fn raise(vm: &mut VM, exc: Value) -> Value {
         PENDING.with(|p| *p.borrow_mut() = Some(exc));
         return Value::Undef;
     }
-    FFI_ERROR.with(|e| *e.borrow_mut() = Some(scala_str(&exc)));
+    FFI_ERROR.with(|e| *e.borrow_mut() = Some(uncaught_report(&exc)));
     vm.request_halt();
     Value::Undef
+}
+
+/// What an uncaught throwable reports: its `toString`, then — as the JVM's
+/// default handler prints after the stack trace — one `Caused by: <cause>` line
+/// per link of its cause chain.
+fn uncaught_report(exc: &Value) -> String {
+    let mut out = scala_str(exc);
+    let mut cur = exc.clone();
+    // The chain is finite in practice; the bound only stops a cycle.
+    for _ in 0..64 {
+        let cause = match as_exc(&cur) {
+            Some(e) => e.cause.unwrap_or(Value::Undef),
+            None => user_throwable_state(&cur).map_or(Value::Undef, |(_, c)| c),
+        };
+        if !is_throwable_value(&cause) {
+            break;
+        }
+        out.push_str("\nCaused by: ");
+        out.push_str(&scala_str(&cause));
+        cur = cause;
+    }
+    out
 }
 
 /// Parse a `java.lang.Xxx: message` fault string into a throwable object, or
@@ -857,6 +880,7 @@ fn new_throwable(fqn: &str, msg: Option<&str>) -> Value {
     heap_push(HeapVal::Exc(ExcObj {
         class: Arc::from(fqn),
         msg: msg.map(Arc::from),
+        cause: None,
     }))
 }
 
@@ -899,6 +923,8 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     ),
     ("NoSuchElementException", "java.util.NoSuchElementException"),
     ("MatchError", "scala.MatchError"),
+    // `Predef.???` raises this; an `Error`, so `case e: Exception` misses it.
+    ("NotImplementedError", "scala.NotImplementedError"),
     // Predef `assert`/`assume` raise this, and it is an `Error` rather than an
     // `Exception` — so `catch { case e: Exception }` does NOT catch one.
     ("AssertionError", "java.lang.AssertionError"),
@@ -955,6 +981,7 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("VirtualMachineError", "Error"),
     ("OutOfMemoryError", "VirtualMachineError"),
     ("AssertionError", "Error"),
+    ("NotImplementedError", "Error"),
     // Deliberately hangs off `Throwable`, not `Exception`: Scala's
     // `ControlThrowable` is a direct `Throwable` so control-flow signals are not
     // caught by ordinary `case e: Exception` handlers.
@@ -996,6 +1023,9 @@ struct ExcObj {
     /// The constructor message, or `None` for the no-arg constructor (whose
     /// `getMessage` is Scala `null`).
     msg: Option<Arc<str>>,
+    /// The `cause` a `(String, Throwable)` or `(Throwable)` constructor
+    /// recorded — what `getCause` answers; `None` is `null`.
+    cause: Option<Value>,
 }
 
 /// Clone the throwable behind `v`, if it is one.
@@ -1029,14 +1059,52 @@ fn thrown_class(v: &Value) -> Option<String> {
 }
 
 /// `EXC_NEW` builtin — see [`EXC_NEW`].
-fn b_exc_new(vm: &mut VM, _argc: u8) -> Value {
+fn b_exc_new(vm: &mut VM, argc: u8) -> Value {
+    let cause = if argc == 3 { Some(vm.pop()) } else { None };
     let msg = vm.pop();
     let class = vm.pop().as_str_cow().into_owned();
+    // `Throwable(Throwable cause)` takes its message from the cause:
+    // `cause.toString()`, and records the cause.
+    let (msg, cause) = match (msg, cause) {
+        (m, Some(c)) => (m, Some(c)),
+        (m, None) if is_throwable_value(&m) && throwable_takes_cause(&class) => {
+            (Value::str(scala_str(&m)), Some(m))
+        }
+        (m, None) => (m, None),
+    };
     let msg = match msg {
         Value::Undef => None,
         other => Some(scala_str(&other)),
     };
-    new_throwable(&class, msg.as_deref())
+    let exc = new_throwable(&class, msg.as_deref());
+    if let (Some(c), Value::Obj(id)) = (cause, &exc) {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Exc(e)) = h.borrow_mut().get_mut(*id as usize) {
+                // A `null` cause is no cause.
+                e.cause = (!matches!(c, Value::Undef)).then_some(c);
+            }
+        });
+    }
+    exc
+}
+
+/// Whether the built-in throwable `fqn` declares the `(Throwable)` and
+/// `(String, Throwable)` constructors. `Throwable`/`Exception`/`Error`/
+/// `RuntimeException` and the four subclasses listed below declare them;
+/// `ArithmeticException`, `NumberFormatException`, the index faults and
+/// `ClassCastException` declare only `(String)`.
+pub fn throwable_takes_cause(fqn: &str) -> bool {
+    matches!(
+        fqn.rsplit('.').next().unwrap_or(fqn),
+        "Throwable"
+            | "Exception"
+            | "Error"
+            | "RuntimeException"
+            | "IllegalArgumentException"
+            | "IllegalStateException"
+            | "UnsupportedOperationException"
+            | "NoSuchElementException"
+    )
 }
 
 /// `EXC_THROW` builtin — see [`EXC_THROW`].
@@ -1187,7 +1255,7 @@ fn b_exc_unstash(_vm: &mut VM, _argc: u8) -> Value {
 /// `EXC_ABORT` builtin — see [`EXC_ABORT`].
 fn b_exc_abort(vm: &mut VM, _argc: u8) -> Value {
     if let Some(exc) = PENDING.with(|p| p.borrow_mut().take()) {
-        FFI_ERROR.with(|e| *e.borrow_mut() = Some(scala_str(&exc)));
+        FFI_ERROR.with(|e| *e.borrow_mut() = Some(uncaught_report(&exc)));
     }
     vm.request_halt();
     Value::Undef
@@ -1766,6 +1834,7 @@ pub fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     // The intern table holds arena indices, which the clear above invalidates.
     CHARS.with(|t| t.borrow_mut().clear());
+    SINGLETONS.with(|t| t.borrow_mut().clear());
     // Method entries are offsets into the OUTGOING chunk; the next program
     // compiles its own, so a stale hit would jump into unrelated bytecode.
     METHOD_ENTRIES.with(|t| t.borrow_mut().clear());
@@ -1797,6 +1866,10 @@ thread_local! {
     /// [`HeapVal::Char`]. The arena is append-only within a run, so without this
     /// a loop over a long string would allocate one entry per character read.
     static CHARS: RefCell<HashMap<char, u32>> = RefCell::new(HashMap::new());
+    /// The one record per singleton `object`, by name. Every mention of `O`
+    /// materializes it, and Scala has exactly one instance — so `O eq O`, `O ==
+    /// O` and a stable `O.hashCode` all depend on answering the same handle.
+    static SINGLETONS: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
 
 /// The interned `Char` value for `c`.
@@ -2517,17 +2590,27 @@ fn b_obj_new(vm: &mut VM, _argc: u8) -> Value {
         vals.push(vm.pop());
     }
     vals.reverse();
-    let fields = names
+    if is_object && vals.is_empty() {
+        if let Some(v) = SINGLETONS.with(|t| t.borrow().get(&class).cloned()) {
+            return v;
+        }
+    }
+    let fields: Vec<(Arc<str>, Value)> = names
         .into_iter()
         .zip(vals)
         .map(|(nm, v)| (Arc::from(nm), v))
         .collect();
-    heap_alloc(ScalaObj {
+    let singleton = is_object && fields.is_empty();
+    let v = heap_alloc(ScalaObj {
         class: Arc::from(class.as_str()),
         is_case,
         is_object,
         fields,
-    })
+    });
+    if singleton {
+        SINGLETONS.with(|t| t.borrow_mut().insert(class, v.clone()));
+    }
+    v
 }
 
 /// `OBJ_CLASS` builtin — pop one value; push its class name (or `""` for a
@@ -3643,6 +3726,12 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     match (name, args.len()) {
         ("hashCode", 0) => Ok(Value::int(obj_hash(&class, is_case, &fields, recv))),
         ("equals", 1) => Ok(Value::bool(obj_eq(recv, &args[0]))),
+        // `AnyRef.eq`/`ne` — reference identity, which for a class instance is
+        // its heap handle: two `new A` are never `eq`, whatever `equals` says.
+        ("eq" | "ne", 1) => {
+            let same = matches!((recv, &args[0]), (Value::Obj(a), Value::Obj(b)) if a == b);
+            Ok(Value::bool(same == (name == "eq")))
+        }
         // The `Throwable` members a user class inherits by extending one.
         ("getMessage" | "getLocalizedMessage" | "getCause", 0)
             if user_throwable_state(recv).is_some() =>
@@ -5748,6 +5837,12 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
                 None => Value::Undef,
             },
             "toString" => Value::str(exc_to_string(&e)),
+            "getCause" => e.cause.clone().unwrap_or(Value::Undef),
+            // Reference identity, as for any class instance.
+            "eq" | "ne" if args.len() == 1 => {
+                let same = matches!((&recv, &args[0]), (Value::Obj(a), Value::Obj(b)) if a == b);
+                Value::bool(same == (name == "eq"))
+            }
             // The usual way a program names an exception's type.
             "getClass" => match class_of(&recv) {
                 Ok(v) => v,
@@ -7241,6 +7336,9 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(best)
         }
+        // `clone()` on an `Array` or a mutable sequence (`mutable.SeqOps.clone`):
+        // a shallow copy of the same kind that later updates do not share.
+        ("clone", 0) if kind == SeqKind::Array || kind.is_buffer() => Ok(new_seq(kind, items)),
         ("toArray", 0) => Ok(new_seq(SeqKind::Array, items)),
         ("toVector", 0) => Ok(new_seq(SeqKind::Vector, items)),
         // `toIndexedSeq` is `Vector` for every collection EXCEPT an `Array`,
@@ -7627,6 +7725,16 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 .map(|(i, a)| new_pair(a.clone(), Value::int(i as i64)))
                 .collect(),
         )),
+        // `unzip(asPair)`/`unzip3(asTriple)`: the implicit conversion is an
+        // explicit function argument, applied to each element before splitting.
+        ("unzip" | "unzip3", 1) => {
+            let mut split = Vec::with_capacity(items.len());
+            for it in &items {
+                split.push(invoke_closure(vm, &args[0], std::slice::from_ref(it))?);
+            }
+            let derived = derive_seq(kind, split);
+            seq_method(vm, &derived, name, &[])
+        }
         ("unzip", 0) => {
             let mut ls = Vec::with_capacity(items.len());
             let mut rs = Vec::with_capacity(items.len());
@@ -10991,6 +11099,12 @@ fn combinations_of(items: &[Value], n: i64) -> Vec<Vec<Value>> {
 }
 
 fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
+    // `String.equals(Object)`: only another `String` with the same chars —
+    // `"a".equals('a')` is false. Answered before the `Char` → `String`
+    // coercion below would make the two look alike.
+    if let ("equals", [other]) = (name, args) {
+        return Ok(Value::bool(matches!(other, Value::Str(t) if t.as_str() == s)));
+    }
     // `StringOps.split(separator: Char)` is LITERAL: it escapes the character
     // (`StringOps.escape`) before handing it to the regex `split`, so
     // `"a.b".split('.')` is `[a, b]` where `"a.b".split(".")` is empty. It must
@@ -12259,6 +12373,19 @@ fn int_method(n: i64, name: &str, args: &[Value]) -> Result<Value, String> {
         ("hashCode", 0) => Ok(Value::int(i64::from(
             (n ^ ((n as u64) >> 32) as i64) as i32,
         ))),
+        // `Integer.equals(Object)`: true only for another boxed integer of the
+        // same value — never for a `Double` or a `Char` of equal magnitude
+        // (`1.equals(1.0)` is false where `1 == 1.0` is true).
+        ("equals", 1) => Ok(Value::bool(matches!(args[0], Value::Int(m) if m == n))),
+        // `ScalaWholeNumberProxy`: an integral value is always whole, and each
+        // `isValidX` asks whether the narrowing round-trips.
+        ("isWhole" | "isValidLong", 0) => Ok(Value::bool(true)),
+        ("isValidInt", 0) => Ok(Value::bool(n as i32 as i64 == n)),
+        ("isValidShort", 0) => Ok(Value::bool(n as i16 as i64 == n)),
+        ("isValidByte", 0) => Ok(Value::bool(n as i8 as i64 == n)),
+        ("isValidChar", 0) => Ok(Value::bool((0..=0xFFFF).contains(&n))),
+        // `RichInt.sign` is `signum`, an `Int`.
+        ("sign", 0) => Ok(Value::int(n.signum())),
         (
             "abs" | "toDouble" | "toFloat" | "toInt" | "toLong" | "toByte" | "toShort" | "max"
             | "min" | "signum" | "compareTo" | "compare" | "toHexString" | "toBinaryString"
@@ -12310,6 +12437,8 @@ fn bool_method(b: bool, name: &str, args: &[Value]) -> Result<Value, String> {
         ("unary_!", 0) => Ok(Value::bool(!b)),
         // `java.lang.Boolean.hashCode` — the two constants the JDK specifies.
         ("hashCode", 0) => Ok(Value::int(if b { 1231 } else { 1237 })),
+        // `java.lang.Boolean.equals(Object)`: only another `Boolean`.
+        ("equals", 1) => Ok(Value::bool(matches!(args[0], Value::Bool(c) if c == b))),
         _ => Err(no_such_method(&Value::bool(b), name)),
     }
 }
@@ -12461,6 +12590,19 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         // `math` functions of the same names.
         ("floor" | "ceil" | "toRadians" | "toDegrees", 0) => math_member(name, &[Value::float(f)]),
         ("isWhole", 0) => Ok(Value::bool(f.is_finite() && f.fract() == 0.0)),
+        // `RichDouble`'s `isValidX`: the value survives the narrowing round trip
+        // (`4.0.isValidInt` is true, `3.5` and `NaN` are not).
+        ("isValidInt", 0) => Ok(Value::bool(f64::from(f as i32) == f)),
+        ("isValidShort", 0) => Ok(Value::bool(f64::from(to_short(i64::from(f as i32)) as i32) == f)),
+        ("isValidByte", 0) => Ok(Value::bool(f64::from(to_byte(i64::from(f as i32)) as i32) == f)),
+        ("isValidChar", 0) => Ok(Value::bool(f64::from(f as i32 as u16) == f)),
+        // `RichDouble.sign` is `math.signum`, a `Double`: NaN and both zeros
+        // answer themselves.
+        ("sign", 0) => Ok(Value::float(if f.is_nan() || f == 0.0 { f } else { f.signum() })),
+        // `java.lang.Double.equals(Object)`: another boxed `Double` with the same
+        // `doubleToLongBits` — so `NaN` equals itself, `0.0` is not `-0.0`, and
+        // an `Int` of equal value is not equal.
+        ("equals", 1) => Ok(Value::bool(matches!(args[0], Value::Float(g) if double_to_long_bits(g) == double_to_long_bits(f)))),
         // `RichDouble`'s `max`/`min` are `math.max`/`math.min`, so they PROPAGATE
         // a NaN operand rather than ignoring it.
         ("max", 1) => Ok(Value::float(java_double_max(f, num_f64(&args[0])))),
@@ -13106,11 +13248,12 @@ fn b_lazylist_new(vm: &mut VM, argc: u8) -> Value {
         return new_lazy(Vec::new(), LazySrc::End);
     };
     match &*tag.as_str_cow() {
-        // `LazyList.from(n)` — the integers upward.
+        // `LazyList.from(n[, step])` — the integers upward (or by `step`).
         "from" => new_lazy(
             Vec::new(),
             LazySrc::Ints {
                 next: args.first().map(Value::to_int).unwrap_or(0),
+                step: args.get(1).map(Value::to_int).unwrap_or(1),
             },
         ),
         // `LazyList.iterate(seed)(f)`.
@@ -13172,6 +13315,15 @@ fn lazy_method(
                     src: recv.clone(),
                     p: args[0].clone(),
                     at: 0,
+                },
+            )))
+        }
+        ("takeWhile", 1) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::TakeWhile {
+                    src: recv.clone(),
+                    p: args[0].clone(),
                 },
             )))
         }
@@ -13346,10 +13498,11 @@ fn lazy_force(vm: &mut VM, list: &Value, k: usize) -> Result<Vec<Value>, String>
                 l.done = true;
                 set_lazy(list, l);
             }
-            LazySrc::Ints { next } => {
+            LazySrc::Ints { next, step } => {
                 l.forced.push(Value::int(next));
                 l.src = LazySrc::Ints {
-                    next: next.wrapping_add(1),
+                    next: next.wrapping_add(step),
+                    step,
                 };
                 set_lazy(list, l);
             }
@@ -13441,6 +13594,27 @@ fn lazy_force(vm: &mut VM, list: &Value, k: usize) -> Result<Vec<Value>, String>
                 }
                 set_lazy(list, l2);
             }
+            LazySrc::TakeWhile { src, p } => {
+                let i = l.forced.len();
+                let got = lazy_force(vm, &src, i)?;
+                match got.get(i) {
+                    Some(v) => {
+                        let hit = invoke_closure(vm, &p, std::slice::from_ref(v))?;
+                        let mut l2 = as_lazy(list).unwrap_or(l);
+                        if truthy(&hit) {
+                            l2.forced.push(v.clone());
+                        } else {
+                            l2.done = true;
+                            l2.src = LazySrc::End;
+                        }
+                        set_lazy(list, l2);
+                    }
+                    None => {
+                        l.done = true;
+                        set_lazy(list, l);
+                    }
+                }
+            }
             LazySrc::Zip { a, b } => {
                 let i = l.forced.len();
                 let ga = lazy_force(vm, &a, i)?;
@@ -13474,8 +13648,9 @@ pub struct LazyList {
 enum LazySrc {
     /// No more elements.
     End,
-    /// The integers from `next` upward — `LazyList.from(n)`.
-    Ints { next: i64 },
+    /// The integers from `next` upward in steps of `step` — `LazyList.from(n)`
+    /// and `LazyList.from(n, step)`.
+    Ints { next: i64, step: i64 },
     /// `LazyList.iterate(seed)(f)`: `seed`, then `f` of the element before.
     /// Each application waits until its element is asked for, so `take(n)`
     /// runs `f` exactly `n - 1` times.
@@ -13499,6 +13674,9 @@ enum LazySrc {
     /// `src.drop(n)` — element `k` is the source's element `k + n`. `tail` is
     /// this with `n = 1`.
     Drop { src: Value, n: usize },
+    /// `src.takeWhile(p)` — the source's elements up to the first that fails
+    /// `p`, each tested only when it is asked for.
+    TakeWhile { src: Value, p: Value },
     /// A literal `LazyList(1, 2, 3)`. The elements are known, but they are
     /// still produced one at a time: Scala prints `LazyList(<not computed>)`
     /// for a fresh one, so even a literal starts unforced.

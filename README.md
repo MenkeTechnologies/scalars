@@ -118,7 +118,9 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   value, or an `Any`. What it costs is the JIT, which takes only the VM's two
   native numeric shapes; see `BUGS.md`.
 - **Scala 3 implicits** — `given` in all four shapes (named or anonymous, by
-  value or by `with { … }` body), `using` clauses written or supplied,
+  value or by `with { … }` body), `using` clauses written or supplied (named
+  or anonymous, `(using Sh[A])`, and visible inside the lambdas the body
+  writes),
   `summon[T]`, context bounds (`[A: Sh]`), `extension` methods dispatched on
   the receiver's type, and implicit conversions applied where Scala applies
   them. A type-class instance is a singleton `object`, which already works as a
@@ -131,9 +133,9 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   whose argument's element type is read off a collection literal — so
   `def chain[A](xs: List[A])(using Sh[A])` resolves at `chain(List(1, 2, 3))`.
 - **`LazyList`** — a real lazy structure, not a materialized vector: elements
-  are produced on demand and memoised, so `LazyList.from(1)`,
+  are produced on demand and memoised, so `LazyList.from(1)`, `.from(n, step)`,
   `.iterate(seed)(f)` and `.continually(v)` are infinite and usable.
-  `map`/`filter`/`zip`/`tail`/`drop` force nothing, printing one shows only
+  `map`/`filter`/`zip`/`tail`/`drop`/`takeWhile` force nothing, printing one shows only
   what has been computed (`LazyList(1, 2, <not computed>)`), and a second
   traversal recomputes none of it. `#::` conses with a BY-NAME tail, so a list
   can be defined in terms of itself:
@@ -353,7 +355,10 @@ Implemented and checked against the reference `scala`:
   raised are catchable with their JDK messages (`ArithmeticException: / by
   zero`, `NumberFormatException: For input string: "zz"`, `scala.MatchError`);
   `new RuntimeException("…")` and the other built-in throwables construct
-  without a user `class`, and expose `getMessage`/`toString`. A user class
+  without a user `class` — with a `(cause)` or `(message, cause)` argument
+  where the JDK class declares one — and expose `getMessage`/`getCause`/
+  `toString`; an uncaught one reports its `Caused by:` chain, and `???` throws
+  `scala.NotImplementedError`. A user class
   extending one (`class E(m: String) extends Exception(m)`, or a `case class`)
   IS a throwable: it keeps the message and cause it passed up, answers
   `getMessage`/`getCause`, is caught by every JDK supertype, and renders as

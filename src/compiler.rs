@@ -292,6 +292,12 @@ struct PendingClosure {
     /// element of `xs`. A parameter with no inferred width shadows any enclosing
     /// binding of the same name with [`NumTy::Unknown`] rather than inheriting it.
     param_widths: Vec<NumTy>,
+    /// The implicit scope at the lambda site. A `using` parameter of the
+    /// enclosing `def` is a given inside the lambda too (`xs.reduce((a, b) =>
+    /// summon[Ord[A]]…)`), and the body is emitted long after that `def`'s scope
+    /// was restored, so the scope travels with it — and each local given is
+    /// captured, so the name it resolves to is bound in the closure frame.
+    implicits: Vec<(String, String)>,
 }
 
 /// Compile-time class shape.
@@ -1893,6 +1899,28 @@ impl Compiler {
             }
         }
 
+        // The enclosing `def`'s own `using` parameters are frame slots, and a
+        // given the body resolves (a `summon`, or an implicit argument the body
+        // supplies to a call) is a read of one — captured like any free name.
+        if let Some(scope) = self.scope.as_ref() {
+            for (n, _) in &self.implicits {
+                if scope.slots.contains_key(n) && !captures.contains(n) {
+                    captures.push(n.clone());
+                }
+            }
+        }
+
+        // The enclosing `def`'s own `using` parameters are frame slots, and a
+        // given the body resolves (a `summon`, or an implicit argument the body
+        // supplies to a call) is a read of one — captured like any free name.
+        if let Some(scope) = self.scope.as_ref() {
+            for (n, _) in &self.implicits {
+                if scope.slots.contains_key(n) && !captures.contains(n) {
+                    captures.push(n.clone());
+                }
+            }
+        }
+
         // Which captures are boxed cells in the enclosing frame — the closure
         // body must go through `CELL_GET`/`CELL_SET` for exactly those.
         let boxed: HashSet<String> = match self.scope.as_ref() {
@@ -1925,6 +1953,7 @@ impl Compiler {
                     lazies: self.lazies.clone(),
                     widths: self.widths.clone(),
                     param_widths: self.lambda_param_widths.clone(),
+                    implicits: self.implicits.clone(),
                 });
                 Some(idx)
             }
@@ -1963,6 +1992,7 @@ impl Compiler {
             lazies: self.lazies.clone(),
             widths: self.widths.clone(),
             param_widths: self.lambda_param_widths.clone(),
+            implicits: self.implicits.clone(),
         });
         Ok(())
     }
@@ -2013,6 +2043,7 @@ impl Compiler {
         // The enclosing scope's widths travel into the body, so a captured
         // `var n = 0` is still known to be an `Int` here.
         let saved_widths = std::mem::replace(&mut self.widths, pc.widths);
+        let saved_implicits = std::mem::replace(&mut self.implicits, pc.implicits);
         for (i, p) in pc.params.iter().enumerate() {
             self.vals.insert(p.clone(), true);
             // A parameter SHADOWS any enclosing binding of the same name. Its own
@@ -2061,6 +2092,7 @@ impl Compiler {
         self.current_class = saved_class;
         self.current_object = saved_object;
         self.by_name = saved_by_name;
+        self.implicits = saved_implicits;
         Ok(())
     }
 
@@ -3044,6 +3076,7 @@ impl Compiler {
             // arrives as one call of two arguments.
             ("iterate", 2) => mk("iterate", vec![args[0].clone(), args[1].clone()]),
             ("from", 1) => mk("from", vec![args[0].clone()]),
+            ("from", 2) => mk("from", vec![args[0].clone(), args[1].clone()]),
             ("continually", 1) => mk("continually", vec![args[0].clone()]),
             ("empty", 0) => mk("empty", Vec::new()),
             ("apply", _) => mk("empty", args.to_vec()),
@@ -4316,9 +4349,11 @@ impl Compiler {
         Ok(out)
     }
 
-    /// Lower `new <BuiltinThrowable>([message])` to the [`EXC_NEW`] builtin.
-    /// The JVM's `Throwable` constructors this models are the no-arg one (whose
-    /// `getMessage` is `null`) and the single-`String` one.
+    /// Lower `new <BuiltinThrowable>([message[, cause]])` to the [`EXC_NEW`]
+    /// builtin. The JVM's `Throwable` constructors this models are the no-arg
+    /// one (whose `getMessage` is `null`), the single-`String` one, and — for the
+    /// classes that declare them (`host::throwable_takes_cause`) — `(Throwable)`
+    /// and `(String, Throwable)`.
     ///
     /// [`EXC_NEW`]: crate::host::EXC_NEW
     fn construct_throwable(
@@ -4328,21 +4363,23 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<(), String> {
-        if args.len() > 1 {
+        let max = if crate::host::throwable_takes_cause(fqn) { 2 } else { 1 };
+        if args.len() > max {
             return Err(format!(
-                "scalars: {name} takes 0 or 1 constructor argument(s), found {} (line {line})",
+                "scalars: {name} takes 0 to {max} constructor argument(s), found {} (line {line})",
                 args.len()
             ));
         }
         let c = self.b.add_constant(Value::str(fqn.to_string()));
         self.b.emit(Op::LoadConst(c), line);
-        match args.first() {
-            Some(a) => self.expr(a)?,
-            None => {
-                self.b.emit(Op::LoadUndef, line);
-            }
+        if args.is_empty() {
+            self.b.emit(Op::LoadUndef, line);
         }
-        self.b.emit(Op::CallBuiltin(crate::host::EXC_NEW, 2), line);
+        for a in args {
+            self.expr(a)?;
+        }
+        let argc = 1 + args.len().max(1) as u8;
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_NEW, argc), line);
         Ok(())
     }
 

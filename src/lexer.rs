@@ -586,6 +586,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // place (a buffer's `prepend`). Each ends in `:`, so
             // they are right-associative and the RIGHT operand is the receiver.
             ":::" | "++:" | "+=:" => (Tok::Op(three.to_string()), 3),
+            // `???` — `Predef.???`, an identifier made of operator characters;
+            // the parser lowers it to the `NotImplementedError` throw it is.
+            "???" => (Tok::Ident(three.to_string()), 3),
             _ => match two {
                 "<-" => (Tok::LArrow, 2),
                 "=>" => (Tok::FatArrow, 2),

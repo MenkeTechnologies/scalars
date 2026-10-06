@@ -607,6 +607,15 @@ impl Parser {
         if self.is(&Tok::LBracket) {
             self.skip_bracket_group();
         }
+        // The primary constructor's own access modifier — `class W private
+        // (n: Int)` — restricts who may call `new`, which only the reference's
+        // type checker enforces; a program it accepts runs the same without it.
+        if matches!(self.peek(), Tok::Ident(w) if w == "private" || w == "protected") {
+            self.advance();
+            if self.is(&Tok::LBracket) {
+                self.skip_bracket_group();
+            }
+        }
         // Primary-constructor parameters (all become fields).
         let CtorParams {
             params,
@@ -1058,7 +1067,12 @@ impl Parser {
                 || w == "lazy")
         {
             lazy |= matches!(self.peek(), Tok::Ident(w) if w == "lazy");
+            let access = matches!(self.peek(), Tok::Ident(w) if w == "private" || w == "protected");
             self.advance();
+            // A qualified access modifier: `private[this]`, `protected[pkg]`.
+            if access && self.is(&Tok::LBracket) {
+                self.skip_bracket_group();
+            }
             self.skip_annotations();
         }
         lazy
@@ -1286,6 +1300,26 @@ impl Parser {
                 // `val`/`var` prefixes are legal on a class parameter.
                 if self.is(&Tok::Val) || self.is(&Tok::Var) {
                     self.advance();
+                }
+                // An anonymous context parameter — `(using Show[A])` names only
+                // the type; the body reaches it through `summon`. It is bound
+                // under a name no source identifier can spell.
+                if implicit_clause && !matches!(self.peek_at(1), Tok::Colon) {
+                    let ty = self.type_ref()?;
+                    params.push(format!("using${}", params.len()));
+                    sig.push(ParamSig {
+                        ty: Some(ty),
+                        clause_start: first_of_clause,
+                        implicit_clause,
+                        ..ParamSig::default()
+                    });
+                    first_of_clause = false;
+                    if self.is(&Tok::Comma) {
+                        self.advance();
+                        self.skip_seps();
+                        continue;
+                    }
+                    break;
                 }
                 let pname = self.ident()?;
                 let mut ps = ParamSig::default();
@@ -3550,6 +3584,21 @@ impl Parser {
                          found {} arguments (line {line})",
                         args.len()
                     ));
+                }
+                // `???` is `Predef.???`: `throw new NotImplementedError`, whose
+                // message is "an implementation is missing". Typed `Nothing`,
+                // so it stands in for a value of any type.
+                if name == "???" {
+                    let line = self.line();
+                    self.advance();
+                    return Ok(Expr::Throw {
+                        value: Box::new(Expr::New {
+                            name: "NotImplementedError".to_string(),
+                            args: vec![Expr::Str("an implementation is missing".to_string())],
+                            line,
+                        }),
+                        line,
+                    });
                 }
                 // `break` and `break()` are the same expression; Scala types it
                 // `Nothing`, so it is legal in operand position.

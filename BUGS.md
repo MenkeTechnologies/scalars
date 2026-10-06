@@ -954,11 +954,11 @@ reported as parse/compile errors, never silently mis-run.
   element matching a `filter` cannot be told from a slow one.
 
   The structure itself is complete. Elements are produced on demand and
-  MEMOISED, so the infinite factories work (`LazyList.from(1)`,
+  MEMOISED, so the infinite factories work (`LazyList.from(1)`, `.from(n, step)`,
   `.iterate(seed)(f)`, `.continually(v)`), `#::` conses with a BY-NAME tail —
   which is what makes a list definable in terms of itself
   (`val fibs: LazyList[Int] = 0 #:: 1 #:: fibs.zip(fibs.tail).map(…)`) —
-  `map`/`filter`/`zip`/`tail`/`drop` force nothing, a literal starts unforced,
+  `map`/`filter`/`zip`/`tail`/`drop`/`takeWhile` force nothing, a literal starts unforced,
   and printing shows only what has been computed
   (`LazyList(1, 2, <not computed>)`). Traversing twice recomputes nothing,
   which a program can count.
@@ -1000,7 +1000,7 @@ reported as parse/compile errors, never silently mis-run.
   namespace, and the many `String`/numeric methods beyond the wired subset
   above. Members a differential sweep reached and found missing (each an
   honest `not a member` error, never a wrong answer): `Map.foreachEntry`,
-  `empty`/`applyOrElse`/`unzip(f)`/`prefixLength` on a sequence instance, and
+  `empty`/`applyOrElse`/`prefixLength` on a sequence instance, and
   the infinite `Iterator.iterate`/`continually`/`from` (`LazyList` has them).
 - **`getClass` on a collection, a tuple, a function or an `Array`.** Those
   runtime classes are private implementation details — `List(1).getClass.getName`
@@ -1095,6 +1095,16 @@ reported as parse/compile errors, never silently mis-run.
   reference compiler rejects it, so scalars does not implement it either.
 
 ## Modeled with a documented simplification
+
+- **`eq`/`ne` answer reference identity for class instances, singleton
+  `object`s and throwables only.** Those are heap records whose handle IS their
+  identity (every mention of an `object` answers the one record, so `O eq O`).
+  A `String` has no identity in the value model — `"abc" eq "abc"` is true in
+  Scala because literals are interned, while a concatenated copy is not `eq` —
+  so `eq` on a `String` is refused (`not a member`) rather than guessed.
+  `equals` on a primitive follows the boxed class (`1.equals(1.0)` and
+  `"a".equals('a')` are false), but an `Int` and a `Long` of equal value share
+  one representation, so `1L.equals(1)` answers `true` where Scala says `false`.
 
 - **A `String` is indexed by CODE POINT, where the JVM indexes by UTF-16 code
   unit.** `Char` here is a Rust `char` — a whole scalar value — so a character
