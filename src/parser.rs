@@ -3192,7 +3192,9 @@ impl Parser {
             if is_plain_member(&e, &name) {
                 // `immutable.Queue` is the one member of these packages whose
                 // bare spelling means something else (the mutable `Queue`).
-                let name = if name == "Queue" && path_segments(&e).is_some_and(|s| s.last() == Some(&"immutable")) {
+                let name = if name == "Queue"
+                    && path_segments(&e).is_some_and(|s| s.last() == Some(&"immutable"))
+                {
                     IMMUTABLE_QUEUE.to_string()
                 } else {
                     name
@@ -4433,7 +4435,10 @@ impl Parser {
                 let mut elems = Vec::with_capacity(exprs.len());
                 for e in &exprs {
                     let e = e.trim();
-                    let is_ident = e.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                    let is_ident = e
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphabetic() || c == '_')
                         && e.chars().all(|c| c.is_alphanumeric() || c == '_');
                     elems.push(match e {
                         "_" => Pattern::Wildcard,

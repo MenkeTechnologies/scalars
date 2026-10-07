@@ -2595,7 +2595,10 @@ impl Compiler {
         match name.strip_prefix(crate::parser::SGLOB_PATTERN) {
             // An `s"…"` pattern: the extractor is the list of literal parts.
             Some(parts) => {
-                let parts: Vec<Value> = parts.split('\u{1}').map(|p| Value::str(p.to_string())).collect();
+                let parts: Vec<Value> = parts
+                    .split('\u{1}')
+                    .map(|p| Value::str(p.to_string()))
+                    .collect();
                 let c = self.b.add_constant(Value::Array(parts.into()));
                 self.b.emit(Op::LoadConst(c), 0);
             }
@@ -4394,7 +4397,11 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<(), String> {
-        let max = if crate::host::throwable_takes_cause(fqn) { 2 } else { 1 };
+        let max = if crate::host::throwable_takes_cause(fqn) {
+            2
+        } else {
+            1
+        };
         if args.len() > max {
             return Err(format!(
                 "scalars: {name} takes 0 to {max} constructor argument(s), found {} (line {line})",
@@ -4410,7 +4417,8 @@ impl Compiler {
             self.expr(a)?;
         }
         let argc = 1 + args.len().max(1) as u8;
-        self.b.emit(Op::CallBuiltin(crate::host::EXC_NEW, argc), line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::EXC_NEW, argc), line);
         Ok(())
     }
 
@@ -4447,7 +4455,12 @@ impl Compiler {
     /// 0))`), the name alone decides it only when it is unambiguous: every
     /// `case class` declaring a parameter of that name agrees on its conversion.
     /// Otherwise the value goes as is — the one case left unconverted.
-    fn copy_param_conv(&self, class: Option<&str>, named: Option<&str>, pos: usize) -> Option<Conv> {
+    fn copy_param_conv(
+        &self,
+        class: Option<&str>,
+        named: Option<&str>,
+        pos: usize,
+    ) -> Option<Conv> {
         if let Some(meta) = class.and_then(|c| self.classes.get(c)) {
             let field = match named {
                 Some(n) => n.to_string(),
@@ -7986,8 +7999,9 @@ fn math_method_arity(name: &str) -> Option<usize> {
         "abs" | "signum" | "sqrt" | "cbrt" | "exp" | "expm1" | "log" | "log10" | "log1p"
         | "floor" | "ceil" | "rint" | "round" | "sin" | "cos" | "tan" | "asin" | "acos"
         | "atan" | "sinh" | "cosh" | "tanh" | "toRadians" | "toDegrees" | "ulp" => Some(1),
-        "max" | "min" | "pow" | "hypot" | "atan2" | "floorDiv" | "floorMod"
-        | "IEEEremainder" => Some(2),
+        "max" | "min" | "pow" | "hypot" | "atan2" | "floorDiv" | "floorMod" | "IEEEremainder" => {
+            Some(2)
+        }
         _ => None,
     }
 }

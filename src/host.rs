@@ -2472,11 +2472,16 @@ fn b_unapply_seq(vm: &mut VM, _argc: u8) -> Value {
     let extractor = vm.pop();
     // An `s"…"` pattern: the extractor is its literal parts.
     if let Value::Array(parts) = &extractor {
-        let parts: Vec<Vec<char>> = parts.iter().map(|p| scala_str(p).chars().collect()).collect();
+        let parts: Vec<Vec<char>> = parts
+            .iter()
+            .map(|p| scala_str(p).chars().collect())
+            .collect();
         let input: Vec<char> = scala_str(&scrutinee).chars().collect();
         return match string_context_glob(&parts, &input) {
             Some(caps) => heap_push(HeapVal::Tuple(
-                caps.into_iter().map(|c| Value::str(c.into_iter().collect::<String>())).collect(),
+                caps.into_iter()
+                    .map(|c| Value::str(c.into_iter().collect::<String>()))
+                    .collect(),
             )),
             None => Value::Undef,
         };
@@ -8296,7 +8301,10 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 })
             };
             let elem = &args[0];
-            if matches!(kind, SeqKind::List | SeqKind::ListBuffer | SeqKind::ImmQueue) {
+            if matches!(
+                kind,
+                SeqKind::List | SeqKind::ListBuffer | SeqKind::ImmQueue
+            ) {
                 for (i, cur) in items.iter().enumerate() {
                     if eq_vm(vm, elem, cur)? {
                         return Ok(result(true, i));
@@ -8339,9 +8347,9 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             });
             match (name, taken) {
                 ("dequeue", Some(p)) => Ok(p),
-                ("dequeue", None) => Err(
-                    "scalars: java.util.NoSuchElementException: dequeue on empty queue".into(),
-                ),
+                ("dequeue", None) => {
+                    Err("scalars: java.util.NoSuchElementException: dequeue on empty queue".into())
+                }
                 (_, p) => Ok(opt(p)),
             }
         }
@@ -8361,7 +8369,9 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                     Some(Ok(v)) => rights.push(v),
                     Some(Err(v)) => lefts.push(v),
                     // Scala rejects such an `f` at compile time.
-                    None => return Err("scalars: type mismatch: partitionMap needs an Either".into()),
+                    None => {
+                        return Err("scalars: type mismatch: partitionMap needs an Either".into())
+                    }
                 }
             }
             Ok(new_pair(mapped(lefts), mapped(rights)))
@@ -8826,7 +8836,8 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             let n = entries.len() as i64;
             let k = || args.first().map_or(1, Value::to_int).clamp(0, n) as usize;
             let len = entries.len();
-            let part = |from: usize, until: usize| new_map(rep, entries[from..until.max(from)].to_vec());
+            let part =
+                |from: usize, until: usize| new_map(rep, entries[from..until.max(from)].to_vec());
             Ok(match name {
                 "tail" | "drop" => part(k(), len),
                 "init" | "dropRight" => part(0, len - k()),
@@ -11500,7 +11511,9 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
     // `"a".equals('a')` is false. Answered before the `Char` → `String`
     // coercion below would make the two look alike.
     if let ("equals", [other]) = (name, args) {
-        return Ok(Value::bool(matches!(other, Value::Str(t) if t.as_str() == s)));
+        return Ok(Value::bool(
+            matches!(other, Value::Str(t) if t.as_str() == s),
+        ));
     }
     // `StringOps.split(separator: Char)` is LITERAL: it escapes the character
     // (`StringOps.escape`) before handing it to the regex `split`, so
@@ -12298,7 +12311,10 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
             // (`MatchData`). A group that did not participate answers -1 for
             // its offsets and `null` for its context, as `Matcher` does; an
             // out-of-range group is the same array fault `group(i)` raises.
-            if matches!((name, args.len()), ("start" | "end" | "before" | "after", 0 | 1)) {
+            if matches!(
+                (name, args.len()),
+                ("start" | "end" | "before" | "after", 0 | 1)
+            ) {
                 let i = args.first().map_or(0, Value::to_int);
                 let sp = if i == 0 {
                     Some(span)
@@ -13051,16 +13067,26 @@ fn double_method(f: f64, name: &str, args: &[Value]) -> Result<Value, String> {
         // `RichDouble`'s `isValidX`: the value survives the narrowing round trip
         // (`4.0.isValidInt` is true, `3.5` and `NaN` are not).
         ("isValidInt", 0) => Ok(Value::bool(f64::from(f as i32) == f)),
-        ("isValidShort", 0) => Ok(Value::bool(f64::from(to_short(i64::from(f as i32)) as i32) == f)),
-        ("isValidByte", 0) => Ok(Value::bool(f64::from(to_byte(i64::from(f as i32)) as i32) == f)),
+        ("isValidShort", 0) => Ok(Value::bool(
+            f64::from(to_short(i64::from(f as i32)) as i32) == f,
+        )),
+        ("isValidByte", 0) => Ok(Value::bool(
+            f64::from(to_byte(i64::from(f as i32)) as i32) == f,
+        )),
         ("isValidChar", 0) => Ok(Value::bool(f64::from(f as i32 as u16) == f)),
         // `RichDouble.sign` is `math.signum`, a `Double`: NaN and both zeros
         // answer themselves.
-        ("sign", 0) => Ok(Value::float(if f.is_nan() || f == 0.0 { f } else { f.signum() })),
+        ("sign", 0) => Ok(Value::float(if f.is_nan() || f == 0.0 {
+            f
+        } else {
+            f.signum()
+        })),
         // `java.lang.Double.equals(Object)`: another boxed `Double` with the same
         // `doubleToLongBits` — so `NaN` equals itself, `0.0` is not `-0.0`, and
         // an `Int` of equal value is not equal.
-        ("equals", 1) => Ok(Value::bool(matches!(args[0], Value::Float(g) if double_to_long_bits(g) == double_to_long_bits(f)))),
+        ("equals", 1) => Ok(Value::bool(
+            matches!(args[0], Value::Float(g) if double_to_long_bits(g) == double_to_long_bits(f)),
+        )),
         // `RichDouble`'s `max`/`min` are `math.max`/`math.min`, so they PROPAGATE
         // a NaN operand rather than ignoring it.
         ("max", 1) => Ok(Value::float(java_double_max(f, num_f64(&args[0])))),
