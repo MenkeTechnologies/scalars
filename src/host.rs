@@ -12817,24 +12817,25 @@ fn string_fn_method(
     // `groupBy` keys the characters by the function, and each group is itself a
     // `String` (`"aabbc".groupBy(identity)` maps `a` to `"aa"`).
     //
-    // Unlike `List.groupBy` — which is a `HashMap` at every size — this one is
-    // an ordinary immutable `Map`, so up to four groups it is an
-    // insertion-ordered `Map1`..`Map4` and only beyond that a CHAMP `HashMap`.
-    // Building the groups in first-appearance order and handing them to
-    // [`new_map`] applies exactly that rule.
+    // `StringOps.groupBy` is
+    // `new WrappedString(s).groupBy(f).view.mapValues(_.unwrap).toMap`: the
+    // groups are built into the `HashMap` every `IterableOps.groupBy` answers,
+    // and `toMap` re-collects that map in its CHAMP iteration order. Up to four
+    // groups the result is therefore a `Map1`..`Map4` in CHAMP order — not
+    // first-appearance order — and beyond that a `HashMap` again.
     if name == "groupBy" && args.len() == 1 {
-        let mut entries: Vec<(Value, Vec<Value>)> = Vec::new();
+        let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
         for c in &chars {
             let k = call!(c);
-            match entries.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
+            match groups.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
                 Some((_, group)) => group.push(c.clone()),
-                None => entries.push((k, vec![c.clone()])),
+                None => groups.push((k, vec![c.clone()])),
             }
         }
-        return Some(Ok(new_map(
-            HashRep::Small,
-            entries.into_iter().map(|(k, g)| (k, join(&g))).collect(),
-        )));
+        let entries: Vec<(Value, Value)> =
+            groups.into_iter().map(|(k, g)| (k, join(&g))).collect();
+        let entries = champ_sorted(&entries, |(k, _)| k.clone()).unwrap_or(entries);
+        return Some(Ok(new_map(HashRep::Small, entries)));
     }
 
     if args.len() != 1 {
