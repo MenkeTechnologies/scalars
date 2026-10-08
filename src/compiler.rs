@@ -909,6 +909,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // simplification that is observably identical for pure val bodies.
     for od in &objects {
         c.object_inits(od)?;
+        c.adopt_object_record(od);
     }
 
     // An `extends App` body's `val`s are FIELDS of the entry object, and a JVM
@@ -998,6 +999,7 @@ fn builtin_none() -> ObjectDecl {
         is_case: true,
         parents: Vec::new(),
         body: Vec::new(),
+        super_args: Vec::new(),
         methods: Vec::new(),
     }
 }
@@ -5414,6 +5416,57 @@ impl Compiler {
 
     /// Emit `object`-`val` initialization (before `main`) into the `Name.val`
     /// globals; run any side-effecting body statement for effect.
+    /// Give a singleton with `val`s — its own, a supertype's, or the constructor
+    /// parameters of the class it passes arguments to (`object O extends C(5)`,
+    /// an `enum` case `case Red extends Color(1)`) — a record carrying them, so a read through a VALUE of it
+    /// (`List(Red).map(_.rgb)`) finds them as a read through its name does. The
+    /// fields are the object's `val`s — the superclass's constructor parameters
+    /// first (see [`inherit_into_objects`]) — already initialized into their
+    /// `Name.val` globals, so nothing is evaluated twice.
+    fn adopt_object_record(&mut self, od: &ObjectDecl) {
+        let fields: Vec<&str> = od
+            .body
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::Local {
+                    is_val: true,
+                    is_lazy: false,
+                    name,
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if fields.is_empty() {
+            return;
+        }
+        for f in &fields {
+            let g = self.b.add_name(&object_field_global(&od.name, f));
+            self.b.emit(Op::GetVar(g), 0);
+        }
+        let n = self.b.add_constant(Value::str(od.name.clone()));
+        let csv = self.b.add_constant(Value::str(fields.join(",")));
+        self.b.emit(Op::LoadConst(n), 0);
+        self.b.emit(Op::LoadConst(csv), 0);
+        self.b.emit(Op::LoadFalse, 0);
+        self.b.emit(Op::LoadFalse, 0);
+        self.b.emit(
+            Op::CallBuiltin(crate::host::OBJ_NEW, fields.len() as u8 + 4),
+            0,
+        );
+        self.b.emit(Op::LoadConst(n), 0);
+        self.b.emit(
+            if od.is_case {
+                Op::LoadTrue
+            } else {
+                Op::LoadFalse
+            },
+            0,
+        );
+        self.b.emit(Op::CallBuiltin(crate::host::OBJ_ADOPT, 3), 0);
+        self.b.emit(Op::Pop, 0);
+    }
+
     fn object_inits(&mut self, od: &ObjectDecl) -> Result<(), String> {
         let saved = self.current_object.take();
         self.current_object = Some(od.name.clone());
@@ -8275,6 +8328,36 @@ fn inherit_into_objects(
         let mut have_vals: HashSet<String> = od.body.iter().filter_map(local_name).collect();
         let mut inherited_methods = Vec::new();
         let mut inherited_vals: Vec<Vec<Stmt>> = Vec::new();
+        // `extends C(args)`: `C`'s constructor parameters are fields of the
+        // singleton, bound to the arguments (or their defaults) before any
+        // body `val` of `C` initializes.
+        let mut ctor_vals = Vec::new();
+        if let Some(sup) = od
+            .parents
+            .first()
+            .filter(|_| !od.super_args.is_empty())
+            .and_then(|p| by_name.get(p.as_str()))
+        {
+            for (i, p) in sup.params.iter().enumerate() {
+                let init = od
+                    .super_args
+                    .get(i)
+                    .cloned()
+                    .or_else(|| sup.param_defaults.get(i).cloned().flatten());
+                if have_vals.insert(p.clone()) {
+                    ctor_vals.push(Stmt {
+                        line: 0,
+                        kind: StmtKind::Local {
+                            is_val: true,
+                            is_lazy: false,
+                            ty: sup.param_tys.get(i).cloned().flatten(),
+                            name: p.clone(),
+                            init,
+                        },
+                    });
+                }
+            }
+        }
         for anc in mro.iter().skip(1) {
             let Some(parent) = by_name.get(anc.as_str()) else {
                 continue;
@@ -8295,7 +8378,8 @@ fn inherit_into_objects(
         // `have_methods` borrows `od.methods`; release it before extending.
         drop(have_methods);
         od.methods.extend(inherited_methods);
-        let mut body: Vec<Stmt> = inherited_vals.into_iter().rev().flatten().collect();
+        let mut body: Vec<Stmt> = ctor_vals;
+        body.extend(inherited_vals.into_iter().rev().flatten());
         body.append(&mut od.body);
         od.body = body;
     }

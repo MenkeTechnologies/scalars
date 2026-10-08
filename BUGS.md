@@ -906,9 +906,7 @@ reported as parse/compile errors, never silently mis-run.
   provided. Scala 3's `enum` is.
 - **A qualified extractor in a pattern.** `case Obj.Re(a) =>` does not parse;
   bind the extractor to a local first.
-- **`enum` with constructor parameters.** `enum Planet(mass: Double)` and a
-  case `extends Planet(5.97)` are refused with a diagnostic; a `val` in an
-  enum body is refused too. The cases share the one flat type namespace, so two
+- **`enum` cases share one type namespace.** The cases share the one flat type namespace, so two
   enums with a case of the same name are a redeclaration.
 - **What the optional-braces pass does not cover.** An indentation region
   inside `( )` is not a region, so a fewer-braces argument written inside an

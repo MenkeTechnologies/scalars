@@ -277,13 +277,19 @@ Implemented and checked against the reference `scala`:
   redeclaration is refused rather than silently resolved to one of the two.
 - **Scala 3 `enum`** — the simple form (`enum Color { case Red, Green }`), the
   ADT form (`case Circle(r: Double)`, type parameters allowed) and a mix, in
-  braces or indentation, with `def`s in the body. Each case answers `ordinal`
+  braces or indentation, with `def`s and `val`s in the body, and the
+  parameterized form (`enum Planet(mass: Double)` whose cases call its
+  constructor, `case Earth extends Planet(5.976e24)`). Each case answers `ordinal`
   (its position among all cases); the companion answers `fromOrdinal`, and
   `values` / `valueOf` when every case is a singleton, raising the same
   `NoSuchElementException` / `IllegalArgumentException` messages. `Color.Red`,
   `Shape.Circle(1.0)` and the patterns `case Color.Red =>` /
   `case Shape.Circle(r) =>` work wherever the enum is declared, and a
   program's own `object Color` adds members to the companion.
+- **Singleton objects with fields** — an `object`'s `val`s (its own, a
+  supertype's, and the constructor parameters it passes on in
+  `object O extends C(5)` / `case object A extends S(5)`) are read through
+  its name and through any value of it (`List(A, B).map(_.w)`).
 - **Bindings** — `val` / `var` with optional type ascription
   (`val x: Int = …`, `var s = …`), type inferred as storage; plain and compound
   assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`). Reassigning a `val`

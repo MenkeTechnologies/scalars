@@ -160,6 +160,9 @@ pub struct ObjectDecl {
     /// `extends P with T …` — the singleton's supertypes, so `case o: Shape`
     /// matches it and its inherited methods dispatch.
     pub parents: Vec<String>,
+    /// `extends C(args)` — the arguments the singleton passes to its
+    /// superclass constructor (empty when it passes none).
+    pub super_args: Vec<Expr>,
     /// `val`/`var` declarations (initialized once before `main`) and side effects.
     pub body: Vec<Stmt>,
     pub methods: Vec<Func>,

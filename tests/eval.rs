@@ -6035,11 +6035,14 @@ enum Tree {
 }
 
 #[test]
-fn an_enum_with_constructor_parameters_is_refused() {
-    rejects(
+fn an_enum_with_constructor_parameters_runs() {
+    // Once refused; the cases now pass the enum's constructor its arguments
+    // (reference output, Scala 3.9.0).
+    let (out, ok) = run(
         "enum Planet(mass: Double):\n  case Earth extends Planet(5.97)\n@main def run(): Unit = println(Planet.Earth)\n",
-        "an `enum` with constructor parameters",
     );
+    assert!(ok);
+    assert_eq!(out, "Earth\n");
 }
 
 #[test]

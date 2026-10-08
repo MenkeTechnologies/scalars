@@ -471,7 +471,7 @@ impl Parser {
         let name = self.ident()?;
         // `extends Parent with Trait …`. `App` selects the run-the-body entry
         // form; any other supertype list is a mixin on the singleton.
-        let (parents, _) = self.parents_clause()?;
+        let (parents, super_args) = self.parents_clause()?;
         let app_mode = parents.iter().any(|p| p == "App");
         // A bodyless singleton (`case object Red extends Color`) is the ADT
         // idiom and has no braces at all.
@@ -481,6 +481,7 @@ impl Parser {
                 is_case,
                 parents,
                 body: Vec::new(),
+                super_args,
                 methods: Vec::new(),
             }));
         }
@@ -551,6 +552,7 @@ impl Parser {
                 is_case,
                 parents,
                 body,
+                super_args,
                 methods: defs,
             }))
         }
@@ -848,11 +850,13 @@ impl Parser {
         if self.is(&Tok::LBracket) {
             self.skip_bracket_group();
         }
-        if self.is(&Tok::LParen) {
-            return Err(format!(
-                "scalars: an `enum` with constructor parameters (`enum {name}(…)`) is not modelled (line {line})"
-            ));
-        }
+        // `enum Color(val rgb: Int)` — the enum is then an abstract class whose
+        // constructor every case calls (`case Red extends Color(0xff0000)`).
+        let ctor = if self.is(&Tok::LParen) {
+            Some(self.ctor_params()?)
+        } else {
+            None
+        };
         let (mut parents, _) = self.parents_clause()?;
         // `derives C1, C2` names type-class instances to derive; the runtime
         // has no type classes to derive them for.
@@ -866,10 +870,21 @@ impl Parser {
         let mut methods = Vec::new();
         // (case name, its class when parameterized) in declaration order.
         let mut cases: Vec<(String, Option<ClassDecl>)> = Vec::new();
+        // The constructor arguments of each singleton case that passes them, by
+        // its index in `cases`.
+        // The enum's `val`/`var` members — fields of every case.
+        let mut fields: Vec<Stmt> = Vec::new();
+        let mut singleton_args: Vec<(usize, Vec<Expr>)> = Vec::new();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-            self.skip_member_modifiers();
+            let lazy = self.skip_member_modifiers();
             if self.is(&Tok::Def) {
                 methods.push(self.parse_def()?);
+            } else if self.is(&Tok::Val) || self.is(&Tok::Var) {
+                let mut stmt = self.statement()?;
+                if let StmtKind::Local { is_lazy, .. } = &mut stmt.kind {
+                    *is_lazy |= lazy;
+                }
+                fields.push(stmt);
             } else if self.is(&Tok::Case) {
                 self.advance();
                 let case_line = self.line();
@@ -907,16 +922,23 @@ impl Parser {
                         }),
                     ));
                 } else {
+                    let first = cases.len();
                     cases.push((case, None));
                     while self.is(&Tok::Comma) {
                         self.advance();
                         self.skip_seps();
                         cases.push((self.ident()?, None));
                     }
+                    // `case Red extends Color(0xff0000)` — a singleton case passing
+                    // the enum's constructor its arguments.
                     if self.is(&Tok::Extends) {
-                        return Err(format!(
-                            "scalars: an `enum` case with an `extends` clause is not modelled (line {case_line})"
-                        ));
+                        let (case_parents, super_args) = self.parents_clause()?;
+                        if case_parents.first() != Some(&name) || cases.len() != first + 1 {
+                            return Err(format!(
+                                "scalars: an `enum` case may only extend its own enum (line {case_line})"
+                            ));
+                        }
+                        singleton_args.push((cases.len() - 1, super_args));
                     }
                 }
             } else {
@@ -931,19 +953,39 @@ impl Parser {
         self.eat(&Tok::RBrace)?;
 
         parents.retain(|p| p != &name);
+        let CtorParams {
+            params,
+            param_tys,
+            param_by_name,
+            param_defaults,
+        } = ctor.unwrap_or(CtorParams {
+            params: Vec::new(),
+            param_tys: Vec::new(),
+            param_by_name: Vec::new(),
+            param_defaults: Vec::new(),
+        });
         self.declare_class(
             ClassDecl {
                 name: name.clone(),
                 is_case: false,
-                is_trait: true,
+                // A parameterized enum is an abstract CLASS — it has the
+                // constructor its cases call; a plain one is a trait.
+                is_trait: params.is_empty(),
                 parents,
                 super_args: Vec::new(),
-                params: Vec::new(),
-                param_by_name: Vec::new(),
-                param_tys: Vec::new(),
-                param_defaults: Vec::new(),
-                body: Vec::new(),
-                field_names: Vec::new(),
+                field_names: params
+                    .iter()
+                    .cloned()
+                    .chain(fields.iter().filter_map(|s| match &s.kind {
+                        StmtKind::Local { name, .. } => Some(name.clone()),
+                        _ => None,
+                    }))
+                    .collect(),
+                params,
+                param_by_name,
+                param_tys,
+                param_defaults,
+                body: fields,
                 methods,
             },
             line,
@@ -960,12 +1002,18 @@ impl Parser {
                 }
                 None => {
                     singletons.push((ordinal, case.clone()));
+                    let super_args = singleton_args
+                        .iter()
+                        .find(|(i, _)| *i == ordinal)
+                        .map(|(_, a)| a.clone())
+                        .unwrap_or_default();
                     self.declare_object(
                         ObjectDecl {
                             name: case,
                             is_case: true,
                             parents: vec![name.clone()],
                             body: Vec::new(),
+                            super_args,
                             methods: ordinal_def,
                         },
                         line,
@@ -1008,6 +1056,7 @@ impl Parser {
                 is_case: false,
                 parents: Vec::new(),
                 body,
+                super_args: Vec::new(),
                 methods: companion_methods,
             },
             line,
@@ -1960,6 +2009,7 @@ impl Parser {
                 is_case: false,
                 parents: vec![base_type_name(&ty)],
                 body,
+                super_args: Vec::new(),
                 methods,
             });
             self.implicits.push((name, ty));

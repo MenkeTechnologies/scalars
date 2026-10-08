@@ -469,6 +469,11 @@ pub const SSUB_VM: u16 = 792;
 /// `java.lang.Class` record [`class_of`] would for a value of that type — the
 /// same interned record, so `x.getClass == classOf[T]` holds.
 pub const CLASS_OF: u16 = 793;
+/// Builtin id for adopting a constructed record as a singleton `object`: pops
+/// whether it is a `case object`, the object's name and the record its
+/// superclass constructor built, retags the record as that object and makes it
+/// the instance every mention answers. See `object O extends C(args)`.
+pub const OBJ_ADOPT: u16 = 794;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -748,6 +753,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SADD, b_add);
     vm.register_builtin(SSUB_VM, b_sub_vm);
     vm.register_builtin(CLASS_OF, b_class_of);
+    vm.register_builtin(OBJ_ADOPT, b_obj_adopt);
     vm.register_builtin(SEQ_VM, b_eq_vm);
     vm.register_builtin(SNE_VM, b_ne_vm);
     vm.register_builtin(BYNAME, b_byname);
@@ -2936,6 +2942,55 @@ fn b_obj_new(vm: &mut VM, _argc: u8) -> Value {
         SINGLETONS.with(|t| t.borrow_mut().insert(class, v.clone()));
     }
     v
+}
+
+/// `OBJ_ADOPT` builtin — see [`OBJ_ADOPT`]. Answers the adopted instance.
+fn b_obj_adopt(vm: &mut VM, _argc: u8) -> Value {
+    let is_case = matches!(vm.pop(), Value::Bool(true));
+    let name = vm.pop().as_str_cow().into_owned();
+    let rec = vm.pop();
+    if unwinding() {
+        return Value::Undef;
+    }
+    let Some(id) = as_obj_id(&rec) else {
+        return fault(
+            vm,
+            format!("scalars: object {name}: its superclass built no instance"),
+        );
+    };
+    // A mention of the object while its own `val`s were initializing (`val
+    // self = this`) already made the fieldless instance; that handle stays the
+    // object's identity and takes the fields.
+    let target = SINGLETONS
+        .with(|t| t.borrow().get(&name).cloned())
+        .unwrap_or_else(|| rec.clone());
+    let tid = as_obj_id(&target).unwrap_or(id);
+    HEAP.with(|h| {
+        let mut h = h.borrow_mut();
+        let fields = match h.get(id) {
+            Some(HeapVal::Record(o)) => o.fields.clone(),
+            _ => Vec::new(),
+        };
+        if let Some(HeapVal::Record(o)) = h.get_mut(tid) {
+            o.class = Arc::from(name.as_str());
+            o.is_case = is_case;
+            o.is_object = true;
+            o.fields = fields;
+        }
+    });
+    // An object's fields are members, never constructor parameters: its
+    // `Product` view (`productArity`, `hashCode`, `==`) stays empty.
+    TYPES.with(|t| {
+        t.borrow_mut()
+            .entry(name.clone())
+            .or_insert_with(|| TypeInfo {
+                supers: Vec::new(),
+                ctor_arity: 0,
+            })
+            .ctor_arity = 0;
+    });
+    SINGLETONS.with(|t| t.borrow_mut().insert(name, target.clone()));
+    target
 }
 
 /// `OBJ_CLASS` builtin — pop one value; push its class name (or `""` for a
