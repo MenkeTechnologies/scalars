@@ -464,7 +464,8 @@ Implemented and checked against the reference `scala`:
   `lift`/`isDefinedAt`, the `Option`-valued `minOption`/`maxOption`/
   `minByOption`/`maxByOption`, `sizeCompare`/`lengthCompare`, `tapEach`,
   `mkString`, the `to*` conversions, the set
-  algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`), `:::`
+  algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`; on a
+  sequence or `String`, `diff`/`intersect` are multiset operations), `:::`
   and `++:`, and
   `Map`'s `apply`/`get`/`getOrElse`/`keys`/`values`/`updated`/`transform`, and the
   companions' `IterableFactory` members — `List.empty` (including the applied

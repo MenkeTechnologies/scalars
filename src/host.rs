@@ -7251,6 +7251,31 @@ fn updated_fault(kind: SeqKind, i: i64, len: usize) -> String {
     }
 }
 
+/// `SeqOps.diff` (`keep_matched = false`) and `SeqOps.intersect`
+/// (`keep_matched = true`): walk `items` in order and let each one consume the
+/// first not-yet-consumed equal element of `other`; a matched element is kept by
+/// `intersect` and dropped by `diff`. A `Set` receiver holds no duplicates, so
+/// it keeps a plain membership filter and consumes nothing.
+fn multiset_filter(
+    kind: SeqKind,
+    items: &[Value],
+    mut other: Vec<Value>,
+    keep_matched: bool,
+) -> Vec<Value> {
+    let consume = !matches!(kind, SeqKind::Set(_));
+    items
+        .iter()
+        .filter(|x| {
+            let hit = other.iter().position(|y| value_eq(x, y));
+            if let (Some(j), true) = (hit, consume) {
+                other.remove(j);
+            }
+            hit.is_some() == keep_matched
+        })
+        .cloned()
+        .collect()
+}
+
 /// `Seq` (`List`/`Set`/`Iterable`) methods — a faithful subset. Closure-taking
 /// ops run their function argument through [`invoke_closure`].
 fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -8382,25 +8407,17 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             out.extend(as_seq_or_tuple(&args[0]).unwrap_or_default());
             Ok(same(out))
         }
+        // A sequence's `diff`/`intersect` are MULTISET operations
+        // (`SeqOps.diff`/`intersect` over `occCounts(that)`): each element of
+        // the argument cancels or keeps ONE occurrence of an equal element, so
+        // `List(1, 1, 2).diff(List(1))` is `List(1, 2)`.
         ("intersect" | "&", 1) => {
             let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
-            Ok(same(
-                items
-                    .iter()
-                    .filter(|x| other.iter().any(|y| value_eq(x, y)))
-                    .cloned()
-                    .collect(),
-            ))
+            Ok(same(multiset_filter(kind, &items, other, true)))
         }
         ("diff" | "--" | "removedAll" | "&~", 1) => {
             let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
-            Ok(same(
-                items
-                    .iter()
-                    .filter(|x| !other.iter().any(|y| value_eq(x, y)))
-                    .cloned()
-                    .collect(),
-            ))
+            Ok(same(multiset_filter(kind, &items, other, false)))
         }
         ("subsetOf", 1) => {
             let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
@@ -12004,6 +12021,30 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 }
             }
             Ok(Value::str(seen))
+        }
+        // `StringOps.diff`/`intersect` are the `SeqOps` multiset operations
+        // over the receiver's chars: `"hello".diff("lo")` is `hel`.
+        ("diff" | "intersect", 1) => {
+            let mut other: Vec<char> = match &args[0] {
+                Value::Str(t) => t.chars().collect(),
+                v => as_seq_or_tuple(v)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(as_char)
+                    .collect(),
+            };
+            let keep_matched = name == "intersect";
+            let out: String = s
+                .chars()
+                .filter(|c| {
+                    let hit = other.iter().position(|o| o == c);
+                    if let Some(j) = hit {
+                        other.remove(j);
+                    }
+                    hit.is_some() == keep_matched
+                })
+                .collect();
+            Ok(Value::str(out))
         }
         ("sorted", 0) => {
             let mut cs: Vec<char> = s.chars().collect();
