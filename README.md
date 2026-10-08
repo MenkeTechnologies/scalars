@@ -544,7 +544,8 @@ Implemented and checked against the reference `scala`:
   `String.valueOf` and the rest. The two namespaces stay apart exactly as
   Scala's do, and a fixed-width rendering follows its box.
 - **`getClass`** — a `java.lang.Class` answering `getName`/`getSimpleName` for a
-  `String`, a primitive, a user type or a throwable (`e.getClass.getSimpleName`).
+  `String`, a primitive, a user type or a throwable (`e.getClass.getSimpleName`);
+  one `Class` per class, also reached as `classOf[T]`.
 - **`scala.math`** — `abs`, `signum`, `min`/`max`, `round`/`floor`/`ceil`/`rint`,
   `sqrt`/`cbrt`/`exp`/`log`/`log10`/`pow`/`hypot`, the trig family, `atan2`,
   `toRadians`/`toDegrees`, `Pi`, `E`, under the `math`, `scala.math`, `Math` and

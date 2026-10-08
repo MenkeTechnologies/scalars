@@ -628,6 +628,14 @@ reported as parse/compile errors, never silently mis-run.
   class's method is `this.getClass`, so a base class's `toString` can name the
   runtime subclass (`s"${getClass.getSimpleName}(…)"`). A collection's
   `getClass` (`$colon$colon` for a non-empty `List`) is not modelled.
+  There is one `Class` object per class, so `a.getClass == b.getClass` (and
+  `eq`) holds for two values of one class. `classOf[T]` answers that same
+  object under the JVM erasure: a value type is its primitive (`classOf[Int]`
+  is `int`, `classOf[Unit]` `void`), a type constructor drops its arguments
+  (`classOf[List[Int]]` is `class scala.collection.immutable.List`), `Any`/
+  `AnyRef` are `java.lang.Object`, and a declared type or a throwable is its
+  own; an `Array` or function type is refused. `new Object` / `new AnyRef` is
+  a fieldless instance equal only to itself.
 
   A primitive reached through an `Any`-typed position reports the PRIMITIVE
   class where Scala reports the BOXED one: `val a: Any = 1; a.getClass` is

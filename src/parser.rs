@@ -3696,6 +3696,17 @@ impl Parser {
                         line,
                     });
                 }
+                // `classOf[T]` — likewise: the type is the operand.
+                if name == "classOf" && self.is(&Tok::LBracket) {
+                    self.advance();
+                    let ty = self.type_ref()?;
+                    self.eat(&Tok::RBracket)?;
+                    return self.postfix_from(Expr::Call {
+                        name: CLASSOF.to_string(),
+                        args: vec![Expr::Str(ty)],
+                        line,
+                    });
+                }
                 // Optional generic type arguments (`List[Int](…)`, `foo[T](…)`).
                 if self.is(&Tok::LBracket) {
                     self.skip_bracket_group();
@@ -4941,6 +4952,10 @@ fn conversion_args(ty: &str) -> Option<(String, String)> {
 /// The synthetic call `summon[T]` parses to: one argument, the type's name,
 /// resolved against the implicit scope by [`crate::compiler`].
 pub const SUMMON: &str = "summon$";
+
+/// The synthetic call `classOf[T]` parses to: one argument, the type's source
+/// text, answered by `crate::host::CLASS_OF`.
+pub const CLASSOF: &str = "classOf$";
 
 fn base_type_name(ty: &str) -> String {
     match ty.find('[') {

@@ -3885,6 +3885,18 @@ impl Compiler {
             // `new Regex("…")` is the constructor spelling of `"…".r`; both make
             // the same `Regex` value, so it lowers to the same `r` method. The
             // second parameter list (group names) is not modeled.
+            // `new Object` / `new AnyRef` — a bare instance with no fields,
+            // equal only to itself.
+            if matches!(name, "Object" | "AnyRef" | "java.lang.Object") && args.is_empty() {
+                for c in ["java.lang.Object", ""] {
+                    let k = self.b.add_constant(Value::str(c.to_string()));
+                    self.b.emit(Op::LoadConst(k), line);
+                }
+                self.b.emit(Op::LoadFalse, line);
+                self.b.emit(Op::LoadFalse, line);
+                self.b.emit(Op::CallBuiltin(crate::host::OBJ_NEW, 4), line);
+                return Ok(());
+            }
             if name == "Regex" && args.len() == 1 {
                 self.expr(&args[0])?;
                 let m = self.b.add_constant(Value::str("r".to_string()));
@@ -5778,6 +5790,18 @@ impl Compiler {
                 line,
             );
             return Ok(());
+        }
+        if name == crate::parser::CLASSOF {
+            if let [ty @ Expr::Str(text)] = args {
+                // Whether the type is one the program declares, which only the
+                // compiler knows for certain.
+                let base = text.split('[').next().unwrap_or(text).trim();
+                let user = self.classes.contains_key(base);
+                self.expr(ty)?;
+                self.b.emit(Op::LoadInt(i64::from(user)), line);
+                self.b.emit(Op::CallBuiltin(crate::host::CLASS_OF, 2), line);
+                return Ok(());
+            }
         }
         if name == crate::parser::SUMMON {
             if let [Expr::Str(ty)] = args {

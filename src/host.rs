@@ -464,6 +464,11 @@ pub const MAKE_IMMQUEUE: u16 = 791;
 /// with that override, which `Op::Sub`'s VM-less numeric hook cannot run.
 /// Everything else answers what `Op::Sub` would. See `Compiler::may_be_keyed`.
 pub const SSUB_VM: u16 = 792;
+/// Builtin id for `classOf[T]`: pops whether the program declares the type and its
+/// source text, and answers the
+/// `java.lang.Class` record [`class_of`] would for a value of that type — the
+/// same interned record, so `x.getClass == classOf[T]` holds.
+pub const CLASS_OF: u16 = 793;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -742,6 +747,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(IS_GROWABLE, b_is_growable);
     vm.register_builtin(SADD, b_add);
     vm.register_builtin(SSUB_VM, b_sub_vm);
+    vm.register_builtin(CLASS_OF, b_class_of);
     vm.register_builtin(SEQ_VM, b_eq_vm);
     vm.register_builtin(SNE_VM, b_ne_vm);
     vm.register_builtin(BYNAME, b_byname);
@@ -2055,6 +2061,7 @@ pub fn reset_heap() {
     // The intern table holds arena indices, which the clear above invalidates.
     CHARS.with(|t| t.borrow_mut().clear());
     SINGLETONS.with(|t| t.borrow_mut().clear());
+    CLASSES.with(|t| t.borrow_mut().clear());
     // Method entries are offsets into the OUTGOING chunk; the next program
     // compiles its own, so a stale hit would jump into unrelated bytecode.
     METHOD_ENTRIES.with(|t| t.borrow_mut().clear());
@@ -2091,6 +2098,10 @@ thread_local! {
     /// materializes it, and Scala has exactly one instance — so `O eq O`, `O ==
     /// O` and a stable `O.hashCode` all depend on answering the same handle.
     static SINGLETONS: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    /// The one `java.lang.Class` record per class name. The JVM has one
+    /// `Class` object per class, so `a.getClass == b.getClass` (and `eq`) is
+    /// true for two values of one class, and `classOf[T]` is that same object.
+    static CLASSES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
 
 /// The interned `Char` value for `c`.
@@ -4289,7 +4300,8 @@ fn class_of(recv: &Value) -> Result<Value, String> {
             } else {
                 class
             };
-            (n.clone(), n, false)
+            let simple = n.rsplit('.').next().unwrap_or(&n).to_string();
+            (n.clone(), simple, false)
         }
         _ => return Err(no_such_method(recv, "getClass")),
     };
@@ -4300,7 +4312,10 @@ fn class_of(recv: &Value) -> Result<Value, String> {
 /// FIELDS called `getName`/`getSimpleName` so the ordinary paren-less field read
 /// in [`obj_method`] answers them.
 fn class_record(name: &str, simple: &str, primitive: bool) -> Value {
-    heap_alloc(ScalaObj {
+    if let Some(v) = CLASSES.with(|t| t.borrow().get(name).cloned()) {
+        return v;
+    }
+    let v = heap_alloc(ScalaObj {
         class: Arc::from(CLASS_CLASS),
         is_case: false,
         is_object: false,
@@ -4309,7 +4324,70 @@ fn class_record(name: &str, simple: &str, primitive: bool) -> Value {
             (Arc::from("getSimpleName"), Value::str(simple.to_string())),
             (Arc::from("isPrimitive"), Value::bool(primitive)),
         ],
-    })
+    });
+    CLASSES.with(|t| t.borrow_mut().insert(name.to_string(), v.clone()));
+    v
+}
+
+/// `classOf[T]` — the `Class` of the type written `ty`, under the JVM erasure
+/// Scala compiles it to: a value type is its primitive (`classOf[Int]` prints
+/// `int`), a type constructor drops its arguments (`classOf[List[Int]]` is
+/// `scala.collection.immutable.List`), and a user type is its own name (`user`
+/// says the program declares `ty`). A type
+/// whose erasure is not modelled here (an `Array`, a function type) is refused
+/// rather than guessed.
+fn class_of_type(ty: &str, user: bool) -> Result<Value, String> {
+    let ty = ty.trim();
+    let base = ty.split('[').next().unwrap_or(ty).trim();
+    let base = base.strip_prefix("scala.").unwrap_or(base);
+    let primitive = match base {
+        "Int" => Some("int"),
+        "Long" => Some("long"),
+        "Double" => Some("double"),
+        "Float" => Some("float"),
+        "Boolean" => Some("boolean"),
+        "Char" => Some("char"),
+        "Byte" => Some("byte"),
+        "Short" => Some("short"),
+        "Unit" => Some("void"),
+        _ => None,
+    };
+    if let Some(p) = primitive {
+        return Ok(class_record(p, p, true));
+    }
+    let qualified = match base {
+        "String" | "java.lang.String" | "Predef.String" => "java.lang.String",
+        "Any" | "AnyRef" | "Object" | "java.lang.Object" => "java.lang.Object",
+        "List" => "scala.collection.immutable.List",
+        "Seq" => "scala.collection.immutable.Seq",
+        "IndexedSeq" => "scala.collection.immutable.IndexedSeq",
+        "Vector" => "scala.collection.immutable.Vector",
+        "Map" => "scala.collection.immutable.Map",
+        "Set" => "scala.collection.immutable.Set",
+        "Option" => "scala.Option",
+        "Some" => "scala.Some",
+        "BigInt" => "scala.math.BigInt",
+        _ => "",
+    };
+    if !qualified.is_empty() {
+        let simple = qualified.rsplit('.').next().unwrap_or(qualified);
+        return Ok(class_record(qualified, simple, false));
+    }
+    if let Some(fqn) = throwable_fqn(base) {
+        let simple = fqn.rsplit('.').next().unwrap_or(fqn);
+        return Ok(class_record(fqn, simple, false));
+    }
+    if user {
+        return Ok(class_record(base, base, false));
+    }
+    Err(format!("scalars: classOf[{ty}] is not modelled"))
+}
+
+/// `CLASS_OF` builtin — see [`CLASS_OF`].
+fn b_class_of(vm: &mut VM, _argc: u8) -> Value {
+    let user = vm.pop().to_int() != 0;
+    let ty = vm.pop().as_str_cow().into_owned();
+    class_of_type(&ty, user).unwrap_or_else(|e| fault(vm, e))
 }
 
 /// The primary-constructor prefix of a record's fields — exactly what Scala's
