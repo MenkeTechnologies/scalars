@@ -5057,7 +5057,6 @@ impl Compiler {
             });
         }
         if (name == "to" || name == "until") && args.len() == 1 {
-            Self::reject_char_range(recv, &args[0])?;
             self.expr(recv)?;
             self.expr(&args[0])?;
             self.b.emit(
@@ -6359,7 +6358,12 @@ impl Compiler {
         // `a to b` / `a until b` — a `Range` of the endpoints' width. Scala's
         // `1 to 3` is a `Range` (an `Int` one); `1L to 3L` is a
         // `NumericRange[Long]`, which does not wrap.
+        // A `Char` endpoint makes it a `NumericRange[Char]`, whose elements are
+        // `Char`s, not the `Int` a `Char` widens to in arithmetic.
         if args.len() == 1 && matches!(name, "to" | "until") {
+            if matches!(recv, Expr::Char(_)) || matches!(&args[0], Expr::Char(_)) {
+                return NumTy::Unknown;
+            }
             return self.num_ty(recv).combine(self.num_ty(&args[0]));
         }
         // The combinators that return a collection of the SAME element type, so

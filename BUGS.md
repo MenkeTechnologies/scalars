@@ -815,6 +815,17 @@ reported as parse/compile errors, never silently mis-run.
   (`(1 to 5).take(2)` is `Range 1 to 2`, an empty slice `empty Range 3 until 3`), and `sum`/`length`/`head`/`last`/`toList`/`mkString`/`contains`/
   `min`/`max` all work. Used as a `for` generator it still compiles to the
   counted loop (no materialization).
+- **A `Char` range — `'a' to 'e'`, `'a' until 'z' by 2`.** Scala's
+  `NumericRange[Char]`, a class of its own rather than a `Range`: it prints
+  `NumericRange a to e` (`empty NumericRange e to a`, and `by` renders its step
+  as the `Char` it is), `take`/`drop`/`tail`/`init`/`splitAt` keep the class
+  with the bounds `NumericRange.scala` computes while `slice`/`takeRight`/`span`
+  and every transformation build a `Vector` (`grouped` an `ArraySeq` per
+  group), `sum`/`product` answer a `Char` that wraps at 16 bits, `contains`/
+  `indexOf` miss a non-`Char` probe (`('a' to 'c').contains(98)` is `false`),
+  `reverse` of a non-empty one raises `ArithmeticException` because a `Char`
+  step cannot be negated, and an empty one's `head`/`last`/`min`/`max` report
+  `Nil.head`. A `for` over a `Char`-literal range iterates the `Char`s.
 - **`scala.math`.** `abs`, `signum`, `min`, `max`, `round`, `floor`, `ceil`,
   `rint`, `sqrt`, `cbrt`, `exp`, `log`, `log10`, `pow`, `hypot`, the trig and
   inverse-trig functions, `atan2`, `toRadians`/`toDegrees`, `Pi`, `E` — under
@@ -1000,16 +1011,15 @@ reported as parse/compile errors, never silently mis-run.
   (`LazyList(1, 2, <not computed>)`). Traversing twice recomputes nothing,
   which a program can count.
 
-- **A `Char` range — `'a' to 'e'`, `'a' until 'z'`, `for (c <- 'a' to 'd')`.**
-  Scala's is a `NumericRange[Char]`, which this frontend has no representation
-  for: a `Char` is a heap value here, so reading the endpoints as integers built
-  `Range 0 to 0` and answered `List(0)`, `size` 1, `contains('c')` false. That is
-  a silent wrong answer, so it is now REFUSED — at compile time for a `Char`
-  literal endpoint, and in `MAKE_RANGE`/`RANGE_LIST` for endpoints that arrive as
-  values. Write `('a'.toInt to 'e'.toInt).map(_.toChar)`. The one spelling that
-  still escapes both checks is a *counted `for` loop* whose endpoints are BOTH
-  `Char` variables (`val a = 'a'; val z = 'z'; for (c <- a to z)`), which lowers
-  to inline loop bytecode rather than through either builtin.
+- **A counted `for` over a `Char` range whose endpoints are both variables.**
+  `val a = 'a'; val z = 'z'; for (c <- a to z)` is recognized as a range
+  generator by shape and lowers to the inline integer loop, so `c` is the code
+  point rather than the `Char`; the parser can see a `Char` literal endpoint
+  but not a binding's type. `(a to z)` as a VALUE is a `NumericRange[Char]`, so
+  `(a to z).foreach(…)` is right.
+- **A `Char` range stepped by zero.** `'a' to 'c' by 0` raises
+  `IllegalArgumentException: step cannot be 0.` where it is built; the
+  reference builds it (it prints) and raises on the first element access.
 - **Overloads that differ only in parameter type.** `def f(x: Int)` and `def
   f(x: String)` in one class are a compile error, not a dispatch: both would key
   the same `C$f$1` subroutine, and the runtime is dynamically typed, so the

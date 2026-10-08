@@ -2795,24 +2795,23 @@ fn applying_a_field_reads_the_field_and_applies_that() {
 }
 
 #[test]
-fn a_char_range_is_refused_rather_than_read_as_integers() {
+fn a_char_range_is_a_numeric_range_of_chars_not_integers() {
     // `'a' to 'e'` is a `NumericRange[Char]`. Reading the endpoints as integers
-    // answered `List(0)` — a silent wrong answer, which this frontend does not
-    // ship. Every spelling is refused, including endpoints held in bindings.
-    for src in [
-        "println(('a' to 'e').toList)",
-        "println(('a' until 'e').size)",
-        "for (c <- 'a' to 'd') print(c)",
-        "val a = 'a'; val z = 'e'; println((a to z).toList)",
+    // answered `List(0)` — a silent wrong answer — so it was refused until it
+    // could be built as the range of `Char`s it is, including from endpoints
+    // held in bindings. Expected values captured from Scala 3.9.0.
+    for (src, want) in [
+        ("println(('a' to 'e').toList)", "List(a, b, c, d, e)\n"),
+        ("println(('a' until 'e').size)", "4\n"),
+        ("for (c <- 'a' to 'd') print(c)", "abcd"),
+        (
+            "val a = 'a'; val z = 'e'; println((a to z).toList)",
+            "List(a, b, c, d, e)\n",
+        ),
     ] {
         let (out, err, ok) = run_full(&wrap(src));
-        assert!(!ok, "a Char range must be refused: {src}");
-        assert_eq!(out, "", "a refused Char range must print nothing: {src}");
-        // Without this, a parse error anywhere in `src` would pass the test.
-        assert!(
-            err.contains("a Char range"),
-            "refused for the wrong reason on {src}: {err:?}"
-        );
+        assert!(ok, "a Char range must run: {src}: {err:?}");
+        assert_eq!(out, want, "{src}");
     }
     // The integer range it would be confused with is untouched.
     let (out, ok) = run(&wrap("println((1 to 4).toList); println((1 until 4).size)"));

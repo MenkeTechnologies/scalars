@@ -1464,6 +1464,20 @@ enum SeqKind {
         inclusive: bool,
         step: i64,
     },
+    /// A `NumericRange[Char]` — `'a' to 'e'`, `'a' until 'z' by 2`. Materialized
+    /// like a `Range`, and like it printed from its bounds
+    /// (`NumericRange a to e`), but it is a different class with different
+    /// overrides: a positional slice is another `NumericRange` only for
+    /// `take`/`drop`/`tail`/`init`/`splitAt`, `reverse` raises (a `Char` step
+    /// cannot be negated), `sum`/`product` answer a `Char`, and an empty one
+    /// reports its accesses through `Nil`. The bounds and step are UTF-16 code
+    /// units; the step is never negative, so the range only counts upward.
+    CharRange {
+        start: u16,
+        end: u16,
+        inclusive: bool,
+        step: u16,
+    },
 }
 
 /// Which empty-receiver access [`SeqKind::empty_fault`] is reporting. The four
@@ -1512,6 +1526,7 @@ impl SeqKind {
             SeqKind::PriorityQueue => "PriorityQueue",
             SeqKind::StrBuf => "StringBuilder",
             SeqKind::Range { .. } => "Range",
+            SeqKind::CharRange { .. } => "NumericRange",
         }
     }
 
@@ -1602,6 +1617,12 @@ impl SeqKind {
             SeqKind::List | SeqKind::Iterable | SeqKind::Iterator => {
                 Some(format!("{} of empty list", op.word()))
             }
+            // `NumericRange` reports an empty access through `Nil`, and both its
+            // `head` and its `last` (so `min`/`max` too) are `Nil.head`.
+            SeqKind::CharRange { .. } => Some(match op {
+                EmptyOp::Head | EmptyOp::Last => "head of empty list".into(),
+                _ => format!("{} of empty list", op.word()),
+            }),
             SeqKind::View(_) | SeqKind::ArrayView => Some(format!("{} of empty list", op.word())),
             // `Vector`/`IndexedSeq` name the operation on an `empty` receiver —
             // and `last` reports `empty.tail`, because it is implemented as one.
@@ -1718,7 +1739,7 @@ fn take_iterator_head(recv: &Value) {
 fn derive_seq(kind: SeqKind, items: Vec<Value>) -> Value {
     match kind {
         SeqKind::Set(rep) => new_set(rep, items),
-        SeqKind::Range { .. } => new_seq(SeqKind::Vector, items),
+        SeqKind::Range { .. } | SeqKind::CharRange { .. } => new_seq(SeqKind::Vector, items),
         // A transformed `PriorityQueue` is rebuilt through the same builder, so
         // the result is heapified rather than carrying the source array order.
         SeqKind::PriorityQueue => new_priority_queue(items),
@@ -1780,6 +1801,166 @@ fn range_items(start: i64, end: i64, inclusive: bool, step: i64) -> Result<Vec<V
         }
     }
     Ok(out)
+}
+
+/// A `NumericRange[Char]` value — see [`SeqKind::CharRange`]. A zero step is the
+/// `IllegalArgumentException` the reference raises as soon as the elements
+/// are counted; it is raised at construction here, because the elements are.
+fn new_char_range(start: u16, end: u16, inclusive: bool, step: u16) -> Result<Value, String> {
+    if step == 0 {
+        return Err("scalars: java.lang.IllegalArgumentException: step cannot be 0.".into());
+    }
+    let items = range_items(i64::from(start), i64::from(end), inclusive, i64::from(step))?
+        .iter()
+        .map(|v| make_char(char_of_code(v.to_int())))
+        .collect();
+    Ok(new_seq(
+        SeqKind::CharRange {
+            start,
+            end,
+            inclusive,
+            step,
+        },
+        items,
+    ))
+}
+
+/// `NumericRange.toString`: the bounds with `to`/`until`, the step when it is
+/// not 1 — rendered as the `Char` it is, so `by 5` prints U+0005 — and an
+/// `empty ` prefix. Unlike `Range` there is no `inexact` form.
+fn char_range_to_string(start: u16, end: u16, inclusive: bool, step: u16, empty: bool) -> String {
+    let c = |u: u16| char_of_code(i64::from(u));
+    format!(
+        "{}NumericRange {} {} {}{}",
+        if empty { "empty " } else { "" },
+        c(start),
+        if inclusive { "to" } else { "until" },
+        c(end),
+        if step == 1 {
+            String::new()
+        } else {
+            format!(" by {}", c(step))
+        }
+    )
+}
+
+/// The code unit a `NumericRange[Char]` bound or step argument names: a `Char`,
+/// or an `Int` constant Scala narrowed to one (`'a' to 'z' by 5`).
+fn char_range_unit(v: &Value) -> u16 {
+    char_code(v).unwrap_or_else(|| v.to_int()) as u16
+}
+
+/// The members `NumericRange[Char]` overrides, ported from `NumericRange.scala`
+/// (`take`/`drop`/`splitAt`/`tail`/`init` keep the class; `reverse`, `distinct`,
+/// `by`, the bound accessors, typed `contains`/`indexOf`, and the `Char`-valued
+/// `sum`/`product`). `None` for any member the generic `IndexedSeq` path
+/// answers — which builds a `Vector`, as the reference's does.
+fn char_range_method(
+    kind: SeqKind,
+    recv: &Value,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let SeqKind::CharRange {
+        start,
+        end,
+        inclusive,
+        step,
+    } = kind
+    else {
+        return None;
+    };
+    let len = items.len() as i64;
+    // `locationAfterN(n)` — the code unit `n` steps past `start`, in `Char`
+    // arithmetic (which wraps at 16 bits).
+    let at = |n: i64| (i64::from(start) + i64::from(step) * n) as u16;
+    let make = |start: u16, end: u16, inclusive: bool| new_char_range(start, end, inclusive, step);
+    let take = |n: i64| {
+        if n <= 0 || len == 0 {
+            make(start, start, false)
+        } else if n >= len {
+            Ok(recv.clone())
+        } else {
+            make(start, at(n - 1), true)
+        }
+    };
+    let drop = |n: i64| {
+        if n <= 0 || len == 0 {
+            Ok(recv.clone())
+        } else if n >= len {
+            make(end, end, false)
+        } else {
+            make(at(n), end, inclusive)
+        }
+    };
+    // `contains`/`indexOf` cast the probe to `Char` first, and a probe of any
+    // other type is a `ClassCastException` they answer as a miss — so
+    // `('a' to 'c').contains(98)` is `false` where `List('b').contains(98)` is
+    // `true`.
+    let typed_probe = || args.first().and_then(as_char);
+    let empty_fault = |op| Err(kind.empty_fault(op));
+    Some(match (name, args.len()) {
+        ("take", 1) => take(args[0].to_int()),
+        ("drop", 1) => drop(args[0].to_int()),
+        ("splitAt", 1) => {
+            take(args[0].to_int()).and_then(|a| Ok(new_pair(a, drop(args[0].to_int())?)))
+        }
+        ("tail", 0) if len == 0 => empty_fault(EmptyOp::Tail),
+        ("tail", 0) => make(start.wrapping_add(step), end, inclusive),
+        ("init", 0) if len == 0 => empty_fault(EmptyOp::Init),
+        ("init", 0) => make(start, end.wrapping_sub(step), inclusive),
+        ("head" | "last" | "min" | "max", 0) if len == 0 => empty_fault(EmptyOp::Head),
+        // Negating a `Char` step wraps to another positive one, which
+        // `NumericRange.reverse` detects and refuses.
+        ("reverse", 0) if len == 0 => Ok(recv.clone()),
+        ("reverse", 0) => Err("scalars: java.lang.ArithmeticException: number type is \
+                               unsigned, and .reverse requires a negative step"
+            .into()),
+        ("distinct" | "toSeq" | "toIndexedSeq", 0) => Ok(recv.clone()),
+        ("by", 1) => new_char_range(start, end, inclusive, char_range_unit(&args[0])),
+        ("start", 0) => Ok(make_char(char_of_code(i64::from(start)))),
+        ("end", 0) => Ok(make_char(char_of_code(i64::from(end)))),
+        ("step", 0) => Ok(make_char(char_of_code(i64::from(step)))),
+        ("isInclusive", 0) => Ok(Value::bool(inclusive)),
+        ("contains", 1) => {
+            Ok(Value::bool(typed_probe().is_some_and(|c| {
+                items.iter().any(|x| as_char(x) == Some(c))
+            })))
+        }
+        ("indexOf" | "lastIndexOf", 1) => {
+            let hit = |x: &Value| typed_probe().is_some_and(|c| as_char(x) == Some(c));
+            let pos = if name == "indexOf" {
+                items.iter().position(hit)
+            } else {
+                items.iter().rposition(hit)
+            };
+            Ok(Value::int(pos.map_or(-1, |p| p as i64)))
+        }
+        // `Numeric[Char]` adds and multiplies in `Char`, wrapping at 16 bits.
+        ("sum" | "product", 0) => {
+            let mut acc: i64 = if name == "sum" { 0 } else { 1 };
+            for x in items {
+                let c = char_code(x).unwrap_or(0);
+                acc = if name == "sum" { acc + c } else { acc * c } & 0xFFFF;
+            }
+            Ok(make_char(char_of_code(acc)))
+        }
+        // `grouped` chunks are whatever `IndexedSeq.from` keeps of the
+        // iterator's own `ArraySeq` groups.
+        ("grouped", 1) => {
+            let n = args[0].to_int();
+            if n <= 0 {
+                return None;
+            }
+            let groups: Vec<Value> = items
+                .chunks(n as usize)
+                .map(|g| new_seq(SeqKind::ArraySeq, g.to_vec()))
+                .collect();
+            Ok(new_seq(SeqKind::Iterator, groups))
+        }
+        _ => return None,
+    })
 }
 
 /// A first-class function value. `name_idx` is the closure body's name-pool index
@@ -3416,13 +3597,14 @@ fn b_list_cons(vm: &mut VM, _argc: u8) -> Value {
 /// the materializing path (a range feeding a collection generator) reports it
 /// identically to the counted-loop path's compile-time guard.
 fn b_range_list(vm: &mut VM, _argc: u8) -> Value {
-    let step = vm.pop().to_int();
+    let step_v = vm.pop();
     let inclusive = matches!(vm.pop(), Value::Bool(true));
     let end_v = vm.pop();
     let start_v = vm.pop();
-    if let Err(e) = reject_char_endpoint(&start_v, &end_v) {
-        return fault(vm, e);
+    if let Some(r) = char_range_of(&start_v, &end_v, inclusive, &step_v) {
+        return r.unwrap_or_else(|e| fault(vm, e));
     }
+    let step = step_v.to_int();
     let end = end_v.to_int();
     let start = start_v.to_int();
     if step == 0 {
@@ -3450,17 +3632,24 @@ fn b_range_list(vm: &mut VM, _argc: u8) -> Value {
     heap_push(HeapVal::Seq(SeqKind::Vector, items))
 }
 
-/// `'a' to 'e'` is a `NumericRange[Char]`, which this frontend does not build.
-/// A `Char` endpoint would read as an integer here and the range would come out
-/// silently wrong, so it is refused instead. The compiler already refuses the
-/// literal spelling; this catches the endpoints that arrive as values.
-fn reject_char_endpoint(start: &Value, end: &Value) -> Result<(), String> {
-    if as_char(start).is_some() || as_char(end).is_some() {
-        return Err("scalars: a Char range (`'a' to 'z'`) is not modeled — its \
-                    NumericRange[Char] has no representation here"
-            .to_string());
+/// `'a' to 'e'` — a `Char` endpoint makes the range a `NumericRange[Char]`
+/// ([`SeqKind::CharRange`]) rather than an integer `Range`. `None` when neither
+/// endpoint is a `Char`.
+fn char_range_of(
+    start: &Value,
+    end: &Value,
+    inclusive: bool,
+    step: &Value,
+) -> Option<Result<Value, String>> {
+    if as_char(start).is_none() && as_char(end).is_none() {
+        return None;
     }
-    Ok(())
+    Some(new_char_range(
+        char_range_unit(start),
+        char_range_unit(end),
+        inclusive,
+        char_range_unit(step),
+    ))
 }
 
 /// The elements `v` contributes to a `flatMap`/`flatten`, if it is an
@@ -4099,6 +4288,15 @@ fn obj_to_string(v: &Value) -> String {
                 },
                 items,
             )) => range_to_string(*start, *end, *inclusive, *step, items.is_empty()),
+            Some(HeapVal::Seq(
+                SeqKind::CharRange {
+                    start,
+                    end,
+                    inclusive,
+                    step,
+                },
+                items,
+            )) => char_range_to_string(*start, *end, *inclusive, *step, items.is_empty()),
             // `StringBuilder.toString` is the contents, not a rendered sequence.
             Some(HeapVal::Seq(SeqKind::StrBuf, items)) => {
                 items.iter().map(scala_str).collect::<String>()
@@ -7448,6 +7646,9 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             return out;
         }
     }
+    if let Some(out) = char_range_method(kind, recv, &items, name, args) {
+        return out;
+    }
     // The pure slice/reorder methods first — they share one body.
     if let Some(out) = seq_slice_method(&items, name, args) {
         return Ok(same(out));
@@ -9797,13 +9998,14 @@ fn indices_range(n: usize) -> Value {
 /// `MAKE_RANGE` builtin — pop the step, `inclusive`, end and start; return the
 /// materialized range.
 fn b_make_range(vm: &mut VM, _argc: u8) -> Value {
-    let step = vm.pop().to_int();
+    let step_v = vm.pop();
     let inclusive = matches!(vm.pop(), Value::Bool(true));
     let end_v = vm.pop();
     let start_v = vm.pop();
-    if let Err(e) = reject_char_endpoint(&start_v, &end_v) {
-        return fault(vm, e);
+    if let Some(r) = char_range_of(&start_v, &end_v, inclusive, &step_v) {
+        return r.unwrap_or_else(|e| fault(vm, e));
     }
+    let step = step_v.to_int();
     let end = end_v.to_int();
     let start = start_v.to_int();
     match range_items(start, end, inclusive, step) {
@@ -10120,14 +10322,22 @@ fn java_parse_hex_float(text: &str, single: bool) -> Option<f64> {
     if mant == 0 {
         return Some(0.0);
     }
-    let (precision, emin, emax) = if single { (24, -126, 127) } else { (53, -1022, 1023) };
+    let (precision, emin, emax) = if single {
+        (24, -126, 127)
+    } else {
+        (53, -1022, 1023)
+    };
     let bits = 128 - i64::from(mant.leading_zeros());
     let top = bits - 1 + e2;
     if top > emax {
         return Some(f64::INFINITY);
     }
     // A subnormal result keeps fewer bits: one fewer per binade below `emin`.
-    let keep = if top >= emin { precision } else { precision - (emin - top) };
+    let keep = if top >= emin {
+        precision
+    } else {
+        precision - (emin - top)
+    };
     let shift = bits - keep;
     let (mut m, mut scale) = (mant, e2);
     if shift > 0 {
@@ -10146,7 +10356,11 @@ fn java_parse_hex_float(text: &str, single: bool) -> Option<f64> {
     let value = (m as f64) * pow2(scale / 2) * pow2(scale - scale / 2);
     if single {
         let f = value as f32;
-        return Some(if f.is_infinite() { f64::INFINITY } else { f64::from(f) });
+        return Some(if f.is_infinite() {
+            f64::INFINITY
+        } else {
+            f64::from(f)
+        });
     }
     Some(value)
 }
@@ -11959,8 +12173,7 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("toDouble" | "toFloat", 0) => java_parse_float(s, name == "toFloat")
             .map_err(|e| format!("scalars: java.lang.NumberFormatException: {e}")),
         ("toDoubleOption" | "toFloatOption", 0) => Ok(
-            java_parse_float(s, name == "toFloatOption")
-                .map_or_else(|_| make_none(), make_some),
+            java_parse_float(s, name == "toFloatOption").map_or_else(|_| make_none(), make_some)
         ),
         // `StringOps.toBoolean` is case-insensitive but NOT trimming, and its
         // failure is an `IllegalArgumentException` rather than the
@@ -12832,8 +13045,7 @@ fn string_fn_method(
                 None => groups.push((k, vec![c.clone()])),
             }
         }
-        let entries: Vec<(Value, Value)> =
-            groups.into_iter().map(|(k, g)| (k, join(&g))).collect();
+        let entries: Vec<(Value, Value)> = groups.into_iter().map(|(k, g)| (k, join(&g))).collect();
         let entries = champ_sorted(&entries, |(k, _)| k.clone()).unwrap_or(entries);
         return Some(Ok(new_map(HashRep::Small, entries)));
     }
@@ -13686,7 +13898,10 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
             }
             // A `Range` renders from its bounds and a `StringBuilder` from its
             // characters; neither can hold a record.
-            Some(HeapVal::Seq(SeqKind::Range { .. } | SeqKind::StrBuf, _)) => Renderable::Leaf,
+            Some(HeapVal::Seq(
+                SeqKind::Range { .. } | SeqKind::CharRange { .. } | SeqKind::StrBuf,
+                _,
+            )) => Renderable::Leaf,
             Some(HeapVal::Seq(kind, items)) => Renderable::Seq(kind.label(), items.clone()),
             Some(HeapVal::Map(rep, entries)) => {
                 let label = map_label(id as usize, *rep);

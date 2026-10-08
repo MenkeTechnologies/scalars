@@ -2652,8 +2652,15 @@ impl Parser {
         let src = self.expression()?;
         // `x <- (expr): T` — an ascribed generator source.
         let src = self.ascription_tail(src, src_line)?;
+        // A `Char`-literal endpoint makes the source a `NumericRange[Char]`, whose
+        // elements are `Char`s, so it is iterated as the collection it is rather
+        // than counted as integers.
+        let char_range =
+            |s: &Expr, e: &Expr| matches!(s, Expr::Char(_)) || matches!(e, Expr::Char(_));
         match (&pat, as_range(&src)) {
-            (Pattern::Bind(name), Some((start, end, inclusive, step))) if !filtering => {
+            (Pattern::Bind(name), Some((start, end, inclusive, step)))
+                if !filtering && !char_range(&start, &end) =>
+            {
                 Ok(ForEnum::Gen {
                     name: name.clone(),
                     start,
