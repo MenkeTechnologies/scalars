@@ -142,7 +142,8 @@
             <tr><td>Parity fuzzer vs reference <code>scala</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Differential probes diffed against a real Scala toolchain (<code>src/bin/parity_fuzz.rs</code>).</td></tr>
             <tr><td>User methods, classes, traits</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Block-local <code>def</code>s with lambda lifting, <code>case class</code> pattern matching, trait mixin and virtual dispatch (<code>src/resolve.rs</code>, <code>src/compiler.rs</code>).</td></tr>
             <tr><td>Collections (immutable + mutable)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>The combinator set over <code>List</code>/<code>Vector</code>/<code>Set</code>/<code>Map</code>/<code>Array</code>/<code>Range</code>, Scala&rsquo;s own CHAMP <code>HashSet</code>/<code>HashMap</code> iteration order, and the <code>scala.collection.mutable</code> buffers/sets/maps in their hash table&rsquo;s order (<code>src/host.rs</code>).</td></tr>
-            <tr><td>Lazy views, <code>Iterator</code>, <code>LazyList</code></td><td><span class="status-pill status-planned">Planned</span></td><td><code>.view</code>/<code>.iterator</code> and user <code>Ordering</code>s pending.</td></tr>
+            <tr><td><code>Iterator</code>, <code>LazyList</code>, explicit <code>Ordering</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Consumable iterators, memoised lazy lists and user <code>Ordering</code>s.</td></tr>
+            <tr><td>Lazy views</td><td><span class="status-pill status-planned">Planned</span></td><td><code>.view</code> currently materializes.</td></tr>
           </tbody>
         </table>
       </section>

@@ -136,7 +136,8 @@
             <tr><td>generated reference (<code>gen-docs</code>)</td><td>Implemented</td><td><code>docs/reference.html</code> emitted from the LSP corpus (<code>src/bin/gen_docs.rs</code>).</td></tr>
             <tr><td>user methods / classes / traits</td><td>Implemented</td><td>Block-local <code>def</code>s with lambda lifting, <code>case class</code> pattern matching, trait mixin and virtual dispatch (<code>src/resolve.rs</code>, <code>src/compiler.rs</code>).</td></tr>
             <tr><td>collections (immutable + mutable)</td><td>Implemented</td><td>The combinator set, Scala&rsquo;s CHAMP <code>HashSet</code>/<code>HashMap</code> trie order, and the mutable buffers/sets/maps in their hash table&rsquo;s order (<code>src/host.rs</code>).</td></tr>
-            <tr><td>lazy views / <code>Iterator</code> / <code>LazyList</code></td><td>Planned</td><td><code>.view</code>, <code>.iterator</code> and user <code>Ordering</code>s pending.</td></tr>
+            <tr><td><code>Iterator</code> / <code>LazyList</code> / explicit <code>Ordering</code></td><td>Implemented</td><td>Consumable iterators, memoised lazy lists and user <code>Ordering</code>s.</td></tr>
+            <tr><td>lazy views</td><td>Planned</td><td><code>.view</code> currently materializes.</td></tr>
           </tbody>
         </table>
       </section>

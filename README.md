@@ -1033,7 +1033,7 @@ arguments — reported `empty is not a member` where the reference raises
 
 Next waves, in priority order:
 
-1. **Lazy views** — `.view` and `LazyList`. (`Iterator` itself is done: it is a
+1. **Lazy views** — `.view`. (`Iterator` and `LazyList` are done: `Iterator` is a
    real consumable iterator, not a strict `Iterable`.)
 2. **The broader standard library** — `scala.io`, `scala.util.Random`, `BigInt`
    and `BigDecimal`. (`scala.util.Try` is done, and `Either`'s right-biased
