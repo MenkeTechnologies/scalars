@@ -459,6 +459,11 @@ pub const SUPER_DYN: u16 = 790;
 /// Builtin id for a `scala.collection.immutable.Queue(...)` literal: pops `argc`
 /// elements, front first.
 pub const MAKE_IMMQUEUE: u16 = 791;
+/// Builtin id for Scala `-` on an operand that may be an immutable `Set`/`Map`
+/// in a program that overrides `equals`: removing an element or key compares it
+/// with that override, which `Op::Sub`'s VM-less numeric hook cannot run.
+/// Everything else answers what `Op::Sub` would. See `Compiler::may_be_keyed`.
+pub const SSUB_VM: u16 = 792;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -736,6 +741,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_PRIORITYQUEUE, b_make_priorityqueue);
     vm.register_builtin(IS_GROWABLE, b_is_growable);
     vm.register_builtin(SADD, b_add);
+    vm.register_builtin(SSUB_VM, b_sub_vm);
     vm.register_builtin(SEQ_VM, b_eq_vm);
     vm.register_builtin(SNE_VM, b_ne_vm);
     vm.register_builtin(BYNAME, b_byname);
@@ -3064,7 +3070,12 @@ fn b_make_iterator(vm: &mut VM, argc: u8) -> Value {
 
 /// `MAKE_SET` builtin — pop `argc` element values (deepest first) into a `Set`.
 fn b_make_set(vm: &mut VM, argc: u8) -> Value {
-    new_set(HashRep::Small, pop_n(vm, argc))
+    let items = pop_n(vm, argc);
+    if user_equals_present(vm) {
+        return keyed_set(vm, HashRep::Small, Vec::new(), items, KeyOp::Build)
+            .unwrap_or_else(|e| fault(vm, e));
+    }
+    new_set(HashRep::Small, items)
 }
 
 /// `MAKE_LISTBUFFER` / `MAKE_ARRAYBUFFER` builtins — pop `argc` elements into a
@@ -3104,6 +3115,39 @@ fn b_from_seq(vm: &mut VM, _argc: u8) -> Value {
         }
         Some(out)
     };
+    if user_equals_present(vm) {
+        let keyed = match ctor.as_str() {
+            "Set" => Some(keyed_set(
+                vm,
+                HashRep::Small,
+                Vec::new(),
+                items.clone(),
+                KeyOp::Build,
+            )),
+            "LinkedHashSet" => Some(keyed_set(
+                vm,
+                HashRep::Linked,
+                Vec::new(),
+                items.clone(),
+                KeyOp::Build,
+            )),
+            "Map" | "LinkedHashMap" => {
+                let rep = if ctor == "Map" {
+                    HashRep::Small
+                } else {
+                    HashRep::Linked
+                };
+                match pairs(vm) {
+                    Some(e) => Some(keyed_map(vm, rep, Vec::new(), e, KeyOp::Build)),
+                    None => return Value::Undef,
+                }
+            }
+            _ => None,
+        };
+        if let Some(r) = keyed {
+            return r.unwrap_or_else(|e| fault(vm, e));
+        }
+    }
     match ctor.as_str() {
         "List" => new_seq(SeqKind::List, items),
         "Vector" => new_seq(SeqKind::Vector, items),
@@ -3434,6 +3478,32 @@ fn b_is_growable(vm: &mut VM, _argc: u8) -> Value {
     Value::bool(mutable_seq || mutable_map)
 }
 
+/// `a + b` / `a - b` on an immutable `Set`/`Map` under a user `equals` — see
+/// [`keyed_user_method`]. `None` for any other operands.
+fn keyed_binop(vm: &mut VM, a: &Value, op: &str, b: &Value) -> Option<Value> {
+    if !user_equals_present(vm) {
+        return None;
+    }
+    let r = keyed_user_method(vm, a, op, std::slice::from_ref(b))?;
+    Some(r.unwrap_or_else(|e| fault(vm, e)))
+}
+
+/// `SSUB_VM` builtin — see [`SSUB_VM`].
+fn b_sub_vm(vm: &mut VM, _argc: u8) -> Value {
+    let b = vm.stack.pop().unwrap_or(Value::Undef);
+    let a = vm.stack.pop().unwrap_or(Value::Undef);
+    if unwinding() {
+        return Value::Undef;
+    }
+    if let Some(r) = keyed_binop(vm, &a, "-", &b) {
+        return r;
+    }
+    match numeric_hook(NumOp::Sub, &a, &b) {
+        Ok(v) => v,
+        Err(e) => fault(vm, e),
+    }
+}
+
 /// `SADD` builtin — Scala `+`, able to run a user `toString` override.
 ///
 /// Every answer here is the one [`numeric_hook`] gives for the same pair, which
@@ -3451,6 +3521,9 @@ fn b_add(vm: &mut VM, _argc: u8) -> Value {
     // and rejecting it here would displace the real exception.
     if unwinding() {
         return Value::Undef;
+    }
+    if let Some(r) = keyed_binop(vm, &a, "+", &b) {
+        return r;
     }
     let concatenates = matches!(a, Value::Str(_))
         || (matches!(b, Value::Str(_)) && matches!(a, Value::Int(_) | Value::Float(_)));
@@ -3587,6 +3660,14 @@ fn b_make_map(vm: &mut VM, argc: u8) -> Value {
             Some(t) if t.len() == 2 => (t[0].clone(), t[1].clone()),
             _ => return fault(vm, "scalars: Map(...) expects `key -> value` pairs"),
         };
+        if user_equals_present(vm) {
+            let adds = pairs
+                .iter()
+                .filter_map(|p| as_seq_or_tuple(p).map(|t| (t[0].clone(), t[1].clone())))
+                .collect();
+            return keyed_map(vm, HashRep::Small, Vec::new(), adds, KeyOp::Build)
+                .unwrap_or_else(|e| fault(vm, e));
+        }
         map_put(&mut entries, k, v);
     }
     new_map(HashRep::Small, entries)
@@ -3776,6 +3857,11 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
     // the lazy dispatcher rather than the strict sequence one.
     if as_lazy(recv).is_some() {
         if let Some(r) = lazy_method(vm, recv, "apply", args) {
+            return r;
+        }
+    }
+    if user_equals_present(vm) && map_default(recv).is_none() {
+        if let Some(r) = keyed_user_method(vm, recv, "apply", args) {
             return r;
         }
     }
@@ -5094,6 +5180,9 @@ fn eq_vm(vm: &mut VM, a: &Value, b: &Value) -> Result<bool, String> {
     if let Some(r) = call_user_method(vm, a, "equals", std::slice::from_ref(b)) {
         return r.map(|v| truthy(&v));
     }
+    if let Some(r) = keyed_eq(vm, a, b) {
+        return r;
+    }
     if let (Some(x), Some(y)) = (as_option(a), as_option(b)) {
         return match (x, y) {
             (Some(x), Some(y)) => eq_vm(vm, &x, &y),
@@ -5255,6 +5344,457 @@ fn hash_vm(vm: &mut VM, v: &Value) -> Result<i64, String> {
         || with_obj(v, |o| obj_hash(&o.class, o.is_case, &o.fields, v)).unwrap_or(0),
         i64::from,
     ))
+}
+
+// ── A user `equals`/`hashCode` as a Set element or a Map key ─────────────────
+//
+// The immutable `Set`/`Map` builders above compare with [`value_eq`], which
+// holds no VM and so can only see structural (`case`) or identity equality. A
+// program that overrides `equals` is routed here instead, by the builtins and
+// dispatchers that DO hold the VM, so `Set(new Box(1), new Box(1))` is one
+// element and `Map(new Box(1) -> "a")(new Box(1))` finds its key.
+//
+// Which `equals` runs, against which stored keys, is observable through an
+// override that prints, and follows the 2.13 collections:
+//
+// - `Set1`..`Set4` / `Map1`..`Map4` test every stored key in order with
+//   `probe == stored`, for lookups, additions and removals alike.
+// - A `HashSet`/`HashMap` (CHAMP) compares only keys whose `hashCode`s agree.
+//   A key alone under its hash is compared as `probe == stored` by a lookup and
+//   `stored == probe` by an update, a removal or a builder. A hash-collision
+//   group is scanned `stored == probe`, except that a `HashSet` BUILDER scans
+//   it `probe == stored` (`Vector.indexOf`); a removal scans it twice (the
+//   `contains` test, then the `filterNot` that drops the key).
+// - Growing past four entries replays the switch to a trie: the four stored
+//   keys are inserted into an empty one, then the newcomer.
+// - `Map.updated` on an existing key keeps the STORED key and takes the new
+//   value; a `Set` that already holds an equal element is returned unchanged.
+//
+// A `HashSet`/`HashMap` is laid out in trie order by each key's `hashCode`,
+// the user override included; a key whose hash is not reproducible keeps
+// insertion order, as [`champ_sorted`] does. Two keys of DIFFERENT hashes
+// that share a trie slot are compared by the real `get`/`removed` but not
+// here, and the mutable hash tables are not routed here (see `BUGS.md`).
+
+/// What a [`key_slot_vm`] search is for — it decides which side's `equals`
+/// runs (see the section comment).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyOp {
+    /// `HashSetBuilder`/`HashMapBuilder` — a factory, `toSet`/`toMap`, or a
+    /// re-keyed transform.
+    Build,
+    /// `contains`/`apply`/`get`/`getOrElse`.
+    Lookup,
+    /// `+`/`incl`/`updated`/`++`.
+    Update,
+    /// `-`/`excl`/`removed`.
+    Remove,
+}
+
+/// `probe == stored` for a set element or map key: the probe's own `equals`
+/// when its class defines one, element-wise through a tuple, and the native
+/// cooperative [`value_eq`] otherwise.
+fn key_eq_vm(vm: &mut VM, probe: &Value, stored: &Value) -> Result<bool, String> {
+    if let Some(r) = call_user_method(vm, probe, "equals", std::slice::from_ref(stored)) {
+        return r.map(|v| truthy(&v));
+    }
+    let tuple = |v: &Value| {
+        HEAP.with(|h| match h.borrow().get(as_obj_id(v)?) {
+            Some(HeapVal::Tuple(t)) => Some(t.clone()),
+            _ => None,
+        })
+    };
+    if let (Some(xs), Some(ys)) = (tuple(probe), tuple(stored)) {
+        if xs.len() != ys.len() {
+            return Ok(false);
+        }
+        for (x, y) in xs.iter().zip(&ys) {
+            if !key_eq_vm(vm, x, y)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    Ok(value_eq(probe, stored))
+}
+
+/// The hash a hashed `Set`/`Map` files `v` under: a user `hashCode` when its
+/// class defines one, else [`scala_hash`] (`None` when that is not
+/// reproducible).
+fn key_hash_vm(vm: &mut VM, v: &Value) -> Result<Option<i32>, String> {
+    match call_user_method(vm, v, "hashCode", &[]) {
+        Some(r) => r.map(|h| Some(h.to_int() as i32)),
+        None => Ok(scala_hash(v)),
+    }
+}
+
+/// The index of the stored key equal to `probe`, compared the way `op` on a
+/// `Set` (`is_map` false) or `Map` compares it. `hashed` is whether the
+/// collection is a trie at this point.
+fn key_slot_vm(
+    vm: &mut VM,
+    keys: &[&Value],
+    hashed: bool,
+    probe: &Value,
+    op: KeyOp,
+    is_map: bool,
+) -> Result<Option<usize>, String> {
+    let want = if hashed {
+        key_hash_vm(vm, probe)?
+    } else {
+        None
+    };
+    let Some(h) = want else {
+        // `Set1`..`Set4` / `Map1`..`Map4`, or a key whose hash is unknown.
+        for (i, k) in keys.iter().enumerate() {
+            if key_eq_vm(vm, probe, k)? {
+                return Ok(Some(i));
+            }
+        }
+        return Ok(None);
+    };
+    let mut group = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        if key_hash_vm(vm, k)?.map_or(true, |kh| kh == h) {
+            group.push(i);
+        }
+    }
+    let probe_side = match (group.len(), op) {
+        (1, KeyOp::Lookup) => true,
+        (1, _) => false,
+        (_, KeyOp::Build) => !is_map,
+        _ => false,
+    };
+    let mut hit = None;
+    for &i in &group {
+        let eq = if probe_side {
+            key_eq_vm(vm, probe, keys[i])?
+        } else {
+            key_eq_vm(vm, keys[i], probe)?
+        };
+        if eq {
+            hit = Some(i);
+            break;
+        }
+    }
+    if hit.is_some() && op == KeyOp::Remove && group.len() > 1 {
+        for &i in &group {
+            key_eq_vm(vm, keys[i], probe)?;
+        }
+    }
+    Ok(hit)
+}
+
+/// Whether an immutable `rep` holding `len` entries is a trie: a `HashSet`/
+/// `HashMap` already, or past `Set4`/`Map4`. A `LinkedHashSet`/`LinkedHashMap`
+/// is a hash table too.
+fn keyed_hashed(rep: HashRep, len: usize) -> bool {
+    rep != HashRep::Small || len > 4
+}
+
+/// Lay a hashed key list out in trie order by each key's (user) hash, or keep
+/// insertion order when one is not reproducible.
+fn keyed_order<T: Clone>(
+    vm: &mut VM,
+    items: Vec<T>,
+    key: impl Fn(&T) -> Value,
+) -> Result<Vec<T>, String> {
+    let mut hashes = Vec::with_capacity(items.len());
+    for it in &items {
+        match key_hash_vm(vm, &key(it))? {
+            Some(h) => hashes.push(improve(h)),
+            None => return Ok(items),
+        }
+    }
+    Ok(champ_order(&hashes)
+        .into_iter()
+        .map(|i| items[i].clone())
+        .collect())
+}
+
+/// Add `probe` to the keys of a collection of `rep`, answering the index of an
+/// equal stored key, or `None` when `probe` is new. A `Set4`/`Map4` that has
+/// to grow replays its switch to a trie first.
+fn keyed_insert(
+    vm: &mut VM,
+    rep: HashRep,
+    keys: &[&Value],
+    probe: &Value,
+    op: KeyOp,
+    is_map: bool,
+) -> Result<Option<usize>, String> {
+    let hashed = keyed_hashed(rep, keys.len());
+    let found = key_slot_vm(vm, keys, hashed, probe, op, is_map)?;
+    if found.is_none() && rep == HashRep::Small && keys.len() == 4 {
+        for i in 1..4 {
+            key_slot_vm(vm, &keys[..i], true, keys[i], op, is_map)?;
+        }
+        key_slot_vm(vm, keys, true, probe, op, is_map)?;
+    }
+    Ok(found)
+}
+
+/// An immutable `Set` of `rep` holding `base` (already distinct) plus each of
+/// `adds` that no stored element equals.
+fn keyed_set(
+    vm: &mut VM,
+    rep: HashRep,
+    base: Vec<Value>,
+    adds: Vec<Value>,
+    op: KeyOp,
+) -> Result<Value, String> {
+    let mut uniq = base;
+    for x in adds {
+        let found = {
+            let keys: Vec<&Value> = uniq.iter().collect();
+            let rep = if rep == HashRep::Small {
+                hash_rep(rep, uniq.len())
+            } else {
+                rep
+            };
+            keyed_insert(vm, rep, &keys, &x, op, false)?
+        };
+        if found.is_none() {
+            uniq.push(x);
+        }
+    }
+    if rep == HashRep::Linked {
+        return Ok(heap_push(HeapVal::Seq(SeqKind::Set(rep), uniq)));
+    }
+    let rep = hash_rep(rep, uniq.len());
+    if rep == HashRep::Hashed {
+        uniq = keyed_order(vm, uniq, Clone::clone)?;
+    }
+    Ok(heap_push(HeapVal::Seq(SeqKind::Set(rep), uniq)))
+}
+
+/// An immutable `Map` of `rep` holding `base` (already keyed uniquely) updated
+/// with each of `adds`: a key equal to a stored one keeps the stored key and
+/// its position and takes the new value.
+fn keyed_map(
+    vm: &mut VM,
+    rep: HashRep,
+    base: Vec<(Value, Value)>,
+    adds: Vec<(Value, Value)>,
+    op: KeyOp,
+) -> Result<Value, String> {
+    let mut entries = base;
+    for (k, v) in adds {
+        let found = {
+            let keys: Vec<&Value> = entries.iter().map(|(ek, _)| ek).collect();
+            let rep = if rep == HashRep::Small {
+                hash_rep(rep, entries.len())
+            } else {
+                rep
+            };
+            keyed_insert(vm, rep, &keys, &k, op, true)?
+        };
+        match found {
+            Some(i) => entries[i].1 = v,
+            None => entries.push((k, v)),
+        }
+    }
+    if rep == HashRep::Linked {
+        return Ok(heap_push(HeapVal::Map(rep, entries)));
+    }
+    let rep = hash_rep(rep, entries.len());
+    if rep == HashRep::Hashed {
+        entries = keyed_order(vm, entries, |(k, _)| k.clone())?;
+    }
+    Ok(heap_push(HeapVal::Map(rep, entries)))
+}
+
+/// The `(k, v)` pairs of a `Map` argument or of a collection of `Tuple2`s.
+fn keyed_pairs(v: &Value) -> Option<Vec<(Value, Value)>> {
+    if let Some(m) = as_map(v) {
+        return Some(m);
+    }
+    as_seq_or_tuple(v)?
+        .iter()
+        .map(|p| match as_seq_or_tuple(p) {
+            Some(t) if t.len() == 2 => Some((t[0].clone(), t[1].clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The immutable `Set`/`Map` members whose answer depends on key equality,
+/// answered under a user `equals`. `None` for everything else, which the
+/// native dispatch answers (and [`keyed_rebuild`] then re-keys when it can
+/// have merged keys).
+fn keyed_user_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    if let Some((SeqKind::Set(rep), items)) = seq_kind_items(recv) {
+        if matches!(rep, HashRep::Mutable(_)) {
+            return None;
+        }
+        let hashed = keyed_hashed(rep, items.len());
+        let keys: Vec<&Value> = items.iter().collect();
+        let r = match (name, args.len()) {
+            ("contains" | "apply", 1) => {
+                key_slot_vm(vm, &keys, hashed, &args[0], KeyOp::Lookup, false)
+                    .map(|s| Value::bool(s.is_some()))
+            }
+            ("+" | "incl", 1) => match keyed_insert(vm, rep, &keys, &args[0], KeyOp::Update, false)
+            {
+                Ok(Some(_)) => Ok(recv.clone()),
+                Ok(None) => {
+                    let mut out = items.clone();
+                    out.push(args[0].clone());
+                    keyed_set(vm, rep, out, Vec::new(), KeyOp::Update)
+                }
+                Err(e) => Err(e),
+            },
+            ("-" | "excl", 1) => {
+                match key_slot_vm(vm, &keys, hashed, &args[0], KeyOp::Remove, false) {
+                    Ok(Some(i)) => {
+                        let mut out = items.clone();
+                        out.remove(i);
+                        let rep = if rep == HashRep::Linked {
+                            rep
+                        } else {
+                            hash_rep(rep, out.len())
+                        };
+                        Ok(heap_push(HeapVal::Seq(SeqKind::Set(rep), out)))
+                    }
+                    Ok(None) => Ok(recv.clone()),
+                    Err(e) => Err(e),
+                }
+            }
+            ("++" | "concat" | "union" | "|", 1) => {
+                let adds = as_seq_or_tuple(&args[0]).unwrap_or_default();
+                keyed_set(vm, rep, items.clone(), adds, KeyOp::Update)
+            }
+            _ => return None,
+        };
+        return Some(r);
+    }
+    let (rep, entries) = map_rep_entries(recv)?;
+    if matches!(rep, HashRep::Mutable(_)) || map_default(recv).is_some() {
+        return None;
+    }
+    let hashed = keyed_hashed(rep, entries.len());
+    let keys: Vec<&Value> = entries.iter().map(|(k, _)| k).collect();
+    let lookup = |vm: &mut VM, op| key_slot_vm(vm, &keys, hashed, &args[0], op, true);
+    let r = match (name, args.len()) {
+        ("contains" | "isDefinedAt", 1) => {
+            lookup(vm, KeyOp::Lookup).map(|s| Value::bool(s.is_some()))
+        }
+        ("get" | "lift", 1) => lookup(vm, KeyOp::Lookup).map(|s| match s {
+            Some(i) => make_some(entries[i].1.clone()),
+            None => make_none(),
+        }),
+        ("getOrElse", 2) => lookup(vm, KeyOp::Lookup).map(|s| match s {
+            Some(i) => entries[i].1.clone(),
+            None => args[1].clone(),
+        }),
+        ("apply", 1) => match lookup(vm, KeyOp::Lookup) {
+            Ok(Some(i)) => Ok(entries[i].1.clone()),
+            Ok(None) => Err(format!(
+                "scalars: java.util.NoSuchElementException: key not found: {}",
+                scala_str_vm(vm, &args[0])
+            )),
+            Err(e) => Err(e),
+        },
+        ("-" | "removed", 1) => match lookup(vm, KeyOp::Remove) {
+            Ok(Some(i)) => {
+                let mut out = entries.clone();
+                out.remove(i);
+                let rep = if rep == HashRep::Linked {
+                    rep
+                } else {
+                    hash_rep(rep, out.len())
+                };
+                Ok(heap_push(HeapVal::Map(rep, out)))
+            }
+            Ok(None) => Ok(recv.clone()),
+            Err(e) => Err(e),
+        },
+        ("updated", 2) => keyed_map(
+            vm,
+            rep,
+            entries.clone(),
+            vec![(args[0].clone(), args[1].clone())],
+            KeyOp::Update,
+        ),
+        ("+", 1) => match keyed_pairs(&new_list(vec![args[0].clone()])) {
+            Some(adds) => keyed_map(vm, rep, entries.clone(), adds, KeyOp::Update),
+            None => return None,
+        },
+        ("++" | "concat", 1) => match keyed_pairs(&args[0]) {
+            Some(adds) => keyed_map(vm, rep, entries.clone(), adds, KeyOp::Update),
+            None => return None,
+        },
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// Re-key a `Set`/`Map` a native op BUILT (rather than selected) from new
+/// elements — `map`/`flatMap`/`collect`/`toSet`/`toMap`/… — whose builder
+/// merged only natively equal keys. The elements are re-added in order through
+/// [`keyed_set`]/[`keyed_map`], as the reference's builder adds them.
+fn keyed_rebuild(vm: &mut VM, name: &str, out: Value) -> Result<Value, String> {
+    if !matches!(
+        name,
+        "map" | "flatMap" | "collect" | "flatten" | "zip" | "toSet" | "toMap"
+    ) {
+        return Ok(out);
+    }
+    if let Some((SeqKind::Set(HashRep::Small | HashRep::Hashed), items)) = seq_kind_items(&out) {
+        return keyed_set(vm, HashRep::Small, Vec::new(), items, KeyOp::Build);
+    }
+    match map_rep_entries(&out) {
+        Some((HashRep::Small | HashRep::Hashed, entries)) => {
+            keyed_map(vm, HashRep::Small, Vec::new(), entries, KeyOp::Build)
+        }
+        _ => Ok(out),
+    }
+}
+
+/// `Set.equals` / `Map.equals` under a user `equals`: the same size, and every
+/// element of `a` contained in `b` (`b.contains(x)`), or every key of `a` mapped
+/// in `b` to an equal value. `None` unless both sides are sets or both maps.
+fn keyed_eq(vm: &mut VM, a: &Value, b: &Value) -> Option<Result<bool, String>> {
+    let set = |v: &Value| match seq_kind_items(v) {
+        Some((SeqKind::Set(rep), items)) => Some((rep, items)),
+        _ => None,
+    };
+    if let (Some((_, xs)), Some((rb, ys))) = (set(a), set(b)) {
+        let keys: Vec<&Value> = ys.iter().collect();
+        let hashed = keyed_hashed(rb, ys.len());
+        return Some((|| {
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for x in &xs {
+                if key_slot_vm(vm, &keys, hashed, x, KeyOp::Lookup, false)?.is_none() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })());
+    }
+    let (_, ma) = map_rep_entries(a)?;
+    let (rb, mb) = map_rep_entries(b)?;
+    let keys: Vec<&Value> = mb.iter().map(|(k, _)| k).collect();
+    let hashed = keyed_hashed(rb, mb.len());
+    Some((|| {
+        if ma.len() != mb.len() {
+            return Ok(false);
+        }
+        for (k, v) in &ma {
+            match key_slot_vm(vm, &keys, hashed, k, KeyOp::Lookup, true)? {
+                Some(i) if eq_vm(vm, &mb[i].1, v)? => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    })())
 }
 
 /// The first index in `order` at which `target == element` under [`eq_vm`].
@@ -6496,6 +7036,11 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
         return Ok(Value::str(scala_str_vm(vm, recv)));
     }
     if (name == "equals" || name == "==") && args.len() == 1 {
+        if user_equals_present(vm) {
+            if let Some(r) = keyed_eq(vm, recv, &args[0]) {
+                return r.map(Value::bool);
+            }
+        }
         return Ok(Value::bool(obj_eq(recv, &args[0])));
     }
     // A collection's `hashCode` is its `MurmurHash3` seq/set/map hash; an
@@ -6510,13 +7055,30 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
             },
         }));
     }
+    // A user `equals` decides Set membership and Map keys — see
+    // [`keyed_user_method`].
+    let keyed = user_equals_present(vm);
+    if keyed {
+        if let Some(r) = keyed_user_method(vm, recv, name, args) {
+            return r;
+        }
+    }
     match heap_kind(recv) {
-        Some(0) => seq_method(vm, recv, name, args),
+        Some(0) => {
+            let out = seq_method(vm, recv, name, args)?;
+            if keyed {
+                return keyed_rebuild(vm, name, out);
+            }
+            Ok(out)
+        }
         Some(1) => {
             if let Some(r) = map_default_method(vm, recv, name, args) {
                 return r;
             }
-            let out = map_method(vm, recv, name, args)?;
+            let mut out = map_method(vm, recv, name, args)?;
+            if keyed {
+                out = keyed_rebuild(vm, name, out)?;
+            }
             inherit_map_default(recv, name, &out);
             Ok(out)
         }

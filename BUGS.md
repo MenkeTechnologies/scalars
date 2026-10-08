@@ -318,7 +318,20 @@ reported as parse/compile errors, never silently mis-run.
   from the end; `distinct` hashes (running a `hashCode` override) and calls
   `equals` only between elements whose hashes agree. `diff`/`intersect` count the
   argument in a hash table the same way (`occCounts`), comparing a new key
-  against its same-hash keys twice, as `updateWith` then `put0` do. A program with no override
+  against its same-hash keys twice, as `updateWith` then `put0` do. An immutable
+  `Set`'s elements and a `Map`'s keys are compared through the override too —
+  building one (`Set(…)`, `Map(…)`, `toSet`, `toMap`, a `map` that collides two
+  elements), `contains`/`apply`/`get`/`getOrElse`, `+`/`-`/`updated`/`++` and
+  `Set`/`Map` equality — and a `HashSet`/`HashMap` is laid out in trie order by
+  the `hashCode` override. `Set1`..`Set4`/`Map1`..`Map4` test `probe == stored`
+  front to back; a trie compares only same-hash keys, alone as `probe == stored`
+  for a lookup and `stored == probe` for an update, removal or builder, a
+  collision group `stored == probe` (a `HashSet` builder's `probe == stored`,
+  a removal's twice), and growing past four replays the switch to a trie. Not
+  modelled: two keys of different hashes sharing a trie slot (the real
+  `get`/`removed` compare those too), the order a trie takes after a removal
+  empties a collision group down to one key, and the mutable `HashSet`/
+  `HashMap`, which still compare natively. A program with no override
   keeps the native `Op::NumEq`.
 - **By-name arguments of library methods.** `getOrElse(d)` on an
   `Option`/`Either`/`Try`, `orElse(alt)`, `Map.getOrElse(k, d)` and
@@ -869,12 +882,6 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **A user `equals`/`hashCode` inside a `Set` or as a `Map` key.** Membership
-  and deduplication of a `Set` and key lookup in a `Map` use the built-in
-  structural comparison, so `Set(new Pt(1, 2), new Pt(1, 2))` keeps both when
-  `Pt` overrides `equals`/`hashCode`. Building one needs the VM to run the
-  override, and the set/map constructors are reached from paths that do not
-  hold it.
 - **Unbounded `Iterator`s.** `Iterator.from(n)`, `Iterator.continually(x)` and
   `Iterator.iterate(x)(f)` are not provided: an `Iterator` here is a consumed,
   materialized sequence. Their `LazyList` counterparts are, and `Iterator(…)`,

@@ -396,7 +396,7 @@ Implemented and checked against the reference `scala`:
   (`def this(n: Int) = this(n, n)`), chosen by argument count; a class
   declaring `apply` makes its instances applicable (`m(i, j)`); an
   `override def equals` answers `==`/`!=` and the `contains`/`indexOf`/
-  `distinct` lookups, with the receiver and traversal order Scala uses. Built-in
+  `distinct` lookups, `Set` membership and `Map` keys, with the receiver and traversal order Scala uses. Built-in
   `Option` (`Some(v)` / `None`). All of it rides a host-side object heap behind
   fusevm's `Value::Obj` handle (`src/host.rs`) — no fusevm changes, no JVM.
 - **`override def toString`, everywhere a value is rendered** — `println(p)`,

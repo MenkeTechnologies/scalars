@@ -6905,7 +6905,17 @@ impl Compiler {
         // that makes this a concatenation is left to run time: it is a `val`,
         // a parameter or an element at least as often as it is a literal, and
         // a syntactic test misses every one of those.
-        if op == BinOp::Add && (self.needs_render(lhs) || self.needs_render(rhs)) {
+        // A `+`/`-` on an immutable `Set`/`Map` compares the element or key it
+        // adds or removes with the program's `equals` override, which the hook
+        // cannot run either.
+        if op == BinOp::Sub && self.may_be_keyed(lhs) {
+            self.b.emit(Op::CallBuiltin(crate::host::SSUB_VM, 2), 0);
+            self.narrow(w, 0);
+            return Ok(());
+        }
+        if op == BinOp::Add
+            && (self.needs_render(lhs) || self.needs_render(rhs) || self.may_be_keyed(lhs))
+        {
             self.b.emit(Op::CallBuiltin(crate::host::SADD, 2), 0);
             self.narrow(w, 0);
             return Ok(());
@@ -6972,6 +6982,20 @@ impl Compiler {
     /// program that happens to define one override somewhere keeps the native
     /// `Op::Add` for its arithmetic. So is anything already a `String`, which
     /// renders as itself.
+    /// Whether the left operand of a `+`/`-` could be an immutable `Set`/`Map`
+    /// in a program that overrides `equals` — the test that selects
+    /// [`crate::host::SADD`] / [`crate::host::SSUB_VM`] over the native op. The
+    /// same exclusions as [`Self::needs_render`] keep proven arithmetic native.
+    fn may_be_keyed(&self, e: &Expr) -> bool {
+        self.has_user_equals
+            && !yields_strings(e)
+            && self.num_ty(e) == NumTy::Unknown
+            && !matches!(
+                e,
+                Expr::Int(_) | Expr::Long(_) | Expr::Float(_) | Expr::Char(_) | Expr::Bool(_)
+            )
+    }
+
     fn needs_render(&self, e: &Expr) -> bool {
         self.has_user_tostring
             && !yields_strings(e)
