@@ -463,7 +463,9 @@ Implemented and checked against the reference `scala`:
   (`take`/`drop`/`slice`/`splitAt`/`span`/`partition`/`partitionMap`/
   `takeWhile`/`dropWhile`/`init`/`tail`/`headOption`), in-place sorting
   (`sortInPlace`/`sortInPlaceBy`/`sortInPlaceWith`, `scala.util.Sorting.quickSort`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
-  `grouped`/`sliding`), arrangement (`permutations`/`combinations`/`updated`),
+  `grouped`/`sliding`, and `lazyZip` — chained up to any width, with its
+  multi-parameter `map`/`flatMap`/`filter`/`foreach`/`exists`/`forall` and its
+  `xs.lazyZip(ys)` rendering), arrangement (`permutations`/`combinations`/`updated`),
   lockstep comparison (`corresponds`), the sequential `aggregate(z)(seqop,
   combop)`, prefix tests (`startsWith`/`endsWith`), slice search
   (`indexOfSlice`/`containsSlice`/`lastIndexOfSlice`), `groupBy`/`groupMap`/

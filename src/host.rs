@@ -2078,6 +2078,7 @@ pub fn reset_heap() {
     MUT_SORTED.with(|t| t.borrow_mut().clear());
     MAP_DEFAULTS.with(|t| t.borrow_mut().clear());
     LIST_ITERS.with(|t| t.borrow_mut().clear());
+    LAZY_ZIPS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -4464,6 +4465,9 @@ fn no_such_obj_member(class: &str, name: &str) -> String {
 /// hash). A collection renders `List(e0, e1)` / `Set(…)` / `Iterable(…)`; a map
 /// `Map(k -> v, …)`; a tuple `(a,b)`; a function `<functionN>`.
 fn obj_to_string(v: &Value) -> String {
+    if let Some(sources) = lazy_zip_sources(v) {
+        return lazy_zip_string(&sources, scala_str);
+    }
     let id = if let Value::Obj(i) = v { *i } else { 0 };
     HEAP.with(|h| {
         let h = h.borrow();
@@ -7198,6 +7202,7 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
         }
     }
     match heap_kind(recv) {
+        Some(0) if name == "lazyZip" && args.len() == 1 => lazy_zip(vm, recv, &args[0]),
         Some(0) => {
             let list_iter = list_iter_len(recv);
             let out = seq_method(vm, recv, name, args)?;
@@ -7261,6 +7266,63 @@ thread_local! {
     /// has elements to hand out when the list runs dry.
     static LIST_ITERS: RefCell<std::collections::HashSet<usize>> =
         RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// The `LazyZip2`/`LazyZip3`/`LazyZip4` values, keyed by arena index
+    /// (cleared by [`reset_heap`]), each with the collections it zips.
+    ///
+    /// `xs.lazyZip(ys)` is held as the zipped sequence `xs.zip(ys)` would be —
+    /// the same element tuples in a collection of `xs`'s kind, which is what
+    /// its `map`/`flatMap`/`filter`/`foreach`/`exists`/`forall`/`size` and its
+    /// conversion to an `Iterable` all read — and this table adds the two
+    /// things that differ: its `toString` names the sources
+    /// (`List(1, 2).lazyZip(List(a, b))`), and a further `.lazyZip(zs)`
+    /// widens each tuple instead of nesting it.
+    static LAZY_ZIPS: RefCell<HashMap<usize, Vec<Value>>> = RefCell::new(HashMap::new());
+}
+
+/// The collections a [`LAZY_ZIPS`] value zips, if `v` is one.
+fn lazy_zip_sources(v: &Value) -> Option<Vec<Value>> {
+    let id = as_obj_id(v)?;
+    LAZY_ZIPS.with(|t| t.borrow().get(&id).cloned())
+}
+
+/// `recv.lazyZip(that)` — see [`LAZY_ZIPS`].
+fn lazy_zip(vm: &mut VM, recv: &Value, that: &Value) -> Result<Value, String> {
+    let zipped = seq_method(vm, recv, "zip", std::slice::from_ref(that))?;
+    let (out, mut sources) = match lazy_zip_sources(recv) {
+        Some(sources) => {
+            let (kind, pairs) = seq_kind_items(&zipped).unwrap_or((SeqKind::List, Vec::new()));
+            let widened = pairs
+                .iter()
+                .map(|p| {
+                    let mut t = as_seq_or_tuple(p).unwrap_or_default();
+                    let last = t.pop().unwrap_or(Value::Undef);
+                    let mut items = as_seq_or_tuple(&t[0]).unwrap_or_default();
+                    items.push(last);
+                    heap_push(HeapVal::Tuple(items))
+                })
+                .collect();
+            (derive_seq(kind, widened), sources)
+        }
+        None => (zipped, vec![recv.clone()]),
+    };
+    sources.push(that.clone());
+    if let Some(id) = as_obj_id(&out) {
+        LAZY_ZIPS.with(|t| t.borrow_mut().insert(id, sources));
+    }
+    Ok(out)
+}
+
+/// `LazyZipN.toString`: the first collection, then `.lazyZip(c)` for each
+/// further one, each rendered by `render`.
+fn lazy_zip_string(sources: &[Value], mut render: impl FnMut(&Value) -> String) -> String {
+    let mut out = render(&sources[0]);
+    for s in &sources[1..] {
+        out.push_str(&format!(".lazyZip({})", render(s)));
+    }
+    out
 }
 
 /// The element count of `v` when it is a [`LIST_ITERS`] iterator.
@@ -14819,6 +14881,9 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
             Value::Undef => class,
             m => format!("{class}: {}", scala_str(&m)),
         };
+    }
+    if let Some(sources) = lazy_zip_sources(v) {
+        return lazy_zip_string(&sources, |s| scala_str_vm(vm, s));
     }
     let id = if let Value::Obj(i) = v { *i } else { 0 };
     let shape = HEAP.with(|h| {
