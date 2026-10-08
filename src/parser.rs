@@ -4396,6 +4396,11 @@ impl Parser {
                     // A capitalized bare identifier is a stable-identifier
                     // pattern (`case None =>`), matched by `==`, not a binding.
                     Ok(Pattern::Stable(name))
+                } else if self.is(&Tok::Star) {
+                    // `rest*` — Scala 3's spelling of the named sequence
+                    // wildcard `rest @ _*`.
+                    self.advance();
+                    Ok(Pattern::Rest(Some(name)))
                 } else {
                     Ok(Pattern::Bind(name))
                 }

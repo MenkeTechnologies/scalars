@@ -672,7 +672,7 @@ reported as parse/compile errors, never silently mis-run.
   scrutinee alongside its parts), `|` alternations (`case 0 | 1 | 2 =>`, each
   branch tried in turn), the cons pattern `h :: t` and `Nil`, and sequence
   patterns `List(a, b)` / `Seq(…)` / `Vector(…)` / `Array(…)` with an optional
-  trailing `_*` (named — `rest @ _*` — or anonymous). A sequence pattern tests the
+  trailing `_*` (named — `rest @ _*`, or Scala 3's `rest*` — or anonymous). A sequence pattern tests the
   receiver's REPRESENTATION first and its length second, so `case List(a, b)`
   does not match a two-element `Vector`, matching Scala. The same grammar backs
   **pattern definitions**: `val (a, b) = pair`, `val Some(x) = opt`,
