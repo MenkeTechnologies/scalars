@@ -746,8 +746,9 @@ reported as parse/compile errors, never silently mis-run.
   iterator`, as every other kind's iterator does.
   Scala 3's generic tuple operations `size`/`head`/`last`/`tail`/`init`/
   `take`/`drop`/`splitAt`/`reverse`/`++`/`toList`/`toArray` (each positional
-  one answering a tuple of the arity left), and `TupleN(…)` as both a factory
-  and a pattern (`val Tuple2(a, b) = …`).
+  one answering a tuple of the arity left), and `TupleN(…)` (`Tuple1` through
+  `Tuple22`) as both a factory and a pattern (`val Tuple2(a, b) = …`); a
+  `Tuple1` prints `(a)`.
 - **`search` and `scala.collection.Searching`.** `xs.search(e)` answers
   `Found(i)` or `InsertionPoint(i)` (both also answer `insertionPoint`, and
   both work as patterns). A `List`/`ListBuffer`/immutable `Queue` scans as

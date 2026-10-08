@@ -6009,12 +6009,14 @@ impl Compiler {
         if name == "identity" && args.len() == 1 {
             return self.expr(&args[0]);
         }
-        // `Tuple2(a, b)` … `Tuple22(…)` — the case-class `apply` of `scala.TupleN`,
-        // which builds the same value as the literal `(a, b)`.
+        // `Tuple1(a)` … `Tuple22(…)` — the case-class `apply` of `scala.TupleN`,
+        // which builds the same value as the literal `(a, b)`. `Tuple1` has no
+        // literal spelling (`(a)` is just `a`) but is the same kind of value,
+        // printed `(a)`.
         if name
             .strip_prefix("Tuple")
             .and_then(|n| n.parse::<usize>().ok())
-            .is_some_and(|n| (2..=22).contains(&n) && n == args.len())
+            .is_some_and(|n| (1..=22).contains(&n) && n == args.len())
         {
             return self.expr(&Expr::Tuple(args.to_vec()));
         }
