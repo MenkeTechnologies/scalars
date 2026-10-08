@@ -4862,10 +4862,19 @@ impl Compiler {
                 .map(|m| (m.methods.contains(name), m.vals.contains(name)));
             if let Some((is_method, is_val)) = member {
                 if is_method {
+                    let owner = self.object_method_owner(obj, name);
+                    if self.applies_paramless_result(&owner, name, args) {
+                        let call = Expr::Method {
+                            recv: Box::new(recv.clone()),
+                            name: name.to_string(),
+                            args: Vec::new(),
+                            line,
+                        };
+                        return self.method(&call, "apply", args, line);
+                    }
                     for a in args {
                         self.expr(a)?;
                     }
-                    let owner = self.object_method_owner(obj, name);
                     let sub = self.sub_name(&owner, name, args.len())?;
                     let nidx = self.b.add_name(&sub);
                     self.b.emit(Op::Call(nidx, args.len() as u8), line);
@@ -5115,6 +5124,20 @@ impl Compiler {
         classes: &[(String, String)],
         line: u32,
     ) -> Result<(), String> {
+        // Every candidate a parameterless `def`: the arguments apply its result.
+        if !classes.is_empty()
+            && classes
+                .iter()
+                .all(|(_, owner)| self.applies_paramless_result(owner, name, args))
+        {
+            let call = Expr::Method {
+                recv: Box::new(recv.clone()),
+                name: name.to_string(),
+                args: Vec::new(),
+                line,
+            };
+            return self.method(&call, "apply", args, line);
+        }
         // A single implementation and a receiver already known to be that class
         // needs no tag test: call it directly.
         if let [(tag, owner)] = classes {
@@ -5560,6 +5583,14 @@ impl Compiler {
     /// is the part this frontend can decide statically — so an `argc` no
     /// overload declares is refused here rather than dispatched into a body that
     /// takes a different number of arguments.
+    /// Whether `owner.name(args)` applies the RESULT of a parameterless `def`
+    /// rather than calling it with `args`: `def xs = List(10, 20)` called
+    /// `xs(1)` is `xs.apply(1)`. A `def f()` given arguments does not compile in
+    /// Scala, so a member declaring no parameters can only mean this.
+    fn applies_paramless_result(&self, owner: &str, name: &str, args: &[Expr]) -> bool {
+        !args.is_empty() && self.member_arity.get(&method_sub_name(owner, name)) == Some(&0)
+    }
+
     fn sub_name(&self, owner: &str, method: &str, argc: usize) -> Result<String, String> {
         let plain = method_sub_name(owner, method);
         let Some(arities) = self.overloads.get(&plain) else {
@@ -5859,6 +5890,14 @@ impl Compiler {
                 .get(&obj)
                 .is_some_and(|meta| meta.methods.contains(name))
             {
+                if self.applies_paramless_result(&obj, name, args) {
+                    let call = Expr::Call {
+                        name: name.to_string(),
+                        args: Vec::new(),
+                        line,
+                    };
+                    return self.method(&call, "apply", args, line);
+                }
                 for a in args {
                     self.expr(a)?;
                 }
@@ -5874,6 +5913,22 @@ impl Compiler {
         if self.func_arity.contains_key(name) {
             if let Some(e) = self.implicit_ambiguity(name, args, line) {
                 return Err(e);
+            }
+            // A parameterless `def` given an argument list is an APPLICATION of
+            // its result: `def xs = List(10, 20); xs(1)` is `xs.apply(1)`, 20.
+            // (`def f()` given arguments does not compile in Scala, so a `def`
+            // with no written parameters can only mean this.) The trailing
+            // capture arguments `crate::resolve` appended stay with the call.
+            if let Some((params, _, captured)) = self.func_sig.get(name) {
+                let written = args.len().saturating_sub(*captured);
+                if params.len() == *captured && written > 0 {
+                    let call = Expr::Call {
+                        name: name.to_string(),
+                        args: args[written..].to_vec(),
+                        line,
+                    };
+                    return self.method(&call, "apply", &args[..written], line);
+                }
             }
             // An UNDER-applied `def` is not a call — it is the function of the
             // parameters that were not supplied. `def add(a: Int)(b: Int)`

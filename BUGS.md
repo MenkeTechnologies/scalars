@@ -117,7 +117,9 @@ reported as parse/compile errors, never silently mis-run.
   `Op::Call` frame ABI: parameters bind to per-call frame slots, recursion and
   mutual recursion work, the body's last expression (including a tail
   `if`/`else`) is the result, and `return` performs an early exit. A
-  zero-parameter `def` is callable paren-less (`def x = …; x`). Parameter types
+  zero-parameter `def` is callable paren-less (`def x = …; x`). Given an argument
+  list it APPLIES its result — `def xs = List(10, 20); xs(1)` is `xs.apply(1)`,
+  `20` — at the top level, in an `object` (`O.xs(1)`) and on an instance. Parameter types
   and return types are parsed but not checked.
 - **Block-local `def`s.** A `def` declared inside a block belongs to that block:
   two blocks may each declare `def f`, an inner one shadows an outer one, a
