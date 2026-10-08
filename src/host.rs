@@ -12974,6 +12974,25 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             let c = string_method(s, "charAt", args)?;
             Ok(Value::int(char_code(&c).unwrap_or(0)))
         }
+        // `String.codePointBefore(i)` — the code point ending at `i`, checked as
+        // `charAt(i - 1)` is (`Index -1 out of bounds for length 3`).
+        ("codePointBefore", 1) => {
+            let c = string_method(s, "charAt", &[Value::int(args[0].to_int() - 1)])?;
+            Ok(Value::int(char_code(&c).unwrap_or(0)))
+        }
+        // `String.codePointCount(begin, end)` — the code points in `[begin,
+        // end)`, after `Preconditions.checkFromToIndex`'s range check.
+        ("codePointCount", 2) => {
+            let (b, e) = (args[0].to_int(), args[1].to_int());
+            let len = s.chars().count() as i64;
+            if b < 0 || b > e || e > len {
+                return Err(format!(
+                    "scalars: java.lang.IndexOutOfBoundsException: \
+                     Range [{b}, {e}) out of bounds for length {len}"
+                ));
+            }
+            Ok(Value::int(e - b))
+        }
         ("contains", 1) => Ok(Value::bool(s.contains(&*args[0].as_str_cow()))),
         ("startsWith", 1) => Ok(Value::bool(s.starts_with(&*args[0].as_str_cow()))),
         // `startsWith(prefix, offset)` — false for an offset outside the string.
@@ -13052,14 +13071,11 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             s.strip_prefix(&*args[0].as_str_cow()).unwrap_or(s),
         )),
         // `"…".format(args)` — Java's `Formatter` over a whole format string.
-        ("format", _) => Ok(Value::str(format_all(s, args, None)?)),
-        // `x.formatted(spec)` is the mirror image: the RECEIVER is the value and
-        // the argument is the format string.
-        ("formatted", 1) => Ok(Value::str(format_all(
-            &args[0].as_str_cow(),
-            std::slice::from_ref(&Value::str(s.to_string())),
-            None,
-        )?)),
+        // `"…".formatted(args)` is `java.lang.String.formatted(Object...)` — the
+        // same thing. A `String` receiver reaches that MEMBER before the
+        // deprecated `StringFormat.formatted(spec)` extension every other value
+        // gets, so here the receiver is the format, whatever the arity.
+        ("format" | "formatted", _) => Ok(Value::str(format_all(s, args, None)?)),
         ("stripSuffix", 1) => Ok(Value::str(
             s.strip_suffix(&*args[0].as_str_cow()).unwrap_or(s),
         )),

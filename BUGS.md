@@ -777,7 +777,8 @@ reported as parse/compile errors, never silently mis-run.
   char-difference result, not a normalized sign)/`compareToIgnoreCase`/
   `equalsIgnoreCase`, `*` (repeat), the total slicing operations `take`/`drop`/
   `takeRight`/`dropRight`/`slice`/`splitAt` (clamped, never throwing),
-  `head`/`last`/`init`/`tail`, `apply(i)`, `distinct`, `sorted`, `mkString`
+  `head`/`last`/`init`/`tail`, `apply(i)`, `codePointAt`/`codePointBefore`/`codePointCount`
+  (with the JDK's index messages), `distinct`, `sorted`, `mkString`
   (0/1/3-arg), `toCharArray`, `zipWithIndex`, and the closure-taking
   combinators `map`, `flatMap`, `collect`, `filter`/`filterNot`,
   `takeWhile`/`dropWhile`, `count`, `exists`/`forall`, `foreach`, `find`,

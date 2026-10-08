@@ -336,7 +336,8 @@ Implemented and checked against the reference `scala`:
   expected (an argument, a `val` initializer), with the numeric widening
   `3: Double` actually widening; Scala's `+` string concatenation
   and `*` string repetition; the `java.util.Formatter` conversions behind the
-  `f"…"` interpolator, `"…".format(…)`, `String.format(…)`, `x.formatted(…)` and
+  `f"…"` interpolator, `"…".format(…)`, `String.format(…)`, `x.formatted(…)` (on a `String`
+  receiver, Java's `String.formatted(args…)`: the receiver is the format) and
   `printf(…)`
   (`%s %S %d %f %e %E %g %G %x %X %o %b %B %c %C %h %H %n`, with the `- 0 + , ( #`
   and space flags, width, precision and the `n$`/`<` argument indices, rounded
