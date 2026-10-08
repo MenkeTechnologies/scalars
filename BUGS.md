@@ -588,7 +588,11 @@ reported as parse/compile errors, never silently mis-run.
   (`toByte`/`toShort`/`toBoolean` alongside `toInt`/`toLong`/`toDouble`), and
   none of the INTEGER parses trim: `" 42".toInt` raises where `" 42".trim.toInt`
   answers 42, while `toDouble` accepts the padding because
-  `Double.parseDouble` does.
+  `Double.parseDouble` does. `toDouble`/`toFloat` (and `Double.parseDouble`/
+  `Float.parseFloat`) follow `FloatingDecimal`'s grammar exactly: a trailing
+  `f`/`F`/`d`/`D`, hex floats (`0x1.8p1`), case-sensitive `NaN`/`Infinity`
+  (`inf` is rejected), `empty String` and `multiple points` as their own
+  messages, and `toFloat` rounding once, straight to single precision.
 - **`getClass`.** Answers a `java.lang.Class` carrying `getName` and
   `getSimpleName`, and printing as `class <name>` (a reference type) or the bare
   name (`int`, `double`, `boolean`, `char`). Modeled for a `String`, the

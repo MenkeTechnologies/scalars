@@ -542,7 +542,8 @@ fn parse_main_arg(text: &str, ty: &str) -> Result<Value, String> {
                 Err(out_of_range())
             }
         }
-        "Double" => text.parse::<f64>().map(Value::Float).map_err(|_| bad_num()),
+        "Double" => java_parse_float(text, false)
+            .map_err(|e| format!("java.lang.NumberFormatException: {e}")),
         other => Err(format!("scalars: no command-line reader for `{other}`")),
     }
 }
@@ -9988,6 +9989,173 @@ fn java_parse_int(s: &str, radix: i64) -> Result<i64, String> {
     Ok(v)
 }
 
+/// `Double.parseDouble` (`single = false`) and `Float.parseFloat`
+/// (`single = true`) — the JDK's `FloatingDecimal.readJavaFormatString` grammar,
+/// which is what `StringOps.toDouble`/`toFloat` call. The error is the
+/// `NumberFormatException` message alone.
+///
+/// The string is first stripped of every char `<= ' '` (`String.trim`, not
+/// Unicode whitespace). What remains is an optional sign and then exactly one of
+/// `NaN`, `Infinity` (both case-sensitive: `inf`/`nan` are rejected), a hex
+/// float `0x…p…`, or a decimal with optional fraction and exponent. A decimal or
+/// hex float may end in one of `f`/`F`/`d`/`D`. An empty string and a second `.`
+/// have their own messages; everything else is `For input string: "<s>"`. A `Float`
+/// answers the single-precision value [`make_f32`] carries.
+fn java_parse_float(s: &str, single: bool) -> Result<Value, String> {
+    let bad = || format!("For input string: \"{s}\"");
+    let t = s.trim_matches(|c: char| c <= ' ');
+    if t.is_empty() {
+        return Err("empty String".to_string());
+    }
+    let (negative, body) = match t.as_bytes()[0] {
+        b'-' => (true, &t[1..]),
+        b'+' => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let signed = |v: f64| {
+        let v = if negative { -v } else { v };
+        if single {
+            make_f32(v as f32)
+        } else {
+            Value::float(v)
+        }
+    };
+    match body {
+        "NaN" => return Ok(signed(f64::NAN)),
+        "Infinity" => return Ok(signed(f64::INFINITY)),
+        _ => {}
+    }
+    if body.len() > 1 && body.starts_with('0') && matches!(body.as_bytes()[1], b'x' | b'X') {
+        return java_parse_hex_float(&body[2..], single)
+            .map(signed)
+            .ok_or_else(bad);
+    }
+    // The decimal grammar: digits with at most one `.` and at least one digit,
+    // then an optional exponent with at least one digit, then at most one
+    // type suffix. A second `.` is reported as soon as it is seen.
+    let b = body.as_bytes();
+    let mut i = 0;
+    let (mut digits, mut point) = (0, false);
+    while i < b.len() {
+        match b[i] {
+            b'0'..=b'9' => digits += 1,
+            b'.' if point => return Err("multiple points".to_string()),
+            b'.' => point = true,
+            _ => break,
+        }
+        i += 1;
+    }
+    if digits == 0 {
+        return Err(bad());
+    }
+    if i < b.len() && matches!(b[i], b'e' | b'E') {
+        i += 1;
+        if i < b.len() && matches!(b[i], b'+' | b'-') {
+            i += 1;
+        }
+        let exp_digits = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if exp_digits == 0 {
+            return Err(bad());
+        }
+        i += exp_digits;
+    }
+    let number_end = i;
+    if i < b.len() && !(i == b.len() - 1 && matches!(b[i], b'f' | b'F' | b'd' | b'D')) {
+        return Err(bad());
+    }
+    // Validated against Java's grammar, the text (less its suffix) is in the
+    // subset Rust's correctly-rounded parsers accept, and both parsers round to
+    // nearest-even, so they agree on every value.
+    let text = &body[..number_end];
+    let v = if single {
+        text.parse::<f32>().map(f64::from).map_err(|_| bad())?
+    } else {
+        text.parse::<f64>().map_err(|_| bad())?
+    };
+    Ok(signed(v))
+}
+
+/// The value of a Java hex float's text after `0x` — `HEXDIGITS[.HEXDIGITS]p[±]DIGITS[fFdD]`
+/// with at least one hex digit — correctly rounded (nearest-even) to a `double`
+/// or, with `single`, to a `float`, subnormals included. `None` when the text
+/// does not match the grammar.
+fn java_parse_hex_float(text: &str, single: bool) -> Option<f64> {
+    let p = text.find(['p', 'P'])?;
+    let (significand, exponent) = (&text[..p], &text[p + 1..]);
+    let exponent = exponent
+        .strip_suffix(['f', 'F', 'd', 'D'])
+        .unwrap_or(exponent);
+    let (int_part, frac_part) = match significand.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (significand, ""),
+    };
+    let all_hex = |s: &str| s.bytes().all(|c| c.is_ascii_hexdigit());
+    if int_part.len() + frac_part.len() == 0 || !all_hex(int_part) || !all_hex(frac_part) {
+        return None;
+    }
+    let exp_digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if exp_digits.is_empty() || !exp_digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // A binary exponent far past either end of the range only decides
+    // overflow or underflow, so it saturates rather than overflowing here.
+    let exp: i64 = exponent.parse().unwrap_or(if exponent.starts_with('-') {
+        i64::from(i32::MIN)
+    } else {
+        i64::from(i32::MAX)
+    });
+    let exp = exp.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    // The significand as `mant × 2^e2`, keeping the first 31 significant hex
+    // digits exactly and folding any non-zero digit past them into a sticky bit.
+    let (mut mant, mut e2, mut sticky) = (0u128, exp - 4 * frac_part.len() as i64, false);
+    for c in int_part.bytes().chain(frac_part.bytes()) {
+        let d = u128::from((c as char).to_digit(16).unwrap_or(0));
+        if mant >> 120 == 0 {
+            mant = mant << 4 | d;
+        } else {
+            sticky |= d != 0;
+            e2 += 4;
+        }
+    }
+    if mant == 0 {
+        return Some(0.0);
+    }
+    let (precision, emin, emax) = if single { (24, -126, 127) } else { (53, -1022, 1023) };
+    let bits = 128 - i64::from(mant.leading_zeros());
+    let top = bits - 1 + e2;
+    if top > emax {
+        return Some(f64::INFINITY);
+    }
+    // A subnormal result keeps fewer bits: one fewer per binade below `emin`.
+    let keep = if top >= emin { precision } else { precision - (emin - top) };
+    let shift = bits - keep;
+    let (mut m, mut scale) = (mant, e2);
+    if shift > 0 {
+        if shift > 127 {
+            return Some(0.0);
+        }
+        let dropped = mant & ((1u128 << shift) - 1);
+        let half = 1u128 << (shift - 1);
+        m = mant >> shift;
+        scale += shift;
+        let above_half = dropped > half || (dropped == half && sticky);
+        if above_half || (dropped == half && m & 1 == 1) {
+            m += 1;
+        }
+    }
+    let value = (m as f64) * pow2(scale / 2) * pow2(scale - scale / 2);
+    if single {
+        let f = value as f32;
+        return Some(if f.is_infinite() { f64::INFINITY } else { f64::from(f) });
+    }
+    Some(value)
+}
+
+/// `2^n` exactly, for `n` in the normal exponent range of a `double`.
+fn pow2(n: i64) -> f64 {
+    f64::from_bits(((n + 1023) as u64) << 52)
+}
+
 /// `Byte.parseByte`/`Short.parseShort`: `parseInt` first, then the box's own
 /// range — so `"7f".toByte` fails on the DIGITS (radix ten has no `f`) while
 /// `"128".toByte` fails on the VALUE, with the two different messages.
@@ -10217,11 +10385,8 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         ("java.Double" | "java.Float", "parseDouble" | "parseFloat" | "valueOf", 1) => {
             let s = args[0].as_str_cow();
             match &args[0] {
-                Value::Str(_) => s
-                    .trim()
-                    .parse::<f64>()
-                    .map(Value::float)
-                    .map_err(|_| number_format(&s)),
+                Value::Str(_) => java_parse_float(&s, module == "java.Float")
+                    .map_err(|e| format!("scalars: java.lang.NumberFormatException: {e}")),
                 other => Ok(Value::float(num_f64(other))),
             }
         }
@@ -11789,31 +11954,14 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // `Double.parseDouble` DOES accept surrounding whitespace, which is the
         // asymmetry above: the same padding that makes `toInt` throw is fine
         // here.
-        ("toDouble" | "toFloat", 0) => s
-            .trim()
-            .parse::<f64>()
-            .map(|v| {
-                // `"0.1".toFloat` parses AT single precision, so the parse and
-                // the rounding are one step in Scala and two here.
-                Value::float(if name == "toFloat" {
-                    f64::from(v as f32)
-                } else {
-                    v
-                })
-            })
-            .map_err(|_| {
-                format!("scalars: java.lang.NumberFormatException: For input string: \"{s}\"")
-            }),
-        ("toDoubleOption" | "toFloatOption", 0) => Ok(s.trim().parse::<f64>().map_or_else(
-            |_| make_none(),
-            |v| {
-                make_some(Value::float(if name == "toFloatOption" {
-                    f64::from(v as f32)
-                } else {
-                    v
-                }))
-            },
-        )),
+        // `"0.1".toFloat` parses AT single precision rather than rounding the
+        // `Double` parse, which could round twice.
+        ("toDouble" | "toFloat", 0) => java_parse_float(s, name == "toFloat")
+            .map_err(|e| format!("scalars: java.lang.NumberFormatException: {e}")),
+        ("toDoubleOption" | "toFloatOption", 0) => Ok(
+            java_parse_float(s, name == "toFloatOption")
+                .map_or_else(|_| make_none(), make_some),
+        ),
         // `StringOps.toBoolean` is case-insensitive but NOT trimming, and its
         // failure is an `IllegalArgumentException` rather than the
         // `NumberFormatException` every other conversion here raises.
