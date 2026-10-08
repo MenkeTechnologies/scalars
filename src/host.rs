@@ -4982,17 +4982,54 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         return x == y;
     }
     match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Obj(_), Value::Obj(_)) => obj_eq(a, b),
-        // A `Float` is a distinct VARIANT, so `a == b` would answer `false` for
-        // it against the `Int` or `Double` of the same value. Scala's `==`
-        // crosses the numeric widths: `1.0f == 1` and `1.0f == 1.0` are both
-        // true, and `0.1f == 0.1` is false because the widening is what is
-        // compared, not the rendering.
-        (Value::Status(_), _) | (_, Value::Status(_)) => match (float_of(a), float_of(b)) {
-            (Some(x), Some(y)) => x == y,
+        _ => match (boxed_num(a), boxed_num(b)) {
+            (Some(x), Some(y)) => boxed_num_eq(x, y),
             _ => a == b,
         },
-        _ => a == b,
+    }
+}
+
+/// A primitive as `BoxesRunTime` sees it once boxed: its numeric value and the
+/// width that decides how it is compared. `Int` stands for every integral width
+/// (`Long` included — the two compare as `long`s either way).
+#[derive(Clone, Copy)]
+enum BoxedNum {
+    Char(i64),
+    Int(i64),
+    Float(f32),
+    Double(f64),
+}
+
+fn boxed_num(v: &Value) -> Option<BoxedNum> {
+    match v {
+        Value::Int(i) => Some(BoxedNum::Int(*i)),
+        Value::Float(d) => Some(BoxedNum::Double(*d)),
+        Value::Status(_) => f32_of(v).map(BoxedNum::Float),
+        Value::Obj(_) => char_code(v).map(BoxedNum::Char),
+        _ => None,
+    }
+}
+
+/// `BoxesRunTime.equals` between two boxed primitives — the COOPERATIVE
+/// equality a collection's `contains`/`indexOf`/`==`/`distinct` and a `Set`/`Map`
+/// key all use. It crosses widths at the wider of the two (`equalsNumNum`), so
+/// `List(1.0).contains(1)` and `List(1) == List(1L)` are true, and a `Char`
+/// compares by its code point (`equalsCharObject`), so `List('b').contains(98)`
+/// is true. A `Float` side compares in single precision unless the other side
+/// is a `Double`, which is why `0.1f == 0.1` is false.
+fn boxed_num_eq(a: BoxedNum, b: BoxedNum) -> bool {
+    use BoxedNum::*;
+    match (a, b) {
+        (Char(x) | Int(x), Char(y) | Int(y)) => x == y,
+        (Double(x), other) | (other, Double(x)) => match other {
+            Char(y) | Int(y) => x == y as f64,
+            Float(y) => x == f64::from(y),
+            Double(y) => x == y,
+        },
+        (Float(x), Char(y) | Int(y)) | (Char(y) | Int(y), Float(x)) => x == y as f32,
+        (Float(x), Float(y)) => x == y,
     }
 }
 

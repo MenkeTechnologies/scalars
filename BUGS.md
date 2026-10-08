@@ -297,6 +297,15 @@ reported as parse/compile errors, never silently mis-run.
   Built-in `Option` (`Some(v)`, the `None` case object) rides the same model.
   Plain (non-`case`) classes use reference-identity `equals`/`hashCode` and a
   `Class@hex` `toString`, matching Scala.
+- **Cooperative numeric equality inside collections.** An element, tuple
+  field, `Option` content or `Set`/`Map` key compares as `BoxesRunTime.equals`
+  does: across widths at the wider of the two (`List(1) == List(1.0)`,
+  `List(1.0).contains(1)`, `Set[Any](1, 1L, 1.0).size == 1`), a `Float` in single
+  precision against an integer (`List(16777217).contains(16777216f)`), and a
+  `Char` by its code point (`List('b').contains(98)`). `x.equals(y)` on two
+  numbers of different widths is NOT modelled: an `Int` and a `Long` share one
+  runtime representation, so `1.equals(1L)` answers `true` where Scala's
+  `Integer.equals` answers `false`.
 - **`override def equals`, honoured by `==`.** A class that overrides
   `equals(o: Any)` answers `==`/`!=` through it, and so do a `List`/`Vector`/
   tuple/`Option` holding such instances (they compare element by element with
