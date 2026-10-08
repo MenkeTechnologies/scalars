@@ -5781,7 +5781,11 @@ impl Compiler {
         }
         if name == crate::parser::SUMMON {
             if let [Expr::Str(ty)] = args {
-                let found = self.resolve_implicit(ty, line)?;
+                // With no given of the type in scope, `Ordering[T]` still resolves:
+                // to the standard library's instance in `Ordering`'s companion.
+                let found = self
+                    .resolve_implicit(ty, line)
+                    .or_else(|e| natural_ordering(ty).ok_or(e))?;
                 return self.expr(&found);
             }
         }

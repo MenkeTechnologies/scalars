@@ -3685,7 +3685,8 @@ impl Parser {
                 // `summon[T]` — the one place a type application is not erased,
                 // because the type IS the argument: it names which given to
                 // fetch from the implicit scope.
-                if name == "summon" && self.is(&Tok::LBracket) {
+                // `implicitly[T]` is Predef's spelling of the same fetch.
+                if (name == "summon" || name == "implicitly") && self.is(&Tok::LBracket) {
                     self.advance();
                     let ty = self.type_ref()?;
                     self.eat(&Tok::RBracket)?;

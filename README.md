@@ -121,7 +121,8 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   value or by `with { … }` body), `using` clauses written or supplied (named
   or anonymous, `(using Sh[A])`, and visible inside the lambdas the body
   writes),
-  `summon[T]`, context bounds (`[A: Sh]`), `extension` methods dispatched on
+  `summon[T]` and Predef's `implicitly[T]` (an `Ordering[T]` with no given in
+  scope resolving to the standard library's), context bounds (`[A: Sh]`), `extension` methods dispatched on
   the receiver's type, and implicit conversions applied where Scala applies
   them. A type-class instance is a singleton `object`, which already works as a
   value, so `def show[A: Sh](x: A)` resolves to the right instance from the
