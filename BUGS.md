@@ -314,7 +314,9 @@ reported as parse/compile errors, never silently mis-run.
   `element == target` front to back; `indexOf` is `target == element`;
   `lastIndexOf` walks a `List` whole from the front but any other kind back
   from the end; `distinct` hashes (running a `hashCode` override) and calls
-  `equals` only between elements whose hashes agree. A program with no override
+  `equals` only between elements whose hashes agree. `diff`/`intersect` count the
+  argument in a hash table the same way (`occCounts`), comparing a new key
+  against its same-hash keys twice, as `updateWith` then `put0` do. A program with no override
   keeps the native `Op::NumEq`.
 - **By-name arguments of library methods.** `getOrElse(d)` on an
   `Option`/`Either`/`Try`, `orElse(alt)`, `Map.getOrElse(k, d)` and

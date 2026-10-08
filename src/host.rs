@@ -5151,6 +5151,41 @@ fn seq_user_eq_method(
             }
             SeqEqAnswer::Value(index(last))
         }
+        // `SeqOps.diff`/`intersect` over `occCounts(that)`: the argument's
+        // elements are counted in a `mutable.HashMap` (hash, then `==` against
+        // the stored key), and each receiver element looked up there either
+        // consumes one occurrence or finds none. Counting goes through
+        // `updateWith`, whose miss inserts with `put0` — a SECOND walk of the
+        // bucket — so a new key is compared against the same-hash keys twice,
+        // which an `equals` that prints can observe.
+        "diff" | "intersect" => {
+            let mut occ: Vec<(i64, Value, usize)> = Vec::new();
+            for y in as_seq_or_tuple(&args[0]).unwrap_or_default() {
+                let h = hash_vm(vm, &y)?;
+                match occ_slot(vm, &occ, h, &y)? {
+                    Some(i) => occ[i].2 += 1,
+                    None => {
+                        occ_slot(vm, &occ, h, &y)?;
+                        occ.push((h, y, 1));
+                    }
+                }
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for x in items {
+                let h = hash_vm(vm, x)?;
+                let found = occ_slot(vm, &occ, h, x)?;
+                if let Some(i) = found {
+                    occ[i].2 -= 1;
+                    if occ[i].2 == 0 {
+                        occ.remove(i);
+                    }
+                }
+                if found.is_some() == (name == "intersect") {
+                    out.push(x.clone());
+                }
+            }
+            SeqEqAnswer::Seq(out)
+        }
         "lastIndexOf" => SeqEqAnswer::Value(index(first_eq(
             vm,
             items,
@@ -5175,6 +5210,22 @@ fn seq_user_eq_method(
             SeqEqAnswer::Seq(kept.into_iter().map(|(_, v)| v).collect())
         }
     })
+}
+
+/// The entry of a [`seq_user_eq_method`] occurrence table whose key is `x`: the
+/// same hash, then `x == key` under [`eq_vm`].
+fn occ_slot(
+    vm: &mut VM,
+    occ: &[(i64, Value, usize)],
+    h: i64,
+    x: &Value,
+) -> Result<Option<usize>, String> {
+    for (i, (kh, k, _)) in occ.iter().enumerate() {
+        if *kh == h && eq_vm(vm, x, k)? {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
 }
 
 /// The `hashCode` of `v`, running a user override when its class has one.
@@ -7680,7 +7731,10 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     if user_equals_present(vm)
         && matches!(
             (name, args.len()),
-            ("contains" | "indexOf" | "lastIndexOf", 1) | ("distinct", 0)
+            (
+                "contains" | "indexOf" | "lastIndexOf" | "diff" | "intersect",
+                1
+            ) | ("distinct", 0)
         )
         && !matches!(kind, SeqKind::Set(_))
     {
