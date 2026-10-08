@@ -739,6 +739,11 @@ reported as parse/compile errors, never silently mis-run.
   `productIterator` and `productElementNames`, all over the
   primary-constructor prefix (a body `val` is a field but not a product
   element). `Tuple2.swap` and `iterator`/`reverseIterator` on a sequence.
+  A `List`'s (and `ListBuffer`'s) iterator advances with `current.head`
+  and no `hasNext` test, so `next()` past its end raises `head of empty list`,
+  as does a `map`, `zipWithIndex`, or a `drop`/`take`/`slice` that outlasts
+  it; a `filter`/`collect` or an exhausted `take` raises `next on empty
+  iterator`, as every other kind's iterator does.
   Scala 3's generic tuple operations `size`/`head`/`last`/`tail`/`init`/
   `take`/`drop`/`splitAt`/`reverse`/`++`/`toList`/`toArray` (each positional
   one answering a tuple of the arity left), and `TupleN(…)` as both a factory

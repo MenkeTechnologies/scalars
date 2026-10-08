@@ -2064,6 +2064,7 @@ pub fn reset_heap() {
     // invalidates; a stale id would claim a fresh collection is already sorted.
     MUT_SORTED.with(|t| t.borrow_mut().clear());
     MAP_DEFAULTS.with(|t| t.borrow_mut().clear());
+    LIST_ITERS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -7065,7 +7066,11 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
     }
     match heap_kind(recv) {
         Some(0) => {
+            let list_iter = list_iter_len(recv);
             let out = seq_method(vm, recv, name, args)?;
+            if let Some(len) = list_iter {
+                derive_list_iter(&out, name, args, len);
+            }
             if keyed {
                 return keyed_rebuild(vm, name, out);
             }
@@ -7109,6 +7114,58 @@ enum MapDefault {
     Value(Value),
     /// `withDefault(f)` — `f(key)`.
     Fn(Value),
+}
+
+thread_local! {
+    /// The `Iterator`s whose `next()` advances a `List` with no `hasNext`
+    /// test, keyed by arena index (cleared by [`reset_heap`]).
+    ///
+    /// A non-empty `List`'s `iterator` is `StrictOptimizedLinearSeqOps`' own,
+    /// whose `next()` is `current.head` — so asking it past the end raises
+    /// `Nil.head`'s `head of empty list`, not `next on empty iterator`. So does
+    /// every iterator that forwards to it without asking `hasNext`: `map`,
+    /// `zipWithIndex`, and a `drop`/`take`/`slice` whose `SliceIterator` still
+    /// has elements to hand out when the list runs dry.
+    static LIST_ITERS: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// The element count of `v` when it is a [`LIST_ITERS`] iterator.
+fn list_iter_len(v: &Value) -> Option<usize> {
+    let id = as_obj_id(v)?;
+    if !LIST_ITERS.with(|t| t.borrow().contains(&id)) {
+        return None;
+    }
+    with_seq(v, |_, items| items.len())
+}
+
+/// Record `v` as a [`LIST_ITERS`] iterator.
+fn mark_list_iter(v: &Value) {
+    if let Some(id) = as_obj_id(v) {
+        LIST_ITERS.with(|t| t.borrow_mut().insert(id));
+    }
+}
+
+/// Carry [`LIST_ITERS`] from an iterator of `len` elements to the iterator
+/// `name(args)` derived from it, when the derived one still advances the list
+/// unasked: `map`/`zipWithIndex` always, and a slice whose remaining count
+/// outlasts the elements left after its drop.
+fn derive_list_iter(out: &Value, name: &str, args: &[Value], len: usize) {
+    let len = len as i64;
+    let arg = |i: usize| args.get(i).map_or(0, Value::to_int);
+    let unasked = match (name, args.len()) {
+        ("map" | "zipWithIndex", _) => true,
+        ("drop", 1) => true,
+        ("take", 1) => arg(0) > len,
+        ("slice", 2) => {
+            let lo = arg(0).max(0);
+            arg(1) - lo > (len - lo).max(0)
+        }
+        _ => false,
+    };
+    if unasked && seq_kind(out) == Some(SeqKind::Iterator) {
+        mark_list_iter(out);
+    }
 }
 
 thread_local! {
@@ -8465,11 +8522,24 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // frontend is strict — but answer an `Iterator`, not an `Iterable`, so
         // the two behaviors that ARE observable without laziness hold: it
         // renders as `<iterator>`, and traversing it consumes it.
-        ("iterator", 0) => Ok(new_seq(SeqKind::Iterator, items)),
-        ("reverseIterator", 0) => Ok(new_seq(
-            SeqKind::Iterator,
-            items.into_iter().rev().collect(),
-        )),
+        ("iterator", 0) => {
+            let list = matches!(kind, SeqKind::List | SeqKind::ListBuffer) && !items.is_empty();
+            let it = new_seq(SeqKind::Iterator, items);
+            if list {
+                mark_list_iter(&it);
+            }
+            Ok(it)
+        }
+        ("reverseIterator", 0) => {
+            // `SeqOps.reverseIterator` is `reversed.iterator`, and a linear
+            // sequence reverses into a `List`.
+            let list = matches!(kind, SeqKind::List | SeqKind::ListBuffer) && !items.is_empty();
+            let it = new_seq(SeqKind::Iterator, items.into_iter().rev().collect());
+            if list {
+                mark_list_iter(&it);
+            }
+            Ok(it)
+        }
         // The `Iterator` protocol itself. Guarded on the kind because Scala
         // declares neither on any other collection — `List(1).hasNext` is a
         // compile error there and stays a missing method here.
@@ -8491,6 +8561,9 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         ("hasNext", 0) if kind == SeqKind::Iterator => Ok(Value::bool(!items.is_empty())),
         ("next", 0) if kind == SeqKind::Iterator => {
             let Some(first) = items.first().cloned() else {
+                if list_iter_len(recv).is_some() {
+                    return Err(SeqKind::List.empty_fault(EmptyOp::Head));
+                }
                 return Err(
                     "scalars: java.util.NoSuchElementException: next on empty iterator".to_string(),
                 );
@@ -9717,6 +9790,9 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             let seq = new_list(rendered);
             seq_method(vm, &seq, name, args)
         }
+        // A `Map`'s iterator is a trie or table iterator, which tests `hasNext`
+        // before advancing — not the `List` one the pair sequence below has.
+        ("iterator", 0) => Ok(new_seq(SeqKind::Iterator, pairs())),
         // Everything else that only reads the entries as a pair sequence is the
         // sequence implementation over `Map`'s `Tuple2` elements.
         (
