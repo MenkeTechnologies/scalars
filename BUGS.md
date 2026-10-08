@@ -752,7 +752,7 @@ reported as parse/compile errors, never silently mis-run.
   caller. No `catch` arm can intercept it. `return` is also accepted in
   expression position (`xs.foreach(x => if (p(x)) return x)`), as in Scala,
   where its type is `Nothing`.
-- **The wider `String`/`StringOps` surface.** `indexOf`(+`from`), `lastIndexOf`,
+- **The wider `String`/`StringOps` surface.** `indexOf`(+`from`), `lastIndexOf`(+`from`),
   `replace`, `stripPrefix`/`stripSuffix`, `capitalize`, `compareTo`(the JDK's
   char-difference result, not a normalized sign)/`compareToIgnoreCase`/
   `equalsIgnoreCase`, `*` (repeat), the total slicing operations `take`/`drop`/
@@ -762,7 +762,8 @@ reported as parse/compile errors, never silently mis-run.
   combinators `map`, `flatMap`, `collect`, `filter`/`filterNot`,
   `takeWhile`/`dropWhile`, `count`, `exists`/`forall`, `foreach`, `find`,
   `indexWhere`, `partition`, `span`, `foldLeft`/`foldRight`, `reduce`,
-  `scanLeft`, `sortWith`/`sortBy`, `maxBy`/`minBy`, `groupBy`, `zip`, and the
+  `scanLeft`, `sortWith`/`sortBy`, `maxBy`/`minBy`, `groupBy`, `groupMap`/`groupMapReduce`,
+  `zip`, `sum`/`product` (a `Char`, wrapping at 16 bits, as `Numeric[Char]` does), and the
   conversions `toList`/`toVector`/`toArray`/`toSet`. Every accessor that hands
   out an element hands out a `Char` (`head`, `last`, `apply`/`charAt`,
   `headOption`/`lastOption`, `min`/`max`, and the elements of `toList` and

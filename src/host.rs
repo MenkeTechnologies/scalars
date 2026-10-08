@@ -1937,15 +1937,10 @@ fn char_range_method(
             };
             Ok(Value::int(pos.map_or(-1, |p| p as i64)))
         }
-        // `Numeric[Char]` adds and multiplies in `Char`, wrapping at 16 bits.
-        ("sum" | "product", 0) => {
-            let mut acc: i64 = if name == "sum" { 0 } else { 1 };
-            for x in items {
-                let c = char_code(x).unwrap_or(0);
-                acc = if name == "sum" { acc + c } else { acc * c } & 0xFFFF;
-            }
-            Ok(make_char(char_of_code(acc)))
-        }
+        ("sum" | "product", 0) => Ok(char_fold(
+            name == "sum",
+            items.iter().map(|x| char_code(x).unwrap_or(0)),
+        )),
         // `grouped` chunks are whatever `IndexedSeq.from` keeps of the
         // iterator's own `ArraySeq` groups.
         ("grouped", 1) => {
@@ -1961,6 +1956,17 @@ fn char_range_method(
         }
         _ => return None,
     })
+}
+
+/// `sum` (`add`) or `product` over `Char`s under `Numeric[Char]`, which adds and
+/// multiplies in `Char` and so wraps at 16 bits: the answer is a `Char`
+/// (`"abc".sum` is `Ħ`, U+0126).
+fn char_fold(add: bool, codes: impl Iterator<Item = i64>) -> Value {
+    let mut acc: i64 = if add { 0 } else { 1 };
+    for c in codes {
+        acc = if add { acc + c } else { acc * c } & 0xFFFF;
+    }
+    make_char(char_of_code(acc))
 }
 
 /// A first-class function value. `name_idx` is the closure body's name-pool index
@@ -12371,6 +12377,20 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             }))
         }
         ("lastIndexOf", 1) => Ok(Value::int(char_index(s, s.rfind(&*args[0].as_str_cow())))),
+        // `lastIndexOf(str, from)` — the rightmost occurrence STARTING at or
+        // before `from`, so the search window ends `str.length` past it.
+        ("lastIndexOf", 2) => {
+            let needle = args[0].as_str_cow();
+            let from = args[1].to_int();
+            if from < 0 {
+                return Ok(Value::int(-1));
+            }
+            let mut end = (char_offset(s, from) + needle.len()).min(s.len());
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            Ok(Value::int(char_index(s, s[..end].rfind(&*needle))))
+        }
         ("replace" | "replaceAllLiterally", 2) => Ok(Value::str(
             s.replace(&*args[0].as_str_cow(), &args[1].as_str_cow()),
         )),
@@ -12467,6 +12487,10 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 format!("scalars: java.lang.UnsupportedOperationException: empty.{name}")
             })
         }
+        ("sum" | "product", 0) => Ok(char_fold(
+            name == "sum",
+            s.chars().map(|c| i64::from(c as u32)),
+        )),
         // Both raise on an empty receiver — `StringOps` inherits `SeqOps`'
         // checks, so `"".tail` is NOT `""`.
         ("init", 0) if s.is_empty() => Err(
@@ -13059,6 +13083,8 @@ fn string_fn_method(
     const REBUILDS_STRING: &[&str] = &["collect"];
     const PASSES_THROUGH: &[&str] = &[
         "foldLeft",
+        "groupMap",
+        "groupMapReduce",
         "foldRight",
         "fold",
         "reduce",
