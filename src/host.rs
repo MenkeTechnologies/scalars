@@ -474,6 +474,11 @@ pub const CLASS_OF: u16 = 793;
 /// superclass constructor built, retags the record as that object and makes it
 /// the instance every mention answers. See `object O extends C(args)`.
 pub const OBJ_ADOPT: u16 = 794;
+/// Builtin ids for a `TreeSet(...)` / `TreeMap(...)` literal (`SortedSet` /
+/// `SortedMap` too): pop `argc` elements or `key -> value` pairs into the
+/// ordered representation, [`HashRep::Sorted`].
+pub const MAKE_SORTEDSET: u16 = 795;
+pub const MAKE_SORTEDMAP: u16 = 796;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -754,6 +759,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SSUB_VM, b_sub_vm);
     vm.register_builtin(CLASS_OF, b_class_of);
     vm.register_builtin(OBJ_ADOPT, b_obj_adopt);
+    vm.register_builtin(MAKE_SORTEDSET, b_make_sortedset);
+    vm.register_builtin(MAKE_SORTEDMAP, b_make_sortedmap);
     vm.register_builtin(SEQ_VM, b_eq_vm);
     vm.register_builtin(SNE_VM, b_ne_vm);
     vm.register_builtin(BYNAME, b_byname);
@@ -1399,6 +1406,12 @@ enum HashRep {
     /// linked list, so an add appends and a remove unlinks. It prints
     /// `LinkedHashSet(…)`/`LinkedHashMap(…)` at every size.
     Linked,
+    /// A `scala.collection.immutable.TreeSet`/`TreeMap` (also reached as
+    /// `SortedSet`/`SortedMap`) — a red-black tree, iterated in ascending order
+    /// of its natural `Ordering`, which is also what decides two keys are the
+    /// same one (`compare == 0`, not `equals`). The stored `Vec` is kept in
+    /// that order. It prints `TreeSet(…)`/`TreeMap(…)` at every size.
+    Sorted,
 }
 
 /// The rendered prefix of a [`HeapVal::Seq`].
@@ -1528,6 +1541,7 @@ impl SeqKind {
             SeqKind::Set(HashRep::Small) => "Set",
             SeqKind::Set(HashRep::Hashed | HashRep::Mutable(_)) => "HashSet",
             SeqKind::Set(HashRep::Linked) => "LinkedHashSet",
+            SeqKind::Set(HashRep::Sorted) => "TreeSet",
             SeqKind::Iterable => "Iterable",
             SeqKind::Iterator => "Iterator",
             SeqKind::View(false) => "SeqView",
@@ -3231,6 +3245,7 @@ fn b_from_seq(vm: &mut VM, _argc: u8) -> Value {
         "StringBuilder" => new_seq(SeqKind::StrBuf, items.iter().flat_map(str_chars).collect()),
         "Set" => new_set(HashRep::Small, items),
         "LinkedHashSet" => new_set(HashRep::Linked, items),
+        "TreeSet" => new_set(HashRep::Sorted, items),
         "mutable.Set" => mut_set_from(mut_initial_len(items.len()), items),
         "Map" => match pairs(vm) {
             Some(e) => new_map(HashRep::Small, e),
@@ -3238,6 +3253,10 @@ fn b_from_seq(vm: &mut VM, _argc: u8) -> Value {
         },
         "LinkedHashMap" => match pairs(vm) {
             Some(e) => new_map(HashRep::Linked, e),
+            None => Value::Undef,
+        },
+        "TreeMap" => match pairs(vm) {
+            Some(e) => new_map(HashRep::Sorted, e),
             None => Value::Undef,
         },
         "mutable.Map" => match pairs(vm) {
@@ -3497,6 +3516,146 @@ fn b_make_linkedset(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// `MAKE_LINKEDMAP` builtin — the `mutable.LinkedHashMap` counterpart.
+/// `MAKE_SORTEDSET` builtin — see [`MAKE_SORTEDSET`].
+fn b_make_sortedset(vm: &mut VM, argc: u8) -> Value {
+    let items = pop_n(vm, argc);
+    if let Err(e) = sorted_keys_modelled(&items) {
+        return fault(vm, e);
+    }
+    new_set(HashRep::Sorted, items)
+}
+
+/// `MAKE_SORTEDMAP` builtin — see [`MAKE_SORTEDMAP`].
+fn b_make_sortedmap(vm: &mut VM, argc: u8) -> Value {
+    let pairs = pop_n(vm, argc);
+    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
+    for p in &pairs {
+        match as_seq_or_tuple(p) {
+            Some(t) if t.len() == 2 => entries.push((t[0].clone(), t[1].clone())),
+            _ => return fault(vm, "scalars: Map(...) expects `key -> value` pairs"),
+        }
+    }
+    let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+    if let Err(e) = sorted_keys_modelled(&keys) {
+        return fault(vm, e);
+    }
+    new_map(HashRep::Sorted, entries)
+}
+
+/// A `TreeSet`/`TreeMap` orders its keys by their natural `Ordering`, which
+/// [`value_cmp`] reproduces for the numbers, `String`, `Boolean`, `Char`,
+/// `BigInt` and tuples/sequences of them. A class instance's ordering comes from
+/// the program (`Ordered`, a given `Ordering`) and needs the VM at every
+/// insertion, so it is refused rather than mis-ordered.
+fn sorted_keys_modelled(keys: &[Value]) -> Result<(), String> {
+    match keys.iter().find(|k| with_obj(k, |_| ()).is_some()) {
+        Some(_) => Err(
+            "scalars: a TreeSet/TreeMap of class instances (a user Ordering) is not modelled"
+                .to_string(),
+        ),
+        None => Ok(()),
+    }
+}
+
+/// The `SortedSet`/`SortedMap` members a `TreeSet`/`TreeMap` adds to `Set`/
+/// `Map`: its end keys, the key-range views (`range(from, until)`,
+/// `rangeFrom`, `rangeUntil`, `rangeTo` — each another tree of the same kind)
+/// and the neighbour searches `minAfter`/`maxBefore`. A map's `keySet`/`keys`
+/// is a `TreeSet`. `None` for any other receiver or member.
+fn sorted_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let (is_map, entries) = match seq_kind_items(recv) {
+        Some((SeqKind::Set(HashRep::Sorted), items)) => (
+            false,
+            items
+                .into_iter()
+                .map(|k| (k, Value::Undef))
+                .collect::<Vec<_>>(),
+        ),
+        _ => match map_rep_entries(recv) {
+            Some((HashRep::Sorted, entries)) => (true, entries),
+            _ => return None,
+        },
+    };
+    let rebuild = |kept: Vec<(Value, Value)>| {
+        if is_map {
+            heap_push(HeapVal::Map(HashRep::Sorted, kept))
+        } else {
+            let keys = kept.into_iter().map(|(k, _)| k).collect();
+            heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), keys))
+        }
+    };
+    let entry = |(k, v): &(Value, Value)| {
+        if is_map {
+            new_pair(k.clone(), v.clone())
+        } else {
+            k.clone()
+        }
+    };
+    let keep = |test: &dyn Fn(Ordering) -> bool, bound: &Value| {
+        entries
+            .iter()
+            .filter(|(k, _)| test(value_cmp(k, bound)))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // Every end access of an empty tree is `RedBlackTree`'s own failure.
+    if entries.is_empty()
+        && args.is_empty()
+        && matches!(
+            name,
+            "head" | "last" | "firstKey" | "lastKey" | "tail" | "init"
+        )
+    {
+        return Some(Err(
+            "scalars: java.util.NoSuchElementException: empty tree".to_string()
+        ));
+    }
+    Some(match (name, args.len()) {
+        ("firstKey", 0) => Ok(entries[0].0.clone()),
+        ("lastKey", 0) => Ok(entries[entries.len() - 1].0.clone()),
+        ("range", 2) => {
+            let from = keep(&|o| o != Ordering::Less, &args[0]);
+            Ok(rebuild(
+                from.into_iter()
+                    .filter(|(k, _)| value_cmp(k, &args[1]) == Ordering::Less)
+                    .collect(),
+            ))
+        }
+        ("rangeFrom", 1) => Ok(rebuild(keep(&|o| o != Ordering::Less, &args[0]))),
+        ("rangeUntil", 1) => Ok(rebuild(keep(&|o| o == Ordering::Less, &args[0]))),
+        ("rangeTo", 1) => Ok(rebuild(keep(&|o| o != Ordering::Greater, &args[0]))),
+        ("minAfter", 1) => Ok(opt(entries
+            .iter()
+            .find(|(k, _)| value_cmp(k, &args[0]) != Ordering::Less)
+            .map(entry))),
+        ("maxBefore", 1) => Ok(opt(entries
+            .iter()
+            .rev()
+            .find(|(k, _)| value_cmp(k, &args[0]) == Ordering::Less)
+            .map(entry))),
+        ("keySet" | "keys", 0) if is_map => Ok(heap_push(HeapVal::Seq(
+            SeqKind::Set(HashRep::Sorted),
+            entries.into_iter().map(|(k, _)| k).collect(),
+        ))),
+        _ => return None,
+    })
+}
+
+/// The ascending, `compare`-distinct order a `TreeSet` holds `items` in. A
+/// later element comparing equal to a stored one is dropped, as
+/// `RedBlackTree.update` without overwrite keeps the stored key.
+fn sorted_insert_all<T>(items: Vec<T>, key: impl Fn(&T) -> &Value, overwrite: bool) -> Vec<T> {
+    let mut out: Vec<T> = Vec::with_capacity(items.len());
+    for it in items {
+        match out.binary_search_by(|x| value_cmp(key(x), key(&it))) {
+            Ok(i) if overwrite => out[i] = it,
+            Ok(_) => {}
+            Err(i) => out.insert(i, it),
+        }
+    }
+    out
+}
+
 fn b_make_linkedmap(vm: &mut VM, argc: u8) -> Value {
     let pairs = pop_n(vm, argc);
     let mut entries: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
@@ -5767,7 +5926,7 @@ fn keyed_user_method(
     args: &[Value],
 ) -> Option<Result<Value, String>> {
     if let Some((SeqKind::Set(rep), items)) = seq_kind_items(recv) {
-        if matches!(rep, HashRep::Mutable(_)) {
+        if matches!(rep, HashRep::Mutable(_) | HashRep::Sorted) {
             return None;
         }
         let hashed = keyed_hashed(rep, items.len());
@@ -5812,7 +5971,7 @@ fn keyed_user_method(
         return Some(r);
     }
     let (rep, entries) = map_rep_entries(recv)?;
-    if matches!(rep, HashRep::Mutable(_)) || map_default(recv).is_some() {
+    if matches!(rep, HashRep::Mutable(_) | HashRep::Sorted) || map_default(recv).is_some() {
         return None;
     }
     let hashed = keyed_hashed(rep, entries.len());
@@ -7193,6 +7352,9 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
             },
         }));
     }
+    if let Some(r) = sorted_method(recv, name, args) {
+        return r;
+    }
     // A user `equals` decides Set membership and Map keys — see
     // [`keyed_user_method`].
     let keyed = user_equals_present(vm);
@@ -7240,6 +7402,7 @@ fn map_label(id: usize, rep: HashRep) -> &'static str {
     match rep {
         HashRep::Hashed | HashRep::Mutable(_) => "HashMap",
         HashRep::Linked => "LinkedHashMap",
+        HashRep::Sorted => "TreeMap",
         HashRep::Small => "Map",
     }
 }
@@ -11853,6 +12016,10 @@ fn new_seq(kind: SeqKind, items: Vec<Value>) -> Value {
 /// representation upgraded to a `HashSet` when `rep` already was one or the
 /// result exceeds four elements, and a `HashSet`'s elements put in trie order.
 fn new_set(rep: HashRep, items: Vec<Value>) -> Value {
+    if rep == HashRep::Sorted {
+        let sorted = sorted_insert_all(items, |v| v, false);
+        return heap_push(HeapVal::Seq(SeqKind::Set(rep), sorted));
+    }
     // A mutable receiver derives through a fresh `HashSet.newBuilder`, which
     // starts at the default capacity however large the receiver was.
     if matches!(rep, HashRep::Mutable(_)) {
@@ -11928,6 +12095,11 @@ fn mut_map_from(len: usize, entries: Vec<(Value, Value)>) -> Value {
 /// Build an immutable `Map` from already-deduplicated `entries` — the `Set`
 /// treatment of [`new_set`], keyed by the entry key.
 fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
+    // `TreeMap.updated` overwrites both the key and the value it finds.
+    if rep == HashRep::Sorted {
+        let sorted = sorted_insert_all(entries, |(k, _)| k, true);
+        return heap_push(HeapVal::Map(rep, sorted));
+    }
     if matches!(rep, HashRep::Mutable(_)) {
         return mut_map_from(mut_table_size_for(MUT_INITIAL_CAPACITY), entries);
     }
@@ -11958,8 +12130,8 @@ fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
 /// A mutable receiver stays mutable — [`new_set`]/[`new_map`] intercept it
 /// before this is reached.
 fn hash_rep(rep: HashRep, len: usize) -> HashRep {
-    if rep == HashRep::Linked {
-        return HashRep::Linked;
+    if rep == HashRep::Linked || rep == HashRep::Sorted {
+        return rep;
     }
     if rep == HashRep::Hashed || len > 4 {
         HashRep::Hashed

@@ -3344,6 +3344,15 @@ impl Parser {
                 elems,
             }));
         }
+        // `TreeSet(…)` / `TreeMap(…)`, and the `SortedSet` / `SortedMap` factories
+        // that build them.
+        if let Some(ctor) = sorted_ctor(&name) {
+            let elems = self.arg_list()?;
+            return Ok(eta_bare_args(Expr::Collection {
+                ctor: ctor.to_string(),
+                elems,
+            }));
+        }
         self.call(name, line)
     }
 
@@ -5139,6 +5148,16 @@ fn is_mutable_pkg(e: &Expr) -> bool {
 /// `mutable.Queue`, …) rather than something curried.
 fn mutable_factory_name(name: &str) -> bool {
     mutable_buffer_ctor(name).is_some() || matches!(name, "Set" | "HashSet" | "Map" | "HashMap")
+}
+
+/// The ordered collection a `TreeSet`/`TreeMap`/`SortedSet`/`SortedMap` factory
+/// builds (`scala.collection.immutable`), else `None`.
+pub fn sorted_ctor(name: &str) -> Option<&'static str> {
+    match name {
+        "TreeSet" | "SortedSet" => Some("TreeSet"),
+        "TreeMap" | "SortedMap" => Some("TreeMap"),
+        _ => None,
+    }
 }
 
 fn mutable_buffer_ctor(name: &str) -> Option<&'static str> {

@@ -555,6 +555,15 @@ reported as parse/compile errors, never silently mis-run.
   the linked list Scala threads through the table, so an add appends, a re-added
   element keeps its original position, and one removed and re-added moves to the
   end. They print `LinkedHashSet(…)`/`LinkedHashMap(…)` at every size.
+- **`TreeSet`/`TreeMap` (`SortedSet`/`SortedMap`) keep KEY order.** Their own
+  representation too: ascending under the natural `Ordering`, which also
+  decides that two keys are one (`compare == 0`); `updated` replaces key and
+  value. Every derived `Set`/`Map` stays a tree (`map`, `filter`, `+`, `-`,
+  `++`, `range`/`rangeFrom`/`rangeUntil`/`rangeTo`), `firstKey`/`lastKey`,
+  `minAfter`/`maxBefore` and a map's `keySet`/`keys` (a `TreeSet`) are
+  present, and an end access of an empty tree raises `empty tree`. Keys whose
+  ordering is the program's own (a class instance under `Ordered` or a given
+  `Ordering`) are refused with a diagnostic, not mis-ordered.
 - **`StringBuilder`.** `new StringBuilder`, `new StringBuilder(s)` and
   `StringBuilder(s)`. It is a growable `Seq[Char]` whose `toString` is its
   CONTENTS with no wrapper, so `println(b)` prints the text. `append` takes

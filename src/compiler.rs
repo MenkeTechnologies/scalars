@@ -1886,6 +1886,8 @@ impl Compiler {
             "StringBuilder" => crate::host::MAKE_STRINGBUILDER,
             "LinkedHashSet" => crate::host::MAKE_LINKEDSET,
             "LinkedHashMap" => crate::host::MAKE_LINKEDMAP,
+            "TreeSet" => crate::host::MAKE_SORTEDSET,
+            "TreeMap" => crate::host::MAKE_SORTEDMAP,
             _ => return Err(format!("scalars: unknown collection constructor `{ctor}`")),
         };
         self.b.emit(Op::CallBuiltin(id, elems.len() as u8), 0);
@@ -7547,10 +7549,15 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
     // element-wise members so `Map.empty` works too, where `Map.fill` would need
     // pairs and is left alone.
     if name == "empty"
-        && (factory_conversion(owner).is_some() || owner == "Map" || owner == "immutable.Queue")
+        && (factory_conversion(owner).is_some()
+            || owner == "Map"
+            || owner == "immutable.Queue"
+            || crate::parser::sorted_ctor(owner).is_some())
     {
         let empty = Expr::Collection {
-            ctor: owner.to_string(),
+            ctor: crate::parser::sorted_ctor(owner)
+                .unwrap_or(owner)
+                .to_string(),
             elems: Vec::new(),
         };
         // `List.empty[Int](0)` is an APPLICATION of the empty list, not a
