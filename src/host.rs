@@ -2112,10 +2112,22 @@ fn empty_collection() -> String {
     "scalars: java.util.NoSuchElementException: empty collection".into()
 }
 
-/// `java.lang.StringBuilder`'s out-of-range message, which reports the length
-/// rather than the max index.
+/// `java.lang.StringBuilder`'s out-of-range messages, as `AbstractStringBuilder`
+/// raises them through `Preconditions`: an element index (`deleteCharAt`,
+/// `setCharAt`) fails `checkIndex`, an insertion offset fails
+/// `checkOffset`, which reports the range `[offset, length)`.
 fn string_index_len(i: i64, len: usize) -> String {
-    format!("scalars: java.lang.StringIndexOutOfBoundsException: index {i}, length {len}")
+    format!(
+        "scalars: java.lang.StringIndexOutOfBoundsException: \
+         Index {i} out of bounds for length {len}"
+    )
+}
+
+fn string_offset_fault(offset: i64, len: usize) -> String {
+    format!(
+        "scalars: java.lang.StringIndexOutOfBoundsException: \
+         Range [{offset}, {len}) out of bounds for length {len}"
+    )
 }
 
 /// The `char` behind `v`, if `v` is a `Char`. This is the exact test that the
@@ -7013,8 +7025,12 @@ fn mut_seq_method(
         // does.
         ("setLength", 1) if strbuf => {
             let n = args[0].to_int();
+            // `setLength` raises the plain `StringIndexOutOfBoundsException(int)`.
             if n < 0 {
-                return Some(Err(string_index_len(n, items.len())));
+                return Some(Err(format!(
+                    "scalars: java.lang.StringIndexOutOfBoundsException: \
+                     String index out of range: {n}"
+                )));
             }
             let mut out = items.to_vec();
             out.resize(n as usize, make_char('\0'));
@@ -7051,7 +7067,7 @@ fn mut_seq_method(
         ("insert", 2) if strbuf => {
             let i = args[0].to_int();
             if i < 0 || i as usize > items.len() {
-                return Some(Err(string_index_len(i, items.len())));
+                return Some(Err(string_offset_fault(i, items.len())));
             }
             let mut out = items.to_vec();
             out.splice(i as usize..i as usize, str_chars(&args[1]));
