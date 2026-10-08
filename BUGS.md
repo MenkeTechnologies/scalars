@@ -656,7 +656,9 @@ reported as parse/compile errors, never silently mis-run.
   (`String`, `Int`/`Long`, `Statics.doubleHash`, `Boolean`,
   `MurmurHash3.productHash` for tuples and `case` records, and its
   `orderedHash`/`unorderedHash` for collections), the trie's `improve`
-  scramble, and the depth-first order its iterator walks. A derived collection
+  scramble, and the depth-first order its iterator walks. The same hash is a
+  method: `x.##` answers it (`1.0.## == 1.##`, unlike `1.0.hashCode`), running a
+  user `hashCode` override for anything that is not a number, and `0` for null. A derived collection
   keeps the receiver's representation, so `Set(1,2,3,4,5).filter(_ > 1)` is a
   four-element `HashSet` and `groupBy` is always a `HashMap`. A `case class`'s
   `hashCode` is therefore Scala's exact `MurmurHash3` value, not just a

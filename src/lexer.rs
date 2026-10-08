@@ -589,6 +589,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // `???` — `Predef.???`, an identifier made of operator characters;
             // the parser lowers it to the `NotImplementedError` throw it is.
             "???" => (Tok::Ident(three.to_string()), 3),
+            _ if two == "##" => (Tok::Ident(two.to_string()), 2),
             _ => match two {
                 "<-" => (Tok::LArrow, 2),
                 "=>" => (Tok::FatArrow, 2),

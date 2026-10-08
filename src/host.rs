@@ -6165,6 +6165,19 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
         return Value::Undef;
     }
 
+    // `Any.##` — the hash collections use: for a number the COOPERATIVE one,
+    // which a whole-valued `Double`/`Float`/`Long` shares with the `Int` of its
+    // value (`1.0.## == 1.##`, where `1.0.hashCode` is `1072693248`); for
+    // anything else its `hashCode`, a user override included; `0` for null.
+    if name == "##" && args.is_empty() {
+        let h = match &recv {
+            Value::Undef => Ok(0),
+            v if boxed_num(v).is_some() => Ok(scala_hash(v).map_or(0, i64::from)),
+            v => hash_vm(vm, v),
+        };
+        return h.map(Value::int).unwrap_or_else(|e| fault(vm, e));
+    }
+
     // A by-name argument runs only when the method needs it: the default of
     // a `getOrElse` whose receiver has a value is never evaluated. Every other
     // method receives it evaluated, as a by-value argument.
