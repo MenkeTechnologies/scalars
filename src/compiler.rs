@@ -3004,7 +3004,11 @@ impl Compiler {
         // A `case class` with no explicit companion, used as a value: the
         // synthesized companion is a `FunctionN`, so `xs.map(Pt)` and
         // `val mk = Pt` are the constructor as a function.
-        if self.classes.get(name).is_some_and(|m| m.is_case && m.arity > 0) {
+        if self
+            .classes
+            .get(name)
+            .is_some_and(|m| m.is_case && m.arity > 0)
+        {
             return self.case_factory_value(name);
         }
         // A bare reference to a `def`. A zero-parameter `def` is a paren-less
@@ -3568,10 +3572,17 @@ impl Compiler {
             // `v_=`: the call `this.v_=(e)`.
             let setter = format!("{name}_=");
             let owner = match (&self.current_class, &self.current_object) {
-                (Some((c, _)), _) if self.classes.get(c).is_some_and(|m| m.responds.contains(&setter)) => {
+                (Some((c, _)), _)
+                    if self
+                        .classes
+                        .get(c)
+                        .is_some_and(|m| m.responds.contains(&setter)) =>
+                {
                     Some(Expr::Var("this".to_string()))
                 }
-                (_, Some(o)) if self.method_index.contains_key(&setter) => Some(Expr::Var(o.clone())),
+                (_, Some(o)) if self.method_index.contains_key(&setter) => {
+                    Some(Expr::Var(o.clone()))
+                }
                 _ => None,
             };
             if let Some(recv) = owner {
@@ -3825,12 +3836,12 @@ impl Compiler {
             let to_end = self.b.emit(Op::Jump(0), 0);
             let arith = self.b.current_pos();
             self.b.patch_jump(to_arith, arith);
-            self.emit_place_store(r, &r_name, field, op, value, conv.as_ref(), line)?;
+            self.emit_place_store((r, &r_name), field, op, value, conv.as_ref(), line)?;
             let end = self.b.current_pos();
             self.b.patch_jump(to_end, end);
             return Ok(());
         }
-        self.emit_place_store(r, &r_name, field, op, value, conv.as_ref(), line)
+        self.emit_place_store((r, &r_name), field, op, value, conv.as_ref(), line)
     }
 
     /// The setter method `field_=` when some class declares one: an assignment
@@ -3845,14 +3856,14 @@ impl Compiler {
     /// [`OBJ_SET`].
     fn emit_place_store(
         &mut self,
-        r: Place,
-        r_name: &str,
+        target: (Place, &str),
         field: &str,
         op: AssignOp,
         value: &Expr,
         conv: Option<&Conv>,
         line: u32,
     ) -> Result<(), String> {
+        let (r, r_name) = target;
         self.compound_tail(op, value, NumTy::Unknown)?;
         if let Some(c) = conv {
             self.emit_conv(c, line);

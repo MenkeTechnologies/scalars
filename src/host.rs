@@ -466,7 +466,7 @@ pub const MAKE_IMMQUEUE: u16 = 791;
 pub const SSUB_VM: u16 = 792;
 /// Builtin id for `classOf[T]`: pops whether the program declares the type and its
 /// source text, and answers the
-/// `java.lang.Class` record [`class_of`] would for a value of that type — the
+/// `java.lang.Class` record `class_of` would for a value of that type — the
 /// same interned record, so `x.getClass == classOf[T]` holds.
 pub const CLASS_OF: u16 = 793;
 /// Builtin id for adopting a constructed record as a singleton `object`: pops
@@ -476,7 +476,7 @@ pub const CLASS_OF: u16 = 793;
 pub const OBJ_ADOPT: u16 = 794;
 /// Builtin ids for a `TreeSet(...)` / `TreeMap(...)` literal (`SortedSet` /
 /// `SortedMap` too): pop `argc` elements or `key -> value` pairs into the
-/// ordered representation, [`HashRep::Sorted`].
+/// ordered representation, `HashRep::Sorted`.
 pub const MAKE_SORTEDSET: u16 = 795;
 pub const MAKE_SORTEDMAP: u16 = 796;
 
@@ -4414,7 +4414,11 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             }
         }
         // `obj.f_=(v)` on a plain `var f`: the setter Scala synthesizes.
-        (setter, 1) if setter.strip_suffix("_=").is_some_and(|f| fields.iter().any(|(n, _)| &**n == f)) => {
+        (setter, 1)
+            if setter
+                .strip_suffix("_=")
+                .is_some_and(|f| fields.iter().any(|(n, _)| &**n == f)) =>
+        {
             let field = setter.strip_suffix("_=").unwrap_or(setter);
             if let Value::Obj(id) = recv {
                 HEAP.with(|h| {
@@ -6032,14 +6036,14 @@ fn keyed_user_method(
             vec![(args[0].clone(), args[1].clone())],
             KeyOp::Update,
         ),
-        ("+", 1) => match keyed_pairs(&new_list(vec![args[0].clone()])) {
-            Some(adds) => keyed_map(vm, rep, entries.clone(), adds, KeyOp::Update),
-            None => return None,
-        },
-        ("++" | "concat", 1) => match keyed_pairs(&args[0]) {
-            Some(adds) => keyed_map(vm, rep, entries.clone(), adds, KeyOp::Update),
-            None => return None,
-        },
+        ("+", 1) => {
+            let adds = keyed_pairs(&new_list(vec![args[0].clone()]))?;
+            keyed_map(vm, rep, entries.clone(), adds, KeyOp::Update)
+        }
+        ("++" | "concat", 1) => {
+            let adds = keyed_pairs(&args[0])?;
+            keyed_map(vm, rep, entries.clone(), adds, KeyOp::Update)
+        }
         _ => return None,
     };
     Some(r)
