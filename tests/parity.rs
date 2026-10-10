@@ -90,7 +90,11 @@ fn frozen_corpus_matches_reference_scala() {
             ),
         };
         let expected = expected_enc.replace("\\n", "\n");
-        let (got, err, ok) = run_full(prog);
+        // The program field carries the same `\n` encoding as the others (and
+        // as `scripts/capture-parity.sh` decodes it), so a multi-line program
+        // is one record.
+        let source = prog.replace("\\n", "\n");
+        let (got, err, ok) = run_full(&source);
 
         match want_exc {
             None => {
