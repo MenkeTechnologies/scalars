@@ -1020,6 +1020,16 @@ reported as parse/compile errors, never silently mis-run.
   which is what the `match` a program writes against them already checks;
   `opaque type`, `type` aliases and `inline def` behave as the reference does.
 
+  A `type` alias is substituted textually where a type is written, scoped to the
+  declaring block, class or `def`. A parameterized alias (`type Pair[A] = (A, A)`)
+  is not expanded, and a class type parameter named like an in-scope alias is not
+  shadowed — both fall back to the unexpanded name, which is erased as before.
+
+- **`getClass.getName` of a class declared inside an object.** A class written
+  in the entry object's body or in another object is `T$C` on the JVM; the name
+  here is the bare `C`, because no enclosing-object name is recorded for a
+  class. `getSimpleName` is unaffected.
+
 - **`BigDecimal`.** `BigDecimal("1.5") + BigDecimal("2.25")` is
   `not found: BigDecimal`. `BigInt` is supported (see below); `BigDecimal`
   additionally needs `java.math.BigDecimal`'s scale and rounding rules, which

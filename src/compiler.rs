@@ -2874,6 +2874,19 @@ impl Compiler {
     /// Read a bare identifier. Resolution order: function-local slot, enclosing
     /// class field (`this.field`) or sibling method, enclosing object `val`/method,
     /// singleton object value, zero-arg `def` (paren-less call), then global.
+    /// A `case class`'s synthesized factory as a function value:
+    /// `(a0, …) => C(a0, …)`, which is what a bare `C` and `C.apply` denote.
+    fn case_factory_value(&mut self, class: &str) -> Result<(), String> {
+        let arity = self.classes[class].arity;
+        let params: Vec<String> = (0..arity).map(|i| format!("$eta{i}")).collect();
+        let call = Expr::Call {
+            name: class.to_string(),
+            args: params.iter().map(|p| Expr::Var(p.clone())).collect(),
+            line: 0,
+        };
+        self.lambda(&params, &call, false)
+    }
+
     fn var_ref(&mut self, name: &str) -> Result<(), String> {
         // A `lazy val`'s place holds a CELL whose contents start as a thunk, so
         // a read is a force rather than a load — see
@@ -2987,6 +3000,12 @@ impl Compiler {
         // A class name used as a value is its companion object.
         if let Some(obj) = self.companions.get(name).cloned() {
             return self.materialize_object(&obj);
+        }
+        // A `case class` with no explicit companion, used as a value: the
+        // synthesized companion is a `FunctionN`, so `xs.map(Pt)` and
+        // `val mk = Pt` are the constructor as a function.
+        if self.classes.get(name).is_some_and(|m| m.is_case && m.arity > 0) {
+            return self.case_factory_value(name);
         }
         // A bare reference to a `def`. A zero-parameter `def` is a paren-less
         // call; a `def` with parameters used as a value is eta-expanded to a
@@ -3545,6 +3564,19 @@ impl Compiler {
                     return self.field_assign(name, op, value, line);
                 }
             }
+            // `v = e` where the enclosing class or object declares the setter
+            // `v_=`: the call `this.v_=(e)`.
+            let setter = format!("{name}_=");
+            let owner = match (&self.current_class, &self.current_object) {
+                (Some((c, _)), _) if self.classes.get(c).is_some_and(|m| m.responds.contains(&setter)) => {
+                    Some(Expr::Var("this".to_string()))
+                }
+                (_, Some(o)) if self.method_index.contains_key(&setter) => Some(Expr::Var(o.clone())),
+                _ => None,
+            };
+            if let Some(recv) = owner {
+                return self.select_assign(&recv, name, op, value, line);
+            }
             // A `var` reassignment inside an object method updates its
             // `Name.val` global.
             if let Some(obj) = self.current_object.clone() {
@@ -3744,6 +3776,12 @@ impl Compiler {
             .and_then(|c| self.classes.get(&c))
             .and_then(|m| m.field_convs.get(field).cloned());
         if op == AssignOp::Assign {
+            if let Some(setter) = self.user_setter(field) {
+                // `obj.f = v` is `obj.f_=(v)` when a class declares that setter.
+                self.method(recv, &setter, std::slice::from_ref(value), line)?;
+                self.b.emit(Op::Pop, 0);
+                return Ok(());
+            }
             self.expr(recv)?;
             let fc = self.b.add_constant(Value::str(field.to_string()));
             self.b.emit(Op::LoadConst(fc), line);
@@ -3759,13 +3797,19 @@ impl Compiler {
         self.obj_counter += 1;
         let n = self.obj_counter;
         self.expr(recv)?;
-        let r = self.declare_place(&format!(" ps_r{n}"));
+        let r_name = format!(" ps_r{n}");
+        let r = self.declare_place(&r_name);
         self.emit_store(r);
         // The current value, read once through the ordinary selection path.
-        self.emit_load(r);
-        let fc = self.b.add_constant(Value::str(field.to_string()));
-        self.b.emit(Op::LoadConst(fc), line);
-        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), line);
+        if self.method_index.contains_key(field) {
+            // A user-defined getter is resolved statically, by class tag.
+            self.method(&Expr::Var(r_name.clone()), field, &[], line)?;
+        } else {
+            self.emit_load(r);
+            let fc = self.b.add_constant(Value::str(field.to_string()));
+            self.b.emit(Op::LoadConst(fc), line);
+            self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 2), line);
+        }
         if matches!(op, AssignOp::Add | AssignOp::Sub) && self.has_mutable {
             let method = if op == AssignOp::Add { "+=" } else { "-=" };
             self.b.emit(Op::Dup, 0);
@@ -3781,12 +3825,19 @@ impl Compiler {
             let to_end = self.b.emit(Op::Jump(0), 0);
             let arith = self.b.current_pos();
             self.b.patch_jump(to_arith, arith);
-            self.emit_place_store(r, field, op, value, conv.as_ref(), line)?;
+            self.emit_place_store(r, &r_name, field, op, value, conv.as_ref(), line)?;
             let end = self.b.current_pos();
             self.b.patch_jump(to_end, end);
             return Ok(());
         }
-        self.emit_place_store(r, field, op, value, conv.as_ref(), line)
+        self.emit_place_store(r, &r_name, field, op, value, conv.as_ref(), line)
+    }
+
+    /// The setter method `field_=` when some class declares one: an assignment
+    /// `obj.field = v` is then the call `obj.field_=(v)`, as in Scala.
+    fn user_setter(&self, field: &str) -> Option<String> {
+        let setter = format!("{field}_=");
+        self.method_index.contains_key(&setter).then_some(setter)
     }
 
     /// The arithmetic half of [`Compiler::select_assign`]: the field's current
@@ -3795,6 +3846,7 @@ impl Compiler {
     fn emit_place_store(
         &mut self,
         r: Place,
+        r_name: &str,
         field: &str,
         op: AssignOp,
         value: &Expr,
@@ -3810,6 +3862,13 @@ impl Compiler {
         self.obj_counter += 1;
         let t = self.declare_place(&format!(" ps_v{}", self.obj_counter));
         self.emit_store(t);
+        if let Some(setter) = self.user_setter(field) {
+            let recv = Expr::Var(r_name.to_string());
+            let new = Expr::Var(format!(" ps_v{}", self.obj_counter));
+            self.method(&recv, &setter, &[new], line)?;
+            self.b.emit(Op::Pop, 0);
+            return Ok(());
+        }
         self.emit_load(r);
         let fc = self.b.add_constant(Value::str(field.to_string()));
         self.b.emit(Op::LoadConst(fc), line);
@@ -4849,6 +4908,23 @@ impl Compiler {
             if let Expr::Var(owner) = recv {
                 if self.classes.get(owner).is_some_and(|m| m.is_case) {
                     return self.expr(&args[0]);
+                }
+            }
+        }
+        // `P.apply(a, b)` on a `case class` is the synthesized factory, exactly
+        // `P(a, b)`, unless the companion declares its own `apply`.
+        if name == "apply" {
+            if let Expr::Var(owner) = recv {
+                let own_apply = self
+                    .objects
+                    .get(owner)
+                    .is_some_and(|m| m.methods.contains("apply"));
+                if !own_apply && self.classes.get(owner).is_some_and(|m| m.is_case) {
+                    // An unapplied `P.apply` is the factory as a function value.
+                    if args.is_empty() && self.classes[owner].arity > 0 {
+                        return self.case_factory_value(owner);
+                    }
+                    return self.call(owner, args, line);
                 }
             }
         }
@@ -6081,6 +6157,14 @@ impl Compiler {
             self.b
                 .emit(Op::CallBuiltin(crate::host::APPLY, args.len() as u8), line);
             return Ok(());
+        }
+        // `M(args)` where `M` is a singleton `object` declaring `apply`.
+        if self
+            .objects
+            .get(name)
+            .is_some_and(|m| m.methods.contains("apply"))
+        {
+            return self.method(&Expr::Var(name.to_string()), "apply", args, line);
         }
         // An `import`'s named selector, which every binding above has now had
         // its chance to shadow.

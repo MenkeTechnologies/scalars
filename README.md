@@ -733,7 +733,7 @@ probe. Individual generators run with `--mode <name>` (`step`, `ieee`, `exc`,
 `partial`, `mutable`, `bitwise`, `patmatch`, `option`, `caseclass`, `strops`,
 `nlr`, `ascribe`, `forval`, `regex`, `capture`, `char`, `patregex`, `breaks`,
 `params`, `fmt`, `apply`, `narrow`, `braces`, `arrange`, `seqmore`, `interp`,
-`lazyval`, `shadow`, …). It needs a real `scala` on
+`lazyval`, `shadow`, `members`, …). It needs a real `scala` on
 `PATH` (or `SCALARS_FUZZ_SCALA`), so CI never runs it; `tests/parity.rs` replays
 a frozen, scala-verified corpus instead. The fuzzer found the float-notation and
 `Boolean/null + String` gaps, the `catch`-guard binding bug, and — in this
@@ -1032,6 +1032,21 @@ And `X.empty` was answered only with an EMPTY argument list, so
 arguments — reported `empty is not a member` where the reference raises
 `IndexOutOfBoundsException: 0`, and `Map.empty[String, Int]("k")` hid
 `NoSuchElementException: key not found: k` the same way.
+
+The `members` mode covers declarations whose written form differs from what the
+runtime stores. A user-defined setter (`def v_=(x: Int)`) was skipped by
+`obj.v = 5`, `obj.v += 1` and a bare `v = 5` inside the class, which stored the
+raw value straight into the field and left the setter's side effects and
+transformation unrun, with no diagnostic. An assignment whose target is a
+selection or an application (`xs.foreach(s => s.n = 1)`, `i => a(i) = 0`) did
+not parse as a lambda body. A `type` alias was not a declaration at all: it was
+read as a name followed by an assignment, so `type Num = Double; val n: Num = 3`
+printed `3` where the reference prints `3.0`, and a union alias
+(`type U = Int | String`) failed outright. Aliases are now recorded by the
+parser and substituted where a type is written, scoped to the block, class or
+`def` that declares them. A singleton `object` with an `apply` is callable as
+`M(args)`, a `case class`'s synthesized factory is reachable as `C.apply(...)`,
+and `C` / `C.apply` are usable as function values (`xs.map(C)`).
 
 Next waves, in priority order:
 

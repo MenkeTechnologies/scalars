@@ -4413,6 +4413,20 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 )),
             }
         }
+        // `obj.f_=(v)` on a plain `var f`: the setter Scala synthesizes.
+        (setter, 1) if setter.strip_suffix("_=").is_some_and(|f| fields.iter().any(|(n, _)| &**n == f)) => {
+            let field = setter.strip_suffix("_=").unwrap_or(setter);
+            if let Value::Obj(id) = recv {
+                HEAP.with(|h| {
+                    if let Some(HeapVal::Record(o)) = h.borrow_mut().get_mut(*id as usize) {
+                        if let Some(f) = o.fields.iter_mut().find(|f| &*f.0 == field) {
+                            f.1 = args[0].clone();
+                        }
+                    }
+                });
+            }
+            Ok(Value::Undef)
+        }
         // A paren-less access naming a field reads that field.
         (_, 0) => match fields.iter().find(|(fname, _)| &**fname == name) {
             Some((_, v)) => Ok(v.clone()),

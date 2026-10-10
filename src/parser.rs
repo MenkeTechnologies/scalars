@@ -83,6 +83,12 @@ struct Parser {
     /// order — collected by [`scan_enums`] before parsing starts, so a
     /// qualified `Color.Red` resolves even where it is written above the `enum`.
     enums: HashMap<String, Vec<String>>,
+    /// `type Name = Ty` aliases in scope, name to the (already expanded) type
+    /// text. Types are plain strings here, and every consumer matches on the
+    /// written name (`Double`, `List[Int]`), so an alias has to be substituted
+    /// where it is read — otherwise `val x: Num = 3` with `type Num = Double`
+    /// loses the `Double` and prints `3`.
+    type_aliases: HashMap<String, String>,
 }
 
 impl Parser {
@@ -102,6 +108,7 @@ impl Parser {
             givens: 0,
             anon_classes: 0,
             enums,
+            type_aliases: HashMap::new(),
         }
     }
 }
@@ -311,6 +318,10 @@ impl Parser {
             }
             if self.at_soft_declaration_start() {
                 top_stmts.push(self.statement()?);
+                continue;
+            }
+            if self.at_type_decl() {
+                self.type_decl()?;
                 continue;
             }
             // Leading modifiers (`final`, `sealed`, `abstract`, …) arrive as
@@ -669,6 +680,7 @@ impl Parser {
         is_trait: bool,
         params: &[String],
     ) -> Result<ClassBody, String> {
+        let outer_aliases = self.type_aliases.clone();
         let mut body = Vec::new();
         let mut methods = Vec::new();
         let mut field_names = params.to_vec();
@@ -704,6 +716,7 @@ impl Parser {
             }
             self.eat(&Tok::RBrace)?;
         }
+        self.type_aliases = outer_aliases;
         Ok(ClassBody {
             body,
             methods,
@@ -1243,10 +1256,21 @@ impl Parser {
                 }
             }
         }
+        for n in &names {
+            self.type_aliases.remove(n);
+        }
         Ok((names, bounds))
     }
 
     fn parse_def(&mut self) -> Result<Func, String> {
+        // A type parameter or a member alias declared inside the def is scoped to it.
+        let outer_aliases = self.type_aliases.clone();
+        let def = self.parse_def_inner();
+        self.type_aliases = outer_aliases;
+        def
+    }
+
+    fn parse_def_inner(&mut self) -> Result<Func, String> {
         self.eat(&Tok::Def)?;
         // A symbolic name — `def +(o: Pt)`, `def ++(o: V)`, `def <(o: Pt)` — is
         // an ordinary method; the infix use `a + b` reaches it through the
@@ -1548,6 +1572,7 @@ impl Parser {
     /// [`Parser::program`] fills, so `object T extends App { class C(…); … }`
     /// declares exactly what `class C(…)` beside the object would.
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
+        let outer_aliases = self.type_aliases.clone();
         let mut out = Vec::new();
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
@@ -1564,6 +1589,7 @@ impl Parser {
             self.skip_seps();
         }
         self.eat(&Tok::RBrace)?;
+        self.type_aliases = outer_aliases;
         Ok(out)
     }
 
@@ -1869,6 +1895,8 @@ impl Parser {
             // for effect (its `Vector`/`Unit` value is discarded).
             Tok::For => Ok(StmtKind::Expr(self.for_comprehension()?)),
             Tok::Val | Tok::Var => self.local_decl(),
+            // `type T = Ty` / `opaque type T = Ty` / abstract `type T`.
+            Tok::Ident(_) if self.at_type_decl() => self.type_decl(),
             // `lazy val x = e` in statement position. The modifier is dropped
             // everywhere else it may appear (it carries no runtime meaning on a
             // `def`, whose body is already only run when called); on a `val` it
@@ -2316,7 +2344,82 @@ impl Parser {
                 self.line()
             ));
         }
-        Ok(s)
+        Ok(self.expand_type_aliases(s))
+    }
+
+    /// Replace every alias name in a type text with what it stands for.
+    fn expand_type_aliases(&self, ty: String) -> String {
+        if self.type_aliases.is_empty() {
+            return ty;
+        }
+        let mut out = String::with_capacity(ty.len());
+        let mut word = String::new();
+        let mut after_dot = false;
+        let flush = |word: &mut String, out: &mut String, after_dot: bool| {
+            match self.type_aliases.get(word.as_str()) {
+                Some(full) if !after_dot => out.push_str(full),
+                _ => out.push_str(word),
+            }
+            word.clear();
+        };
+        for c in ty.chars() {
+            if c.is_alphanumeric() || c == '_' || c == '$' {
+                word.push(c);
+                continue;
+            }
+            flush(&mut word, &mut out, after_dot);
+            after_dot = c == '.';
+            out.push(c);
+        }
+        flush(&mut word, &mut out, after_dot);
+        out
+    }
+
+    /// Whether the cursor is on `type Name` or `opaque type Name`.
+    fn at_type_decl(&self) -> bool {
+        match self.peek() {
+            Tok::Ident(w) if w == "type" => matches!(self.peek_at(1), Tok::Ident(_)),
+            Tok::Ident(w) if w == "opaque" => {
+                matches!(self.peek_at(1), Tok::Ident(t) if t == "type")
+                    && matches!(self.peek_at(2), Tok::Ident(_))
+            }
+            _ => false,
+        }
+    }
+
+    /// A type declaration in statement or member position: `type T = Ty`,
+    /// `opaque type T = Ty`, or an abstract `type T` / `type T <: Bound`.
+    /// A concrete alias is recorded for [`Parser::expand_type_aliases`]; an
+    /// abstract one only shadows an alias of the same name. The declaration
+    /// itself is no runtime statement.
+    fn type_decl(&mut self) -> Result<StmtKind, String> {
+        if matches!(self.peek(), Tok::Ident(w) if w == "opaque") {
+            self.advance();
+        }
+        self.advance(); // `type`
+        let name = self.ident()?;
+        let parameterized = self.is(&Tok::LBracket);
+        if parameterized {
+            self.skip_bracket_group();
+        }
+        self.type_aliases.remove(&name);
+        if self.is(&Tok::Assign) {
+            self.advance();
+            self.skip_seps();
+            let ty = self.type_ref()?;
+            if !parameterized {
+                self.type_aliases.insert(name, ty);
+            }
+        } else {
+            // Bounds (`<: B`, `>: B`) carry nothing the runtime uses.
+            while !matches!(
+                self.peek(),
+                Tok::Newline | Tok::Semi | Tok::RBrace | Tok::Eof
+            ) {
+                self.advance();
+            }
+        }
+        Ok(StmtKind::Expr(Expr::Block(Vec::new())))
     }
 
     /// Whether the cursor is at an assignment target (`ident <assign-op>`), used
@@ -2355,6 +2458,13 @@ impl Parser {
             }
         }
         let e = self.expression()?;
+        self.finish_statement(e)
+    }
+
+    /// The tail of [`Parser::simple_statement`]: an already-parsed expression
+    /// followed by an assignment or compound-assignment operator becomes the
+    /// assignment statement it is; anything else is an expression statement.
+    fn finish_statement(&mut self, e: Expr) -> Result<StmtKind, String> {
         // A compound assignment whose target is not a plain name — `a(i) += 1`,
         // `m(k) *= 2`, `obj.field += 1`. `expression` reads those as the
         // [`Expr::CompoundAssign`] they are in Scala; in STATEMENT position
@@ -2928,7 +3038,16 @@ impl Parser {
             // The body is an `Expr`, so it takes a trailing ascription:
             // `x => x: Double` ascribes the body, not the whole function.
             let e = self.expression()?;
-            self.ascription_tail(e, line)?
+            if self.is(&Tok::Assign) {
+                // `x => x.n = 9` / `i => a(i) = 0`: a selection or application
+                // target, which `assignment_ahead` (names only) cannot see
+                // before the target is parsed.
+                let mut kind = self.finish_statement(e)?;
+                expand_statement_placeholders(&mut kind);
+                Expr::Block(vec![Stmt { line, kind }])
+            } else {
+                self.ascription_tail(e, line)?
+            }
         };
         Ok(typed_lambda(params, body, line))
     }

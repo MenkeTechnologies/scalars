@@ -2500,6 +2500,7 @@ enum Mode {
     PlaceAssign,
     AssignExpr,
     AppMember,
+    Members,
     Narrow,
     Arrange,
     SeqMore,
@@ -2561,6 +2562,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::PlaceAssign => "placeassign",
         Mode::AssignExpr => "assignexpr",
         Mode::AppMember => "appmember",
+        Mode::Members => "members",
         Mode::Narrow => "narrow",
         Mode::Braces => "braces",
         Mode::Arrange => "arrange",
@@ -2623,6 +2625,7 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "placeassign" => Mode::PlaceAssign,
         "assignexpr" => Mode::AssignExpr,
         "appmember" => Mode::AppMember,
+        "members" => Mode::Members,
         "narrow" => Mode::Narrow,
         "braces" => Mode::Braces,
         "arrange" => Mode::Arrange,
@@ -2684,6 +2687,7 @@ const CONCRETE: &[Mode] = &[
     Mode::PlaceAssign,
     Mode::AssignExpr,
     Mode::AppMember,
+    Mode::Members,
     Mode::Narrow,
     Mode::Arrange,
     Mode::SeqMore,
@@ -3657,6 +3661,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::PlaceAssign => g_placeassign(r),
         Mode::AssignExpr => g_assignexpr(r),
         Mode::AppMember => g_appmember(r),
+        Mode::Members => g_members(r),
         Mode::Narrow => g_narrow(r),
         Mode::Braces => g_braces(r),
         Mode::Arrange => g_arrange(r),
@@ -3820,6 +3825,114 @@ fn g_assignexpr(r: &mut Rng) -> String {
             "class Q{u}(var n: Int, val items: mutable.ListBuffer[Int])\n{sep}\
              {{ val p = new Q{u}({a}, mutable.ListBuffer({b})); println(p.n += {d}); \
                println(p.n); println(p.items += 9) }}"
+        ),
+    }
+}
+
+/// Member-level surface that is written in the program but erased by the
+/// runtime model: user-defined `x_=` setters (and the plain `var` setter Scala
+/// synthesizes), assignments as lambda bodies through selection and application
+/// targets, `type` aliases that carry a numeric width or a collection element
+/// type, and a companion's `apply` used as a value.
+///
+/// Every arm is a case where the written form and the lowered form differ, so a
+/// frontend that handled only the common spelling prints a plausible but wrong
+/// value rather than failing: `p.x = 5` on a class that declares `def x_=`
+/// silently skipped the setter, and `val n: Num = 3` with `type Num = Double`
+/// printed `3`.
+fn g_members(r: &mut Rng) -> String {
+    let sep = TOP_SEP;
+    let u = r.next_u64() % 100_000;
+    let a = pick(r, &["1", "2", "3", "5", "7"]);
+    let b = pick(r, &["1", "2", "4", "6"]);
+    let op = pick(r, &["+", "-", "*"]);
+    let scale = pick(r, &["2", "3", "10"]);
+    match r.below(14) {
+        // A setter with a visible side effect and a transformed store: the
+        // plain, compound and explicit-call spellings all reach it.
+        0 => format!(
+            "class S{u} {{ private var _v = {a}; def v: Int = _v; \
+               def v_=(x: Int): Unit = {{ println(\"set \" + x); _v = x * {scale} }} }}\n\
+             {sep}{{ val s = new S{u}; s.v = {b}; println(s.v); s.v {op}= {a}; println(s.v); \
+               s.v_=({b}); println(s.v) }}"
+        ),
+        // The same property written to by the class's own methods, bare and
+        // through `this`.
+        1 => format!(
+            "class S{u} {{ private var _v = {a}.5; def v: Double = _v; \
+               def v_=(x: Double): Unit = {{ _v = x }}; \
+               def bump(d: Double): Unit = {{ v = v + d; this.v {op}= {b} }} }}\n\
+             {sep}{{ val s = new S{u}; s.bump({b}); println(s.v); s.v = {a}; println(s.v) }}"
+        ),
+        // A singleton's setter, reached from outside and from its own method.
+        2 => format!(
+            "object S{u} {{ private var _z = {a}; def z: Int = _z; \
+               def z_=(x: Int): Unit = {{ _z = x + 1 }}; def go(): Unit = {{ z = {b}; z += {a} }} }}\n\
+             {sep}{{ S{u}.go(); println(S{u}.z); S{u}.z = {a}; println(S{u}.z) }}"
+        ),
+        // A plain `var` has a synthesized setter spelled `n_=`.
+        3 => format!(
+            "class S{u} {{ var n = {a} }}\n\
+             {sep}{{ val s = new S{u}; s.n_=({b}); println(s.n); s.n = {a}; println(s.n) }}"
+        ),
+        // Assignment as the whole body of a lambda, through a selection.
+        4 => format!(
+            "class S{u}(var n: Int, var t: String)\n\
+             {sep}{{ val xs = List(new S{u}({a}, \"p\"), new S{u}({b}, \"q\")); \
+               xs.foreach(s => s.n = s.n {op} {b}); xs.foreach(s => s.t += \"!\"); \
+               println(xs.map(s => s.t + s.n).mkString(\",\")) }}"
+        ),
+        // ... through an application target (`update`).
+        5 => format!(
+            "{{ val a = new Array[Int](4); (0 until 4).foreach(i => a(i) = i {op} {a}); \
+               println(a.mkString(\",\")); \
+               val m = scala.collection.mutable.Map[Int, Int](); \
+               List({a}, {b}).foreach(k => m(k) = k {op} {b}); println(m.toList.sorted) }}"
+        ),
+        // A numeric alias: the declared width decides the printed form.
+        6 => format!(
+            "type Num{u} = Double\n\
+             {sep}{{ val n: Num{u} = {a}; println(n); \
+               def h(x: Num{u}): Num{u} = x / {scale}; println(h({b})) }}"
+        ),
+        7 => format!(
+            "type Big{u} = Long\n\
+             {sep}{{ val n: Big{u} = {a}; println(n * 2147483647 * 4) }}"
+        ),
+        // A collection alias keeps its element width through a combinator.
+        8 => format!(
+            "type Xs{u} = List[Double]\n\
+             {sep}{{ def avg(xs: Xs{u}): Double = xs.sum / xs.size; \
+               println(avg(List({a}, {b}))); val ys: Xs{u} = List({a}); println(ys) }}"
+        ),
+        // A union alias and a function alias.
+        9 => format!(
+            "type U{u} = Int | String\ntype F{u} = Int => Int\n\
+             {sep}{{ def d(x: U{u}): String = x match {{ case i: Int => \"i\" + i; \
+               case s: String => \"s\" + s }}; println(d({a}) + d(\"k\")); \
+               val f: F{u} = _ {op} {b}; println(f({a})) }}"
+        ),
+        // A member alias inside a class.
+        10 => format!(
+            "class C{u} {{ type N = Long; def big(x: N): N = x * 1000000000 }}\n\
+             {sep}{{ println(new C{u}().big({a}000)) }}"
+        ),
+        // A singleton's `apply` called as sugar, explicitly, and as a value.
+        11 => format!(
+            "object Add{u} {{ def apply(x: Int, y: Int): Int = x {op} y }}\n\
+             {sep}{{ println(Add{u}({a}, {b})); println(Add{u}.apply({b}, {a})); \
+               println(List({a}, {b}).map(Add{u}({scale}, _))) }}"
+        ),
+        // A case class's factory spelled `apply`, and the class as a function.
+        12 => format!(
+            "case class Pt{u}(x: Int, y: Int)\n\
+             {sep}{{ println(Pt{u}.apply({a}, {b})); val mk: (Int, Int) => Pt{u} = Pt{u}.apply; \
+               println(mk({b}, {a})); \
+               println(List({a}, {b}).zip(List({b}, {a})).map {{ case (p, q) => Pt{u}.apply(p, q) }}) }}"
+        ),
+        _ => format!(
+            "case class Wr{u}(v: Int)\n\
+             {sep}{{ println(List({a}, {b}).map(Wr{u})); val k = Wr{u}; println(k({scale})) }}"
         ),
     }
 }
