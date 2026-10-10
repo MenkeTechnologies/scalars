@@ -57,11 +57,13 @@ For a shorter quick\-reference page see
 The program text is a single
 .B .scala
 file named as the first non\-option argument.  Arguments after the file
-are collected but not yet exposed to the program (the
+are passed to the program as the
 .B args
-parameter of
-.B main
-is parsed and ignored).
+of
+.B def main
+and to the parameters of an
+.B @main
+method.
 .TP
 .B \-\-dump\-tokens
 Print the lexer token stream and exit.
@@ -72,6 +74,9 @@ Print the parsed AST and exit.
 .B \-\-disasm
 Print the lowered fusevm bytecode disassembly and exit.
 .TP
+.B \-\-tiers
+Run the file, then report which fusevm execution tier took each of its chunks.
+.TP
 .B \-\-lsp
 Speak the Language Server Protocol over stdio.
 .TP
@@ -81,7 +86,7 @@ Speak the Debug Adapter Protocol over stdio.
 .BR \-version ", " \-\-version
 Print the version banner and exit.
 .TP
-.BR \-h ", " \-\-help
+.BR \-h ", " \-help ", " \-\-help ", " \-?
 Print the option grammar and exit.
 .SH "2.  LANGUAGE SLICE"
 .SS Entry object
@@ -100,10 +105,19 @@ runs
 directly, and
 .B object Name { ... def main(args: Array[String]): Unit = { <body> } ... }
 runs its
-.BR main .
+.BR main ,
+and a Scala 3
+.B @main def
+method runs with its parameters read from the command line.
+The
+.B args
+of an
+.B extends App
+body is null.
 Optional
 .BR package / import
-prologue lines are tolerated and ignored.
+prologue lines are accepted; a wildcard import binds only the members the
+runtime provides for that package.
 .SS Statements
 .BR val / var
 bindings (with an optional
@@ -138,7 +152,7 @@ Statements are separated by inferred line breaks or explicit
 .SS Expressions
 Integer, floating, string (including
 .BR s / f
-interpolation), char (as a one\-char string), boolean, and
+interpolation), char, boolean, and
 .B null
 literals; variable reads; unary
 .BR - / ! ;
@@ -182,6 +196,8 @@ as a native integer,
 as a float,
 .BR Boolean
 as a bool,
+.BR Char
+as its own tagged runtime value,
 .BR String
 as a VM string, and the
 .B null
@@ -213,10 +229,8 @@ and floats when either operand is a
 Because scalars carries no static types, the choice is made at runtime by
 a type\-dispatching
 .B SDIV
-builtin.  Integer division by zero yields
-.B null
-(a documented gap; Scala throws
-.BR ArithmeticException ).
+builtin.  Integer division by zero raises
+.BR ArithmeticException .
 .SS String +
 Scala's
 .B +
@@ -388,40 +402,35 @@ Documented gaps (see
 .B BUGS.md
 in the source tree for the full ledger):
 .IP \[bu] 2
-Lazy views and iterators \(em
-.BR .view ,
-.BR .iterator ,
+Unbounded iterators \(em
+.BR Iterator.from ,
+.BR Iterator.continually ,
 and
-.BR LazyList .
-.BR grouped / sliding
-answer the
-.B List
-of windows rather than an
-.BR Iterator .
+.BR Iterator.iterate
+are not provided
+.RB ( LazyList
+has them).
 .IP \[bu] 2
-Sorting by a user
-.BR Ordering ,
+.BR Map.view ,
+.BR mapValues ,
 and
-.BR Ordered / Comparable
-on a user class.  The built\-in ordering covers numbers,
-.BR String ,
-.BR Boolean
-and tuples of those.
+.BR filterKeys
+answer a strict
+.BR Map ,
+not a
+.BR MapView .
 .IP \[bu] 2
-The insertion\-ordered
-.BR LinkedHashSet / LinkedHashMap ,
-and the rest of
-.BR scala.collection.mutable
-.RB ( Queue ,
-.BR Stack ,
-.BR ArrayDeque ).
-They are an unresolved name rather than an alias onto the hash\-table
-forms, whose order differs.
+.BR scala.Enumeration
+and anonymous classes (\fBnew T { ... }\fR).
 .IP \[bu] 2
 The symbolic operators
 .BR /: ,
 .BR :\e ,
-and user\-defined symbolic method names.
+and user\-defined symbolic method names beyond
+.BR + ,
+.BR < ,
+and
+.BR unary_- .
 .IP \[bu] 2
 The wider standard library \(em
 .BR scala.io ,
@@ -432,7 +441,8 @@ methods beyond the wired subset.
 .IP \[bu] 2
 Types are parsed but not checked, and
 .B Int
-arithmetic uses 64\-bit semantics rather than wrapping at 32 bits.
+arithmetic narrows to 32 bits only where the width is statically proven;
+elsewhere it uses 64\-bit semantics.
 .SH SEE ALSO
 .BR scala (1),
 .BR awkrsall (1),

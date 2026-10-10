@@ -10,7 +10,7 @@ lexes and parses Scala and lowers it to
 .B fusevm
 bytecode executed on a three\-tier Cranelift JIT.
 There is no bespoke VM and no JVM; execution and codegen live in fusevm,
-the same engine behind zshrs, stryke, awkrs, elisp, rubylang, and pythonrs.
+the same engine behind zshrs, stryke, awkrs, elisp, and ruby.
 .PP
 The program text is a single
 .B .scala
@@ -18,8 +18,11 @@ file whose entry point is an
 .B object
 that either
 .B extends App
-(its body runs directly) or declares
-.BR "def main(args: Array[String]): Unit" .
+(its body runs directly), declares
+.BR "def main(args: Array[String]): Unit" ,
+or is a Scala 3
+.B @main
+method.
 It supports
 .BR val / var
 bindings,
@@ -63,12 +66,10 @@ and
 with the
 .B scala.util.matching.Regex
 surface.  For the gaps that remain \(em
-.B Char
-as its own type, lazy views,
-.BR Iterator ,
-.BR LazyList ,
-user
-.BR Ordering s,
+unbounded
+.BR Iterator s,
+.BR scala.Enumeration ,
+anonymous classes,
 and the wider standard library \(em see
 .B BUGS.md
 in the source tree.
@@ -97,7 +98,7 @@ stepping, stack/scopes/variables).
 .BR \-version ", " \-\-version
 Print the version banner and exit.
 .TP
-.BR \-h ", " \-\-help
+.BR \-h ", " \-help ", " \-\-help ", " \-?
 Print the option grammar and exit.
 .SH EXIT STATUS
 .TP
@@ -133,7 +134,6 @@ scala --dap
 .RE
 .SH SEE ALSO
 .BR scalaall (1),
-.BR scala (1),
 .BR pythonrs (1)
 .PP
 Project home:
