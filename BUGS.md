@@ -462,9 +462,10 @@ reported as parse/compile errors, never silently mis-run.
   Int, y: Int)`); each registers its own subroutine and every call site — direct,
   `super.m`, virtual dispatch off a runtime tag, and an unqualified self-call —
   picks the one matching the arity it passes. Overloads that differ only in
-  parameter TYPE (`f(Int)` / `f(String)`) are refused at compile time: Scala
-  resolves those by type, which this frontend does not model, and answering the
-  first silently is the worse failure.
+  parameter TYPE (`f(Int)` / `f(String)` / `f(Any)`) are renamed apart and
+  fronted by a dispatcher that tests the declared parameter types against the
+  arguments' run-time types, the most specific first; see *Overloads that
+  differ only in parameter type* below for what that cannot tell apart.
 - **Traits and inheritance.** `trait T { … }` with abstract members (`def f:
   Int`, `val x: String`) and concrete ones; `class C(x) extends P(x) with T1
   with T2`; `override def`; `super.m(…)`; and virtual dispatch — a method call
@@ -636,7 +637,13 @@ reported as parse/compile errors, never silently mis-run.
   reason to call it, `e.getClass.getSimpleName`. A bare `getClass` inside a
   class's method is `this.getClass`, so a base class's `toString` can name the
   runtime subclass (`s"${getClass.getSimpleName}(…)"`). A collection's
-  `getClass` (`$colon$colon` for a non-empty `List`) is not modelled.
+  `getClass` answers the reference's representation class: `$colon$colon` for a
+  non-empty `List`, `Vector1`/`Vector2`/`Vector3` by length, `Map1`..`Map4` then
+  `HashMap`, `Set1`..`Set4` then `HashSet`, `Some`, `None$`, and
+  `Tuple2$mc<A><B>$sp` for a pair of `Int`/`Double`/`Boolean`/`Char`
+  components (a `Long` component is an `Int` here, so a `(Boolean, Long)` reads
+  `Tuple2$mcZI$sp`). A class declared inside an `object` carries the enclosing
+  names (`T$O$In`); its `getSimpleName` stays `In`.
   There is one `Class` object per class, so `a.getClass == b.getClass` (and
   `eq`) holds for two values of one class. `classOf[T]` answers that same
   object under the JVM erasure: a value type is its primitive (`classOf[Int]`
@@ -903,18 +910,61 @@ reported as parse/compile errors, never silently mis-run.
   `PriorityQueue`. The ordering is the implicit one, including a user
   `Ordered`/`Comparable` class's `compare`; an explicitly passed `Ordering`
   argument is not accepted.
+- **`for` comprehensions follow the reference's desugaring, which a user-defined
+  collection can observe.** Value definitions after a generator become `val`s
+  of its lambda (`for (a <- w; b = f(a); c <- g(b)) yield c` is one `flatMap`
+  and one `map`, no tuple), a guard after a definition pairs the value onto the
+  generator and filters the pair, a destructuring definition `(p, q) = e` is
+  accepted, and `for (c <- w) yield c` does not call a user `map` at all.
+  A constructor or typed pattern without `case` (`Some(x) <- w`, `a: Int <- w`)
+  parses and does not filter.
+- **A member `lazy val` is a memoizing method.** In a class, a trait or a
+  singleton object it initializes on its first READ — after the constructor, so
+  it sees the fields as they are then — instead of with the instance. (An entry
+  object's `lazy val` already did.)
+- **Unbounded iterators.** `Iterator.from(n[, step])`, `continually(x)`,
+  `iterate(x)(f)` and `unfold(s)(f)` are the `LazyList` machinery marked as an
+  iterator: they print `<iterator>`, answer `hasNext`/`next()` and derive
+  lazily (`map`/`filter`/`take`/`takeWhile`/`zip`/`drop`). `Iterator.single`,
+  `fill` and `tabulate` work. `LazyList` also has `take`, `slice`, `flatMap`,
+  `zipWithIndex`, `scanLeft`, `collect`, `dropWhile`, `++`/`#:::`/`:+`/`+:`,
+  `range`, `tabulate`, `fill` and `unfold` lazily; every other member forces
+  the list and answers the strict result as the `LazyList` it is on the
+  reference. `Stream` is the same list printing `Stream(…)` with its head
+  evaluated.
+- **`scala.Enumeration`.** See *`Enumeration` beyond `Value`* below for what is
+  modelled; a value is a record carrying `id`, `name` and the owning object, a
+  `ValueSet` is a sorted set of them printing `Color.ValueSet(…)`.
+- **`BigDecimal`**, with `RoundingMode.X` / `BigDecimal.RoundingMode.X` as the
+  mode argument — see below.
+- **Qualified names through an object.** `new O.In()`, `O.Sub.m(…)`, `case
+  O.P(x) =>`, `case O.Const =>` and `import O._` name a type or member declared
+  inside an object; the flat type namespace holds it under its own name.
+  `` `x` `` in a pattern compares against the value of `x`.
+- **A literal with `_` digit separators** (`1_000_000`, `0xFF_FF`).
+- **An extractor whose `unapply` parameter is declared `String`, `Int`, … or a
+  class** applies only to a scrutinee of that type; any other value falls
+  through to the next case.
+- **A repeated constructor parameter** (`class C(val xs: Int*)`,
+  `case class D(items: String*)`), packed from the trailing arguments or from
+  `xs: _*`.
+- **The innermost given wins.** A `using` parameter of the enclosing `def` is
+  preferred over a same-typed given declared outside it, as Scala's nesting
+  rule has it, instead of reporting an ambiguity.
+- **`x.asInstanceOf[T]` raises `ClassCastException`** when a `String`, a boxed
+  primitive, a collection or a user class is cast to a different one of those
+  (numeric-to-numeric casts convert and `null` casts to anything). `sys.error(m)`
+  is `throw new RuntimeException(m)`; a tuple has `copy(_1 = …)`.
+- **A `MatchError` names the scrutinee's JVM class** the way `getClass` does —
+  `B(x) (of class B)`, `List(1, 2) (of class …$colon$colon)`.
 
 ## Not implemented (parse errors / unresolved today)
 
-- **Unbounded `Iterator`s.** `Iterator.from(n)`, `Iterator.continually(x)` and
-  `Iterator.iterate(x)(f)` are not provided: an `Iterator` here is a consumed,
-  materialized sequence. Their `LazyList` counterparts are, and `Iterator(…)`,
-  `Iterator.range` and `xs.iterator` work.
-- **`scala.Enumeration`.** `object Color extends Enumeration { val Red, Green =
-  Value }` parses, but `Value`, `values`, `withName` and `id` are not
-  provided. Scala 3's `enum` is.
-- **A qualified extractor in a pattern.** `case Obj.Re(a) =>` does not parse;
-  bind the extractor to a local first.
+- **`Enumeration` beyond `Value`.** `object Color extends Enumeration { val Red,
+  Green = Value }`, `Value("n")`, `Value(id)`, `Value(id, "n")`, `values`,
+  `withName`, `apply(id)`, `maxId`, `id`, `compare` and the orderings are
+  modelled. A `case class V extends super.Val` (extra members on a value), the
+  `nextId`/`ValueSet` constructors and `Enumeration(initial)` are not.
 - **`enum` cases share one type namespace.** The cases share the one flat type namespace, so two
   enums with a case of the same name are a redeclaration.
 - **What the optional-braces pass does not cover.** An indentation region
@@ -1025,17 +1075,15 @@ reported as parse/compile errors, never silently mis-run.
   is not expanded, and a class type parameter named like an in-scope alias is not
   shadowed — both fall back to the unexpanded name, which is erased as before.
 
-- **`getClass.getName` of a class declared inside an object.** A class written
-  in the entry object's body or in another object is `T$C` on the JVM; the name
-  here is the bare `C`, because no enclosing-object name is recorded for a
-  class. `getSimpleName` is unaffected.
-
-- **`BigDecimal`.** `BigDecimal("1.5") + BigDecimal("2.25")` is
-  `not found: BigDecimal`. `BigInt` is supported (see below); `BigDecimal`
-  additionally needs `java.math.BigDecimal`'s scale and rounding rules, which
-  decide its `toString` and its `==`, and is left out rather than approximated
-  with a `Double`, which would silently answer a rounded number for the exact
-  case the type exists to serve.
+- **`BigDecimal`.** An unscaled `BigInt` and a scale, under
+  `MathContext.DECIMAL128` (34 significant digits, half-even) for `+ - * /` and
+  `pow`, with `java.math.BigDecimal`'s `toString` (plain unless the scale is
+  negative or the adjusted exponent is below -6) and its scale-insensitive
+  `==`/`compare`/`hashCode`. `setScale(n[, RoundingMode.X])`, `scale`,
+  `precision`, `abs`, `signum`, `max`/`min`, `toInt`/`toLong`/`toDouble`/
+  `toBigInt`, `floor`/`ceil`, `sum`/`product` and `Int`/`Double`/`BigInt`
+  operands on either side are modelled; `MathContext`-taking members (`sqrt`,
+  `round(mc)`, `BigDecimal(x, mc)`) are not.
 
   `BigInt` is a host-heap value (`Value::Obj` carrying a `num_bigint::BigInt`),
   the same shape a `Char` has, so every operator on one reaches the numeric hook
@@ -1075,11 +1123,14 @@ reported as parse/compile errors, never silently mis-run.
 - **A `Char` range stepped by zero.** `'a' to 'c' by 0` raises
   `IllegalArgumentException: step cannot be 0.` where it is built; the
   reference builds it (it prints) and raises on the first element access.
-- **Overloads that differ only in parameter type.** `def f(x: Int)` and `def
-  f(x: String)` in one class are a compile error, not a dispatch: both would key
-  the same `C$f$1` subroutine, and the runtime is dynamically typed, so the
-  argument's static type — which is what Scala resolves on — is not available.
-  Argument COUNT is modelled (see above); argument type is not.
+- **Overloads that differ only in parameter type** are dispatched on the
+  arguments' RUN-TIME types, not the static ones Scala resolves on. The
+  declared parameter types are tested most specific first (`Any` and type
+  parameters last), so `f(Int)`/`f(String)`/`f(Any)` pick as Scala does for a
+  value of known type. What a run-time test cannot tell apart is two overloads
+  that differ only by `Int` vs `Long` (one representation here), or a static
+  type narrower than the value's class — `val a: Animal = new Dog; f(a)` picks
+  the `f(Dog)` overload here and `f(Animal)` in Scala.
 - **Symbolic operators beyond the wired set.** `/:` and `:\`. A user class's
   own symbolic methods (`def +(o: V)`, `def <(o: V)`, `def unary_-`) are
   supported: the infix use dispatches on the left operand's runtime class, so
@@ -1090,35 +1141,23 @@ reported as parse/compile errors, never silently mis-run.
   would be a class declared inside an expression, and a class here cannot
   capture the locals of the frame that declares it (see below), which is what
   an anonymous class body reads most often.
-- **`scala.Enumeration`.** `object Color extends Enumeration { val Red, Green =
-  Value }` does not parse: neither the multi-name `val a, b = e` definition nor
-  `Enumeration#Value`'s auto-numbering is modelled. Scala 3 `enum` is supported.
 - **A companion `apply` overloaded by parameter TYPE on a `case class`.**
   `case class Pt(x: Int); object Pt { def apply(s: String) = … }`: `Pt("41")`
   has the constructor's arity, so it constructs, where Scala resolves the
   `String` overload. A companion `apply` of a different arity — or any companion
-  `apply` of a plain class — is called.
+  `apply` of a plain class — is called, and a companion `apply` overloaded among
+  itself by type (`apply(Int)`/`apply(String)`) is dispatched on the argument's
+  run-time type.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
   namespace, and the many `String`/numeric methods beyond the wired subset
   above. Members a differential sweep reached and found missing (each an
   honest `not a member` error, never a wrong answer): `Map.foreachEntry`,
-  `empty`/`applyOrElse`/`prefixLength` on a sequence instance, and
-  the infinite `Iterator.iterate`/`continually`/`from` (`LazyList` has them).
-- **`getClass` on a collection, a tuple, a function or an `Array`.** Those
-  runtime classes are private implementation details — `List(1).getClass.getName`
-  is `scala.collection.immutable.$colon$colon`, a one-element `Vector` is
-  `Vector1`, and `(1, 2)` carries the specialization suffix `Tuple2$mcII$sp` —
-  so naming them would mean modelling Scala's class hierarchy AND its
-  `@specialized` naming. They stay an error; `getClass` on a `String`, a
-  primitive, a user `class`/`case class`/`object` or a throwable works (see
-  above).
-
-  This one is **settled, not pending**: the answer would have to be a table of
-  private class names — which representation a `Vector` of each size picks,
-  which specialization suffix each primitive tuple carries — that says nothing
-  about how a program runs and goes stale with every library release. Refusing
-  it is the intended behaviour, so a program asking for it gets `value getClass
-  is not a member of value` rather than a plausible-looking wrong name.
+  `empty`/`applyOrElse`/`prefixLength` on a sequence instance.
+- **`getClass` on a function, an `Array`, an `Iterator` or a `Range`.** The
+  representation classes of those (`Range$Inclusive`, `[I`, the lambda's
+  synthetic name) are not modelled, and `getClass` on them answers `value
+  getClass is not a member of value`. The collection, option, either and tuple
+  classes are (see above).
 - **A `Float` is not observable through a JIT-compiled loop.** `Float` is a real
   type — single-precision literals, arithmetic, conversions, constants,
   `toString`, `getClass` and `hashCode` all match Scala, and they match it

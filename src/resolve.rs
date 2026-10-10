@@ -828,6 +828,10 @@ impl Resolver {
                             let n = name.clone();
                             *name = self.bind_value(&n);
                         }
+                        ForEnum::ValPat { pat, value } => {
+                            self.walk_expr(value)?;
+                            self.rebind_pattern(pat);
+                        }
                     }
                 }
                 self.walk_expr(body)?;
@@ -1114,6 +1118,7 @@ fn cs_expr(e: &mut Expr, sigs: &HashMap<String, Sig>) {
                     ForEnum::GenColl { coll, .. } => cs_expr(coll, sigs),
                     ForEnum::Guard(g) => cs_expr(g, sigs),
                     ForEnum::Val { value, .. } => cs_expr(value, sigs),
+                    ForEnum::ValPat { value, .. } => cs_expr(value, sigs),
                 }
             }
             cs_expr(body, sigs);

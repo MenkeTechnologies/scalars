@@ -83,6 +83,10 @@ pub struct Program {
     /// an argument passed to a parameter of one — and only when the value's
     /// static type is known and is not already the target.
     pub conversions: Vec<Conversion>,
+    /// For a type declared inside an `object` or `class`: the JVM name prefix of
+    /// the enclosing chain (`T$O$` for a class in `object O` in `object T`), so
+    /// `getClass.getName` answers `T$O$In`. Absent for a top-level type.
+    pub jvm_prefixes: HashMap<String, String>,
     /// `implicit val NAME: TY` declarations, as `(name, declared type)`.
     ///
     /// This is the implicit SCOPE, and it is resolved by declared type name: an
@@ -362,6 +366,9 @@ pub enum ForEnum {
     /// generator (`for (x <- xs; y = f(x))` becomes `for ((x, y) <- xs.map(x =>
     /// (x, f(x))))`), so a later guard can see both names.
     Val { name: String, value: Expr },
+    /// `(a, b) = e` — a value definition whose left side is a destructuring
+    /// pattern. Lowered like [`ForEnum::Val`] but binding every name of `pat`.
+    ValPat { pat: Pattern, value: Expr },
 }
 
 /// Compound-assignment operator. `Assign` is a plain `=`.

@@ -418,7 +418,7 @@ Implemented and checked against the reference `scala`:
 - **Overloaded methods** — one name at several arities on a `class` or `object`,
   resolved at the call site by argument count through every dispatch route
   (direct, `super.m`, virtual, unqualified self-call). Overloads differing only
-  in parameter type are refused rather than silently answered by the first.
+  in parameter type are dispatched on the arguments' run-time types.
 - **Traits and inheritance** — `trait T { def f: Int; def g = … }` with abstract
   and concrete members, `class C(x) extends P(x) with T1 with T2`, `override
   def`, `super.m(…)`, and virtual dispatch off the receiver's runtime class tag
@@ -555,8 +555,9 @@ Implemented and checked against the reference `scala`:
   `String.valueOf` and the rest. The two namespaces stay apart exactly as
   Scala's do, and a fixed-width rendering follows its box.
 - **`getClass`** — a `java.lang.Class` answering `getName`/`getSimpleName` for a
-  `String`, a primitive, a user type or a throwable (`e.getClass.getSimpleName`);
-  one `Class` per class, also reached as `classOf[T]`.
+  `String`, a primitive, a user type (nested ones with their enclosing names), a
+  collection, an option or a throwable (`e.getClass.getSimpleName`); one `Class`
+  per class, also reached as `classOf[T]`.
 - **`scala.math`** — `abs`, `signum`, `min`/`max`, `round`/`floor`/`ceil`/`rint`,
   `sqrt`/`cbrt`/`exp`/`log`/`log10`/`pow`/`hypot`, the trig family, `atan2`,
   `toRadians`/`toDegrees`, `Pi`, `E`, under the `math`, `scala.math`, `Math` and
@@ -567,7 +568,13 @@ Implemented and checked against the reference `scala`:
   mixed with `Int`/`Long` operands on either side, `pow`/`gcd`/`mod`/`modPow`/
   `/%`/`isProbablePrime`/bitwise ops, `sum`/`product`/`sorted` over a
   collection of them, and `val b: BigInt = 7` widening as Scala's `int2bigInt`
-  does. `BigDecimal` is not modelled (see `BUGS.md`).
+  does.
+- **`BigDecimal`** — `java.math.BigDecimal`'s unscaled-value-and-scale model under
+  `MathContext.DECIMAL128`: exact `+ - *`, a 34-digit `/`, `setScale` with a
+  `RoundingMode`, scale-insensitive `==`, and `toString` in plain or scientific
+  form as the JDK writes it.
+- **`scala.Enumeration`** — `val A, B = Value`, named and numbered values,
+  `values`, `withName`, `apply(id)`, `maxId`, ordering by id.
 - **Method dispatch** — postfix `.` on core values: `String` (`length`,
   `toUpperCase`/`toLowerCase`, `trim`, `strip`, `stripMargin`, `reverse`,
   `substring`, `charAt`, `contains`/`startsWith`/`endsWith`,
@@ -1052,14 +1059,11 @@ Next waves, in priority order:
 
 1. **Lazy views** — `.view`. (`Iterator` and `LazyList` are done: `Iterator` is a
    real consumable iterator, not a strict `Iterable`.)
-2. **The broader standard library** — `scala.io`, `scala.util.Random` and
-   `BigDecimal`. (`scala.util.Try` is done, and `Either`'s right-biased
+2. **The broader standard library** — `scala.io` and `scala.util.Random`. (`scala.util.Try` is done, and `Either`'s right-biased
    surface with `Either.left`'s `LeftProjection` beside it. Package-QUALIFIED
    spellings now resolve too: `scala.util.Try(e)`, `scala.Some(1)` and
    `scala.collection.immutable.List(1)` are the same expressions their bare
-   names compile to.) `BigDecimal` is left out rather than approximated: it needs
-   `java.math.BigDecimal`'s scale and rounding rules, which decide its
-   `toString` and `==`. See `BUGS.md`.
+   names compile to.) See `BUGS.md`.
 3. **Overloading a block-level `def`** — a class member's overload resolves by
    argument count, but the flat `def` namespace has no such split, so two
    same-name `def`s in one block are refused.

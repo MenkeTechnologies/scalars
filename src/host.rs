@@ -21,6 +21,7 @@
 //!    `Int`/`Float` pair whose integer is past `2^53` — which [`numeric_hook`]
 //!    answers with Scala's own rules (`Long` wraps; a mixed pair promotes).
 
+use crate::bigdec::{BigDec, Round};
 use fusevm::{Frame, NumOp, VMResult, Value, VM};
 use num_bigint::BigInt;
 use num_integer::Integer;
@@ -167,7 +168,7 @@ pub const EXC_ABORT: u16 = 730;
 /// had already caught it.
 pub const EXC_RESTORE: u16 = 731;
 /// Builtin id for registering one declared type's shape, emitted once per
-/// `class`/`trait`/`object` before `main`. Pops the primary-constructor arity,
+/// `class`/`trait`/`object` before `main`. Pops the enclosing-type JVM name prefix, the primary-constructor arity,
 /// the comma-separated *linearized* supertype names, and the type name.
 ///
 /// The runtime needs two things the flat record cannot carry: which supertypes
@@ -603,15 +604,19 @@ struct TypeInfo {
     /// Primary-constructor field count — the prefix of `fields` that Scala's
     /// derived `case class` members operate on.
     ctor_arity: usize,
+    /// The JVM name prefix of the enclosing types (`T$O$`), empty at top level.
+    jvm_prefix: String,
 }
 
 /// Clear the declared-type registry. Called by the runner before each program.
 pub fn reset_types() {
     TYPES.with(|t| t.borrow_mut().clear());
+    ENUMS.with(|e| e.borrow_mut().clear());
 }
 
 /// `TYPE_REG` builtin — see [`TYPE_REG`]. Returns `Unit`.
 fn b_type_reg(vm: &mut VM, _argc: u8) -> Value {
+    let jvm_prefix = vm.pop().as_str_cow().into_owned();
     let ctor_arity = vm.pop().to_int().max(0) as usize;
     let supers_csv = vm.pop().as_str_cow().into_owned();
     let name = vm.pop().as_str_cow().into_owned();
@@ -620,7 +625,16 @@ fn b_type_reg(vm: &mut VM, _argc: u8) -> Value {
     } else {
         supers_csv.split(',').map(|s| s.to_string()).collect()
     };
-    TYPES.with(|t| t.borrow_mut().insert(name, TypeInfo { supers, ctor_arity }));
+    TYPES.with(|t| {
+        t.borrow_mut().insert(
+            name,
+            TypeInfo {
+                supers,
+                ctor_arity,
+                jvm_prefix,
+            },
+        )
+    });
     Value::Undef
 }
 
@@ -785,6 +799,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(LAZY_FORCE, b_lazy_force);
     vm.register_builtin(LAZYLIST_NEW, b_lazylist_new);
     vm.register_builtin(LAZY_CONS, b_lazy_cons);
+    vm.register_builtin(ENUM_NEW, b_enum_new);
+    vm.register_builtin(ENUM_OP, b_enum_op);
+    vm.register_builtin(AS_INSTANCE, b_as_instance);
     vm.register_builtin(EXTRACTED, b_extracted);
     vm.register_builtin(THROWABLE_STATE, b_throwable_state);
     vm.register_builtin(NONFATAL, b_nonfatal);
@@ -964,6 +981,27 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     // which is what makes a user's `catch { case e: Exception => … }` let a
     // `break` pass through to its enclosing `breakable` — the behavior a
     // `catch`-all handler would otherwise silently swallow.
+    ("StackOverflowError", "java.lang.StackOverflowError"),
+    ("OutOfMemoryError", "java.lang.OutOfMemoryError"),
+    ("VirtualMachineError", "java.lang.VirtualMachineError"),
+    ("InterruptedException", "java.lang.InterruptedException"),
+    ("ArrayStoreException", "java.lang.ArrayStoreException"),
+    (
+        "NegativeArraySizeException",
+        "java.lang.NegativeArraySizeException",
+    ),
+    (
+        "CloneNotSupportedException",
+        "java.lang.CloneNotSupportedException",
+    ),
+    (
+        "ConcurrentModificationException",
+        "java.util.ConcurrentModificationException",
+    ),
+    ("IOException", "java.io.IOException"),
+    ("FileNotFoundException", "java.io.FileNotFoundException"),
+    ("EOFException", "java.io.EOFException"),
+    ("TimeoutException", "java.util.concurrent.TimeoutException"),
     ("ControlThrowable", "scala.util.control.ControlThrowable"),
     ("BreakControl", "scala.util.control.BreakControl"),
 ];
@@ -1009,6 +1047,14 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("PatternSyntaxException", "IllegalArgumentException"),
     ("NegativeArraySizeException", "RuntimeException"),
     ("VirtualMachineError", "Error"),
+    ("StackOverflowError", "VirtualMachineError"),
+    ("ArrayStoreException", "RuntimeException"),
+    ("CloneNotSupportedException", "Exception"),
+    ("ConcurrentModificationException", "RuntimeException"),
+    ("IOException", "Exception"),
+    ("FileNotFoundException", "IOException"),
+    ("EOFException", "IOException"),
+    ("TimeoutException", "Exception"),
     ("OutOfMemoryError", "VirtualMachineError"),
     ("AssertionError", "Error"),
     ("NotImplementedError", "Error"),
@@ -1380,6 +1426,8 @@ enum HeapVal {
     Char(char),
     /// A `scala.math.BigInt` — see [`make_big`].
     BigInt(BigInt),
+    /// A `scala.math.BigDecimal` — see [`make_dec`].
+    BigDec(BigDec),
 }
 
 /// Which representation an immutable `Set`/`Map` has. Scala's factories return
@@ -3001,6 +3049,7 @@ fn b_obj_adopt(vm: &mut VM, _argc: u8) -> Value {
             .or_insert_with(|| TypeInfo {
                 supers: Vec::new(),
                 ctor_arity: 0,
+                jvm_prefix: String::new(),
             })
             .ctor_arity = 0;
     });
@@ -3029,6 +3078,22 @@ fn b_obj_copy(vm: &mut VM, argc: u8) -> Value {
     vals.reverse();
     let spec = vm.pop().as_str_cow().into_owned();
     let recv = vm.pop();
+    // A tuple's `copy(_1 = …, _2 = …)` — the components are named `_1`, `_2`, ….
+    if let Some(mut items) = as_tuple_items(&recv) {
+        for (s, val) in spec.split(',').filter(|s| !s.is_empty()).zip(vals) {
+            let slot = match s.strip_prefix('#') {
+                Some(i) => i.parse::<usize>().ok(),
+                None => s
+                    .strip_prefix('_')
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .map(|n| n - 1),
+            };
+            if let Some(item) = slot.and_then(|i| items.get_mut(i)) {
+                *item = val;
+            }
+        }
+        return heap_push(HeapVal::Tuple(items));
+    }
     let base = match with_obj(&recv, |o| o.clone()) {
         Some(o) => o,
         None => return fault(vm, "scalars: copy is not a member of a non-object"),
@@ -4366,6 +4431,14 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         with_obj(recv, |o| (o.class.to_string(), o.is_case, o.fields.clone()))
             .ok_or_else(|| "scalars: dangling object handle".to_string())?;
     match (name, args.len()) {
+        ("compare", 1) if enum_id(recv).is_some() => {
+            let (a, b) = (enum_id(recv), enum_id(&args[0]));
+            Ok(Value::int(match a.cmp(&b) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            }))
+        }
         ("hashCode", 0) => Ok(Value::int(obj_hash(&class, is_case, &fields, recv))),
         ("equals", 1) => Ok(Value::bool(obj_eq(recv, &args[0]))),
         // `AnyRef.eq`/`ne` — reference identity, which for a class instance is
@@ -4488,6 +4561,78 @@ fn sort_by_ordering(vm: &mut VM, ord: &Value, items: &[Value]) -> Result<Vec<Val
     Ok(idx.into_iter().map(|i| items[i].clone()).collect())
 }
 
+/// The JVM class a collection, option, either or tuple value has — what
+/// `getClass.getName` answers and what a `MatchError` names. `None` for any
+/// value whose class is not one of those.
+///
+/// Only the sizes the reference's representation changes at are modeled: a
+/// `Vector` is `Vector0$`/`Vector1`/`Vector2`/… by length, a `Map`/`Set` is
+/// `Map1`..`Map4`/`Set1`..`Set4` up to four entries and a `HashMap`/`HashSet`
+/// beyond, and a tuple of two is specialized (`Tuple2$mcII$sp`) when both
+/// components are `Int`/`Double`/`Boolean`/`Char`.
+fn jvm_collection_class(v: &Value) -> Option<String> {
+    let Value::Obj(id) = v else { return None };
+    enum Shape {
+        Name(String),
+        Pair(Value, Value),
+    }
+    let imm = "scala.collection.immutable";
+    let shape = HEAP.with(|h| {
+        let h = h.borrow();
+        Some(match h.get(*id as usize)? {
+            HeapVal::Seq(kind, items) => Shape::Name(match kind {
+                SeqKind::List if items.is_empty() => format!("{imm}.Nil$"),
+                SeqKind::List => format!("{imm}.$colon$colon"),
+                SeqKind::Vector => match items.len() {
+                    0 => format!("{imm}.Vector0$"),
+                    1..=32 => format!("{imm}.Vector1"),
+                    33..=1024 => format!("{imm}.Vector2"),
+                    _ => format!("{imm}.Vector3"),
+                },
+                SeqKind::Set(HashRep::Small) => match items.len() {
+                    0 => format!("{imm}.Set$EmptySet$"),
+                    n @ 1..=4 => format!("{imm}.Set$Set{n}"),
+                    _ => format!("{imm}.HashSet"),
+                },
+                SeqKind::Set(HashRep::Hashed) => format!("{imm}.HashSet"),
+                SeqKind::ListBuffer => "scala.collection.mutable.ListBuffer".to_string(),
+                SeqKind::ArrayBuffer => "scala.collection.mutable.ArrayBuffer".to_string(),
+                _ => return None,
+            }),
+            HeapVal::Map(HashRep::Small, entries) => Shape::Name(match entries.len() {
+                0 => format!("{imm}.Map$EmptyMap$"),
+                n @ 1..=4 => format!("{imm}.Map$Map{n}"),
+                _ => format!("{imm}.HashMap"),
+            }),
+            HeapVal::Map(HashRep::Hashed, _) => Shape::Name(format!("{imm}.HashMap")),
+            HeapVal::Tuple(items) if items.len() == 2 => {
+                Shape::Pair(items[0].clone(), items[1].clone())
+            }
+            HeapVal::Tuple(items) => Shape::Name(format!("scala.Tuple{}", items.len())),
+            _ => return None,
+        })
+    });
+    match shape? {
+        Shape::Name(n) => Some(n),
+        Shape::Pair(a, b) => {
+            // `Tuple2` is `@specialized` for `Int`, `Long`, `Double`, `Char` and
+            // `Boolean` components; a `Long` and an `Int` are one value here, so
+            // `I` stands for both.
+            let tag = |x: &Value| match x {
+                Value::Int(_) => Some('I'),
+                Value::Float(_) => Some('D'),
+                Value::Bool(_) => Some('Z'),
+                Value::Obj(_) if as_char(x).is_some() => Some('C'),
+                _ => None,
+            };
+            Some(match (tag(&a), tag(&b)) {
+                (Some(x), Some(y)) => format!("scala.Tuple2$mc{x}{y}$sp"),
+                _ => "scala.Tuple2".to_string(),
+            })
+        }
+    }
+}
+
 /// `x.getClass` — a `java.lang.Class` record carrying the two names a program
 /// reads off it. The names are stored as FIELDS called `getName`/`getSimpleName`
 /// so the ordinary paren-less field read in [`obj_method`] answers them.
@@ -4513,9 +4658,19 @@ fn class_of(recv: &Value) -> Result<Value, String> {
         Value::Obj(_) if as_big(recv).is_some() => {
             ("scala.math.BigInt".to_string(), "BigInt".to_string(), false)
         }
+        Value::Obj(_) if as_dec(recv).is_some() => (
+            "scala.math.BigDecimal".to_string(),
+            "BigDecimal".to_string(),
+            false,
+        ),
         // A built-in throwable knows its own fully-qualified JDK name.
         Value::Obj(_) if as_exc(recv).is_some() => {
             let n = as_exc(recv).expect("just matched").class.to_string();
+            let simple = n.rsplit('.').next().unwrap_or(&n).to_string();
+            (n, simple, false)
+        }
+        Value::Obj(_) if jvm_collection_class(recv).is_some() => {
+            let n = jvm_collection_class(recv).unwrap_or_default();
             let simple = n.rsplit('.').next().unwrap_or(&n).to_string();
             (n, simple, false)
         }
@@ -4527,13 +4682,26 @@ fn class_of(recv: &Value) -> Result<Value, String> {
             else {
                 return Err(no_such_method(recv, "getClass"));
             };
+            let class = match class.as_str() {
+                "Some" => "scala.Some".to_string(),
+                "None" => "scala.None$".to_string(),
+                "Left" => "scala.util.Left".to_string(),
+                "Right" => "scala.util.Right".to_string(),
+                _ => class,
+            };
+            let bare = if is_object && !class.ends_with('$') {
+                format!("{class}$")
+            } else {
+                class.clone()
+            };
+            let class = jvm_qualified(&class);
             // A companion object is already stored under its `Pt$` name.
             let n = if is_object && !class.ends_with('$') {
                 format!("{class}$")
             } else {
                 class
             };
-            let simple = n.rsplit('.').next().unwrap_or(&n).to_string();
+            let simple = bare.rsplit('.').next().unwrap_or(&bare).to_string();
             (n.clone(), simple, false)
         }
         _ => return Err(no_such_method(recv, "getClass")),
@@ -4650,6 +4818,11 @@ fn obj_to_string(v: &Value) -> String {
         let h = h.borrow();
         match h.get(id as usize) {
             Some(HeapVal::Record(o)) => {
+                if &*o.class == ENUM_CLASS {
+                    if let Some((_, n)) = o.fields.iter().find(|(f, _)| &**f == "name") {
+                        return scala_str(n);
+                    }
+                }
                 // `java.lang.Class.toString` is `class <name>` for a reference
                 // type and the bare name for a primitive (`int`, `void`).
                 if &*o.class == CLASS_CLASS {
@@ -4726,12 +4899,14 @@ fn obj_to_string(v: &Value) -> String {
             // A `LazyList` shows what it has FORCED and says the rest is not
             // computed — printing one must not force it, which is the whole
             // difference between this collection and every other.
+            Some(HeapVal::Lazy(l)) if l.iter => "<iterator>".to_string(),
             Some(HeapVal::Lazy(l)) => {
                 let mut parts: Vec<String> = l.forced.iter().map(scala_str).collect();
                 if !l.done {
                     parts.push("<not computed>".to_string());
                 }
-                format!("LazyList({})", parts.join(", "))
+                let label = if l.stream { "Stream" } else { "LazyList" };
+                format!("{label}({})", parts.join(", "))
             }
             Some(HeapVal::Seq(SeqKind::Iterator, _)) => "<iterator>".to_string(),
             // A view does not show its contents: `List(1,2,3).view` is
@@ -4742,6 +4917,12 @@ fn obj_to_string(v: &Value) -> String {
             }
             Some(HeapVal::Seq(kind, items)) => {
                 let inner = items.iter().map(scala_str).collect::<Vec<_>>().join(", ");
+                // A set of `Enumeration` values is the enumeration's `ValueSet`.
+                if let (SeqKind::Set(HashRep::Sorted), Some(first)) = (kind, items.first()) {
+                    if let Some(owner) = enum_field(first, "enum") {
+                        return format!("{}.ValueSet({inner})", owner.as_str_cow());
+                    }
+                }
                 format!("{}({inner})", kind.label())
             }
             Some(HeapVal::Map(rep, entries)) => {
@@ -4775,6 +4956,7 @@ fn obj_to_string(v: &Value) -> String {
             // element (`List('a')` is `List(a)`).
             Some(HeapVal::Char(c)) => c.to_string(),
             Some(HeapVal::BigInt(b)) => b.to_string(),
+            Some(HeapVal::BigDec(d)) => d.render(),
             // A boxed `var` is compiler-internal — every access goes through
             // `CELL_GET`/`CELL_SET`, so a cell handle never reaches user code.
             // Rendering the value it holds keeps a diagnostic dump readable.
@@ -4957,6 +5139,7 @@ fn scala_hash(v: &Value) -> Option<i32> {
                 // is — so a `Char` and its `Int` code point hash alike.
                 HeapVal::Char(c) => Some(c as u32 as i32),
                 HeapVal::BigInt(b) => Some(big_hash(&b)),
+                HeapVal::BigDec(d) => Some(dec_hash(&d)),
                 HeapVal::Tuple(items) => product_hash(&format!("Tuple{}", items.len()), &items),
                 HeapVal::Record(o) if o.is_case => {
                     let n = ctor_arity(&o.class, o.fields.len());
@@ -5396,6 +5579,9 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
 
 /// Structural equality of two field values (recurses into nested objects).
 fn value_eq(a: &Value, b: &Value) -> bool {
+    if let Some((x, y)) = dec_pair(a, b) {
+        return x.compare(&y) == Ordering::Equal;
+    }
     // `BigInt(3) == 3` — a `BigInt` equals any integral value of its value.
     if let Some((x, y)) = big_pair(a, b) {
         return x == y;
@@ -6216,6 +6402,50 @@ fn b_extracted(vm: &mut VM, _argc: u8) -> Value {
     }
 }
 
+/// A user type's JVM name: its declared name behind the chain of enclosing
+/// `object`/`class` names (`T$O$In` for `In` inside `object O` inside
+/// `object T`).
+fn jvm_qualified(class: &str) -> String {
+    TYPES.with(|t| {
+        t.borrow()
+            .get(class)
+            .map_or_else(|| class.to_string(), |i| format!("{}{class}", i.jvm_prefix))
+    })
+}
+
+/// The JVM class a value has once boxed to `Any` — what `getClass.getName`
+/// answers on an `Any`-typed receiver, and what a `MatchError` reports.
+fn boxed_class_name(v: &Value) -> String {
+    match v {
+        Value::Int(_) => "java.lang.Integer".to_string(),
+        Value::Float(_) => "java.lang.Double".to_string(),
+        Value::Status(_) => "java.lang.Float".to_string(),
+        Value::Bool(_) => "java.lang.Boolean".to_string(),
+        Value::Str(_) => "java.lang.String".to_string(),
+        Value::Obj(_) if as_char(v).is_some() => "java.lang.Character".to_string(),
+        Value::Obj(_) if as_big(v).is_some() => "scala.math.BigInt".to_string(),
+        Value::Obj(_) if as_dec(v).is_some() => "scala.math.BigDecimal".to_string(),
+        Value::Obj(_) => {
+            if let Some(n) = jvm_collection_class(v) {
+                return n;
+            }
+            if let Some(e) = as_exc(v) {
+                return e.class.to_string();
+            }
+            match with_obj(v, |o| (o.class.to_string(), o.is_object)) {
+                Some((c, _)) if c == "Some" => "scala.Some".to_string(),
+                Some((c, _)) if c == "None" => "scala.None$".to_string(),
+                Some((c, _)) if c == "Left" => "scala.util.Left".to_string(),
+                Some((c, _)) if c == "Right" => "scala.util.Right".to_string(),
+                Some((c, true)) if !c.ends_with('$') => format!("{}$", jvm_qualified(&c)),
+                Some((c, _)) => jvm_qualified(&c),
+                None => "scala.runtime.Null$".to_string(),
+            }
+        }
+        _ => "scala.runtime.Null$".to_string(),
+    }
+}
+
 /// `SMATCHERR` builtin: pop the unmatched scrutinee and raise `scala.MatchError`,
 /// with the boxed class name Scala reports (`java.lang.Integer`, …).
 fn b_matcherr(vm: &mut VM, _argc: u8) -> Value {
@@ -6226,14 +6456,7 @@ fn b_matcherr(vm: &mut VM, _argc: u8) -> Value {
     if unwinding() {
         return Value::Undef;
     }
-    let class = match &v {
-        Value::Int(_) => "java.lang.Integer",
-        Value::Float(_) => "java.lang.Double",
-        Value::Status(_) => "java.lang.Float",
-        Value::Bool(_) => "java.lang.Boolean",
-        Value::Str(_) => "java.lang.String",
-        _ => "scala.runtime.Null$",
-    };
+    let class = boxed_class_name(&v);
     fault(
         vm,
         format!("scala.MatchError: {} (of class {class})", scala_str(&v)),
@@ -6308,6 +6531,7 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Float" => matches!(v, Value::Status(_)),
         "Boolean" => matches!(v, Value::Bool(_)),
         "BigInt" => as_big(v).is_some(),
+        "BigDecimal" => as_dec(v).is_some(),
         "Any" | "AnyRef" | "AnyVal" | "Object" => true,
         // The sequence shapes a sequence pattern (`case List(a, b) =>`) and the
         // cons pattern (`case h :: t =>`) test against. `Seq`/`Iterable` accept
@@ -7334,6 +7558,7 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 HeapVal::Lazy(_) => 10,
                 // A `BigInt` is answered by `big_method`, like a `Char`.
                 HeapVal::BigInt(_) => 11,
+                HeapVal::BigDec(_) => 12,
             })
         })
     } else {
@@ -7346,6 +7571,12 @@ fn heap_kind(v: &Value) -> Option<u8> {
 fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     if let Some(b) = as_big(recv) {
         return big_method(&b, name, args);
+    }
+    if let Some(d) = as_dec(recv) {
+        return dec_method(&d, name, args);
+    }
+    if name == "getClass" && args.is_empty() {
+        return class_of(recv);
     }
     if name == "toString" && args.is_empty() {
         return Ok(Value::str(scala_str_vm(vm, recv)));
@@ -7379,6 +7610,20 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
     if keyed {
         if let Some(r) = keyed_user_method(vm, recv, name, args) {
             return r;
+        }
+    }
+    // A `ValueSet`'s `zipWithIndex` is a plain `Set` of pairs: the pair has no
+    // `Ordering`, which the sorted-set override would need.
+    if name == "zipWithIndex" && args.is_empty() {
+        if let Some((SeqKind::Set(HashRep::Sorted), items)) = seq_kind_items(recv) {
+            if items.first().is_some_and(|f| enum_id(f).is_some()) {
+                let pairs = items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| new_pair(v, Value::int(i as i64)))
+                    .collect();
+                return Ok(new_set(HashRep::Small, pairs));
+            }
         }
     }
     match heap_kind(recv) {
@@ -9900,6 +10145,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
 ///
 /// The integral accumulator wraps, for the reason given on [`seq_sum`].
 fn seq_product(items: &[Value]) -> Value {
+    if items.iter().any(|v| as_dec(v).is_some()) {
+        if let Some(xs) = items.iter().map(dec_operand).collect::<Option<Vec<_>>>() {
+            return make_dec(xs.iter().fold(BigDec::from_int(1), |acc, x| acc.mul(x)));
+        }
+    }
     if items.iter().any(|v| as_big(v).is_some()) {
         if let Some(xs) = items.iter().map(big_operand).collect::<Option<Vec<_>>>() {
             return make_big(xs.into_iter().product());
@@ -10413,6 +10663,9 @@ fn truthy(v: &Value) -> bool {
 /// (`Ordering.Tuple2`). Any other pairing compares equal, which leaves the sort
 /// — stable in both languages — holding the input order.
 fn value_cmp(a: &Value, b: &Value) -> Ordering {
+    if let Some((x, y)) = dec_pair(a, b) {
+        return x.compare(&y);
+    }
     if let Some((x, y)) = big_pair(a, b) {
         return x.cmp(&y);
     }
@@ -10431,6 +10684,10 @@ fn value_cmp(a: &Value, b: &Value) -> Ordering {
         // of the same characters does.
         (Value::Obj(_), Value::Obj(_)) if as_char(a).is_some() && as_char(b).is_some() => {
             as_char(a).cmp(&as_char(b))
+        }
+        // `Enumeration` values order by `id`.
+        (Value::Obj(_), Value::Obj(_)) if enum_id(a).is_some() && enum_id(b).is_some() => {
+            enum_id(a).cmp(&enum_id(b))
         }
         (Value::Obj(_), Value::Obj(_)) => match (as_seq_or_tuple(a), as_seq_or_tuple(b)) {
             (Some(xs), Some(ys)) => xs
@@ -11071,6 +11328,12 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
 /// case; a `List[Int]` is narrowed to 32 bits by `member_width` on the compiler
 /// side, so both widths overflow where Scala does.
 fn seq_sum(items: &[Value]) -> Value {
+    // A `List[BigDecimal]` sums with `BigDecimal.+`.
+    if items.iter().any(|v| as_dec(v).is_some()) {
+        if let Some(xs) = items.iter().map(dec_operand).collect::<Option<Vec<_>>>() {
+            return make_dec(xs.iter().fold(BigDec::from_int(0), |acc, x| acc.add(x)));
+        }
+    }
     // A `List[BigInt]` sums exactly.
     if items.iter().any(|v| as_big(v).is_some()) {
         if let Some(xs) = items.iter().map(big_operand).collect::<Option<Vec<_>>>() {
@@ -11787,6 +12050,7 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         }
         ("java.String", "valueOf", 1) => Ok(Value::str(scala_str(&args[0]))),
         ("BigInt", "apply", _) => big_apply(args),
+        ("BigDecimal", "apply" | "valueOf" | "decimal" | "exact", _) => dec_apply(args),
         // `String.join(delim, a, b, …)`, or one `Array[String]` passed to the
         // varargs parameter.
         ("java.String", "join", n) if n >= 1 => {
@@ -12648,6 +12912,9 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     }
     if let Some(b) = as_big(recv) {
         return big_method(&b, name, args);
+    }
+    if let Some(d) = as_dec(recv) {
+        return dec_method(&d, name, args);
     }
     // An `Ordering` handle is likewise not a record; `.reverse` on one must not
     // reach the sequence dispatcher, which would try to reverse a collection.
@@ -14800,6 +15067,9 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
     if unwinding() {
         return Value::Undef;
     }
+    if let Some(r) = dec_binop(NumOp::Div, &a, &b) {
+        return r.unwrap_or_else(|e| fault(vm, e));
+    }
     if let Some((x, y)) = big_pair(&a, &b) {
         return match big_div_rem(&x, &y, false) {
             Ok(v) => v,
@@ -14848,6 +15118,9 @@ fn b_mod(vm: &mut VM, _argc: u8) -> Value {
     let a = vm.stack.pop().unwrap_or(Value::Undef);
     if unwinding() {
         return Value::Undef;
+    }
+    if let Some(r) = dec_binop(NumOp::Mod, &a, &b) {
+        return r.unwrap_or_else(|e| fault(vm, e));
     }
     if let Some((x, y)) = big_pair(&a, &b) {
         return match big_div_rem(&x, &y, true) {
@@ -15324,7 +15597,34 @@ fn b_lazylist_new(vm: &mut VM, argc: u8) -> Value {
     let Some(tag) = args.pop() else {
         return new_lazy(Vec::new(), LazySrc::End);
     };
-    match &*tag.as_str_cow() {
+    let tag_text = tag.as_str_cow().into_owned();
+    // `Stream` is a `LazyList` that prints as `Stream` and has its head
+    // evaluated (`Stream.from(1)` is `Stream(1, <not computed>)`).
+    if let Some(real) = tag_text.strip_prefix("st:") {
+        let v = build_lazylist(real, args);
+        if let Some(mut l) = as_lazy(&v) {
+            l.stream = true;
+            stream_evaluate_head(&mut l);
+            set_lazy(&v, l);
+        }
+        return v;
+    }
+    // `Iterator.from` / `continually` / `iterate` are the same lazy lists,
+    // marked as iterators.
+    if let Some(real) = tag_text.strip_prefix("it:") {
+        let v = build_lazylist(real, args);
+        if let Some(mut l) = as_lazy(&v) {
+            l.iter = true;
+            set_lazy(&v, l);
+        }
+        return v;
+    }
+    build_lazylist(&tag_text, args)
+}
+
+/// The `LazyList` a factory `tag` names, built from its arguments.
+fn build_lazylist(tag: &str, args: Vec<Value>) -> Value {
+    match tag {
         // `LazyList.from(n[, step])` — the integers upward (or by `step`).
         "from" => new_lazy(
             Vec::new(),
@@ -15341,6 +15641,52 @@ fn b_lazylist_new(vm: &mut VM, argc: u8) -> Value {
                 f: args.get(1).cloned().unwrap_or(Value::Undef),
             },
         ),
+        // `LazyList.range(a, b[, step])` — the integers from `a` stepping toward
+        // `b`, exclusive.
+        "range" => {
+            let start = args.first().map(Value::to_int).unwrap_or(0);
+            let end = args.get(1).map(Value::to_int).unwrap_or(0);
+            let step = args.get(2).map(Value::to_int).unwrap_or(1);
+            let n = if step == 0 {
+                0
+            } else {
+                let span = (end - start) / step;
+                let exact = (end - start) % step == 0;
+                (if exact { span } else { span + 1 }).max(0) as usize
+            };
+            let ints = new_lazy(Vec::new(), LazySrc::Ints { next: start, step });
+            new_lazy(Vec::new(), LazySrc::Take { src: ints, n })
+        }
+        // `LazyList.tabulate(n)(f)` — `f(0)` … `f(n - 1)`.
+        "tabulate" => {
+            let n = args.first().map(Value::to_int).unwrap_or(0).max(0) as usize;
+            let ints = new_lazy(Vec::new(), LazySrc::Ints { next: 0, step: 1 });
+            let mapped = new_lazy(
+                Vec::new(),
+                LazySrc::Map {
+                    src: ints,
+                    f: args.get(1).cloned().unwrap_or(Value::Undef),
+                },
+            );
+            new_lazy(Vec::new(), LazySrc::Take { src: mapped, n })
+        }
+        "fill" => {
+            let n = args.first().map(Value::to_int).unwrap_or(0).max(0) as usize;
+            let rep = new_lazy(
+                Vec::new(),
+                LazySrc::Rep {
+                    v: args.get(1).cloned().unwrap_or(Value::Undef),
+                },
+            );
+            new_lazy(Vec::new(), LazySrc::Take { src: rep, n })
+        }
+        "unfold" => new_lazy(
+            Vec::new(),
+            LazySrc::Unfold {
+                state: args.first().cloned().unwrap_or(Value::Undef),
+                f: args.get(1).cloned().unwrap_or(Value::Undef),
+            },
+        ),
         "continually" => new_lazy(
             Vec::new(),
             LazySrc::Rep {
@@ -15351,7 +15697,17 @@ fn b_lazylist_new(vm: &mut VM, argc: u8) -> Value {
         // but a fresh literal is still UNFORCED — the reference prints
         // `LazyList(<not computed>)` for one — so they are a rule rather than
         // a prefix.
-        _ => new_lazy(Vec::new(), LazySrc::Elems { items: args, at: 0 }),
+        _ => {
+            let empty = args.is_empty();
+            let list = new_lazy(Vec::new(), LazySrc::Elems { items: args, at: 0 });
+            if empty {
+                if let Some(mut l) = as_lazy(&list) {
+                    l.done = true;
+                    set_lazy(&list, l);
+                }
+            }
+            list
+        }
     }
 }
 
@@ -15369,6 +15725,52 @@ fn b_lazy_cons(vm: &mut VM, _argc: u8) -> Value {
 /// a new rule over this one, which is what keeps them usable on an infinite
 /// source.
 fn lazy_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let source = as_lazy(recv)?;
+    if source.iter {
+        match (name, args.len()) {
+            ("hasNext", 0) => {
+                let got = lazy_force(vm, recv, source.cursor);
+                return Some(got.map(|g| Value::bool(g.len() > source.cursor)));
+            }
+            ("next", 0) => {
+                let got = match lazy_force(vm, recv, source.cursor) {
+                    Ok(g) => g,
+                    Err(e) => return Some(Err(e)),
+                };
+                let Some(v) = got.get(source.cursor).cloned() else {
+                    return Some(Err(
+                        "scalars: java.util.NoSuchElementException: next on empty iterator"
+                            .to_string(),
+                    ));
+                };
+                if let Some(mut l) = as_lazy(recv) {
+                    l.cursor += 1;
+                    set_lazy(recv, l);
+                }
+                return Some(Ok(v));
+            }
+            _ => {}
+        }
+    }
+    let result = lazy_method_inner(vm, recv, name, args);
+    // A lazily derived collection of an iterator is an iterator.
+    if source.iter {
+        if let Some(Ok(v)) = &result {
+            if let Some(mut l) = as_lazy(v) {
+                l.iter = true;
+                set_lazy(v, l);
+            }
+        }
+    }
+    result
+}
+
+fn lazy_method_inner(
     vm: &mut VM,
     recv: &Value,
     name: &str,
@@ -15414,14 +15816,24 @@ fn lazy_method(
             )))
         }
         // `tail` is the same list one element along, and is itself lazy.
+        // A tail of a list whose head is already forced is the SAME node the
+        // reference holds, so what was forced shows in it.
         ("tail", 0) => {
-            return Some(Ok(new_lazy(
+            let mut tail = new_lazy(
                 Vec::new(),
                 LazySrc::Drop {
                     src: recv.clone(),
                     n: 1,
                 },
-            )))
+            );
+            if let Some(mut l) = as_lazy(&tail) {
+                if let Some(src) = as_lazy(recv) {
+                    l.forced = src.forced.iter().skip(1).cloned().collect();
+                    l.done = src.done;
+                }
+                set_lazy(&tail, l);
+            }
+            return Some(Ok(std::mem::replace(&mut tail, Value::Undef)));
         }
         ("drop", 1) => {
             let n = args[0].to_int().max(0) as usize;
@@ -15431,6 +15843,125 @@ fn lazy_method(
                     src: recv.clone(),
                     n,
                 },
+            )));
+        }
+        ("take", 1) => {
+            let n = args[0].to_int().max(0) as usize;
+            if n == 0 {
+                return Some(Ok(new_lazy(Vec::new(), LazySrc::End)));
+            }
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Take {
+                    src: recv.clone(),
+                    n,
+                },
+            )));
+        }
+        ("slice", 2) => {
+            let from = args[0].to_int().max(0) as usize;
+            let until = args[1].to_int().max(0) as usize;
+            let dropped = new_lazy(
+                Vec::new(),
+                LazySrc::Drop {
+                    src: recv.clone(),
+                    n: from,
+                },
+            );
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Take {
+                    src: dropped,
+                    n: until.saturating_sub(from),
+                },
+            )));
+        }
+        ("dropWhile", 1) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::DropWhile {
+                    src: recv.clone(),
+                    p: args[0].clone(),
+                    from: None,
+                },
+            )))
+        }
+        ("flatMap", 1) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::FlatMap {
+                    src: recv.clone(),
+                    f: args[0].clone(),
+                    at: 0,
+                    inner: Vec::new(),
+                    ipos: 0,
+                },
+            )))
+        }
+        ("zipWithIndex", 0) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::ZipIdx { src: recv.clone() },
+            )))
+        }
+        ("scanLeft", 2) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Scan {
+                    src: recv.clone(),
+                    z: args[0].clone(),
+                    f: args[1].clone(),
+                },
+            )))
+        }
+        ("collect", 1) => {
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Collect {
+                    src: recv.clone(),
+                    pf: args[0].clone(),
+                    at: 0,
+                },
+            )))
+        }
+        ("++" | "lazyAppendedAll" | "appendedAll" | "concat", 1) => {
+            let b = lazy_operand(&args[0]);
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Concat { a: recv.clone(), b },
+            )));
+        }
+        ("#:::" | "prependedAll", 1) => {
+            let a = lazy_operand(&args[0]);
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Concat { a, b: recv.clone() },
+            )));
+        }
+        ("appended" | ":+", 1) => {
+            let b = new_lazy(
+                Vec::new(),
+                LazySrc::Elems {
+                    items: args.to_vec(),
+                    at: 0,
+                },
+            );
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Concat { a: recv.clone(), b },
+            )));
+        }
+        ("prepended" | "+:", 1) => {
+            let a = new_lazy(
+                Vec::new(),
+                LazySrc::Elems {
+                    items: args.to_vec(),
+                    at: 0,
+                },
+            );
+            return Some(Ok(new_lazy(
+                Vec::new(),
+                LazySrc::Concat { a, b: recv.clone() },
             )));
         }
         _ => {}
@@ -15491,6 +16022,68 @@ fn lazy_method(
                 lazy_all(vm, recv)?;
                 Some(recv.clone())
             }
+            // Searches stop at the first answer, so they terminate on an
+            // infinite source that has one.
+            ("find", 1) => {
+                let mut k = 0usize;
+                loop {
+                    let got = lazy_force(vm, recv, k)?;
+                    let Some(v) = got.get(k) else {
+                        break Some(make_none());
+                    };
+                    if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(v))?) {
+                        break Some(make_some(v.clone()));
+                    }
+                    k += 1;
+                }
+            }
+            ("exists" | "forall", 1) => {
+                let want = name == "exists";
+                let mut k = 0usize;
+                loop {
+                    let got = lazy_force(vm, recv, k)?;
+                    let Some(v) = got.get(k) else {
+                        break Some(Value::bool(!want));
+                    };
+                    if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(v))?) == want {
+                        break Some(Value::bool(want));
+                    }
+                    k += 1;
+                }
+            }
+            ("contains", 1) => {
+                let mut k = 0usize;
+                loop {
+                    let got = lazy_force(vm, recv, k)?;
+                    let Some(v) = got.get(k) else {
+                        break Some(Value::bool(false));
+                    };
+                    if obj_eq(v, &args[0]) {
+                        break Some(Value::bool(true));
+                    }
+                    k += 1;
+                }
+            }
+            // Everything else is a strict operation over the whole list (the
+            // list is finite or the force reports). The identity members are
+            // answered by the ordinary dispatch.
+            _ if !matches!(
+                name,
+                "toString" | "hashCode" | "equals" | "==" | "!=" | "eq" | "ne" | "getClass"
+            ) =>
+            {
+                let all = new_list(lazy_all(vm, recv)?);
+                let out = heap_method(vm, &all, name, args)?;
+                // What the strict computation answers as a `List` is, on a
+                // `LazyList`, another (unevaluated) `LazyList`.
+                Some(
+                    if matches!(name, "toList" | "toSeq" | "to" | "toBuffer" | "toStream") {
+                        out
+                    } else {
+                        relazify(&out)
+                    },
+                )
+            }
             _ => None,
         })
     })();
@@ -15499,6 +16092,78 @@ fn lazy_method(
         Ok(None) => None,
         Err(e) => Some(Err(e)),
     }
+}
+
+/// A `List` a strict computation answered, as the unevaluated `LazyList` the
+/// same operation answers on a `LazyList` — also inside the pair or the list of
+/// lists that `partition`/`splitAt`/`grouped`/`tails` answer.
+fn relazify(v: &Value) -> Value {
+    let Value::Obj(id) = v else { return v.clone() };
+    enum Shape {
+        List(Vec<Value>),
+        Nested(Vec<Value>),
+        Other,
+    }
+    let shape = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::Seq(SeqKind::List | SeqKind::Iterator, items)) => {
+            if items
+                .iter()
+                .all(|i| matches!(seq_kind(i), Some(SeqKind::List)))
+                && !items.is_empty()
+            {
+                Shape::Nested(items.clone())
+            } else {
+                Shape::List(items.clone())
+            }
+        }
+        Some(HeapVal::Tuple(items))
+            if items
+                .iter()
+                .all(|i| matches!(seq_kind(i), Some(SeqKind::List))) =>
+        {
+            Shape::Nested(items.clone())
+        }
+        _ => Shape::Other,
+    });
+    let wrap = |items: Vec<Value>| {
+        let empty = items.is_empty();
+        let list = new_lazy(Vec::new(), LazySrc::Elems { items, at: 0 });
+        if empty {
+            if let Some(mut l) = as_lazy(&list) {
+                l.done = true;
+                set_lazy(&list, l);
+            }
+        }
+        list
+    };
+    match shape {
+        Shape::List(items) => wrap(items),
+        Shape::Nested(inner) => {
+            let lazies: Vec<Value> = inner
+                .iter()
+                .map(|i| wrap(as_seq(i).unwrap_or_default()))
+                .collect();
+            let outer = HEAP.with(|h| match h.borrow().get(*id as usize) {
+                Some(HeapVal::Seq(kind, _)) => Some(*kind),
+                _ => None,
+            });
+            match outer {
+                Some(kind) => heap_push(HeapVal::Seq(kind, lazies)),
+                None => heap_push(HeapVal::Tuple(lazies)),
+            }
+        }
+        Shape::Other => v.clone(),
+    }
+}
+
+/// An operand of a lazy concatenation as a `LazyList`: a `LazyList` stays one,
+/// any other collection becomes a literal one.
+fn lazy_operand(v: &Value) -> Value {
+    if as_lazy(v).is_some() {
+        return v.clone();
+    }
+    let items = as_iterable_once(v).unwrap_or_default();
+    new_lazy(Vec::new(), LazySrc::Elems { items, at: 0 })
 }
 
 /// Force a `LazyList` to the end and answer every element. Only meaningful for
@@ -15530,7 +16195,14 @@ fn as_lazy(v: &Value) -> Option<LazyList> {
 /// Allocate a `LazyList` with the given prefix and rule.
 fn new_lazy(forced: Vec<Value>, src: LazySrc) -> Value {
     let done = matches!(src, LazySrc::End);
-    heap_push(HeapVal::Lazy(LazyList { forced, src, done }))
+    heap_push(HeapVal::Lazy(LazyList {
+        forced,
+        src,
+        done,
+        iter: false,
+        cursor: 0,
+        stream: false,
+    }))
 }
 
 /// Write a `LazyList` handle's state back — how memoisation is recorded.
@@ -15586,6 +16258,27 @@ fn lazy_force(vm: &mut VM, list: &Value, k: usize) -> Result<Vec<Value>, String>
             LazySrc::Rep { v } => {
                 l.forced.push(v.clone());
                 set_lazy(list, l);
+            }
+            LazySrc::Unfold { state, f } => {
+                let step = invoke_closure(vm, &f, std::slice::from_ref(&state))?;
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                match as_option(&step) {
+                    Some(Some(pair)) => {
+                        let items = as_tuple_items(&pair).unwrap_or_default();
+                        match items.as_slice() {
+                            [elem, next] => {
+                                l2.forced.push(elem.clone());
+                                l2.src = LazySrc::Unfold {
+                                    state: next.clone(),
+                                    f,
+                                };
+                            }
+                            _ => l2.done = true,
+                        }
+                    }
+                    _ => l2.done = true,
+                }
+                set_lazy(list, l2);
             }
             LazySrc::Iter { seed, f } => {
                 let next = match l.forced.last() {
@@ -15692,6 +16385,179 @@ fn lazy_force(vm: &mut VM, list: &Value, k: usize) -> Result<Vec<Value>, String>
                     }
                 }
             }
+            LazySrc::Concat { a, b } => {
+                let i = l.forced.len();
+                let got = lazy_force(vm, &a, i)?;
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                match got.get(i) {
+                    Some(v) => l2.forced.push(v.clone()),
+                    None => l2.src = LazySrc::Cont { list: b, base: i },
+                }
+                set_lazy(list, l2);
+            }
+            LazySrc::Take { src, n } => {
+                let i = l.forced.len();
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                if i >= n {
+                    l2.done = true;
+                } else {
+                    let got = lazy_force(vm, &src, i)?;
+                    match got.get(i) {
+                        Some(v) => {
+                            l2 = as_lazy(list).unwrap_or(l2);
+                            l2.forced.push(v.clone());
+                            l2.done = l2.forced.len() >= n;
+                        }
+                        None => l2.done = true,
+                    }
+                }
+                set_lazy(list, l2);
+            }
+            LazySrc::FlatMap {
+                src,
+                f,
+                at,
+                inner,
+                ipos,
+            } => {
+                if let Some(v) = inner.get(ipos) {
+                    let mut l2 = l;
+                    l2.forced.push(v.clone());
+                    l2.src = LazySrc::FlatMap {
+                        src,
+                        f,
+                        at,
+                        inner,
+                        ipos: ipos + 1,
+                    };
+                    set_lazy(list, l2);
+                } else {
+                    let got = lazy_force(vm, &src, at)?;
+                    match got.get(at) {
+                        Some(v) => {
+                            let r = invoke_closure(vm, &f, std::slice::from_ref(v))?;
+                            let inner = match as_lazy(&r) {
+                                Some(_) => lazy_all(vm, &r)?,
+                                None => as_iterable_once(&r).ok_or_else(|| {
+                                    "scalars: flatMap function must return a collection".to_string()
+                                })?,
+                            };
+                            let mut l2 = as_lazy(list).unwrap_or(l);
+                            l2.src = LazySrc::FlatMap {
+                                src,
+                                f,
+                                at: at + 1,
+                                inner,
+                                ipos: 0,
+                            };
+                            set_lazy(list, l2);
+                        }
+                        None => {
+                            let mut l2 = l;
+                            l2.done = true;
+                            set_lazy(list, l2);
+                        }
+                    }
+                }
+            }
+            LazySrc::ZipIdx { src } => {
+                let i = l.forced.len();
+                let got = lazy_force(vm, &src, i)?;
+                let mut l2 = as_lazy(list).unwrap_or(l);
+                match got.get(i) {
+                    Some(v) => l2.forced.push(new_pair(v.clone(), Value::int(i as i64))),
+                    None => l2.done = true,
+                }
+                set_lazy(list, l2);
+            }
+            LazySrc::Scan { src, z, f } => {
+                let i = l.forced.len();
+                if i == 0 {
+                    let mut l2 = l;
+                    l2.forced.push(z);
+                    set_lazy(list, l2);
+                } else {
+                    let got = lazy_force(vm, &src, i - 1)?;
+                    match got.get(i - 1) {
+                        Some(v) => {
+                            let prev = l.forced[i - 1].clone();
+                            let next = invoke_closure(vm, &f, &[prev, v.clone()])?;
+                            let mut l2 = as_lazy(list).unwrap_or(l);
+                            l2.forced.push(next);
+                            set_lazy(list, l2);
+                        }
+                        None => {
+                            let mut l2 = l;
+                            l2.done = true;
+                            set_lazy(list, l2);
+                        }
+                    }
+                }
+            }
+            LazySrc::DropWhile { src, p, from } => {
+                match from {
+                    Some(start) => {
+                        let i = l.forced.len() + start;
+                        let got = lazy_force(vm, &src, i)?;
+                        let mut l2 = as_lazy(list).unwrap_or(l);
+                        match got.get(i) {
+                            Some(v) => l2.forced.push(v.clone()),
+                            None => l2.done = true,
+                        }
+                        set_lazy(list, l2);
+                    }
+                    None => {
+                        // Scan for the first element failing `p`.
+                        let mut k = 0usize;
+                        loop {
+                            let got = lazy_force(vm, &src, k)?;
+                            match got.get(k) {
+                                Some(v) => {
+                                    let hit = invoke_closure(vm, &p, std::slice::from_ref(v))?;
+                                    if !truthy(&hit) {
+                                        break;
+                                    }
+                                    k += 1;
+                                }
+                                None => break,
+                            }
+                        }
+                        let mut l2 = as_lazy(list).unwrap_or(l);
+                        l2.src = LazySrc::DropWhile {
+                            src,
+                            p,
+                            from: Some(k),
+                        };
+                        set_lazy(list, l2);
+                    }
+                }
+            }
+            LazySrc::Collect { src, pf, at } => {
+                let got = lazy_force(vm, &src, at)?;
+                match got.get(at) {
+                    Some(v) => {
+                        let mut next = None;
+                        if is_defined_at(vm, &pf, v)? {
+                            next = Some(invoke_closure(vm, &pf, std::slice::from_ref(v))?);
+                        }
+                        let mut l2 = as_lazy(list).unwrap_or(l);
+                        if let Some(x) = next {
+                            l2.forced.push(x);
+                        }
+                        l2.src = LazySrc::Collect {
+                            src,
+                            pf,
+                            at: at + 1,
+                        };
+                        set_lazy(list, l2);
+                    }
+                    None => {
+                        let mut l2 = l;
+                        l2.done = true;
+                        set_lazy(list, l2);
+                    }
+                }
+            }
             LazySrc::Zip { a, b } => {
                 let i = l.forced.len();
                 let ga = lazy_force(vm, &a, i)?;
@@ -15718,6 +16584,13 @@ pub struct LazyList {
     /// Set once the source is known to be finished, so a finite list stops
     /// rather than re-asking a spent rule.
     done: bool,
+    /// An unbounded `Iterator` (`Iterator.from`, `continually`, `iterate`) is
+    /// this same lazy machinery, told apart so it prints as `<iterator>` and
+    /// answers `next`/`hasNext` off `cursor`.
+    iter: bool,
+    cursor: usize,
+    /// Created through the `Stream` companion: prints as `Stream`.
+    stream: bool,
 }
 
 /// How a `LazyList` produces the element after its forced prefix.
@@ -15734,6 +16607,9 @@ enum LazySrc {
     Iter { seed: Value, f: Value },
     /// `LazyList.continually(v)` — the same element forever.
     Rep { v: Value },
+    /// `unfold(init)(f)` — `f(state)` answers `Some((element, next state))` or
+    /// `None` to stop.
+    Unfold { state: Value, f: Value },
     /// The continuation is behind a zero-argument thunk not yet run. This is
     /// what makes `a #:: rest` lazy in `rest`, and so what lets a `LazyList`
     /// refer to ITSELF (`val fibs = 0 #:: 1 #:: fibs.zip(fibs.tail)…`): by the
@@ -15754,6 +16630,33 @@ enum LazySrc {
     /// `src.takeWhile(p)` — the source's elements up to the first that fails
     /// `p`, each tested only when it is asked for.
     TakeWhile { src: Value, p: Value },
+    /// `a ++ b` / `a #::: b` — `a`'s elements, then `b`'s. Once `a` is known to
+    /// be finished the rule becomes a [`LazySrc::Cont`] over `b`.
+    Concat { a: Value, b: Value },
+    /// `src.take(n)` — the first `n` elements, each asked for only on demand.
+    Take { src: Value, n: usize },
+    /// `src.flatMap(f)` — `inner` is the collection `f` last returned, `ipos`
+    /// how much of it has been emitted and `at` the next source element.
+    FlatMap {
+        src: Value,
+        f: Value,
+        at: usize,
+        inner: Vec<Value>,
+        ipos: usize,
+    },
+    /// `src.zipWithIndex` — `(src(k), k)`.
+    ZipIdx { src: Value },
+    /// `src.scanLeft(z)(f)` — `z`, then the running accumulation.
+    Scan { src: Value, z: Value, f: Value },
+    /// `src.dropWhile(p)` — the source from its first element failing `p`.
+    DropWhile {
+        src: Value,
+        p: Value,
+        from: Option<usize>,
+    },
+    /// `src.collect(pf)` — the source scanned from `at` for the next element
+    /// `pf` is defined at.
+    Collect { src: Value, pf: Value, at: usize },
     /// A literal `LazyList(1, 2, 3)`. The elements are known, but they are
     /// still produced one at a time: Scala prints `LazyList(<not computed>)`
     /// for a fresh one, so even a literal starts unforced.
@@ -15844,6 +16747,12 @@ fn conv_to_type(v: Value, ty: &str) -> Value {
         "BigInt" | "scala.math.BigInt" | "math.BigInt" => {
             return match (&v, as_big(&v)) {
                 (Value::Int(n), None) => make_big(BigInt::from(*n)),
+                _ => v,
+            };
+        }
+        "BigDecimal" | "scala.math.BigDecimal" | "math.BigDecimal" => {
+            return match &v {
+                Value::Int(_) | Value::Float(_) => dec_operand(&v).map_or(v, make_dec),
                 _ => v,
             };
         }
@@ -16263,6 +17172,23 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     if let Some(r) = big_binop(op, a, b) {
         return r;
     }
+    // A `BigDecimal` on either side.
+    if let Some(r) = dec_binop(op, a, b) {
+        return r;
+    }
+    // Two `Enumeration` values order by `id`.
+    if let (Some(x), Some(y)) = (enum_id(a), enum_id(b)) {
+        let hit = match op {
+            NumOp::Lt => Some(x < y),
+            NumOp::Gt => Some(x > y),
+            NumOp::Le => Some(x <= y),
+            NumOp::Ge => Some(x >= y),
+            _ => None,
+        };
+        if let Some(h) = hit {
+            return Ok(Value::bool(h));
+        }
+    }
     // A `Char` operand. `Char` is a heap handle, so every operation on one
     // reaches this hook; it is numeric in all of them (`'a' + 1 == 98`) except
     // `+` against a `String`. Answered before the arms below, which would
@@ -16501,5 +17427,417 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             "scalars: unary `-` is not defined for `{}`",
             scala_str(a)
         )),
+    }
+}
+
+// ── scala.Enumeration ────────────────────────────────────────────────────────
+
+/// Builtin id for creating one `Enumeration` value. The stack holds the owning
+/// object's name, the id and the name; `argc` is 3. The value is also recorded
+/// under its owner, in creation order, so `values` can answer it.
+pub const ENUM_NEW: u16 = 797;
+/// Builtin id for the members `object E extends Enumeration` inherits. The
+/// stack holds the operation tag, the owner's name and its argument; `argc` is 3.
+pub const ENUM_OP: u16 = 798;
+
+/// The class tag of an `Enumeration` value. It carries `id`, `name` and `enum`
+/// (the owning object) as fields.
+const ENUM_CLASS: &str = "scala.Enumeration$Val";
+
+thread_local! {
+    /// Every `Enumeration` value created so far, by owning object.
+    static ENUMS: RefCell<HashMap<String, Vec<Value>>> = RefCell::new(HashMap::new());
+}
+
+/// `ENUM_NEW` builtin — see [`ENUM_NEW`].
+fn b_enum_new(vm: &mut VM, _argc: u8) -> Value {
+    let name = vm.pop();
+    let id = vm.pop();
+    let owner = vm.pop();
+    let v = heap_alloc(ScalaObj {
+        class: Arc::from(ENUM_CLASS),
+        is_case: false,
+        is_object: false,
+        fields: vec![
+            (Arc::from("id"), id),
+            (Arc::from("name"), name),
+            (Arc::from("enum"), owner.clone()),
+        ],
+    });
+    ENUMS.with(|e| {
+        e.borrow_mut()
+            .entry(owner.as_str_cow().into_owned())
+            .or_default()
+            .push(v.clone())
+    });
+    v
+}
+
+/// The `id` of an `Enumeration` value, or `None` for any other value.
+fn enum_id(v: &Value) -> Option<i64> {
+    with_obj(v, |o| {
+        if &*o.class != ENUM_CLASS {
+            return None;
+        }
+        o.fields
+            .iter()
+            .find(|(n, _)| &**n == "id")
+            .map(|(_, v)| v.to_int())
+    })
+    .flatten()
+}
+
+/// An `Enumeration` value's field, by name.
+fn enum_field(v: &Value, field: &str) -> Option<Value> {
+    with_obj(v, |o| {
+        (&*o.class == ENUM_CLASS)
+            .then(|| {
+                o.fields
+                    .iter()
+                    .find(|(n, _)| &**n == field)
+                    .map(|(_, v)| v.clone())
+            })
+            .flatten()
+    })
+    .flatten()
+}
+
+/// `ENUM_OP` builtin — see [`ENUM_OP`].
+fn b_enum_op(vm: &mut VM, _argc: u8) -> Value {
+    let arg = vm.pop();
+    let owner = vm.pop().as_str_cow().into_owned();
+    let op = vm.pop().as_str_cow().into_owned();
+    let mut all: Vec<Value> = ENUMS.with(|e| e.borrow().get(&owner).cloned().unwrap_or_default());
+    all.sort_by_key(|v| enum_id(v).unwrap_or(0));
+    match op.as_str() {
+        "values" => heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), all)),
+        "maxId" => Value::int(all.iter().filter_map(enum_id).max().map_or(0, |m| m + 1)),
+        "withName" => {
+            let want = arg.as_str_cow().into_owned();
+            match all
+                .into_iter()
+                .find(|v| enum_field(v, "name").is_some_and(|n| *n.as_str_cow() == *want))
+            {
+                Some(v) => v,
+                None => fault(
+                    vm,
+                    format!(
+                        "scalars: java.util.NoSuchElementException: No value found for '{want}'"
+                    ),
+                ),
+            }
+        }
+        "apply" => {
+            let want = arg.to_int();
+            match all.into_iter().find(|v| enum_id(v) == Some(want)) {
+                Some(v) => v,
+                None => fault(
+                    vm,
+                    format!("scalars: java.util.NoSuchElementException: key not found: {want}"),
+                ),
+            }
+        }
+        _ => fault(vm, format!("scalars: unknown Enumeration member {op}")),
+    }
+}
+
+// ───────────────────────── scala.math.BigDecimal ──────────────────────────
+//
+// The arithmetic lives in [`crate::bigdec`]; this is the heap handle, the
+// operators and the members. Like `BigInt` it is a handle, so every operator on
+// one reaches [`numeric_hook`], and an integral, `Double` or `BigInt` operand on
+// the other side is widened the way Scala's implicit conversions widen it.
+
+/// A fresh `BigDecimal` handle.
+fn make_dec(d: BigDec) -> Value {
+    heap_push(HeapVal::BigDec(d))
+}
+
+/// The value of a `BigDecimal` handle.
+fn as_dec(v: &Value) -> Option<BigDec> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::BigDec(d)) => Some(d.clone()),
+        _ => None,
+    })
+}
+
+/// An operand of a `BigDecimal` operation: a `BigDecimal`, or a `BigInt`, an
+/// integral value or a `Double` widened to one (`BigDecimal.decimal`, which
+/// goes through the `Double`'s shortest rendering).
+fn dec_operand(v: &Value) -> Option<BigDec> {
+    match v {
+        Value::Int(n) => Some(BigDec::from_int(*n)),
+        Value::Float(f) => BigDec::parse(&format_double(*f)).ok(),
+        _ => as_dec(v)
+            .or_else(|| as_big(v).map(BigDec::from_int))
+            .or_else(|| char_code(v).map(BigDec::from_int)),
+    }
+}
+
+/// Both operands as `BigDecimal`s when at least one IS one.
+fn dec_pair(a: &Value, b: &Value) -> Option<(BigDec, BigDec)> {
+    if as_dec(a).is_none() && as_dec(b).is_none() {
+        return None;
+    }
+    Some((dec_operand(a)?, dec_operand(b)?))
+}
+
+/// An arithmetic fault in the form the JDK reports it.
+fn dec_fault(msg: String) -> String {
+    format!("scalars: java.lang.ArithmeticException: {msg}")
+}
+
+/// An infix operator with a `BigDecimal` on either side.
+fn dec_binop(op: NumOp, a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    if op == NumOp::Neg {
+        return as_dec(a).map(|x| Ok(make_dec(x.neg())));
+    }
+    let (x, y) = dec_pair(a, b)?;
+    Some(Ok(match op {
+        NumOp::Add => make_dec(x.add(&y)),
+        NumOp::Sub => make_dec(x.sub(&y)),
+        NumOp::Mul => make_dec(x.mul(&y)),
+        NumOp::Div => return Some(x.div(&y).map(make_dec).map_err(dec_fault)),
+        NumOp::Mod => return Some(x.rem(&y).map(make_dec).map_err(dec_fault)),
+        NumOp::Lt => Value::bool(x.compare(&y) == Ordering::Less),
+        NumOp::Gt => Value::bool(x.compare(&y) == Ordering::Greater),
+        NumOp::Le => Value::bool(x.compare(&y) != Ordering::Greater),
+        NumOp::Ge => Value::bool(x.compare(&y) != Ordering::Less),
+        NumOp::Eq => Value::bool(x.compare(&y) == Ordering::Equal),
+        NumOp::Ne => Value::bool(x.compare(&y) != Ordering::Equal),
+        NumOp::Pow | NumOp::Neg => return None,
+    }))
+}
+
+/// `BigDecimal.hashCode`: a whole value hashes as its `BigInt`, any other as
+/// its `Double`.
+fn dec_hash(d: &BigDec) -> i32 {
+    if d.is_whole() {
+        big_hash(&d.to_bigint())
+    } else {
+        double_hash(d.to_f64())
+    }
+}
+
+/// The rounding mode a `setScale`/`round` argument names.
+fn dec_mode(v: Option<&Value>) -> Result<Round, String> {
+    match v {
+        None => Ok(Round::Unnecessary),
+        Some(v) => Round::parse(&scala_str(v))
+            .ok_or_else(|| format!("scalars: BigDecimal: no rounding mode {}", scala_str(v))),
+    }
+}
+
+/// `BigDecimal(x)` / `BigDecimal.apply` / `valueOf` / `decimal` / `exact`.
+fn dec_apply(args: &[Value]) -> Result<Value, String> {
+    match args {
+        [Value::Str(s)] => BigDec::parse(s).map(make_dec).map_err(|_| {
+            format!(
+                "scalars: java.lang.NumberFormatException: {}",
+                number_format_text(s)
+            )
+        }),
+        [v] => dec_operand(v)
+            .map(make_dec)
+            .ok_or_else(|| format!("scalars: BigDecimal.apply cannot take {}", scala_str(v))),
+        [v, _scale_or_mc] => dec_operand(v)
+            .map(make_dec)
+            .ok_or_else(|| format!("scalars: BigDecimal.apply cannot take {}", scala_str(v))),
+        _ => Err("scalars: BigDecimal.apply takes one argument".into()),
+    }
+}
+
+/// The text of the `NumberFormatException` `new BigDecimal(s)` raises.
+fn number_format_text(s: &str) -> String {
+    match s.chars().find(|c| !c.is_ascii_digit() && !"+-.eE".contains(*c)) {
+        Some(c) => format!(
+            "Character {c} is neither a decimal digit number, decimal point, nor \"e\" notation exponential mark."
+        ),
+        None if s.is_empty() => "Index 0 out of bounds for length 0".to_string(),
+        None => "Character array is missing \"exponent\" mark 'e' or 'E'.".to_string(),
+    }
+}
+
+/// `BigDecimal`'s members.
+fn dec_method(d: &BigDec, name: &str, args: &[Value]) -> Result<Value, String> {
+    let other = |k: usize| -> Result<BigDec, String> {
+        dec_operand(&args[k])
+            .ok_or_else(|| format!("scalars: BigDecimal.{name} expects a numeric argument"))
+    };
+    match (name, args.len()) {
+        ("toString", 0) => Ok(Value::str(d.render())),
+        ("hashCode" | "##", 0) => Ok(Value::int(i64::from(dec_hash(d)))),
+        ("equals" | "==", 1) => Ok(Value::bool(
+            dec_operand(&args[0]).is_some_and(|o| d.compare(&o) == Ordering::Equal),
+        )),
+        ("!=", 1) => Ok(Value::bool(
+            dec_operand(&args[0]).map_or(true, |o| d.compare(&o) != Ordering::Equal),
+        )),
+        ("+", 1) => Ok(make_dec(d.add(&other(0)?))),
+        ("-", 1) => Ok(make_dec(d.sub(&other(0)?))),
+        ("*", 1) => Ok(make_dec(d.mul(&other(0)?))),
+        ("/", 1) => d.div(&other(0)?).map(make_dec).map_err(dec_fault),
+        ("%" | "remainder", 1) => d.rem(&other(0)?).map(make_dec).map_err(dec_fault),
+        ("<", 1) => Ok(Value::bool(d.compare(&other(0)?) == Ordering::Less)),
+        (">", 1) => Ok(Value::bool(d.compare(&other(0)?) == Ordering::Greater)),
+        ("<=", 1) => Ok(Value::bool(d.compare(&other(0)?) != Ordering::Greater)),
+        (">=", 1) => Ok(Value::bool(d.compare(&other(0)?) != Ordering::Less)),
+        ("compare" | "compareTo", 1) => Ok(Value::int(match d.compare(&other(0)?) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        })),
+        ("max", 1) => {
+            let o = other(0)?;
+            Ok(make_dec(if d.compare(&o) == Ordering::Less {
+                o
+            } else {
+                d.clone()
+            }))
+        }
+        ("min", 1) => {
+            let o = other(0)?;
+            Ok(make_dec(if d.compare(&o) == Ordering::Greater {
+                o
+            } else {
+                d.clone()
+            }))
+        }
+        ("abs", 0) => Ok(make_dec(d.abs())),
+        ("unary_-" | "negate", 0) => Ok(make_dec(d.neg())),
+        ("signum", 0) => Ok(Value::int(i64::from(d.signum()))),
+        ("scale", 0) => Ok(Value::int(i64::from(d.scale))),
+        ("precision", 0) => Ok(Value::int(d.precision() as i64)),
+        ("unscaledValue", 0) => Ok(make_big(d.unscaled.clone())),
+        ("isWhole", 0) => Ok(Value::bool(d.is_whole())),
+        ("pow", 1) => {
+            let n = args[0].to_int();
+            if n < 0 {
+                return Err(dec_fault("Invalid operation".to_string()));
+            }
+            Ok(make_dec(d.pow(n as u32)))
+        }
+        ("setScale", 1 | 2) => {
+            let mode = dec_mode(args.get(1))?;
+            d.set_scale(args[0].to_int() as i32, mode)
+                .map(make_dec)
+                .map_err(dec_fault)
+        }
+        ("toBigInt" | "toBigInteger", 0) => Ok(make_big(d.to_bigint())),
+        ("toInt" | "intValue", 0) => Ok(Value::int(i64::from(d.to_i64_lossy() as i32))),
+        ("toLong" | "longValue", 0) => Ok(Value::int(d.to_i64_lossy())),
+        ("toDouble" | "doubleValue", 0) => Ok(Value::float(d.to_f64())),
+        ("floor", 0) => d
+            .set_scale(0, Round::Floor)
+            .map(make_dec)
+            .map_err(dec_fault),
+        ("ceil", 0) => d
+            .set_scale(0, Round::Ceiling)
+            .map(make_dec)
+            .map_err(dec_fault),
+        ("rounded" | "round", 0..=1) => Ok(make_dec(d.clone())),
+        _ => Err(format!(
+            "scalars: value {name} is not a member of BigDecimal"
+        )),
+    }
+}
+
+// ── asInstanceOf ─────────────────────────────────────────────────────────────
+
+/// Builtin id for `x.asInstanceOf[T]`. The stack holds the value and the type
+/// name on top; `argc` is 2. Answers the value, or raises `ClassCastException`
+/// when it is one of the shapes a cast to `T` provably fails for.
+pub const AS_INSTANCE: u16 = 799;
+
+/// `AS_INSTANCE` builtin — see [`AS_INSTANCE`].
+///
+/// Only the casts whose failure is certain are checked: a `String`, a boxed
+/// primitive, a collection or a user class cast to a different one of those. A
+/// numeric value cast to another numeric type is a conversion Scala makes
+/// without failing, `null` casts to anything, and a type this runtime cannot
+/// test (a type parameter, an abstract type) is left alone.
+fn b_as_instance(vm: &mut VM, _argc: u8) -> Value {
+    let ty = vm.pop().as_str_cow().into_owned();
+    let v = vm.pop();
+    if unwinding() || matches!(v, Value::Undef) {
+        return v;
+    }
+    let base = simple_name(ty.split('[').next().unwrap_or(&ty).trim());
+    let numeric = |t: &str| {
+        matches!(
+            t,
+            "Int" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Char"
+        )
+    };
+    let value_numeric = matches!(v, Value::Int(_) | Value::Float(_) | Value::Status(_))
+        || as_char(&v).is_some()
+        || as_big(&v).is_some()
+        || as_dec(&v).is_some();
+    let testable = matches!(
+        base,
+        "String" | "Boolean" | "List" | "Vector" | "Set" | "Map"
+    ) || numeric(base)
+        || with_obj_class_known(base);
+    if !testable || value_is_type(&v, &ty) || (numeric(base) && value_numeric) {
+        return v;
+    }
+    let from = boxed_class_name(&v);
+    let to = match base {
+        "Int" => "java.lang.Integer".to_string(),
+        "Long" => "java.lang.Long".to_string(),
+        "Short" => "java.lang.Short".to_string(),
+        "Byte" => "java.lang.Byte".to_string(),
+        "Double" => "java.lang.Double".to_string(),
+        "Float" => "java.lang.Float".to_string(),
+        "Char" => "java.lang.Character".to_string(),
+        "Boolean" => "java.lang.Boolean".to_string(),
+        "String" => "java.lang.String".to_string(),
+        other => jvm_qualified(other),
+    };
+    let module = |c: &str| {
+        if c.starts_with("java.") {
+            "module java.base of loader 'bootstrap'"
+        } else {
+            "unnamed module of loader 'app'"
+        }
+    };
+    let detail = if module(&from) == module(&to) {
+        format!("{from} and {to} are in {}", module(&from))
+    } else {
+        format!("{from} is in {}; {to} is in {}", module(&from), module(&to))
+    };
+    fault(
+        vm,
+        format!("scalars: java.lang.ClassCastException: class {from} cannot be cast to class {to} ({detail})"),
+    )
+}
+
+/// Whether `name` is a type the program declared.
+fn with_obj_class_known(name: &str) -> bool {
+    TYPES.with(|t| t.borrow().contains_key(name))
+}
+
+/// Evaluate the head of a freshly built `Stream`, without a VM in hand: only
+/// the sources that need no closure call (`Stream.from`, `continually`, a
+/// literal) have one this early; the others are forced on first use.
+fn stream_evaluate_head(l: &mut LazyList) {
+    match l.src.clone() {
+        LazySrc::Ints { next, step } => {
+            l.forced.push(Value::int(next));
+            l.src = LazySrc::Ints {
+                next: next.wrapping_add(step),
+                step,
+            };
+        }
+        LazySrc::Rep { v } => l.forced.push(v),
+        LazySrc::Elems { items, at } => match items.get(at) {
+            Some(v) => {
+                l.forced.push(v.clone());
+                l.src = LazySrc::Elems { items, at: at + 1 };
+            }
+            None => l.done = true,
+        },
+        _ => {}
     }
 }

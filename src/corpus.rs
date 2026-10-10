@@ -1354,7 +1354,7 @@ pub const CORPUS: &[Entry] = &[
     (
         "getClass",
         "Sequence Methods",
-        "The receiver's runtime class, answering `getName` and `getSimpleName`. Modeled for the receivers whose JVM class can be named faithfully — `String`, the primitives, a user `class`/`case class`/`object`, and a throwable (the usual reason to call it). A collection's runtime class is a private implementation detail, so it stays an error rather than a plausible-looking guess.",
+        "The receiver's runtime class, answering `getName` and `getSimpleName`. Modeled for the receivers whose JVM class can be named faithfully — `String`, the primitives, a user `class`/`case class`/`object`, and a throwable (the usual reason to call it). A collection, option or tuple answers the reference's representation class (`scala.collection.immutable.$colon$colon`, `Vector1`, `Map$Map2`, `scala.Tuple2$mcII$sp`); a class declared inside an object carries the enclosing names (`T$O$In`). A function, an `Array`, an `Iterator` or a `Range` stays an error rather than a plausible-looking guess.",
         "x.getClass: Class[_]\ntry { 1 / 0 } catch { case e: Throwable => println(e.getClass.getSimpleName) }   // => ArithmeticException",
     ),
     (

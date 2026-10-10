@@ -72,6 +72,10 @@ struct Parser {
     extensions: Vec<(String, String, String)>,
     /// Implicit conversions — see [`Program::conversions`].
     conversions: Vec<Conversion>,
+    /// The enclosing `object`/`class` names while a body is parsed.
+    type_path: Vec<String>,
+    /// See [`Program::jvm_prefixes`].
+    jvm_prefixes: HashMap<String, String>,
     /// How many anonymous `given`s have been named so far. A `given` need not
     /// be named by the program (`given Int = 5`), but it still has to be a
     /// binding for a call site to reference, so one is synthesized.
@@ -105,6 +109,8 @@ impl Parser {
             implicits: Vec::new(),
             extensions: Vec::new(),
             conversions: Vec::new(),
+            type_path: Vec::new(),
+            jvm_prefixes: HashMap::new(),
             givens: 0,
             anon_classes: 0,
             enums,
@@ -415,7 +421,11 @@ impl Parser {
         Ok(Program {
             object_name,
             main: top_stmts,
-            functions: std::mem::take(&mut self.funcs),
+            functions: {
+                let mut fs = std::mem::take(&mut self.funcs);
+                split_overloads(&mut fs);
+                fs
+            },
             classes: std::mem::take(&mut self.classes),
             objects: std::mem::take(&mut self.objects),
             imports: std::mem::take(&mut self.imports),
@@ -423,6 +433,7 @@ impl Parser {
             implicits: std::mem::take(&mut self.implicits),
             extensions: std::mem::take(&mut self.extensions),
             conversions: std::mem::take(&mut self.conversions),
+            jvm_prefixes: std::mem::take(&mut self.jvm_prefixes),
         })
     }
 
@@ -478,6 +489,18 @@ impl Parser {
     /// the program entry if it `extends App` or declares `def main`, otherwise a
     /// singleton declaration.
     fn object_decl(&mut self, is_case: bool) -> Result<TopObject, String> {
+        let enclosing = match self.toks.get(self.pos + 1).map(|t| &t.kind) {
+            Some(Tok::Ident(n)) => Some(n.clone()),
+            _ => None,
+        };
+        let depth = self.type_path.len();
+        self.type_path.extend(enclosing);
+        let r = self.object_decl_inner(is_case);
+        self.type_path.truncate(depth);
+        r
+    }
+
+    fn object_decl_inner(&mut self, is_case: bool) -> Result<TopObject, String> {
         self.eat(&Tok::Object)?;
         let name = self.ident()?;
         // `extends Parent with Trait …`. `App` selects the run-the-body entry
@@ -558,6 +581,31 @@ impl Parser {
             body.extend(main);
             Ok(TopObject::Entry(name, body))
         } else {
+            // A singleton's `lazy val` is a memoizing method (see
+            // [`Self::lazy_member`]), so it initializes on first read rather
+            // than with the object.
+            let mut defs = defs;
+            split_overloads(&mut defs);
+            let body = if parents.iter().any(|p| p == "Enumeration") {
+                let (stmts, members) = enumeration_members(&name, body);
+                defs.extend(members);
+                stmts
+            } else {
+                body
+            };
+            let mut prelude = Vec::new();
+            let mut kept = Vec::new();
+            for st in body {
+                match Self::lazy_member(&st, false) {
+                    Some((pre, f)) => {
+                        prelude.extend(pre);
+                        defs.push(f);
+                    }
+                    None => kept.push(st),
+                }
+            }
+            prelude.extend(kept);
+            let body = prelude;
             Ok(TopObject::Singleton(ObjectDecl {
                 name,
                 is_case,
@@ -670,6 +718,77 @@ impl Parser {
         })
     }
 
+    /// A member `lazy val z: T = e` as the memoizing zero-argument method the
+    /// reference compiles it to: a flag and a value slot (the returned prelude,
+    /// declared ahead of every initializer so an early read still finds them)
+    /// and `def z = { if (!flag) { value = e; flag = true }; value }`. Unlike the
+    /// statement-level lazy cell, a member is reached through its object, so the
+    /// initializer must run on first READ and see the fields as they are then.
+    fn lazy_member(stmt: &Stmt, lazy_modifier: bool) -> Option<(Vec<Stmt>, Func)> {
+        let StmtKind::Local {
+            is_lazy,
+            is_val: true,
+            ty,
+            name,
+            init: Some(init),
+        } = &stmt.kind
+        else {
+            return None;
+        };
+        if !*is_lazy && !lazy_modifier {
+            return None;
+        }
+        let line = stmt.line;
+        let (flag, slot) = (format!("{name}$lzf"), format!("{name}$lzv"));
+        let mk = |kind: StmtKind| Stmt { line, kind };
+        let prelude = vec![
+            mk(StmtKind::Local {
+                is_val: false,
+                is_lazy: false,
+                ty: Some("Boolean".to_string()),
+                name: flag.clone(),
+                init: Some(Expr::Bool(false)),
+            }),
+            mk(StmtKind::Local {
+                is_val: false,
+                is_lazy: false,
+                ty: ty.clone(),
+                name: slot.clone(),
+                init: None,
+            }),
+        ];
+        let force = mk(StmtKind::If {
+            cond: Expr::Unary {
+                op: UnOp::Not,
+                rhs: Box::new(Expr::Var(flag.clone())),
+            },
+            then: vec![
+                mk(StmtKind::Assign {
+                    name: slot.clone(),
+                    op: AssignOp::Assign,
+                    value: init.clone(),
+                }),
+                mk(StmtKind::Assign {
+                    name: flag,
+                    op: AssignOp::Assign,
+                    value: Expr::Bool(true),
+                }),
+            ],
+            els: Vec::new(),
+        });
+        let func = Func {
+            name: name.clone(),
+            params: Vec::new(),
+            sig: Vec::new(),
+            type_params: Vec::new(),
+            ret_ty: ty.clone(),
+            captured: 0,
+            body: vec![force, mk(StmtKind::Expr(Expr::Var(slot)))],
+            is_abstract: false,
+        };
+        Some((prelude, func))
+    }
+
     /// A class or trait body, when the cursor is on its `{` (empty otherwise):
     /// `def`s become methods, `val`/`var`s fields plus constructor statements,
     /// anything else a constructor side-effect statement. Answers the body,
@@ -680,15 +799,18 @@ impl Parser {
         is_trait: bool,
         params: &[String],
     ) -> Result<ClassBody, String> {
+        let depth = self.type_path.len();
+        self.type_path.push(name.to_string());
         let outer_aliases = self.type_aliases.clone();
         let mut body = Vec::new();
         let mut methods = Vec::new();
+        let mut lazy_prelude: Vec<Stmt> = Vec::new();
         let mut field_names = params.to_vec();
         if self.is(&Tok::LBrace) {
             self.advance();
             self.skip_seps();
             while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-                self.skip_member_modifiers();
+                let lazy = self.skip_member_modifiers();
                 if self.is(&Tok::Def) && matches!(self.peek_at(1), Tok::Ident(w) if w == "this") {
                     let line = self.line();
                     let aux = self.parse_def()?;
@@ -697,6 +819,17 @@ impl Parser {
                     methods.push(self.parse_def()?);
                 } else {
                     let st = self.statement()?;
+                    if let Some((pre, f)) = Self::lazy_member(&st, lazy) {
+                        for p in &pre {
+                            if let StmtKind::Local { name, .. } = &p.kind {
+                                field_names.push(name.clone());
+                            }
+                        }
+                        lazy_prelude.extend(pre);
+                        methods.push(f);
+                        self.skip_seps();
+                        continue;
+                    }
                     match &st.kind {
                         // An initializer-less `val` in a trait is an abstract
                         // member: it names a field the mixing class must supply,
@@ -716,9 +849,12 @@ impl Parser {
             }
             self.eat(&Tok::RBrace)?;
         }
+        lazy_prelude.extend(body);
         self.type_aliases = outer_aliases;
+        split_overloads(&mut methods);
+        self.type_path.truncate(depth);
         Ok(ClassBody {
-            body,
+            body: lazy_prelude,
             methods,
             field_names,
         })
@@ -821,6 +957,12 @@ impl Parser {
                 // into the type string, so the leading `=>` is the marker.
                 by_name = self.is(&Tok::FatArrow);
                 pty = Some(self.type_ref()?);
+                // `xs: Int*` — a repeated parameter; the star stays on the
+                // recorded type so the constructor call can pack its arguments.
+                if self.is(&Tok::Star) {
+                    self.advance();
+                    pty = pty.map(|t| format!("{t}*"));
+                }
             }
             out.param_tys.push(pty);
             out.param_by_name.push(by_name);
@@ -1656,6 +1798,15 @@ impl Parser {
         Ok(())
     }
 
+    /// Record the enclosing-type chain of a declared type (see
+    /// [`Program::jvm_prefixes`]).
+    fn note_jvm_prefix(&mut self, name: &str) {
+        if !self.type_path.is_empty() {
+            let prefix = format!("{}$", self.type_path.join("$"));
+            self.jvm_prefixes.insert(name.to_string(), prefix);
+        }
+    }
+
     /// File a `class`/`trait` declaration, refusing a name already declared.
     ///
     /// Scala distinguishes same-named types by SCOPE: `def a() = { case class
@@ -1675,6 +1826,7 @@ impl Parser {
                 c.name
             ));
         }
+        self.note_jvm_prefix(&c.name);
         self.classes.push(c);
         Ok(())
     }
@@ -1700,6 +1852,7 @@ impl Parser {
                 o.name
             ));
         }
+        self.note_jvm_prefix(&o.name);
         self.objects.push(o);
         Ok(())
     }
@@ -2717,6 +2870,18 @@ impl Parser {
             if self.is(&Tok::If) {
                 self.advance();
                 out.push(ForEnum::Guard(self.expression()?));
+            } else if self.at_for_pattern_def() {
+                // `(a, b) = e` — a destructuring value definition.
+                let pat = self.pattern()?;
+                self.eat(&Tok::Assign)?;
+                out.push(ForEnum::ValPat {
+                    pat,
+                    value: self.expression()?,
+                });
+                while self.is(&Tok::If) {
+                    self.advance();
+                    out.push(ForEnum::Guard(self.expression()?));
+                }
             } else if self.at_for_value_def() {
                 // `y = e` (Scala also accepts the `val y = e` spelling) — a value
                 // definition, in scope for every later enumerator and the body.
@@ -2756,6 +2921,31 @@ impl Parser {
             }
         }
         Ok(out)
+    }
+
+    /// Whether the enumerator at the cursor is a destructuring value definition:
+    /// a parenthesised pattern whose closing `)` is followed by a bare `=`.
+    fn at_for_pattern_def(&self) -> bool {
+        if !self.is(&Tok::LParen) {
+            return false;
+        }
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match t.kind {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(self.toks.get(i + 1).map(|t| &t.kind), Some(Tok::Assign));
+                    }
+                }
+                Tok::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Whether the enumerator at the cursor is a value definition (`y = e`,
@@ -2798,7 +2988,11 @@ impl Parser {
         if filtering {
             self.advance();
         }
-        let pat = if filtering || self.is(&Tok::LParen) {
+        // `Some(x) <- …` / `x: Int <- …` — a constructor or typed pattern, which
+        // Scala 3 accepts (without filtering) when it cannot narrow the source.
+        let structured = matches!(self.peek(), Tok::Ident(_))
+            && matches!(self.peek_at(1), Tok::LParen | Tok::Colon | Tok::Dot);
+        let pat = if filtering || structured || self.is(&Tok::LParen) {
             self.pattern()?
         } else {
             Pattern::Bind(self.ident()?)
@@ -4002,6 +4196,16 @@ impl Parser {
             self.advance();
             name = self.ident()?;
         }
+        // `new Outer.Inner(…)` — a type declared inside an `object`/`class`
+        // lives in the one flat type namespace, so the qualifier names where it
+        // was written and nothing else.
+        while self.is(&Tok::Dot)
+            && name.chars().next().is_some_and(char::is_uppercase)
+            && matches!(self.peek_at(1), Tok::Ident(n) if n.chars().next().is_some_and(char::is_uppercase))
+        {
+            self.advance();
+            name = self.ident()?;
+        }
         // `new Array[T](n)` is the one `new` whose type argument is
         // load-bearing: it picks the zero value the array is filled with.
         let mut elem_ty = None;
@@ -4520,6 +4724,7 @@ impl Parser {
                 }
             }
             Tok::Ident(name) => {
+                let quoted = self.toks[self.pos].quoted;
                 self.advance();
                 // `case Color.Red =>` / `case Shape.Circle(r) =>` — an enum case
                 // qualified by its enum is the bare case (see `enum_decl`).
@@ -4537,6 +4742,18 @@ impl Parser {
                     }
                     _ => name,
                 };
+                // `case Outer.Inner(x)` / `case Outer.Obj =>` — a member of an
+                // object, which the flat namespace holds under its own name.
+                let mut name = name;
+                let mut qualifier: Option<String> = None;
+                while self.is(&Tok::Dot)
+                    && name.chars().next().is_some_and(char::is_uppercase)
+                    && matches!(self.peek_at(1), Tok::Ident(n) if n.chars().next().is_some_and(char::is_uppercase))
+                {
+                    self.advance();
+                    qualifier = Some(name);
+                    name = self.ident()?;
+                }
                 // `Foo(sub, …)` — a constructor/extractor pattern.
                 if self.is(&Tok::LParen) {
                     self.advance();
@@ -4589,6 +4806,17 @@ impl Parser {
                         return Ok(Pattern::Rest(None));
                     }
                     Ok(Pattern::Wildcard)
+                } else if let Some(owner) = qualifier {
+                    // `Color.Red` — a member of an object, compared by `==`.
+                    Ok(Pattern::Literal(Expr::Method {
+                        recv: Box::new(Expr::Var(owner)),
+                        name,
+                        args: Vec::new(),
+                        line: self.line(),
+                    }))
+                } else if quoted {
+                    // `` `n` `` — compare against the value of `n`.
+                    Ok(Pattern::Stable(name))
                 } else if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                     // A capitalized bare identifier is a stable-identifier
                     // pattern (`case None =>`), matched by `==`, not a binding.
@@ -5400,4 +5628,256 @@ fn typed_lambda(params: Vec<(String, Option<String>)>, body: Expr, line: u32) ->
         body: Box::new(body),
         partial: false,
     }
+}
+
+/// Same-name, same-arity overloads that differ only in parameter TYPE — `def
+/// apply(s: String)` next to `def apply(i: Int)`.
+///
+/// Subroutines here are keyed by name and arity, so each such overload is
+/// renamed `name$ov<k>` and a dispatcher takes the original name: a `match` on
+/// the tuple of the arguments whose arms test the declared parameter types, so
+/// the overload chosen is the one the arguments' run-time types select. Arms
+/// whose types are the least specific (`Any`, a type parameter) come last, as
+/// overload resolution prefers the most specific applicable method; a value no
+/// arm names (an `Int` handed to a lone `Double` overload) falls to the last
+/// arm, which is where numeric widening would have sent it.
+pub(crate) fn split_overloads(methods: &mut Vec<Func>) {
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    for m in methods.iter().filter(|m| !m.is_abstract) {
+        let key = (m.name.clone(), m.params.len());
+        if methods
+            .iter()
+            .filter(|o| !o.is_abstract && o.name == key.0 && o.params.len() == key.1)
+            .count()
+            > 1
+            && !groups.contains(&key)
+        {
+            groups.push(key);
+        }
+    }
+    for (name, arity) in groups {
+        let is_member = |m: &Func| !m.is_abstract && m.name == name && m.params.len() == arity;
+        let mut variants: Vec<Func> = Vec::new();
+        let mut rest: Vec<Func> = Vec::new();
+        for m in std::mem::take(methods) {
+            if is_member(&m) {
+                variants.push(m);
+            } else {
+                rest.push(m);
+            }
+        }
+        let general = |m: &Func| {
+            m.sig.iter().any(|p| {
+                p.ty.as_deref().map_or(true, |t| {
+                    let base = t.split('[').next().unwrap_or(t).trim();
+                    base == "Any"
+                        || base == "AnyRef"
+                        || (base.len() == 1 && base.chars().all(|c| c.is_ascii_uppercase()))
+                        || m.type_params.iter().any(|tp| tp == base)
+                })
+            })
+        };
+        let mut order: Vec<usize> = (0..variants.len()).collect();
+        order.sort_by_key(|&i| general(&variants[i]));
+        let line = 0;
+        let mut arms = Vec::new();
+        for (k, &i) in order.iter().enumerate() {
+            let v = &variants[i];
+            let pats: Vec<Pattern> = v
+                .sig
+                .iter()
+                .map(|p| match p.ty.as_deref() {
+                    Some(t) => Pattern::Typed {
+                        name: "_".to_string(),
+                        ty: t.to_string(),
+                    },
+                    None => Pattern::Wildcard,
+                })
+                .collect();
+            let pat = if k + 1 == order.len() {
+                Pattern::Wildcard
+            } else if pats.len() == 1 {
+                pats.into_iter().next().unwrap_or(Pattern::Wildcard)
+            } else {
+                Pattern::Tuple(pats)
+            };
+            arms.push(MatchArm {
+                pat,
+                guard: None,
+                body: vec![Stmt {
+                    line,
+                    kind: StmtKind::Expr(Expr::Call {
+                        name: format!("{name}$ov{i}"),
+                        args: variants[order[0]]
+                            .params
+                            .iter()
+                            .cloned()
+                            .map(Expr::Var)
+                            .collect(),
+                        line,
+                    }),
+                }],
+            });
+        }
+        let first = &variants[order[0]];
+        let scrut = if first.params.len() == 1 {
+            Expr::Var(first.params[0].clone())
+        } else {
+            Expr::Tuple(first.params.iter().cloned().map(Expr::Var).collect())
+        };
+        let dispatcher = Func {
+            name: name.clone(),
+            params: first.params.clone(),
+            sig: first
+                .sig
+                .iter()
+                .map(|s| ParamSig {
+                    ty: None,
+                    default: None,
+                    ..s.clone()
+                })
+                .collect(),
+            type_params: Vec::new(),
+            ret_ty: None,
+            captured: 0,
+            body: vec![Stmt {
+                line,
+                kind: StmtKind::Expr(Expr::Match {
+                    scrut: Box::new(scrut),
+                    arms,
+                }),
+            }],
+            is_abstract: false,
+        };
+        // Each overload keeps its own parameter names, so the dispatcher's
+        // argument list is re-expressed per variant: the names it calls with
+        // are its own, which are positional.
+        *methods = rest;
+        for (i, mut v) in variants.into_iter().enumerate() {
+            v.name = format!("{name}$ov{i}");
+            methods.push(v);
+        }
+        methods.push(dispatcher);
+    }
+}
+
+/// The synthetic calls an `object E extends Enumeration` lowers to; the
+/// compiler maps them onto [`crate::host::ENUM_NEW`] / [`crate::host::ENUM_OP`].
+pub(crate) const ENUM_VAL_CALL: &str = "$enumval";
+pub(crate) const ENUM_OP_CALL: &str = "$enumop";
+
+/// Lower the body of `object owner extends Enumeration`.
+///
+/// Each `val A = Value`, `Value(n)`, `Value("s")` or `Value(n, "s")` becomes the
+/// creation of an enumeration value with its id and name decided here, in
+/// source order, as `Enumeration` decides them at run time: an id is the
+/// previous one plus one unless written, and the name is the one written or,
+/// failing that, the `val`'s own. `val A, B, C = Value` is one creation per
+/// name. Alongside come the inherited members `values`, `withName`, `apply`
+/// and `maxId`, as methods of the object.
+pub(crate) fn enumeration_members(owner: &str, body: Vec<Stmt>) -> (Vec<Stmt>, Vec<Func>) {
+    let mut next_id: i64 = 0;
+    let mut out = Vec::with_capacity(body.len());
+    // `(id, name)` a `Value`-shaped initializer asks for; `None` when it is not one.
+    let shape = |init: &Expr| -> Option<(Option<i64>, Option<String>)> {
+        match init {
+            Expr::Var(v) if v == "Value" => Some((None, None)),
+            Expr::Call { name, args, .. } if name == "Value" => match args.as_slice() {
+                [] => Some((None, None)),
+                [Expr::Int(n)] => Some((Some(*n), None)),
+                [Expr::Str(s)] => Some((None, Some(s.clone()))),
+                [Expr::Int(n), Expr::Str(s)] => Some((Some(*n), Some(s.clone()))),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut create = |val_name: &str, (id, name): (Option<i64>, Option<String>), line: u32| {
+        let id = id.unwrap_or(next_id);
+        next_id = id + 1;
+        Expr::Call {
+            name: ENUM_VAL_CALL.to_string(),
+            args: vec![
+                Expr::Str(owner.to_string()),
+                Expr::Int(id),
+                Expr::Str(name.unwrap_or_else(|| val_name.to_string())),
+            ],
+            line,
+        }
+    };
+    for st in body {
+        let line = st.line;
+        match st.kind {
+            StmtKind::Local {
+                is_val,
+                is_lazy,
+                ty,
+                name,
+                init: Some(init),
+            } if shape(&init).is_some() => {
+                let made = create(&name, shape(&init).unwrap_or((None, None)), line);
+                out.push(Stmt {
+                    line,
+                    kind: StmtKind::Local {
+                        is_val,
+                        is_lazy,
+                        ty,
+                        name,
+                        init: Some(made),
+                    },
+                });
+            }
+            StmtKind::Destructure {
+                pat: Pattern::Tuple(names),
+                init: Expr::Tuple(inits),
+            } if names.iter().all(|p| matches!(p, Pattern::Bind(_)))
+                && inits.iter().all(|i| shape(i).is_some()) =>
+            {
+                for (p, init) in names.iter().zip(inits.iter()) {
+                    let Pattern::Bind(n) = p else { continue };
+                    let made = create(n, shape(init).unwrap_or((None, None)), line);
+                    out.push(Stmt {
+                        line,
+                        kind: StmtKind::Local {
+                            is_val: true,
+                            is_lazy: false,
+                            ty: None,
+                            name: n.clone(),
+                            init: Some(made),
+                        },
+                    });
+                }
+            }
+            kind => out.push(Stmt { line, kind }),
+        }
+    }
+    let op = |tag: &str, arg: Expr| Expr::Call {
+        name: ENUM_OP_CALL.to_string(),
+        args: vec![
+            Expr::Str(tag.to_string()),
+            Expr::Str(owner.to_string()),
+            arg,
+        ],
+        line: 0,
+    };
+    let member = |name: &str, params: &[&str], tag: &str, arg: Expr| Func {
+        name: name.to_string(),
+        params: params.iter().map(|p| p.to_string()).collect(),
+        sig: params.iter().map(|_| ParamSig::default()).collect(),
+        type_params: Vec::new(),
+        ret_ty: None,
+        captured: 0,
+        body: vec![Stmt {
+            line: 0,
+            kind: StmtKind::Expr(op(tag, arg)),
+        }],
+        is_abstract: false,
+    };
+    let methods = vec![
+        member("values", &[], "values", Expr::Null),
+        member("maxId", &[], "maxId", Expr::Null),
+        member("withName", &["s$"], "withName", Expr::Var("s$".to_string())),
+        member("apply", &["i$"], "apply", Expr::Var("i$".to_string())),
+    ];
+    (out, methods)
 }

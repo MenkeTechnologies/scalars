@@ -3352,14 +3352,28 @@ fn getclass_names_the_receivers_class() {
 }
 
 #[test]
-fn getclass_on_a_collection_is_an_error_rather_than_a_guess() {
-    // A collection's runtime class is a private implementation detail
-    // (`$colon$colon`, `Vector1`, `Tuple2$mcII$sp`), so it fails loudly instead
-    // of answering something plausible and wrong.
-    let (out, err, ok) = run_full(&wrap("println(List(1).getClass.getName)"));
-    assert!(!ok);
-    assert_eq!(out, "");
-    assert!(err.contains("value getClass is not a member"), "{err:?}");
+fn getclass_names_the_collection_class_the_reference_uses() {
+    // The reference's representation classes are an implementation detail but a
+    // stable, observable one: `$colon$colon` for a non-empty `List`, `Vector1`
+    // up to 32 elements, `Map1`..`Map4` then `HashMap`, and the `@specialized`
+    // `Tuple2$mcII$sp` for a pair of `Int`s.
+    let (out, ok) = run(&wrap(
+        "println(List(1).getClass.getName); println(Nil.getClass.getName); \
+         println(Vector(1).getClass.getName); println(Vector[Int]().getClass.getName); \
+         println(Set(1, 2).getClass.getName); println(Set(1, 2, 3, 4, 5).getClass.getName); \
+         println(Map(1 -> 2).getClass.getName); println(Map(1 -> 2, 2 -> 3, 3 -> 4, 4 -> 5, 5 -> 6).getClass.getName); \
+         println(Some(1).getClass.getName); println(None.getClass.getName); \
+         println((1, 2).getClass.getName); println((\"a\", 1).getClass.getName); println((1, 2.0).getClass.getName)",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "scala.collection.immutable.$colon$colon\nscala.collection.immutable.Nil$\n\
+         scala.collection.immutable.Vector1\nscala.collection.immutable.Vector0$\n\
+         scala.collection.immutable.Set$Set2\nscala.collection.immutable.HashSet\n\
+         scala.collection.immutable.Map$Map1\nscala.collection.immutable.HashMap\n\
+         scala.Some\nscala.None$\nscala.Tuple2$mcII$sp\nscala.Tuple2\nscala.Tuple2$mcID$sp\n"
+    );
 }
 
 // ── An explicit `Ordering` ─────────────────────────────────────────────────
@@ -3789,25 +3803,20 @@ fn an_overload_survives_override_super_and_upcast_dispatch() {
 }
 
 #[test]
-fn an_overload_that_differs_only_in_parameter_type_is_refused() {
-    // Argument COUNT is the part of Scala's overload resolution this frontend
-    // can decide; `f(Int)` vs `f(String)` needs the argument TYPE. Both would
-    // register as `C$f$1`, so the collision is exactly the one the arity
-    // mangling removes — and the pre-fix behaviour was to run `f(Int)` for
-    // `c.f("a")` and print `int a`. Refusing says so; printing does not.
-    let (out, err, ok) = run_full(
+fn an_overload_that_differs_only_in_parameter_type_is_chosen_by_argument_type() {
+    // `f(Int)` and `f(String)` share a name and an arity, so the subroutine
+    // name cannot tell them apart; the call is dispatched on the argument's
+    // run-time type instead, and the most specific overload wins.
+    let (out, ok) = run(
         "class C {\n\
          \x20 def f(x: Int): String = \"int \" + x\n\
          \x20 def f(x: String): String = \"str \" + x\n\
+         \x20 def f(x: Any): String = \"any \" + x\n\
          }\n\
-         object T extends App { println(new C().f(1)); println(new C().f(\"a\")) }\n",
+         object T extends App { val c = new C(); println(c.f(1)); println(c.f(\"a\")); println(c.f(2.5)) }\n",
     );
-    assert!(!ok, "a type-only overload must be refused, not guessed");
-    assert_eq!(out, "", "nothing may run before the refusal");
-    assert!(
-        err.contains("declares `f` twice with 1 parameter(s)"),
-        "the diagnostic must name the colliding method, got: {err}"
-    );
+    assert!(ok);
+    assert_eq!(out, "int 1\nstr a\nany 2.5\n");
 }
 
 #[test]

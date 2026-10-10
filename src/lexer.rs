@@ -19,6 +19,9 @@ use std::fmt;
 pub struct Token {
     pub kind: Tok,
     pub line: u32,
+    /// Written in backticks (`` `x` ``). In a pattern that makes an identifier a
+    /// stable reference to the value, whatever its case.
+    pub quoted: bool,
 }
 
 /// Token kinds.
@@ -241,6 +244,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     let mut paren_depth: i32 = 0;
     // A source line break has been seen since the last emitted token.
     let mut pending_newline = false;
+    let mut quoted_next = false;
     // For the optional-braces pass: the indentation of every token that is the
     // FIRST on its source line, index-aligned with `out` (`None` for the rest).
     // A token that follows a multi-line string on the string's last line is not
@@ -264,6 +268,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 out.push(Token {
                     kind: Tok::Newline,
                     line: $line,
+                    quoted: false,
                 });
                 starts.push(None);
             }
@@ -273,7 +278,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 Tok::RParen | Tok::RBracket => paren_depth = (paren_depth - 1).max(0),
                 _ => {}
             }
-            out.push(Token { kind, line: $line });
+            out.push(Token {
+                kind,
+                line: $line,
+                quoted: std::mem::take(&mut quoted_next),
+            });
             starts.push(at_line_start.then_some(line_indent));
             at_line_start = false;
         }};
@@ -361,6 +370,20 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
+        // `` `name` `` — an identifier written in backticks: any text, never a
+        // keyword. In a pattern it is a reference to the value of that name.
+        if c == '`' {
+            let rest = &src[i + 1..];
+            let end = rest.find('`').ok_or_else(|| {
+                format!("scalars: unterminated backtick identifier on line {line}")
+            })?;
+            let word = rest[..end].to_string();
+            i += end + 2;
+            quoted_next = true;
+            push!(Tok::Ident(word), line);
+            continue;
+        }
+
         // numbers (int or float)
         if c.is_ascii_digit() {
             // Hexadecimal (`0x1F`) — the one radix Scala 3 still accepts. It
@@ -373,10 +396,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             {
                 let start = i + 2;
                 i = start;
-                while i < bytes.len() && (bytes[i] as char).is_ascii_hexdigit() {
+                while i < bytes.len()
+                    && ((bytes[i] as char).is_ascii_hexdigit() || bytes[i] == b'_')
+                {
                     i += 1;
                 }
-                let text = &src[start..i];
+                let text = src[start..i].replace('_', "");
+                let text = text.as_str();
                 let mut is_long = false;
                 if i < bytes.len() && matches!(bytes[i], b'L' | b'l') {
                     is_long = true;
@@ -398,7 +424,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             let start = i;
             let mut is_float = false;
-            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+            while i < bytes.len() && ((bytes[i] as char).is_ascii_digit() || bytes[i] == b'_') {
                 i += 1;
             }
             if i < bytes.len()
@@ -447,7 +473,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
                 i += 1;
             }
-            let text = src[start..i].trim_end_matches(|ch: char| ch.is_ascii_alphabetic());
+            let cleaned = src[start..i].replace('_', "");
+            let text = cleaned.trim_end_matches(|ch: char| ch.is_ascii_alphabetic());
             if is_float {
                 let v: f64 = text
                     .parse()
@@ -573,7 +600,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         // be one of them: answer `""` and fall through to the one-byte arm.
         let two = peek(src, i, 2);
         let three = peek(src, i, 3);
+        // `#:::` — `LazyList`'s concatenation, longest match before `#::`.
+        let four = peek(src, i, 4);
         let (kind, adv) = match three {
+            _ if four == "#:::" => (Tok::Op(four.to_string()), 4),
             // The growable-collection bulk operators. Longest match first: `++=`
             // would otherwise lex as `++` then `=`.
             "++=" | "--=" => (Tok::OpAssign(three.to_string()), 3),
@@ -655,6 +685,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     out.push(Token {
         kind: Tok::Eof,
         line,
+        quoted: false,
     });
     starts.push(None);
     Ok(optional_braces(out, &starts))
@@ -694,7 +725,11 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
     let mut stack: Vec<Open> = Vec::new();
     let mut line_indent = 0u32;
     let mut line_head: Option<Tok> = None;
-    let brace = |kind: Tok, line: u32| Token { kind, line };
+    let brace = |kind: Tok, line: u32| Token {
+        kind,
+        line,
+        quoted: false,
+    };
 
     // Emit a `}` for every region on top of the stack that `keep` rejects.
     // A separator already emitted before the current token goes AFTER the
@@ -718,6 +753,7 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
             out.push(Token {
                 kind: Tok::RBrace,
                 line,
+                quoted: false,
             });
             // A lambda body closing ends the argument it was passed as.
             if matches!(stack.last(), Some(Open::ColonArg)) {
@@ -725,6 +761,7 @@ fn optional_braces(toks: Vec<Token>, starts: &[Option<u32>]) -> Vec<Token> {
                 out.push(Token {
                     kind: Tok::RParen,
                     line,
+                    quoted: false,
                 });
             }
         }

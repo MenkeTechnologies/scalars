@@ -25,6 +25,11 @@ const RUST_COMPILE: &str = "__rust_compile";
 /// collection comprehension (materialized to a `List` via [`crate::host::RANGE_LIST`]).
 const RANGE_LIST_CALL: &str = "$range_list";
 
+/// The parameter name of the identity lambda a `for (x <- w) yield x` maps with.
+/// [`Compiler::dispatch_instance_method`] recognises it: a user-defined `map` is
+/// not called for that comprehension.
+const FOR_IDENTITY: &str = "$forid";
+
 struct Compiler {
     b: ChunkBuilder,
     /// Distinguishes synthetic `for` upper-bound locals so nested loops do not
@@ -125,6 +130,10 @@ struct Compiler {
     /// The implicit scope: `(name, declared type)` for every `implicit val` —
     /// see [`Compiler::implicit_args`].
     implicits: Vec<(String, String)>,
+    /// Where the CURRENT body's own implicit parameters begin in
+    /// [`Self::implicits`]. Scala prefers the innermost binding, so a `using`
+    /// parameter wins over a same-typed given declared outside the `def`.
+    implicit_floor: usize,
     /// Each user `def`'s type-parameter names, for the substitution
     /// [`Compiler::infer_type_args`] makes.
     func_type_params: HashMap<String, Vec<String>>,
@@ -175,6 +184,9 @@ struct Compiler {
     /// declare exactly ONE arity — which is what makes a method value's shape
     /// knowable without a type system. See [`Compiler::method_value`].
     member_arity: HashMap<String, usize>,
+    /// The declared type of each member method's FIRST parameter, by
+    /// `Owner$method` name — what an extractor's `unapply` accepts.
+    member_first_param_ty: HashMap<String, String>,
     /// Whether any declared type overrides `toString` (or `getMessage`, which a
     /// user throwable renders through). When none does, a `+`
     /// with a `String` operand keeps the raw `Op::Add` lowering it always had
@@ -298,6 +310,8 @@ struct PendingClosure {
     /// was restored, so the scope travels with it — and each local given is
     /// captured, so the name it resolves to is bound in the closure frame.
     implicits: Vec<(String, String)>,
+    /// [`Compiler::implicit_floor`] at the lambda site.
+    implicit_floor: usize,
 }
 
 /// Compile-time class shape.
@@ -322,6 +336,8 @@ struct ClassMeta {
     /// `case class` entirely, so the thunk can never escape as a member, a
     /// `toString` component or a constructor-pattern binding.
     by_name_params: Vec<String>,
+    /// The last constructor parameter is repeated (`xs: Int*`).
+    vararg: bool,
     /// Each primary-constructor parameter's DEFAULT, same order and length as
     /// the arity prefix; `None` where it has none. Spliced at the construction
     /// site by [`Compiler::adapt_ctor_args`], which is where Scala evaluates it.
@@ -643,6 +659,11 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                     .filter(|(_, by)| **by)
                     .map(|(p, _)| p.clone())
                     .collect(),
+                vararg: cd
+                    .param_tys
+                    .last()
+                    .and_then(|t| t.as_deref())
+                    .is_some_and(|t| t.ends_with('*')),
                 param_defaults: cd.param_defaults.clone(),
                 is_case: cd.is_case,
                 is_trait: cd.is_trait,
@@ -749,6 +770,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // already have — so every subroutine actually emitted is accounted for.
     let mut overloads: HashMap<String, Vec<usize>> = HashMap::new();
     let mut member_arity: HashMap<String, usize> = HashMap::new();
+    let mut member_first_param_ty: HashMap<String, String> = HashMap::new();
     let declared = classes
         .iter()
         .map(|cd| {
@@ -763,6 +785,9 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     for (owner, methods) in declared {
         let mut arities: HashMap<&str, Vec<usize>> = HashMap::new();
         for m in methods {
+            if let Some(Some(ty)) = m.sig.first().map(|p| p.ty.clone()) {
+                member_first_param_ty.insert(method_sub_name(owner, &m.name), ty);
+            }
             let seen = arities.entry(m.name.as_str()).or_default();
             // Same name AND same arity: `Owner$m$n` would collide exactly as
             // `Owner$m` did, so nothing here can tell the two apart. Scala picks
@@ -830,10 +855,12 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         method_index,
         overloads,
         member_arity,
+        member_first_param_ty,
         imports: prog.imports.clone(),
         wildcards: prog.import_wildcards.clone(),
         lazies: HashSet::new(),
         implicits: prog.implicits.clone(),
+        implicit_floor: 0,
         extensions: prog.extensions.clone(),
         conversions: prog.conversions.clone(),
         func_ret_ty: prog
@@ -891,16 +918,19 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let needs_types = classes
         .iter()
         .any(|cd| !cd.parents.is_empty() || cd.is_trait || cd.params.len() != cd.field_names.len())
-        || objects.iter().any(|o| !o.parents.is_empty());
+        || objects.iter().any(|o| !o.parents.is_empty())
+        || !prog.jvm_prefixes.is_empty();
     if needs_types {
         for cd in &classes {
             let meta = &c.classes[&cd.name];
             let (supers, arity) = (meta.supers.join(","), meta.arity);
-            c.emit_type_reg(&cd.name, &supers, arity);
+            let prefix = prog.jvm_prefixes.get(&cd.name).map_or("", String::as_str);
+            c.emit_type_reg(&cd.name, &supers, arity, prefix);
         }
         for od in &objects {
             let supers = c.objects[&od.name].supers.join(",");
-            c.emit_type_reg(&od.name, &supers, 0);
+            let prefix = prog.jvm_prefixes.get(&od.name).map_or("", String::as_str);
+            c.emit_type_reg(&od.name, &supers, 0, prefix);
         }
     }
 
@@ -1435,6 +1465,9 @@ impl Compiler {
             // `lower_for` (the counted-loop path handles integer ranges only).
             ForEnum::GenColl { .. } => {
                 unreachable!("collection generators are desugared before lower_for")
+            }
+            ForEnum::ValPat { .. } => {
+                unreachable!("a pattern definition forces the desugared form")
             }
             ForEnum::Guard(cond) => {
                 self.expr(cond)?;
@@ -1981,6 +2014,7 @@ impl Compiler {
                     widths: self.widths.clone(),
                     param_widths: self.lambda_param_widths.clone(),
                     implicits: self.implicits.clone(),
+                    implicit_floor: self.implicit_floor,
                 });
                 Some(idx)
             }
@@ -2020,6 +2054,7 @@ impl Compiler {
             widths: self.widths.clone(),
             param_widths: self.lambda_param_widths.clone(),
             implicits: self.implicits.clone(),
+            implicit_floor: self.implicit_floor,
         });
         Ok(())
     }
@@ -2071,6 +2106,7 @@ impl Compiler {
         // `var n = 0` is still known to be an `Int` here.
         let saved_widths = std::mem::replace(&mut self.widths, pc.widths);
         let saved_implicits = std::mem::replace(&mut self.implicits, pc.implicits);
+        let saved_floor = std::mem::replace(&mut self.implicit_floor, pc.implicit_floor);
         for (i, p) in pc.params.iter().enumerate() {
             self.vals.insert(p.clone(), true);
             // A parameter SHADOWS any enclosing binding of the same name. Its own
@@ -2120,6 +2156,7 @@ impl Compiler {
         self.current_object = saved_object;
         self.by_name = saved_by_name;
         self.implicits = saved_implicits;
+        self.implicit_floor = saved_floor;
         Ok(())
     }
 
@@ -2421,6 +2458,12 @@ impl Compiler {
                         || self.global_binds.contains(name);
                     if is_bound && !self.objects.contains_key(name) {
                         self.var_ref(name)?;
+                    } else if let Some(q) = (!self.objects.contains_key(name))
+                        .then(|| self.imported(name, &[], 0))
+                        .flatten()
+                    {
+                        // `import Color._` then `case Red =>`.
+                        self.expr(&q)?;
                     } else {
                         self.materialize_object(name)?;
                     }
@@ -2694,9 +2737,34 @@ impl Compiler {
                 "scalars: `_*` is only valid as the last element of a sequence pattern".to_string(),
             );
         }
+        // An extractor whose parameter is declared `String`, `Int`, … or a class
+        // only applies to a scrutinee of that type; any other value falls
+        // through to the next case rather than reaching the extractor.
+        let sub = self.sub_name(name, method, 1)?;
+        let declared = self
+            .member_first_param_ty
+            .get(&method_sub_name(name, method))
+            .cloned();
+        if let Some(ty) = declared {
+            let base = base_type(&ty);
+            if matches!(
+                base.as_str(),
+                "String"
+                    | "Int"
+                    | "Long"
+                    | "Short"
+                    | "Byte"
+                    | "Double"
+                    | "Float"
+                    | "Boolean"
+                    | "Char"
+            ) || self.classes.contains_key(&base)
+            {
+                self.emit_type_test(vplace, &base, fail_jumps);
+            }
+        }
         // `Name.unapply(scrutinee)`.
         self.emit_load(vplace);
-        let sub = self.sub_name(name, method, 1)?;
         let nidx = self.b.add_name(&sub);
         self.b.emit(Op::Call(nidx, 1), 0);
         self.obj_counter += 1;
@@ -3101,14 +3169,71 @@ impl Compiler {
     }
 
     /// The `LazyList` a factory call builds, as the synthetic constructor call
+    /// `Iterator.from(n[, step])`, `Iterator.continually(v)` and
+    /// `Iterator.iterate(seed)(f)` — the unbounded iterators: the `LazyList`
+    /// machinery under `it:`-prefixed factory tags, which mark the result as an
+    /// iterator (it renders `<iterator>` and answers `next`/`hasNext`).
+    fn iterator_factory(&self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+        let is_iterator = |e: &Expr| matches!(e, Expr::Var(n) if n == "Iterator");
+        let mk = |tag: &str, mut a: Vec<Expr>| {
+            a.push(Expr::Str(format!("it:{tag}")));
+            Some(Expr::Call {
+                name: LAZYLIST_CALL.to_string(),
+                args: a,
+                line,
+            })
+        };
+        if name == "apply" && args.len() == 1 {
+            if let Expr::Method {
+                recv: inner,
+                name: m,
+                args: first,
+                ..
+            } = recv
+            {
+                if m == "iterate" && first.len() == 1 && is_iterator(inner) {
+                    return mk("iterate", vec![first[0].clone(), args[0].clone()]);
+                }
+                if m == "unfold" && first.len() == 1 && is_iterator(inner) {
+                    return mk("unfold", vec![first[0].clone(), args[0].clone()]);
+                }
+            }
+        }
+        if !is_iterator(recv) {
+            return None;
+        }
+        match (name, args.len()) {
+            ("iterate", 2) => mk("iterate", vec![args[0].clone(), args[1].clone()]),
+            ("from", 1) => mk("from", vec![args[0].clone()]),
+            ("unfold", 2) => mk("unfold", vec![args[0].clone(), args[1].clone()]),
+            ("from", 2) => mk("from", vec![args[0].clone(), args[1].clone()]),
+            ("continually", 1) => mk("continually", vec![args[0].clone()]),
+            _ => None,
+        }
+    }
+
     /// [`LAZYLIST_CALL`] — `LazyList.from(1)`, `.iterate(seed)(f)`,
     /// `.continually(v)`, `.empty`. `None` for anything else.
     ///
     /// The tag rides as a trailing `String` argument, which is what the builtin
     /// reads to pick the rule.
     fn lazylist_factory(&self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+        // The deprecated `Stream` is the same machinery under the `st:` tag,
+        // which also makes it print as `Stream(…)` with its head evaluated.
+        let is_stream = match recv {
+            Expr::Var(n) => n == "Stream",
+            Expr::Method { recv: inner, .. } => {
+                matches!(inner.as_ref(), Expr::Var(n) if n == "Stream")
+            }
+            _ => false,
+        };
         let mk = |tag: &str, mut a: Vec<Expr>| {
-            a.push(Expr::Str(tag.to_string()));
+            let tag = if is_stream {
+                format!("st:{tag}")
+            } else {
+                tag.to_string()
+            };
+            a.push(Expr::Str(tag));
             Some(Expr::Call {
                 name: LAZYLIST_CALL.to_string(),
                 args: a,
@@ -3127,6 +3252,9 @@ impl Compiler {
                 if m == "iterate" && first.len() == 1 && is_lazylist_companion(inner) {
                     return mk("iterate", vec![first[0].clone(), args[0].clone()]);
                 }
+                if m == "unfold" && first.len() == 1 && is_lazylist_companion(inner) {
+                    return mk("unfold", vec![first[0].clone(), args[0].clone()]);
+                }
             }
         }
         if !is_lazylist_companion(recv) {
@@ -3137,9 +3265,17 @@ impl Compiler {
             // arrives as one call of two arguments.
             ("iterate", 2) => mk("iterate", vec![args[0].clone(), args[1].clone()]),
             ("from", 1) => mk("from", vec![args[0].clone()]),
+            ("unfold", 2) => mk("unfold", vec![args[0].clone(), args[1].clone()]),
             ("from", 2) => mk("from", vec![args[0].clone(), args[1].clone()]),
             ("continually", 1) => mk("continually", vec![args[0].clone()]),
             ("empty", 0) => mk("empty", Vec::new()),
+            ("range", 2) => mk("range", vec![args[0].clone(), args[1].clone()]),
+            ("range", 3) => mk(
+                "range",
+                vec![args[0].clone(), args[1].clone(), args[2].clone()],
+            ),
+            ("tabulate", 2) => mk("tabulate", vec![args[0].clone(), args[1].clone()]),
+            ("fill", 2) => mk("fill", vec![args[0].clone(), args[1].clone()]),
             ("apply", _) => mk("empty", args.to_vec()),
             _ => None,
         }
@@ -3232,6 +3368,12 @@ impl Compiler {
                 ["mutable"] | ["collection", "mutable"] | ["scala", "collection", "mutable"] => {
                     MUTABLE_MEMBERS.contains(&name)
                 }
+                // `import Color._` — a program's own object: its members, and
+                // the types declared inside it, are bare names.
+                [obj] => self
+                    .objects
+                    .get(*obj)
+                    .is_some_and(|m| m.vals.contains(name) || m.methods.contains(name)),
                 _ => false,
             };
             if !provides {
@@ -3770,13 +3912,19 @@ impl Compiler {
         // path lowers `Cfg.n` to `GetVar("Cfg.n")` — so writing it through the
         // record builtins would look for a member that was never there. Route
         // it to the same global the object's own methods write.
-        if let Expr::Var(obj) = recv {
+        if let Expr::Var(name) = recv {
+            // `Animal.count = 1` where `Animal` is a class: its companion.
+            let obj = self
+                .companions
+                .get(name)
+                .filter(|_| !self.objects.contains_key(name))
+                .unwrap_or(name)
+                .clone();
             if self
                 .objects
-                .get(obj)
+                .get(&obj)
                 .is_some_and(|m| m.vals.contains(field))
             {
-                let obj = obj.clone();
                 return self.object_val_assign(&obj, field, op, value);
             }
         }
@@ -4026,6 +4174,22 @@ impl Compiler {
             return Ok(args.to_vec());
         };
         let named_any = args.iter().any(|a| matches!(a, Expr::NamedArg { .. }));
+        // `new C(1, 2, 3)` / `C(xs: _*)` — the trailing arguments are one
+        // repeated parameter: an `ArraySeq`, or the spread sequence itself.
+        if meta.vararg && !named_any && meta.arity > 0 && args.len() >= meta.arity - 1 {
+            let fixed = meta.arity - 1;
+            let rest = &args[fixed..];
+            let packed = match spread_operand(rest) {
+                Some(e) => e,
+                None => Expr::Collection {
+                    ctor: "ArraySeq".to_string(),
+                    elems: rest.to_vec(),
+                },
+            };
+            let mut out = args[..fixed].to_vec();
+            out.push(packed);
+            return Ok(out);
+        }
         if !named_any && args.len() >= meta.arity && meta.by_name_params.is_empty() {
             return Ok(args.to_vec());
         }
@@ -4183,11 +4347,23 @@ impl Compiler {
     /// alternative is a program whose behaviour depends on declaration order.
     fn resolve_implicit(&self, ty: &str, line: u32) -> Result<Expr, String> {
         let ty = normalize_type(ty);
-        let hits: Vec<&(String, String)> = self
+        let all: Vec<(usize, &(String, String))> = self
             .implicits
             .iter()
-            .filter(|(_, t)| normalize_type(t) == ty)
+            .enumerate()
+            .filter(|(_, (_, t))| normalize_type(t) == ty)
             .collect();
+        // The innermost scope's candidates shadow the outer ones.
+        let local: Vec<&(String, String)> = all
+            .iter()
+            .filter(|(i, _)| *i >= self.implicit_floor)
+            .map(|(_, h)| *h)
+            .collect();
+        let hits: Vec<&(String, String)> = if local.is_empty() {
+            all.iter().map(|(_, h)| *h).collect()
+        } else {
+            local
+        };
         match hits.as_slice() {
             [one] => Ok(Expr::Var(one.0.clone())),
             [] => Err(format!(
@@ -4511,13 +4687,15 @@ impl Compiler {
     /// Emit one [`crate::host::TYPE_REG`] call: publish a declared type's
     /// supertype list and primary-constructor arity to the runtime. Leaves
     /// nothing on the stack.
-    fn emit_type_reg(&mut self, name: &str, supers_csv: &str, arity: usize) {
+    fn emit_type_reg(&mut self, name: &str, supers_csv: &str, arity: usize, prefix: &str) {
         let n = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(n), 0);
         let s = self.b.add_constant(Value::str(supers_csv.to_string()));
         self.b.emit(Op::LoadConst(s), 0);
         self.b.emit(Op::LoadInt(arity as i64), 0);
-        self.b.emit(Op::CallBuiltin(crate::host::TYPE_REG, 3), 0);
+        let p = self.b.add_constant(Value::str(prefix.to_string()));
+        self.b.emit(Op::LoadConst(p), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::TYPE_REG, 4), 0);
         self.b.emit(Op::Pop, 0);
     }
 
@@ -4610,6 +4788,76 @@ impl Compiler {
     /// the narrowing covers EVERY lowering path — the math builtin, the operator
     /// spellings, and the generic `SMETHOD` fallback all funnel through here.
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        // `sys.error(msg)` is `throw new RuntimeException(msg)`.
+        if args.len() == 1 && name == "error" && matches!(recv, Expr::Var(s) if s == "sys") {
+            return self.expr(&Expr::Throw {
+                value: Box::new(Expr::New {
+                    name: "RuntimeException".to_string(),
+                    args: args.to_vec(),
+                    line,
+                }),
+                line,
+            });
+        }
+        // `RoundingMode.HALF_UP` / `BigDecimal.RoundingMode.HALF_UP` — the mode is
+        // its own name, which is what `setScale` reads it back as.
+        if args.is_empty() && crate::bigdec::Round::parse(name).is_some() {
+            let is_rounding_mode = match recv {
+                Expr::Var(r) => r == "RoundingMode",
+                Expr::Method {
+                    recv: outer,
+                    name: inner,
+                    ..
+                } => {
+                    inner == "RoundingMode"
+                        && matches!(outer.as_ref(), Expr::Var(b) if b == "BigDecimal")
+                }
+                _ => false,
+            };
+            if is_rounding_mode {
+                return self.expr(&Expr::Str(name.to_string()));
+            }
+        }
+        // `Outer.Inner` — a type declared inside an `object` is in the one flat
+        // namespace, so selecting it through its enclosing object names it.
+        // Only a name the object does not itself declare as a member.
+        if let Expr::Var(o) = recv {
+            if let Some(meta) = self.objects.get(o) {
+                let member = meta.methods.contains(name) || meta.vals.contains(name);
+                let inner_type = self.classes.contains_key(name) || self.objects.contains_key(name);
+                if !member && inner_type && name.chars().next().is_some_and(char::is_uppercase) {
+                    let inner = if args.is_empty() && self.objects.contains_key(name) {
+                        Expr::Var(name.to_string())
+                    } else {
+                        Expr::Call {
+                            name: name.to_string(),
+                            args: args.to_vec(),
+                            line,
+                        }
+                    };
+                    return self.expr(&inner);
+                }
+            }
+        }
+        // `Outer.Inner.m(…)`: the receiver is itself `Outer.Inner`.
+        if let Expr::Method {
+            recv: outer,
+            name: inner,
+            args: inner_args,
+            ..
+        } = recv
+        {
+            if let Expr::Var(o) = outer.as_ref() {
+                if inner_args.is_empty()
+                    && self.objects.contains_key(o)
+                    && self.objects.contains_key(inner)
+                    && !self.objects[o].methods.contains(inner)
+                    && !self.objects[o].vals.contains(inner)
+                {
+                    return self.method(&Expr::Var(inner.clone()), name, args, line);
+                }
+            }
+        }
         // `use(3)(g)` / `use(3) { g }` — one clause of a curried `def`.
         if let Some(call) = self.uncurry(recv, name, args, line) {
             return self.expr(&call);
@@ -4661,6 +4909,9 @@ impl Compiler {
         // `LazyList` factories. `iterate` is curried (`LazyList.iterate(1)(f)`),
         // so its second clause arrives as an `apply` on the first.
         if let Some(e) = self.lazylist_factory(recv, name, args, line) {
+            return self.expr(&e);
+        }
+        if let Some(e) = self.iterator_factory(recv, name, args, line) {
             return self.expr(&e);
         }
         // An `extension` method, selected on the RECEIVER's static type. A real
@@ -4794,19 +5045,27 @@ impl Compiler {
         if name != "apply" {
             return None;
         }
-        let Expr::Call {
-            name: callee,
-            args: first,
-            ..
-        } = recv
-        else {
-            return None;
-        };
+        // `f(a)(b)(c)` is `apply` on `apply` on the call `f(a)`: fold the whole
+        // chain, so every clause of a three-clause `def` reaches its parameters.
+        fn base_call(e: &Expr) -> Option<(&String, Vec<Expr>)> {
+            match e {
+                Expr::Call { name, args, .. } => Some((name, args.clone())),
+                Expr::Method {
+                    recv, name, args, ..
+                } if name == "apply" => {
+                    let (callee, mut all) = base_call(recv)?;
+                    all.extend(args.iter().cloned());
+                    Some((callee, all))
+                }
+                _ => None,
+            }
+        }
+        let (callee, first) = base_call(recv)?;
         let arity = *self.func_arity.get(callee)?;
         if first.len() >= arity || first.len() + args.len() != arity {
             return None;
         }
-        let mut all = first.clone();
+        let mut all = first;
         all.extend_from_slice(args);
         Some(Expr::Call {
             name: callee.clone(),
@@ -4955,7 +5214,13 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(crate::host::SISTYPE, 2), line);
                 return Ok(());
             }
-            ("asInstanceOf", [Expr::Str(_)]) => return self.expr(recv),
+            ("asInstanceOf", [ty @ Expr::Str(_)]) => {
+                self.expr(recv)?;
+                self.expr(ty)?;
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::AS_INSTANCE, 2), line);
+                return Ok(());
+            }
             _ => {}
         }
         if let Expr::Var(obj) = recv {
@@ -5276,6 +5541,14 @@ impl Compiler {
             self.b.emit(Op::NumEq, line);
             let jf = self.b.emit(Op::JumpIfFalse(0), line);
             self.emit_load(t);
+            if name == "map"
+                && matches!(args, [Expr::Lambda { params, .. }] if params.len() == 1 && params[0] == FOR_IDENTITY)
+            {
+                end_jumps.push(self.b.emit(Op::Jump(0), line));
+                let next = self.b.current_pos();
+                self.b.patch_jump(jf, next);
+                continue;
+            }
             for a in args {
                 self.expr(a)?;
             }
@@ -5911,9 +6184,14 @@ impl Compiler {
         // argument here rather than an erased annotation.
         // `LazyList(1, 2, 3)` — the literal, which parses as a call on the
         // companion's name.
-        if name == "LazyList" {
+        if (name == "LazyList" || name == "Stream") && !self.classes.contains_key(name) {
             let mut a = args.to_vec();
-            a.push(Expr::Str("empty".to_string()));
+            let tag = if name == "Stream" {
+                "st:empty"
+            } else {
+                "empty"
+            };
+            a.push(Expr::Str(tag.to_string()));
             for e in &a {
                 self.expr(e)?;
             }
@@ -5921,6 +6199,18 @@ impl Compiler {
                 Op::CallBuiltin(crate::host::LAZYLIST_NEW, a.len() as u8),
                 line,
             );
+            return Ok(());
+        }
+        if name == crate::parser::ENUM_VAL_CALL || name == crate::parser::ENUM_OP_CALL {
+            for e in args {
+                self.expr(e)?;
+            }
+            let id = if name == crate::parser::ENUM_VAL_CALL {
+                crate::host::ENUM_NEW
+            } else {
+                crate::host::ENUM_OP
+            };
+            self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
             return Ok(());
         }
         if name == LAZYLIST_CALL {
@@ -6034,7 +6324,7 @@ impl Compiler {
         }
         // `BigInt(x)` / `BigInt("…")` — `scala.math.BigInt.apply`, unless the
         // program declares something of that name itself.
-        if name == "BigInt"
+        if (name == "BigInt" || name == "BigDecimal")
             && !self.classes.contains_key(name)
             && !self.func_arity.contains_key(name)
         {
@@ -6411,6 +6701,7 @@ impl Compiler {
         // it was handed, not to anything in the enclosing scope — where `A` is
         // not even known. Scoped like `widths`: pushed here, restored on exit.
         let saved_implicits = self.implicits.clone();
+        let saved_floor = std::mem::replace(&mut self.implicit_floor, self.implicits.len());
         self.push_implicit_params(&f.params, &f.sig, f.captured);
 
         let saved_ret = std::mem::replace(&mut self.ret_conv, declared_conv(f.ret_ty.as_deref()));
@@ -6428,6 +6719,7 @@ impl Compiler {
         self.widths = saved_widths;
         self.by_name = saved_by_name;
         self.implicits = saved_implicits;
+        self.implicit_floor = saved_floor;
         Ok(())
     }
 
@@ -7368,6 +7660,7 @@ fn enum_any(e: &ForEnum, pred: &impl Fn(&Expr) -> bool) -> bool {
         ForEnum::GenColl { coll, .. } => expr_any(coll, pred),
         ForEnum::Guard(c) => expr_any(c, pred),
         ForEnum::Val { value, .. } => expr_any(value, pred),
+        ForEnum::ValPat { value, .. } => expr_any(value, pred),
     }
 }
 
@@ -7629,6 +7922,17 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
                 line,
             })),
         });
+    }
+    // `Iterator.single(x)` — a one-element iterator.
+    if owner == "Iterator" && name == "single" && args.len() == 1 {
+        return Some(m(
+            Expr::Collection {
+                ctor: "List".to_string(),
+                elems: args.to_vec(),
+            },
+            "iterator",
+            Vec::new(),
+        ));
     }
     // `Range(a, b)` / `Range.inclusive(a, b)` and their stepped forms — see
     // [`range_factory`]. Answered before `factory_conversion`, which has no
@@ -8121,7 +8425,7 @@ const LAZYLIST_CALL: &str = "lazylist$";
 
 /// Whether `e` names the `LazyList` companion.
 fn is_lazylist_companion(e: &Expr) -> bool {
-    matches!(e, Expr::Var(n) if n == "LazyList")
+    matches!(e, Expr::Var(n) if n == "LazyList" || n == "Stream")
 }
 
 /// The single type argument of a `C[A]` type, or `None` when the type has none
@@ -8366,7 +8670,16 @@ fn is_ordering_module(e: &Expr) -> bool {
 fn boxed_module(e: &Expr) -> Option<String> {
     /// The Scala value-class companions, and `BigInt`'s.
     const SCALA: &[&str] = &[
-        "Int", "Long", "Short", "Byte", "Char", "Double", "Float", "Boolean", "BigInt",
+        "Int",
+        "Long",
+        "Short",
+        "Byte",
+        "Char",
+        "Double",
+        "Float",
+        "Boolean",
+        "BigInt",
+        "BigDecimal",
     ];
     /// The `java.lang` boxes, plus `String`.
     const JAVA: &[&str] = &[
@@ -8497,7 +8810,7 @@ fn local_name(s: &Stmt) -> Option<String> {
 
 /// Whether an enumerator is a collection generator (`x <- List(…)`).
 fn is_coll_gen(e: &ForEnum) -> bool {
-    matches!(e, ForEnum::GenColl { .. })
+    matches!(e, ForEnum::GenColl { .. } | ForEnum::ValPat { .. })
 }
 
 /// Desugar a `for` comprehension containing a collection generator into a
@@ -8530,22 +8843,75 @@ fn desugar_for(enums: &[ForEnum], body: &Expr, is_yield: bool) -> Expr {
         src = method(src, "withFilter", vec![lambda1(&pat, g.clone())]);
         i += 1;
     }
-    // `y = e` — Scala's own translation pairs the value onto the generator, so
-    // every enumerator to the right (and the body) sees BOTH names:
-    //   `for (x <- xs; y = e; rest)` → `for ((x, y) <- xs.map(x => (x, e)); rest)`
-    // Recursing on the rewritten list handles a run of definitions (each nests
-    // one more tuple) and a guard that reads a defined name.
-    if let Some(ForEnum::Val { name, value }) = enums.get(i) {
+    // A run of value definitions (`y = e`, `(p, q) = e`) after the generator.
+    let run_end = i + enums[i..]
+        .iter()
+        .take_while(|e| matches!(e, ForEnum::Val { .. } | ForEnum::ValPat { .. }))
+        .count();
+    if run_end > i {
+        // Followed by another generator or by the body, the definitions become
+        // local `val`s of the generator's lambda — `xs.flatMap(x => { val y =
+        // e; … })`, not a tuple threaded through an extra `map`. The reference
+        // calls `map` exactly once for `for (x <- w; y = f(x)) yield y` and
+        // `flatMap` exactly once for `for (x <- w; y = f(x); z <- g(y)) …`,
+        // which a user-defined collection observes.
+        if !matches!(enums.get(run_end), Some(ForEnum::Guard(_))) {
+            let rest = &enums[run_end..];
+            let mut stmts: Vec<Stmt> = enums[i..run_end]
+                .iter()
+                .map(|e| Stmt {
+                    line: 0,
+                    kind: match e {
+                        ForEnum::Val { name, value } => StmtKind::Local {
+                            is_val: true,
+                            is_lazy: false,
+                            ty: None,
+                            name: name.clone(),
+                            init: Some(value.clone()),
+                        },
+                        ForEnum::ValPat { pat, value } => StmtKind::Destructure {
+                            pat: pat.clone(),
+                            init: value.clone(),
+                        },
+                        _ => unreachable!("the run holds only value definitions"),
+                    },
+                })
+                .collect();
+            let tail = if rest.is_empty() {
+                body.clone()
+            } else {
+                desugar_for(rest, body, is_yield)
+            };
+            stmts.push(Stmt {
+                line: 0,
+                kind: StmtKind::Expr(tail),
+            });
+            let m = match (rest.is_empty(), is_yield) {
+                (true, true) => "map",
+                (true, false) => "foreach",
+                (false, true) => "flatMap",
+                (false, false) => "foreach",
+            };
+            return method(src, m, vec![lambda1(&pat, Expr::Block(stmts))]);
+        }
+        // A guard after the definitions reads them, so the reference pairs the
+        // value onto the generator and filters the pair:
+        //   `for (x <- xs; y = e; if g; rest)` → `for ((x, y) <- xs.map(x => (x, e)); if g; rest)`
         // The pair carries the generator's element THROUGH unchanged (read from
         // the mapping lambda's own parameter), so the rewritten generator can
-        // re-destructure it with the very same pattern — whatever shape it has.
-        let paired = Expr::Tuple(vec![gen_elem_expr(&pat), value.clone()]);
+        // re-destructure it with the very same pattern. Recursing on the
+        // rewritten list handles the next definition of a run.
+        let (alias_pat, value) = match &enums[i] {
+            ForEnum::Val { name, value } => (Pattern::Bind(name.clone()), value.clone()),
+            ForEnum::ValPat { pat, value } => (pat.clone(), value.clone()),
+            _ => unreachable!("the run holds only value definitions"),
+        };
+        let paired = Expr::Tuple(vec![gen_elem_expr(&pat), value]);
         let mut rewritten = vec![ForEnum::GenColl {
-            pat: Pattern::Tuple(vec![pat.clone(), Pattern::Bind(name.clone())]),
+            pat: Pattern::Tuple(vec![pat.clone(), alias_pat]),
             coll: method(src, "map", vec![lambda1(&pat, paired)]),
-            // The rewrite re-destructures the pair with the SAME pattern, so a
-            // refutable one has already been filtered out by the `withFilter`
-            // above and cannot fail here.
+            // A refutable pattern has already been filtered out by the
+            // `withFilter` above and cannot fail here.
             filtering: false,
         }];
         rewritten.extend_from_slice(&enums[i + 1..]);
@@ -8553,6 +8919,16 @@ fn desugar_for(enums: &[ForEnum], body: &Expr, is_yield: bool) -> Expr {
     }
     let rest = &enums[i..];
     if rest.is_empty() {
+        // `for (x <- w) yield x` is `w` itself when `w` is a user collection
+        // (the reference does not call its `map`); a built-in still maps.
+        if is_yield && matches!((&pat, body), (Pattern::Bind(n), Expr::Var(v)) if n == v) {
+            let id = Expr::Lambda {
+                params: vec![FOR_IDENTITY.to_string()],
+                body: Box::new(Expr::Var(FOR_IDENTITY.to_string())),
+                partial: false,
+            };
+            return method(src, "map", vec![id]);
+        }
         let m = if is_yield { "map" } else { "foreach" };
         method(src, m, vec![lambda1(&pat, body.clone())])
     } else {
@@ -8630,7 +9006,7 @@ fn gen_source(e: &ForEnum) -> (Pattern, Expr) {
         // Scala requires the first enumerator to be a generator, so neither of
         // these can open a comprehension.
         ForEnum::Guard(_) => unreachable!("a comprehension does not begin with a guard"),
-        ForEnum::Val { .. } => {
+        ForEnum::Val { .. } | ForEnum::ValPat { .. } => {
             unreachable!("a comprehension does not begin with a value definition")
         }
     }
@@ -9016,6 +9392,7 @@ impl<'a> BoxScan<'a> {
                         ForEnum::GenColl { coll, .. } => self.expr(coll, in_lambda),
                         ForEnum::Guard(g) => self.expr(g, in_lambda || desugars),
                         ForEnum::Val { value, .. } => self.expr(value, in_lambda || desugars),
+                        ForEnum::ValPat { value, .. } => self.expr(value, in_lambda || desugars),
                     }
                 }
                 self.expr(body, in_lambda || desugars);
@@ -9350,6 +9727,11 @@ fn fv_expr(e: &Expr, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut 
                     ForEnum::Val { name, value } => {
                         fv_expr(value, &b, out, seen);
                         b.insert(name.clone());
+                    }
+                    ForEnum::ValPat { pat, value } => {
+                        fv_expr(value, &b, out, seen);
+                        fv_pattern(pat, &b, out, seen);
+                        pattern_binds(pat, &mut b);
                     }
                 }
             }

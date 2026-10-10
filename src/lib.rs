@@ -8,6 +8,7 @@
 
 pub mod ast;
 pub mod banner;
+pub mod bigdec;
 pub mod cli;
 pub mod compiler;
 pub mod corpus;
