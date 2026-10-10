@@ -18,8 +18,8 @@
 
 **Scala in Rust** — a Scala frontend that lexes and parses Scala source, lowers
 it to [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode, and runs
-it on the shared three-tier Cranelift JIT — the same engine behind `zshrs`,
-`stryke`, `awkrs`, `elisp`, and `ruby`. No bespoke VM. No JVM. No `.class`
+it on the shared three-tier Cranelift JIT — the same engine every other fusevm
+frontend runs on. No bespoke VM. No JVM. No `.class`
 files.
 
 ---
@@ -50,8 +50,8 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   lower to native fusevm ops (`LoadInt`, `Add`, `NumLt`, `JumpIfFalse`, …), so
   the tracing JIT compiles hot loops to native code.
 - **fusevm-hosted, no JVM** — no local `vm.rs` / `jit.rs`, no `.class` files, no
-  `libjvm`. The same three-tier Cranelift engine that hosts zshrs, stryke,
-  awkrs, elisp, and ruby runs Scala too. `jit-disk-cache` persists native code
+  `libjvm`. The same three-tier Cranelift engine that hosts the other fusevm
+  frontends runs Scala too. `jit-disk-cache` persists native code
   across runs.
 - **Scala print semantics** — `println`/`print` lower to a formatting builtin so
   `Boolean` prints `true`/`false`, `Double` prints `3.0`, `null` prints `null`
@@ -211,7 +211,7 @@ cargo build
 
 `scalars` is a standalone Rust crate (an explicit empty `[workspace]` keeps it
 independent of the meta repo). `fusevm` is pulled from crates.io with the `jit`,
-`jit-disk-cache`, and `aot` features. Run the tests with `cargo test` (no Scala
+`jit-disk-cache`, `aot`, and `ffi` features. Run the tests with `cargo test` (no Scala
 toolchain required).
 
 #### Zsh tab completion
@@ -625,6 +625,8 @@ Implemented and checked against the reference `scala`:
 | `--dump-ast FILE` | Print the parsed AST and exit. |
 | `--disasm FILE` | Print the lowered fusevm bytecode and exit. |
 | `--tiers FILE` | Run it, then report which fusevm execution tier took each of its chunks. |
+| `--lsp` | Speak the Language Server Protocol over stdio. |
+| `--dap` | Speak the Debug Adapter Protocol over stdio. |
 
 `scala --version` reports the targeted language level (`3.3`) followed by the
 real engine (`scalars <crate-version>`) and the host triple, so nothing is
@@ -635,7 +637,7 @@ misrepresented as the JVM Scala.
 ## [0x05] ARCHITECTURE
 
 scalars contains no virtual machine or JIT of its own. The execution path
-mirrors how `zshrs` hosts zsh and `ruby` hosts Ruby:
+mirrors how the other fusevm frontends host their languages:
 
 ```
 Scala source → lexer → parser (AST) → lower to fusevm bytecode → fusevm VM + Cranelift JIT
@@ -1018,7 +1020,7 @@ identical reason: a shadowing value binding is now alpha-renamed too, and every
 read of it rewritten to match. Only a binding an enclosing scope already holds is
 renamed, so a program that shadows nothing compiles to exactly the bytecode it
 did before. A class BODY is the one place the rule is suppressed — its `val`s are
-field declarations, not locals shadowing the frame — and 46 records freeze the
+field declarations, not locals shadowing the frame — and the frozen corpus records the
 result.
 
 Three further gaps closed alongside them. `corresponds` and `aggregate` were
@@ -1035,16 +1037,14 @@ Next waves, in priority order:
 
 1. **Lazy views** — `.view`. (`Iterator` and `LazyList` are done: `Iterator` is a
    real consumable iterator, not a strict `Iterable`.)
-2. **The broader standard library** — `scala.io`, `scala.util.Random`, `BigInt`
-   and `BigDecimal`. (`scala.util.Try` is done, and `Either`'s right-biased
+2. **The broader standard library** — `scala.io`, `scala.util.Random` and
+   `BigDecimal`. (`scala.util.Try` is done, and `Either`'s right-biased
    surface with `Either.left`'s `LeftProjection` beside it. Package-QUALIFIED
    spellings now resolve too: `scala.util.Try(e)`, `scala.Some(1)` and
    `scala.collection.immutable.List(1)` are the same expressions their bare
-   names compile to.) `BigInt`/`BigDecimal` are the hard one and are left out
-   rather than approximated: every number here is one `i64` or `f64`, and the
-   32-bit wrap analysis, `Double.toString` and the mixed `Int`/`Double`
-   dispatch are all built on that — an arbitrary-precision operand needs a host
-   value plus an arithmetic path that dispatches on it. See `BUGS.md`.
+   names compile to.) `BigDecimal` is left out rather than approximated: it needs
+   `java.math.BigDecimal`'s scale and rounding rules, which decide its
+   `toString` and `==`. See `BUGS.md`.
 3. **Overloading a block-level `def`** — a class member's overload resolves by
    argument count, but the flat `def` namespace has no such split, so two
    same-name `def`s in one block are refused.
