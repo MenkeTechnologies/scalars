@@ -5502,6 +5502,11 @@ const PACKAGE_PATHS: &[&[&str]] = &[
 /// The package paths that carry NO members of their own here: what they contain
 /// is spelled exactly as the bare name, so the qualifier can be dropped.
 ///
+/// `scala.collection` is one: its `Seq`/`Map`/`Set`/`SortedMap`/… companions
+/// are `Delegate`s of the immutable ones, so `scala.collection.Seq(1, 2)` is
+/// `List(1, 2)` and `collection.SortedMap(…)` a `TreeMap`, exactly what the
+/// bare names build here.
+///
 /// Deliberately a subset of [`PACKAGE_PATHS`] rather than all of it.
 /// `scala.math` and `scala.collection.mutable` are namespaces whose members are
 /// NOT their bare spellings — `math.signum(5)` is `1` where a bare `signum` is
@@ -5510,6 +5515,8 @@ const PACKAGE_PATHS: &[&[&str]] = &[
 /// qualifier would silently change which value the program builds.
 const PLAIN_PACKAGES: &[&[&str]] = &[
     &["scala"],
+    &["scala", "collection"],
+    &["collection"],
     &["scala", "util"],
     &["util"],
     &["scala", "util", "control"],

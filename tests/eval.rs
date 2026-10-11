@@ -6272,3 +6272,32 @@ object Main {
          Vector(1, 2, 3)\n"
     );
 }
+
+#[test]
+fn a_scala_collection_qualified_factory_is_the_bare_one() {
+    // `scala.collection`'s companions delegate to the immutable ones, so the
+    // qualified spelling builds what the bare name builds. It was walked as a
+    // member selection on an unbound `scala` and answered `value collection is
+    // not a member of Null`. Reference output, Scala 3.9.0.
+    let src = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(scala.collection.Seq(1, 2))
+    println(collection.Map(1 -> 2))
+    println(scala.collection.Set(1))
+    println(collection.IndexedSeq(1))
+    println(scala.collection.SortedMap("b" -> 1, "a" -> 2))
+    println(scala.collection.SortedSet(3, 1))
+    println(collection.Seq.empty[Int])
+    println(scala.collection.mutable.ArrayBuffer(1, 2))
+  }
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "List(1, 2)\nMap(1 -> 2)\nSet(1)\nVector(1)\nTreeMap(a -> 2, b -> 1)\nTreeSet(1, 3)\n\
+         List()\nArrayBuffer(1, 2)\n"
+    );
+}

@@ -1005,8 +1005,9 @@ reported as parse/compile errors, never silently mis-run.
   `scala.collection.immutable.List(1)` and `immutable.List(1)` are the `List`
   literal, and `scala.Some(1)` is `Some(1)`. The stripped prefixes are only the
   packages that hold nothing of their own — `scala`, `scala.util`,
-  `scala.util.control`, `scala.collection.immutable` and their shorter
-  spellings. `scala.math` and `scala.collection.mutable` are NOT stripped,
+  `scala.util.control`, `scala.collection.immutable`, `scala.collection` (whose
+  `Seq`/`Map`/`Set`/`SortedMap` companions delegate to the immutable ones, so
+  `scala.collection.Seq(1)` is `List(1)`) and their shorter spellings. `scala.math` and `scala.collection.mutable` are NOT stripped,
   because their members are not their bare names (`math.signum(5)` is `1` and
   there is no bare `signum`; `mutable.Set(1)` builds a different collection
   than `Set(1)`), and a capitalized selection is required, so a value that
