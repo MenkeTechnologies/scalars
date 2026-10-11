@@ -1206,6 +1206,12 @@ reported as parse/compile errors, never silently mis-run.
   which is the case the reference demonstrates; the stdlib is dispatched at run
   time here, so there is no compile-time list of its names to consult.
 
+  A `given`, an `extension`, an `implicit val`/`def` and an `implicit object`
+  declared as a member of a `def main` entry object enter the implicit scope as
+  they do in an `extends App` body; they used to be skipped there, so a `using`
+  clause found nothing (`value show is not a member of Int`). An `implicit
+  object` is a given of each parent type it declares.
+
   `given` as an implicit CLASS or with an `inline` body is not modeled.
 
 - **A repeated `@main` parameter, and two `@main` methods in one file.**

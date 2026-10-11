@@ -493,10 +493,21 @@ impl Parser {
             Some(Tok::Ident(n)) => Some(n.clone()),
             _ => None,
         };
+        // `implicit object IS extends Show[Int]` is a given of each parent.
+        let given_tys = if self.preceded_by_implicit(self.pos) {
+            self.object_parent_types()
+        } else {
+            Vec::new()
+        };
         let depth = self.type_path.len();
         self.type_path.extend(enclosing);
         let r = self.object_decl_inner(is_case);
         self.type_path.truncate(depth);
+        if let Ok(TopObject::Singleton(o)) = &r {
+            for ty in given_tys {
+                self.implicits.push((o.name.clone(), ty));
+            }
+        }
         r
     }
 
@@ -535,6 +546,16 @@ impl Parser {
         self.skip_seps();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             let lazy = self.skip_member_modifiers();
+            let implicit = self.preceded_by_implicit(self.pos);
+            // `given …` and `extension (x: T) …` are members too, and enter the
+            // implicit scope / the extension table exactly as they do in an
+            // `extends App` body. They were skipped as unknown members, so a
+            // `using` clause in a `def main` object found nothing.
+            if self.at_soft_declaration_start() {
+                body.push(self.statement()?);
+                self.skip_seps();
+                continue;
+            }
             // A class, trait or object declared inside the object is a member
             // type; it joins the flat namespace the way one declared in an
             // `extends App` body or a block does. It was skipped, so a
@@ -552,6 +573,9 @@ impl Parser {
             if self.is(&Tok::Def) {
                 if let Some(m) = self.try_main()? {
                     main = Some(m);
+                } else if implicit {
+                    let f = self.implicit_def()?;
+                    defs.push(f);
                 } else {
                     defs.push(self.parse_def()?);
                 }
@@ -562,6 +586,9 @@ impl Parser {
                 // eagerly, printing its side effects before `main` ran.
                 if let StmtKind::Local { is_lazy, .. } = &mut stmt.kind {
                     *is_lazy |= lazy;
+                }
+                if implicit {
+                    self.register_implicit_local(&stmt.kind);
                 }
                 body.push(stmt);
             } else {
@@ -2077,29 +2104,14 @@ impl Parser {
             // return type.
             Tok::Ident(w) if w == "implicit" && matches!(self.peek_at(1), Tok::Def) => {
                 self.advance();
-                let f = self.parse_def()?;
-                if let (Some(from), Some(to)) =
-                    (f.sig.first().and_then(|p| p.ty.clone()), f.ret_ty.clone())
-                {
-                    self.conversions.push(Conversion {
-                        from,
-                        to,
-                        via: f.name.clone(),
-                        is_value: false,
-                    });
-                }
+                let f = self.implicit_def()?;
                 self.funcs.push(f);
                 Ok(StmtKind::Expr(Expr::Tuple(Vec::new())))
             }
             Tok::Ident(w) if w == "implicit" && matches!(self.peek_at(1), Tok::Val | Tok::Var) => {
                 self.advance();
                 let decl = self.local_decl()?;
-                if let StmtKind::Local {
-                    name, ty: Some(ty), ..
-                } = &decl
-                {
-                    self.implicits.push((name.clone(), ty.clone()));
-                }
+                self.register_implicit_local(&decl);
                 Ok(decl)
             }
             Tok::Return => self.return_stmt(),
@@ -2218,6 +2230,70 @@ impl Parser {
             name,
             init: Some(init),
         })
+    }
+
+    /// `implicit def i2s(i: Int): String = …` (cursor on the `def`) — an
+    /// ordinary `def` that ALSO registers a conversion from its parameter type
+    /// to its return type.
+    fn implicit_def(&mut self) -> Result<Func, String> {
+        let f = self.parse_def()?;
+        if let (Some(from), Some(to)) = (f.sig.first().and_then(|p| p.ty.clone()), f.ret_ty.clone())
+        {
+            self.conversions.push(Conversion {
+                from,
+                to,
+                via: f.name.clone(),
+                is_value: false,
+            });
+        }
+        Ok(f)
+    }
+
+    /// `implicit val n: Int = 5` — an ordinary binding that ALSO enters the
+    /// implicit scope under its declared type.
+    fn register_implicit_local(&mut self, decl: &StmtKind) {
+        if let StmtKind::Local {
+            name, ty: Some(ty), ..
+        } = decl
+        {
+            self.implicits.push((name.clone(), ty.clone()));
+        }
+    }
+
+    /// The declared parent types of the `object` at the cursor, with their type
+    /// arguments (`Show[Int]`), read without consuming anything. An `implicit
+    /// object IS extends Show[Int]` is a given of each of them: its singleton
+    /// type conforms to every parent, which is what a `using Show[Int]` asks
+    /// for. [`Self::parents_clause`] keeps only the bare names, so the full
+    /// spellings are read here on a scratch cursor.
+    fn object_parent_types(&mut self) -> Vec<String> {
+        let start = self.pos;
+        let mut tys = Vec::new();
+        if self.is(&Tok::Object) {
+            self.advance();
+            if self.ident().is_ok() && self.is(&Tok::Extends) {
+                self.advance();
+                while let Ok(ty) = self.type_ref_stop_with() {
+                    tys.push(ty);
+                    // A superclass's constructor arguments.
+                    let mut depth = 0;
+                    while self.is(&Tok::LParen) || depth > 0 {
+                        match self.advance() {
+                            Tok::LParen => depth += 1,
+                            Tok::RParen => depth -= 1,
+                            Tok::Eof => break,
+                            _ => {}
+                        }
+                    }
+                    if !matches!(self.peek(), Tok::Ident(w) if w == "with") {
+                        break;
+                    }
+                    self.advance();
+                }
+            }
+        }
+        self.pos = start;
+        tys
     }
 
     /// The `{ … }` body of a `given … with`, read as an object's members.

@@ -128,7 +128,9 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   value, so `def show[A: Sh](x: A)` resolves to the right instance from the
   argument's type. Two candidates of one type is an error, not a pick. All four
   — `given`, `using`, `implicit`, `extension` — are read at the TOP level of a
-  file as well as inside an `object` body, which is where Scala 3 puts them. A
+  file as well as inside an `object` body — an `extends App` body or a `def
+  main` object alike — which is where Scala 3 puts them. An `implicit object
+  I extends Sh[Int]` is a given of each of its parent types. A
   type parameter is inferred either from a value parameter declared to be exactly
   that parameter (`def show[A](x: A)(using Sh[A])`) or from one declared `C[A]`,
   whose argument's element type is read off a collection literal — so

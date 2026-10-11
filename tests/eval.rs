@@ -6202,3 +6202,35 @@ def pair(): (String, Double) = ("x", 5)
          Some(List(1.0, 2.0))\nMap(a -> 1.0, b -> 2.0)\nList(List(1.0), List(2.0, 3.0))\n"
     );
 }
+
+#[test]
+fn implicit_members_of_a_def_main_object_enter_the_implicit_scope() {
+    // A `def main` entry object's member loop kept only `def`/`val`/`var` and
+    // nested types; `given`, `extension` and the `implicit` modifier were
+    // skipped or dropped, so `pr(5)` answered `value show is not a member of
+    // Int`. `implicit object` registered nowhere, in any entry form.
+    // Reference output, Scala 3.9.0.
+    let src = r##"
+object Main {
+  trait Show[T] { def show(t: T): String }
+  given Show[Int] with { def show(t: Int) = s"#$t" }
+  implicit object StrShow extends Show[String] { def show(t: String) = s"'$t'" }
+  object DS extends Show[Double] { def show(t: Double) = f"$t%.1f" }
+  implicit val dbl: Show[Double] = DS
+  case class Meters(v: Double)
+  implicit def toMeters(d: Int): Meters = Meters(d.toDouble)
+  extension (n: Int) def squared: Int = n * n
+  def pr[T](t: T)(using s: Show[T]) = println(s.show(t))
+  def len(m: Meters) = m.v
+  def main(args: Array[String]): Unit = {
+    pr(5); pr("hi"); pr(2.25)
+    println(summon[Show[Int]].show(7))
+    println(len(3))
+    println(4.squared)
+  }
+}
+"##;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "#5\n'hi'\n2.3\n#7\n3.0\n16\n");
+}
