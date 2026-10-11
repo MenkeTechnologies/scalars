@@ -6301,3 +6301,27 @@ object Main {
          List()\nArrayBuffer(1, 2)\n"
     );
 }
+
+#[test]
+fn index_where_takes_a_start_and_last_index_where_an_end() {
+    // `indexWhere(p, from)` / `lastIndexWhere(p, end)` were not members.
+    // A negative `from` is 0; an `end` past the last index is clamped, and a
+    // negative one finds nothing. Reference output, Scala 3.9.0.
+    let src = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = List(3, 1, 4, 1, 5)
+    println(xs.indexWhere(_ == 1, 2))
+    println(xs.indexWhere(_ == 1, -5))
+    println(xs.indexWhere(_ == 3, 1))
+    println(xs.lastIndexWhere(_ == 1, 2))
+    println(xs.lastIndexWhere(_ == 1, 100))
+    println(xs.lastIndexWhere(_ == 1, -1))
+    println(Vector(1, 2, 1).indexWhere(_ == 1, 1))
+  }
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n1\n-1\n1\n3\n-1\n2\n");
+}

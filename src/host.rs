@@ -9852,16 +9852,24 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(make_none())
         }
-        ("indexWhere", 1) => {
-            for (i, it) in items.iter().enumerate() {
+        // `indexWhere(p, from)` starts at `from` (a negative one is 0) and
+        // `lastIndexWhere(p, end)` scans down from `end` (clamped to the last
+        // index), as `SeqOps` does.
+        ("indexWhere", 1 | 2) => {
+            let from = args.get(1).map_or(0, |v| v.to_int().max(0) as usize);
+            for (i, it) in items.iter().enumerate().skip(from) {
                 if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(it))?) {
                     return Ok(Value::int(i as i64));
                 }
             }
             Ok(Value::int(-1))
         }
-        ("lastIndexWhere", 1) => {
+        ("lastIndexWhere", 1 | 2) => {
+            let end = args.get(1).map_or(i64::MAX, |v| v.to_int());
             for (i, it) in items.iter().enumerate().rev() {
+                if i as i64 > end {
+                    continue;
+                }
                 if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(it))?) {
                     return Ok(Value::int(i as i64));
                 }

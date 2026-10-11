@@ -492,7 +492,8 @@ reported as parse/compile errors, never silently mis-run.
   and the combinator set: `map`/`flatMap`/`filter`/`filterNot`/`foreach`;
   `foldLeft`/`foldRight`/`fold`/`reduce`/`reduceLeft`/`reduceRight`;
   `sum`/`product`/`min`/`max`/`minBy`/`maxBy`/`count`/`length`/`size`;
-  `exists`/`forall`/`find`/`indexOf`/`lastIndexOf`/`indexWhere`/`contains`;
+  `exists`/`forall`/`find`/`indexOf`/`lastIndexOf`/`indexWhere`/`contains`
+  (`indexWhere(p, from)` and `lastIndexWhere(p, end)` too);
   `sorted`/`sortBy`/`sortWith`/`reverse`/`distinct`;
   `take`/`drop`/`takeRight`/`dropRight`/`takeWhile`/`dropWhile`/`slice`/
   `splitAt`/`span`/`partition`/`init`/`tail`/`head`/`last`/`headOption`/
@@ -1244,6 +1245,11 @@ reported as parse/compile errors, never silently mis-run.
   visible in any order, and a forward-referenced field reads its type's default).
   Only the block rule is unchecked. Found by running the `appmember` mode under
   `--entry mainsig`, which no `app` run could have reached.
+- **Found missing by a differential sweep, each an honest error rather than a
+  wrong answer:** `mutable.SortedSet`/`mutable.TreeMap` (`value collection is
+  not a member of Null`), the composite `Ordering.Tuple2(o1, o2)` instance, and
+  SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
+  Double) => …` then `s.show(x)`).
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
 
