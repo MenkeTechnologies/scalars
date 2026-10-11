@@ -502,6 +502,11 @@ reported as parse/compile errors, never silently mis-run.
   `permutations`/`combinations`; `updated`; `startsWith`/`endsWith`; the set
   algebra `union`/`intersect`/`diff`/`subsetOf`/`incl`/`excl`; and the
   operators `++`, `:+`, `+:`, `+`, `-`.
+  A collection ARGUMENT (`zip`, `zipAll`, `++`/`appendedAll`, `++:`, `diff`,
+  `intersect`, `startsWith`, `corresponds`, `++=`/`--=`) is any `IterableOnce`
+  Predef converts: a `String` is its `Char`s (`(1 to 3).zip("abc")`), an
+  `Option` zero or one element, a `Map` its pairs, and a `LazyList` is forced
+  only as far as the operation reads (`xs.zip(LazyList.from(1))`).
   `permutations` and `combinations` enumerate DISTINCT results in Scala's own
   order: the elements are renumbered by the position their value first appeared
   and the walk runs over that, so `List(3,2,1).permutations` leads with

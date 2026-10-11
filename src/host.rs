@@ -4078,6 +4078,38 @@ fn as_iterable_once(v: &Value) -> Option<Vec<Value>> {
     as_seq_or_tuple(v)
 }
 
+/// The elements of a collection method's `IterableOnce` ARGUMENT —
+/// `xs.zip(that)`, `xs ++ that`, `xs.diff(that)`, `xs.startsWith(that)`.
+///
+/// Read through [`as_iterable_once`], because `Predef` converts the argument
+/// exactly as it converts a `flatMap` result: a `String` is its `Char`s
+/// (`(1 to 3).zip("abc")` is `Vector((1,a), (2,b), (3,c))`), an `Option` is
+/// zero or one element. Reading only the `Seq`/`Tuple` shapes made a `String`
+/// argument an EMPTY collection, so those calls answered `Vector()` / `List(1,
+/// 2)` silently.
+fn iterable_arg(v: &Value) -> Vec<Value> {
+    as_iterable_once(v).unwrap_or_default()
+}
+
+/// [`iterable_arg`] for a call site that can FORCE a `LazyList` argument,
+/// whose elements exist only once computed. `upto` bounds the forcing to the
+/// prefix the operation reads — `xs.zip(LazyList.from(1))` stops at `xs`'s
+/// length, as Scala's does — and `None` forces to the end.
+fn iterable_arg_forced(vm: &mut VM, v: &Value, upto: Option<usize>) -> Result<Vec<Value>, String> {
+    if as_lazy(v).is_none() {
+        return Ok(iterable_arg(v));
+    }
+    match upto {
+        Some(0) => Ok(Vec::new()),
+        Some(n) => {
+            let mut got = lazy_force(vm, v, n - 1)?;
+            got.truncate(n);
+            Ok(got)
+        }
+        None => lazy_all(vm, v),
+    }
+}
+
 /// Read a tuple/seq's elements (a `Tuple2` is a 2-element sequence).
 fn as_seq_or_tuple(v: &Value) -> Option<Vec<Value>> {
     if let Value::Obj(id) = v {
@@ -5768,7 +5800,7 @@ fn seq_user_eq_method(
         // which an `equals` that prints can observe.
         "diff" | "intersect" => {
             let mut occ: Vec<(i64, Value, usize)> = Vec::new();
-            for y in as_seq_or_tuple(&args[0]).unwrap_or_default() {
+            for y in iterable_arg(&args[0]) {
                 let h = hash_vm(vm, &y)?;
                 match occ_slot(vm, &occ, h, &y)? {
                     Some(i) => occ[i].2 += 1,
@@ -6167,7 +6199,7 @@ fn keyed_user_method(
                 }
             }
             ("++" | "concat" | "union" | "|", 1) => {
-                let adds = as_seq_or_tuple(&args[0]).unwrap_or_default();
+                let adds = iterable_arg(&args[0]);
                 keyed_set(vm, rep, items.clone(), adds, KeyOp::Update)
             }
             _ => return None,
@@ -7899,9 +7931,7 @@ fn set_seq_items(recv: &Value, kind: SeqKind, items: Vec<Value>) {
 /// forms, the argument's elements for the `All` forms.
 fn spread(v: &Value, all: bool) -> Vec<Value> {
     if all {
-        as_seq_or_tuple(v)
-            .or_else(|| as_map(v).map(|m| m.into_iter().map(new_pair_of).collect()))
-            .unwrap_or_else(|| vec![v.clone()])
+        as_iterable_once(v).unwrap_or_else(|| vec![v.clone()])
     } else {
         vec![v.clone()]
     }
@@ -8532,7 +8562,7 @@ fn mut_map_method(
         // Removals keep the table length and the surviving order.
         ("-=" | "--=" | "subtractOne" | "subtractAll" | "remove", 1) => {
             let drop: Vec<Value> = if all {
-                as_seq_or_tuple(&args[0]).unwrap_or_else(|| vec![args[0].clone()])
+                as_iterable_once(&args[0]).unwrap_or_else(|| vec![args[0].clone()])
             } else {
                 vec![args[0].clone()]
             };
@@ -9121,7 +9151,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // string and live in [`string_method`]). An argument longer than what
         // remains is `false`, and an empty one is `true` at any legal offset.
         ("startsWith", 1) | ("startsWith", 2) | ("endsWith", 1) => {
-            let that = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let that = iterable_arg_forced(vm, &args[0], None)?;
             let from = if args.len() == 2 {
                 args[1].to_int()
             } else if name == "endsWith" {
@@ -9441,7 +9471,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             Ok(same(out))
         }
         ("zip", 1) => {
-            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let other = iterable_arg_forced(vm, &args[0], Some(items.len()))?;
             Ok(same(
                 items
                     .iter()
@@ -9453,7 +9483,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // `zipAll(that, thisElem, thatElem)` — the zip that runs to the LONGER
         // of the two, padding whichever ran out. `zip` stops at the shorter.
         ("zipAll", 3) => {
-            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let other = iterable_arg_forced(vm, &args[0], None)?;
             let n = items.len().max(other.len());
             Ok(same(
                 (0..n)
@@ -9472,7 +9502,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // a predicate with a side effect stops at the first failure, as Scala's
         // does.
         ("corresponds", 2) => {
-            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let other = iterable_arg_forced(vm, &args[0], None)?;
             if items.len() != other.len() {
                 return Ok(Value::bool(false));
             }
@@ -9988,7 +10018,13 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // Set algebra. `+`/`-` also reach here through the numeric hook.
         ("union" | "++" | "concat" | "|", 1) => {
             let mut out = items;
-            out.extend(as_seq_or_tuple(&args[0]).unwrap_or_default());
+            out.extend(iterable_arg_forced(vm, &args[0], None)?);
+            Ok(same(out))
+        }
+        // `SeqOps.appendedAll` — appending every element of an `IterableOnce`.
+        ("appendedAll", 1) if matches!(kind, SeqKind::List | SeqKind::Vector) => {
+            let mut out = items;
+            out.extend(iterable_arg_forced(vm, &args[0], None)?);
             Ok(same(out))
         }
         // A sequence's `diff`/`intersect` are MULTISET operations
@@ -9996,15 +10032,15 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // the argument cancels or keeps ONE occurrence of an equal element, so
         // `List(1, 1, 2).diff(List(1))` is `List(1, 2)`.
         ("intersect" | "&", 1) => {
-            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let other = iterable_arg_forced(vm, &args[0], None)?;
             Ok(same(multiset_filter(kind, &items, other, true)))
         }
         ("diff" | "--" | "removedAll" | "&~", 1) => {
-            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let other = iterable_arg_forced(vm, &args[0], None)?;
             Ok(same(multiset_filter(kind, &items, other, false)))
         }
         ("subsetOf", 1) => {
-            let other = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let other = iterable_arg_forced(vm, &args[0], None)?;
             Ok(Value::bool(
                 items.iter().all(|x| other.iter().any(|y| value_eq(x, y))),
             ))
@@ -10034,7 +10070,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // `xs ::: ys` / `xs ++: ys` are `ys.prependedAll(xs)`: the receiver is
         // the RIGHT operand, and its collection kind is the result's.
         (":::" | "++:" | "prependedAll", 1) => {
-            let mut out = as_seq_or_tuple(&args[0]).unwrap_or_default();
+            let mut out = iterable_arg_forced(vm, &args[0], None)?;
             out.extend(items);
             Ok(same(out))
         }

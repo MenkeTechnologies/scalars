@@ -6234,3 +6234,41 @@ object Main {
     assert!(ok, "{out}");
     assert_eq!(out, "#5\n'hi'\n2.3\n#7\n3.0\n16\n");
 }
+
+#[test]
+fn a_string_option_or_lazylist_argument_is_an_iterable_once() {
+    // `zip`, `++`, `diff`, `startsWith`, `++:` and `--=` read their argument
+    // as a `Seq`/`Tuple` only, so a `String` (converted by `augmentString`),
+    // an `Option` (`option2Iterable`) or a `LazyList` was an EMPTY collection:
+    // `(1 to 3).zip("abc")` answered `Vector()` with no diagnostic.
+    // Reference output, Scala 3.9.0.
+    let src = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    println((1 to 3).zip("abc"))
+    println((1 to 3).toList.zip("abc").toMap)
+    println(List(1, 2) ++ "ab")
+    println(List(1, 2).zipAll("a", 0, '?'))
+    println(Vector(1).appendedAll("hi"))
+    println(List(1, 2).zip(Some(9)))
+    println(List(1, 2, 3) ++ Some(4) ++ None)
+    println(List('a', 'b', 'c').diff("b"))
+    println(List('a', 'b').startsWith("a"))
+    println(Set('a') ++ "bc")
+    println("xy" ++: List('z'))
+    val b = scala.collection.mutable.ArrayBuffer('a', 'b', 'c'); b --= "ab"; println(b)
+    println(List(1, 2, 3).zip(LazyList.from(10)))
+    println(Vector(1) ++ LazyList(2, 3))
+  }
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "Vector((1,a), (2,b), (3,c))\nMap(1 -> a, 2 -> b, 3 -> c)\nList(1, 2, a, b)\n\
+         List((1,a), (2,?))\nVector(1, h, i)\nList((1,9))\nList(1, 2, 3, 4)\nList(a, c)\n\
+         true\nSet(a, b, c)\nList(x, y, z)\nArrayBuffer(c)\nList((1,10), (2,11), (3,12))\n\
+         Vector(1, 2, 3)\n"
+    );
+}
