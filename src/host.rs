@@ -12467,6 +12467,10 @@ fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
         Some(n) => (true, n),
         None => (false, name),
     };
+    let (name, long) = match name.strip_suffix(".long") {
+        Some(n) => (n, true),
+        None => (name, false),
+    };
     let ints = args.iter().all(|a| matches!(a, Value::Int(_))) && !(java && name == "signum");
     let f = |i: usize| num_f64(&args[i]);
     match (name, args.len()) {
@@ -12513,6 +12517,31 @@ fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
             let q = a.div_euclid(b) - i64::from(b < 0 && a.rem_euclid(b) != 0);
             Ok(Value::int(if name == "floorDiv" { q } else { a - q * b }))
         }
+        // The `*Exact` family: the result, or `ArithmeticException` when it
+        // does not fit the overload's width.
+        ("addExact" | "subtractExact" | "multiplyExact", 2)
+        | ("incrementExact" | "decrementExact" | "negateExact", 1)
+            if ints =>
+        {
+            let (a, b) = (args[0].to_int(), args.get(1).map_or(1, Value::to_int));
+            let exact = match name {
+                "addExact" | "incrementExact" => a.checked_add(b),
+                "subtractExact" | "decrementExact" => a.checked_sub(b),
+                "multiplyExact" => a.checked_mul(b),
+                _ => a.checked_neg(),
+            };
+            let fits = |r: &i64| long || i32::try_from(*r).is_ok();
+            match exact.filter(fits) {
+                Some(r) => Ok(Value::int(r)),
+                None => Err(format!(
+                    "scalars: java.lang.ArithmeticException: {} overflow",
+                    if long { "long" } else { "integer" }
+                )),
+            }
+        }
+        ("toIntExact", 1) if ints => i32::try_from(args[0].to_int())
+            .map(|r| Value::int(i64::from(r)))
+            .map_err(|_| "scalars: java.lang.ArithmeticException: integer overflow".to_string()),
         ("sinh", 1) => Ok(Value::float(f(0).sinh())),
         ("cosh", 1) => Ok(Value::float(f(0).cosh())),
         ("tanh", 1) => Ok(Value::float(f(0).tanh())),

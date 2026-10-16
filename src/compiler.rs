@@ -5393,11 +5393,19 @@ impl Compiler {
             // `java.lang.Math` and `scala.math` are not the same namespace:
             // `Math.signum(5)` widens to `1.0` (the JDK has no `int` overload)
             // where `math.signum(5)` is `1`. The spelling travels with the name.
-            let member = if java {
+            let mut member = if java {
                 format!("java.{name}")
             } else {
                 name.to_string()
             };
+            // The `*Exact` family overflows at the width of its overload: an
+            // `Int` pair at 32 bits, anything with a `Long` in it at 64. The
+            // values carry no width, so the static one travels with the name.
+            if name.ends_with("Exact")
+                && combine_all(args.iter().map(|a| self.num_ty(a))) == NumTy::Long
+            {
+                member.push_str(".long");
+            }
             let nc = self.b.add_constant(Value::str(member));
             self.b.emit(Op::LoadConst(nc), line);
             self.b.emit(
@@ -8237,6 +8245,13 @@ const MATH_MEMBERS: &[&str] = &[
     "atan2",
     "toRadians",
     "toDegrees",
+    "addExact",
+    "subtractExact",
+    "multiplyExact",
+    "incrementExact",
+    "decrementExact",
+    "negateExact",
+    "toIntExact",
 ];
 
 /// The members `scala.collection.mutable` provides. The collection factories
@@ -8570,8 +8585,10 @@ fn math_method_arity(name: &str) -> Option<usize> {
     match name {
         "abs" | "signum" | "sqrt" | "cbrt" | "exp" | "expm1" | "log" | "log10" | "log1p"
         | "floor" | "ceil" | "rint" | "round" | "sin" | "cos" | "tan" | "asin" | "acos"
-        | "atan" | "sinh" | "cosh" | "tanh" | "toRadians" | "toDegrees" | "ulp" => Some(1),
-        "max" | "min" | "pow" | "hypot" | "atan2" | "floorDiv" | "floorMod" | "IEEEremainder" => {
+        | "atan" | "sinh" | "cosh" | "tanh" | "toRadians" | "toDegrees" | "ulp" | "incrementExact" | "decrementExact" | "negateExact"
+        | "toIntExact" => Some(1),
+        "max" | "min" | "pow" | "hypot" | "atan2" | "floorDiv" | "floorMod" | "IEEEremainder" | "addExact" | "subtractExact"
+        | "multiplyExact" => {
             Some(2)
         }
         _ => None,
