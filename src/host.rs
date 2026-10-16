@@ -8498,6 +8498,46 @@ fn mut_seq_method(
             set_seq_items(recv, kind, out);
             Some(Ok(gone))
         }
+        // `remove(idx, count)` answers `Unit`. Each buffer words its own bounds
+        // failure: `ArrayBuffer` checks the first and last removed index,
+        // `ListBuffer` reports the whole span, and `ArrayDeque` checks only
+        // `idx` and clamps `count` to what follows it.
+        ("remove", 2) if buffer => {
+            let (idx, count) = (args[0].to_int(), args[1].to_int());
+            let len = items.len();
+            let negative = |prefix: &str| {
+                Some(Err(format!(
+                    "scalars: java.lang.IllegalArgumentException: {prefix}removing negative \
+                     number of elements: {count}"
+                )))
+            };
+            let n = match (kind, count) {
+                (SeqKind::ArrayDeque, c) if c < 0 => return negative("requirement failed: "),
+                (_, c) if c < 0 => return negative(""),
+                (_, 0) => return Some(Ok(unit_value())),
+                (SeqKind::ListBuffer, c) if idx < 0 || idx + c > len as i64 => {
+                    return Some(Err(format!(
+                        "scalars: java.lang.IndexOutOfBoundsException: {idx} to {} is out of \
+                         bounds (min 0, max {})",
+                        idx + c,
+                        len as i64 - 1
+                    )));
+                }
+                (SeqKind::ArrayDeque, _) if idx < 0 || idx >= len as i64 => {
+                    return Some(Err(index_out_of_bounds(idx, len)));
+                }
+                (SeqKind::ArrayDeque, c) => (c as usize).min(len - idx as usize),
+                (_, _) if idx < 0 => return Some(Err(index_out_of_bounds(idx, len))),
+                (_, c) if idx + c > len as i64 => {
+                    return Some(Err(index_out_of_bounds(idx + c - 1, len)));
+                }
+                (_, c) => c as usize,
+            };
+            let mut out = items.to_vec();
+            out.drain(idx as usize..idx as usize + n);
+            set_seq_items(recv, kind, out);
+            Some(Ok(unit_value()))
+        }
         ("insert", 2) | ("insertAll", 2) if buffer => {
             let i = args[0].to_int();
             if i < 0 || i as usize > items.len() {
