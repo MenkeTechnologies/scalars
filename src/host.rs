@@ -1816,6 +1816,107 @@ fn take_iterator_head(recv: &Value) {
     }
 }
 
+/// Remove an `Iterator`'s first `n` elements — what advancing it `n` times
+/// consumes.
+fn consume_iterator(recv: &Value, n: usize) {
+    if let Value::Obj(id) = recv {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Seq(SeqKind::Iterator, xs)) = h.borrow_mut().get_mut(*id as usize)
+            {
+                xs.drain(..n.min(xs.len()));
+            }
+        });
+    }
+}
+
+/// The `Iterator` ops that read only PART of the receiver. The elements are
+/// materialized, but a derived iterator shares its source with the original, so
+/// what the source still holds afterwards is observable: `it.take(2).toList`
+/// leaves the rest of `it`, `find` stops at the match, `takeWhile` also eats the
+/// first element that fails its predicate, and `drop`/`dropWhile` hand back the
+/// very iterator they advanced. Each op consumes exactly what Scala's would
+/// when the result is traversed; every other op drains the receiver whole, and
+/// answers `None` here.
+fn iterator_partial_method(
+    vm: &mut VM,
+    recv: &Value,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    if !matches!(
+        (name, args.len()),
+        ("take" | "drop" | "takeWhile" | "dropWhile" | "find" | "exists" | "forall", 1)
+            | ("indexWhere" | "contains" | "indexOf", 1)
+            | ("slice", 2)
+    ) {
+        return None;
+    }
+    // The length of the leading run of elements whose predicate result is
+    // `keep`, and whether a later element broke it.
+    let run = |vm: &mut VM, keep: bool| -> Result<(usize, bool), String> {
+        for (i, x) in items.iter().enumerate() {
+            let hit = truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(x))?);
+            if hit != keep {
+                return Ok((i, true));
+            }
+        }
+        Ok((items.len(), false))
+    };
+    let iter_of = |xs: &[Value]| new_seq(SeqKind::Iterator, xs.to_vec());
+    Some((|| match name {
+        "take" | "slice" => {
+            let (lo, hi) = match name {
+                "take" => (0, args[0].to_int()),
+                _ => (args[0].to_int().max(0), args[1].to_int()),
+            };
+            if hi <= lo {
+                return Ok(iter_of(&[]));
+            }
+            let end = usize::try_from(hi).map_or(items.len(), |h| h.min(items.len()));
+            consume_iterator(recv, end);
+            Ok(iter_of(items.get(lo as usize..end).unwrap_or(&[])))
+        }
+        "drop" => {
+            consume_iterator(recv, args[0].to_int().max(0) as usize);
+            Ok(recv.clone())
+        }
+        "takeWhile" => {
+            let (n, broke) = run(vm, true)?;
+            consume_iterator(recv, n + usize::from(broke));
+            Ok(iter_of(&items[..n]))
+        }
+        "dropWhile" => {
+            let (n, _) = run(vm, true)?;
+            consume_iterator(recv, n);
+            Ok(recv.clone())
+        }
+        "find" | "exists" | "indexWhere" => {
+            let (n, found) = run(vm, false)?;
+            consume_iterator(recv, n + usize::from(found));
+            Ok(match name {
+                "find" if found => make_some(items[n].clone()),
+                "find" => make_none(),
+                "exists" => Value::bool(found),
+                _ => Value::int(if found { n as i64 } else { -1 }),
+            })
+        }
+        "forall" => {
+            let (n, broke) = run(vm, true)?;
+            consume_iterator(recv, n + usize::from(broke));
+            Ok(Value::bool(!broke))
+        }
+        _ => {
+            let at = items.iter().position(|x| value_eq(x, &args[0]));
+            consume_iterator(recv, at.map_or(items.len(), |i| i + 1));
+            Ok(match (name, at) {
+                ("contains", _) => Value::bool(at.is_some()),
+                (_, found) => Value::int(found.map_or(-1, |i| i as i64)),
+            })
+        }
+    })())
+}
+
 fn derive_seq(kind: SeqKind, items: Vec<Value>) -> Value {
     match kind {
         SeqKind::Set(rep) => new_set(rep, items),
@@ -8913,6 +9014,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // representation already costs. Measured on `v = v :+ i` 10 000 times:
     // 40.3G instructions retired with the clone, 21.4G without it.
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
+    if kind == SeqKind::Iterator {
+        if let Some(r) = iterator_partial_method(vm, recv, &items, name, args) {
+            return r;
+        }
+    }
     // A `scala.collection.Iterator` is CONSUMED by traversing it, and that is
     // the one part of its laziness a strict frontend must still reproduce: the
     // elements were read into `items` just above, so emptying the receiver now
