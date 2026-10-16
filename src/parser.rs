@@ -3142,16 +3142,6 @@ impl Parser {
                 line,
             };
         }
-        // `a -> b` — the tuple-pair sugar (binds looser than every binary op).
-        if self.is(&Tok::RArrow) {
-            self.advance();
-            let rhs = if self.at_lambda_start() {
-                self.lambda()?
-            } else {
-                self.binary(0)?
-            };
-            e = Expr::Tuple(vec![e, rhs]);
-        }
         while self.is(&Tok::Match) {
             e = self.match_expr(e)?;
         }
@@ -3382,6 +3372,19 @@ impl Parser {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
+                continue;
+            }
+            // `a -> b` is an ordinary symbolic operator in Scala: additive
+            // precedence, left-associative, so `1 -> 2 -> 3` is `((1, 2), 3)`
+            // and `a + b -> c` pairs the sum. It builds the pair directly.
+            if self.is(&Tok::RArrow) && 7 >= min_bp {
+                self.advance();
+                let rhs = if self.at_lambda_start() {
+                    self.lambda()?
+                } else {
+                    self.binary(8)?
+                };
+                lhs = Expr::Tuple(vec![lhs, rhs]);
                 continue;
             }
             // A symbolic method operator (`++`, `:+`, `+:`, `--`) is an infix
