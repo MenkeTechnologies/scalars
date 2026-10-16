@@ -1849,6 +1849,7 @@ fn iterator_partial_method(
         ("take" | "drop" | "takeWhile" | "dropWhile" | "find" | "exists" | "forall", 1)
             | ("indexWhere" | "contains" | "indexOf", 1)
             | ("slice", 2)
+            | ("buffered" | "head" | "headOption" | "duplicate", 0)
     ) {
         return None;
     }
@@ -1880,6 +1881,19 @@ fn iterator_partial_method(
         "drop" => {
             consume_iterator(recv, args[0].to_int().max(0) as usize);
             Ok(recv.clone())
+        }
+        // `BufferedIterator` is the same iterator with a peek: `head` reads the
+        // next element without advancing.
+        "buffered" => Ok(recv.clone()),
+        "head" => items.first().cloned().ok_or_else(|| {
+            "scalars: java.util.NoSuchElementException: next on empty iterator".to_string()
+        }),
+        "headOption" => Ok(items.first().cloned().map_or_else(make_none, make_some)),
+        // `duplicate` buffers the source for two independent readers; the
+        // original is spent.
+        "duplicate" => {
+            drain_iterator(recv);
+            Ok(new_pair(iter_of(items), iter_of(items)))
         }
         "takeWhile" => {
             let (n, broke) = run(vm, true)?;
@@ -9739,8 +9753,12 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                      size={n} and step={step}, but both must be positive"
                 ));
             }
+            // `Iterator`'s own windows are `GroupedIterator`'s `ArraySeq`s.
             let out = window_starts(items.len(), n as usize, step as usize)
-                .map(|(a, b)| same(items[a..b].to_vec()))
+                .map(|(a, b)| match kind {
+                    SeqKind::Iterator => new_seq(SeqKind::ArraySeq, items[a..b].to_vec()),
+                    _ => same(items[a..b].to_vec()),
+                })
                 .collect();
             // Both answer an `Iterator` of windows, not a `List` of them, so the
             // un-consumed result prints `<iterator>` and a second traversal
@@ -9792,6 +9810,22 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 .map(same)
                 .collect(),
         )),
+        // `Set.subsets(len)` — the `len`-element subsets in combination order;
+        // `subsets()` is every size from 0 up, smallest first. Both answer an
+        // `Iterator` of `Set`s.
+        ("subsets", 0 | 1) if kind.is_set() => {
+            let sizes = match args.first() {
+                Some(n) => n.to_int()..=n.to_int(),
+                None => 0..=items.len() as i64,
+            };
+            Ok(new_seq(
+                SeqKind::Iterator,
+                sizes
+                    .flat_map(|n| combinations_of(&items, n))
+                    .map(same)
+                    .collect(),
+            ))
+        }
         ("toSet", 0) => Ok(new_set(HashRep::Small, items)),
         // `toIterable` is `Iterable.toIterable`, defined as `this`: it changes
         // nothing at all. A `Vector` stays a `Vector`, a `Set` stays a `Set`, a
