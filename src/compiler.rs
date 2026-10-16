@@ -8048,6 +8048,47 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
             "take",
             vec![len.clone()],
         )),
+        // `List.unfold(init)(f)` — `f` returns `Some((elem, next))` until it
+        // returns `None`. Defined as the elements of the memoized
+        // `LazyList.iterate(f(init))(_.flatMap(p => f(p._2)))` up to its first
+        // `None`, so `f` runs once per element plus the final `None`.
+        ("unfold", [init, f]) => {
+            let lam = |p: &str, body: Expr| Expr::Lambda {
+                params: vec![p.to_string()],
+                body: Box::new(body),
+                partial: false,
+            };
+            let var = |p: &str| Expr::Var(p.to_string());
+            let next = lam(
+                "_$uo",
+                m(
+                    var("_$uo"),
+                    "flatMap",
+                    vec![lam(
+                        "_$up",
+                        m(f.clone(), "apply", vec![m(var("_$up"), "_2", vec![])]),
+                    )],
+                ),
+            );
+            let chain = m(
+                Expr::Var("LazyList".to_string()),
+                "iterate",
+                vec![m(f.clone(), "apply", vec![init.clone()]), next],
+            );
+            let defined = m(
+                chain,
+                "takeWhile",
+                vec![lam("_$ud", m(var("_$ud"), "isDefined", vec![]))],
+            );
+            rebuild(m(
+                defined,
+                "map",
+                vec![lam(
+                    "_$ug",
+                    m(m(var("_$ug"), "get", vec![]), "_1", vec![]),
+                )],
+            ))
+        }
         ("concat", [first, rest @ ..]) => rebuild(
             rest.iter()
                 .fold(first.clone(), |acc, x| m(acc, "++", vec![x.clone()])),
