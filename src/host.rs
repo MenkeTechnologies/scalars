@@ -10463,8 +10463,37 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // A `Map`'s iterator is a trie or table iterator, which tests `hasNext`
         // before advancing — not the `List` one the pair sequence below has.
         ("iterator", 0) => Ok(new_seq(SeqKind::Iterator, pairs())),
+        // Windows and suffixes/prefixes of a `Map` are `Map`s themselves
+        // (`fromSpecific` rebuilds each), inside the same `Iterator` the
+        // sequence implementation answers.
+        ("sliding" | "grouped" | "tails" | "inits", _) => {
+            let seq = new_list(pairs());
+            let windows = seq_method(vm, &seq, name, args)?;
+            let rebuilt = as_seq(&windows)
+                .unwrap_or_default()
+                .iter()
+                .map(|w| {
+                    let es = as_seq(w)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|p| as_seq_or_tuple(p).map(|t| (t[0].clone(), t[1].clone())))
+                        .collect();
+                    new_map(rep, es)
+                })
+                .collect();
+            Ok(new_seq(SeqKind::Iterator, rebuilt))
+        }
         // Everything else that only reads the entries as a pair sequence is the
         // sequence implementation over `Map`'s `Tuple2` elements.
+        (
+            "scanLeft" | "maxByOption" | "minByOption" | "reduceOption" | "reduceLeft"
+            | "reduceLeftOption" | "reduceRight" | "reduceRightOption" | "min" | "max"
+            | "minOption" | "maxOption" | "groupMap" | "groupMapReduce",
+            _,
+        ) => {
+            let seq = new_list(pairs());
+            seq_method(vm, &seq, name, args)
+        }
         (
             "exists" | "forall" | "count" | "find" | "collectFirst" | "foldLeft" | "foldRight"
             | "fold" | "reduce" | "maxBy" | "minBy" | "toList" | "toSeq" | "toVector" | "toArray"
