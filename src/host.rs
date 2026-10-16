@@ -7532,6 +7532,15 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
         }
     }
 
+    // `Regex.replaceAllIn(s, f)` and friends: the replacement comes from a
+    // function of the `Match`, which needs the VM.
+    if let Some(r) = regex_fn_method(vm, &recv, &name, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(e) => fault(vm, e),
+        };
+    }
+
     // An `Ordering`'s surface. Dispatched here rather than in `obj_method`
     // because `compare`/`lt`/… may run the key function, which needs the VM.
     if let Some(r) = ordering_method(vm, &recv, &name, &args) {
@@ -14267,6 +14276,10 @@ fn regex_matches(re: &fancy_regex::Regex, s: &str) -> Vec<(usize, usize)> {
     out
 }
 
+fn iae(msg: &str) -> String {
+    format!("scalars: java.lang.IllegalArgumentException: {msg}")
+}
+
 /// Expand a `java.util.regex.Matcher` replacement string against one match:
 /// `$N` splices capture group `N` (Java takes the longest group number that
 /// exists), `\x` is a literal `x`, and everything else is copied through. A
@@ -14282,8 +14295,9 @@ fn expand_replacement(
     while let Some(c) = it.next() {
         match c {
             '\\' => {
-                if let Some(esc) = it.next() {
-                    out.push(esc);
+                match it.next() {
+                    Some(esc) => out.push(esc),
+                    None => return Err(iae("character to be escaped is missing")),
                 }
             }
             '$' if it.peek().is_some_and(char::is_ascii_digit) => {
@@ -14313,16 +14327,37 @@ fn expand_replacement(
             // declare is Java's `IllegalArgumentException`, whose message
             // spells the name in braces.
             '$' if it.peek() == Some(&'{') => {
-                let name: String = it.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                it.next();
+                let mut name = String::new();
+                while let Some(&n) = it.peek() {
+                    if !n.is_ascii_alphanumeric() {
+                        break;
+                    }
+                    name.push(n);
+                    it.next();
+                }
+                if name.is_empty() {
+                    return Err(iae("named capturing group has 0 length name"));
+                }
+                if it.next() != Some('}') {
+                    return Err(iae("named capturing group is missing trailing '}'"));
+                }
+                if name.starts_with(|c: char| c.is_ascii_digit()) {
+                    return Err(iae(&format!(
+                        "capturing group name {{{name}}} starts with digit character"
+                    )));
+                }
                 if named_group_index(re, &name).is_none() {
-                    return Err(format!(
-                        "scalars: java.lang.IllegalArgumentException: No group with name {{{name}}}"
-                    ));
+                    return Err(iae(&format!("No group with name {{{name}}}")));
                 }
                 if let Some(g) = caps.name(&name) {
                     out.push_str(g.as_str());
                 }
             }
+            '$' if it.peek().is_none() => {
+                return Err(iae("Illegal group reference: group index is missing"));
+            }
+            '$' => return Err(iae("Illegal group reference")),
             _ => out.push(c),
         }
     }
@@ -14413,6 +14448,55 @@ fn make_match(re: &fancy_regex::Regex, s: &str, start: usize) -> Value {
         span,
         group_spans,
     })
+}
+
+/// The `Regex` members whose replacement is computed by a function of each
+/// `Match`: `replaceAllIn(s, f)`, `replaceFirstIn` never takes one, and
+/// `replaceSomeIn(s, f)` takes an `Option[String]` where `None` keeps the
+/// matched text. The function's string is a `Matcher.appendReplacement`
+/// template, so `$1` and `\` in it are special exactly as in the plain-string
+/// overload. `None` when `recv` is not a `Regex` or the call is another shape.
+fn regex_fn_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    if !matches!(name, "replaceAllIn" | "replaceSomeIn") || args.len() != 2 {
+        return None;
+    }
+    as_closure(&args[1])?;
+    let Value::Obj(id) = recv else { return None };
+    let pat = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::Regex(p)) => Some(p.clone()),
+        _ => None,
+    })?;
+    Some((|| {
+        let re = regex_compile(&pat)?;
+        let s = args[0].as_str_cow().into_owned();
+        let mut out = String::new();
+        let mut last = 0;
+        for (start, end) in regex_matches(&re, &s) {
+            let Ok(Some(caps)) = re.captures_from_pos(&s, start) else {
+                continue;
+            };
+            out.push_str(&s[last..start]);
+            let m = make_match(&re, &s, start);
+            let made = invoke_closure(vm, &args[1], &[m])?;
+            let template = match (name, as_option(&made)) {
+                ("replaceSomeIn", Some(Some(t))) => Some(t.as_str_cow().into_owned()),
+                ("replaceSomeIn", _) => None,
+                _ => Some(made.as_str_cow().into_owned()),
+            };
+            match template {
+                Some(t) => out.push_str(&expand_replacement(&t, &re, &caps)?),
+                None => out.push_str(&s[start..end]),
+            }
+            last = end;
+        }
+        out.push_str(&s[last..]);
+        Ok(Value::str(out))
+    })())
 }
 
 /// The `scala.util.matching.Regex` / `Regex.Match` surface, dispatched off a
