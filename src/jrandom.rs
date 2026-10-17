@@ -160,7 +160,7 @@ impl JRandom {
 
     /// `scala.util.Random.between(min, max)` for `Double`; `None` on empty bounds.
     pub fn between_double(&mut self, min: f64, max: f64) -> Option<f64> {
-        if !(min < max) {
+        if min.partial_cmp(&max) != Some(std::cmp::Ordering::Less) {
             return None;
         }
         let next = self.next_double() * (max - min) + min;
