@@ -6325,3 +6325,45 @@ object Main {
     assert!(ok, "{out}");
     assert_eq!(out, "3\n1\n-1\n1\n3\n-1\n2\n");
 }
+
+#[test]
+fn random_unseeded_draws_stay_in_range_and_bounds_are_checked() {
+    let src = r#"
+import scala.util.Random
+object T extends App {
+  val r = new Random()
+  val ok = (1 to 200).forall { _ =>
+    val n = r.nextInt(7); val d = r.nextDouble(); val b = r.between(-3, 3)
+    n >= 0 && n < 7 && d >= 0.0 && d < 1.0 && b >= -3 && b < 3
+  }
+  println(ok)
+  println(Random.shuffle(List(1, 2, 3, 4, 5)).sorted)
+  println(Random.shuffle(1 to 4).sorted)
+  try r.nextInt(-1) catch { case e: IllegalArgumentException => println(e.getMessage) }
+  try r.nextLong(0L) catch { case e: IllegalArgumentException => println(e.getMessage) }
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "true\nList(1, 2, 3, 4, 5)\nVector(1, 2, 3, 4)\nbound must be positive\nrequirement failed: n must be positive\n"
+    );
+}
+
+#[test]
+fn random_same_seed_same_sequence_and_setseed_restarts_it() {
+    let src = r#"
+object T extends App {
+  val a = new java.util.Random(99); val b = new scala.util.Random(99)
+  println((1 to 5).map(_ => a.nextInt(1000)) == (1 to 5).map(_ => b.nextInt(1000)))
+  val first = a.nextInt(1000); a.setSeed(99); a.nextInt(1000)
+  a.setSeed(99); println(a.nextInt(1000) == new java.util.Random(99).nextInt(1000))
+  val c = new java.util.Random(5); val g = c.nextGaussian(); c.setSeed(5)
+  println(g == c.nextGaussian())
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\ntrue\ntrue\n");
+}

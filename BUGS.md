@@ -40,6 +40,19 @@ reported as parse/compile errors, never silently mis-run.
   that is what the reference does — the `DelayedInit` body runs during the
   object's `<clinit>`, ahead of the field, so `args.length` there raises
   `NullPointerException` on both sides.
+- **`scala.util.Random` / `java.util.Random`.** `new Random()`, `new Random(seed)`
+  (also `new java.util.Random(seed)`) and the `Random` companion's process-wide
+  generator. The 48-bit LCG is the JDK's, so a seeded generator reproduces the
+  JVM's sequence: `nextInt()`, `nextInt(bound)`, `nextLong()`, `nextLong(n)`,
+  `nextDouble()`, `nextBoolean()`, `nextGaussian()`, `setSeed`, `between` and
+  `shuffle` (a list, vector or range shuffles to the same collection type,
+  a range to a `Vector`). `nextLong(n)` and `between` follow the Scala library,
+  not the JDK's newer overloads, and the errors carry the library's messages
+  (`bound must be positive`, `requirement failed: Invalid bounds`). `between`
+  picks `Double` when either bound is a `Double`, else `Int` when both fit 32
+  bits, else `Long`; a `Long` literal that fits an `Int` therefore draws as the
+  `Int` form. `nextFloat`, `nextBytes`, `nextString` and `alphanumeric` are not
+  modelled.
 - **Scala 3 optional braces.** A pass over the token stream turns each
   indentation region into the `{ … }` block the parser already reads. A region
   opens after a token that ends its line — `=`, `=>`, `match`, `try`, `catch`,

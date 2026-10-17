@@ -480,6 +480,12 @@ pub const OBJ_ADOPT: u16 = 794;
 /// ordered representation, `HashRep::Sorted`.
 pub const MAKE_SORTEDSET: u16 = 795;
 pub const MAKE_SORTEDMAP: u16 = 796;
+/// Builtin id for `new Random(seed)` / `new java.util.Random(seed)`: pops 0 or 1
+/// operand (the seed) and builds a [`crate::jrandom::JRandom`].
+pub const RANDOM_NEW: u16 = 810;
+/// Builtin id for the bare `Random` companion — the one process-wide generator
+/// `scala.util.Random.nextInt(n)` and friends draw from.
+pub const RANDOM_GLOBAL: u16 = 811;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -775,6 +781,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(OBJ_ADOPT, b_obj_adopt);
     vm.register_builtin(MAKE_SORTEDSET, b_make_sortedset);
     vm.register_builtin(MAKE_SORTEDMAP, b_make_sortedmap);
+    vm.register_builtin(RANDOM_NEW, b_random_new);
+    vm.register_builtin(RANDOM_GLOBAL, b_random_global);
     vm.register_builtin(SEQ_VM, b_eq_vm);
     vm.register_builtin(SNE_VM, b_ne_vm);
     vm.register_builtin(BYNAME, b_byname);
@@ -1428,6 +1436,8 @@ enum HeapVal {
     BigInt(BigInt),
     /// A `scala.math.BigDecimal` — see [`make_dec`].
     BigDec(BigDec),
+    /// A `java.util.Random` / `scala.util.Random` — see [`random_method`].
+    Random(crate::jrandom::JRandom),
 }
 
 /// Which representation an immutable `Set`/`Map` has. Scala's factories return
@@ -2251,6 +2261,7 @@ pub fn reset_heap() {
     // compiles its own, so a stale hit would jump into unrelated bytecode.
     METHOD_ENTRIES.with(|t| t.borrow_mut().clear());
     USER_TOSTRING.with(|t| t.set(None));
+    RANDOM_SINGLETON.with(|s| s.set(None));
     USER_EQUALS.with(|t| t.set(None));
     // The table-order ledger is keyed by arena index, which the clear above
     // invalidates; a stale id would claim a fresh collection is already sorted.
@@ -2279,6 +2290,8 @@ thread_local! {
     /// `char → arena handle`, so every occurrence of a character shares one
     /// [`HeapVal::Char`]. The arena is append-only within a run, so without this
     /// a loop over a long string would allocate one entry per character read.
+    /// Arena handle of the process-wide generator behind the `Random` companion.
+    static RANDOM_SINGLETON: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static CHARS: RefCell<HashMap<char, u32>> = RefCell::new(HashMap::new());
     /// The one record per singleton `object`, by name. Every mention of `O`
     /// materializes it, and Scala has exactly one instance — so `O eq O`, `O ==
@@ -2785,6 +2798,122 @@ fn ordering_cmp(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Orderi
         }
     };
     Ok(if reversed { base.reverse() } else { base })
+}
+
+/// `RANDOM_NEW` builtin — `new Random()` seeds from the clock, `new Random(seed)`
+/// from the given `Long`.
+fn b_random_new(vm: &mut VM, argc: u8) -> Value {
+    let rng = match pop_n(vm, argc).first().and_then(num_of) {
+        Some(seed) => crate::jrandom::JRandom::new(seed),
+        None => crate::jrandom::JRandom::from_entropy(),
+    };
+    heap_push(HeapVal::Random(rng))
+}
+
+/// `RANDOM_GLOBAL` builtin — the single generator behind the `Random` companion,
+/// created on first use.
+fn b_random_global(_vm: &mut VM, _argc: u8) -> Value {
+    RANDOM_SINGLETON.with(|s| match s.get() {
+        Some(id) => Value::Obj(id),
+        None => {
+            let v = heap_push(HeapVal::Random(crate::jrandom::JRandom::from_entropy()));
+            if let Value::Obj(id) = v {
+                s.set(Some(id));
+            }
+            v
+        }
+    })
+}
+
+/// The surface of `java.util.Random` / `scala.util.Random`. Draws advance the
+/// generator in place, so two handles to one generator share its sequence.
+/// `between` picks its overload from the operands: any `Double` means the
+/// `Double` form, otherwise `Int` when both bounds fit 32 bits and `Long` when
+/// not (a `Long` literal that fits `Int` is therefore read as the `Int` form).
+fn random_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let Value::Obj(id) = recv else { return None };
+    let is_random = HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HeapVal::Random(_))));
+    if !is_random {
+        return None;
+    }
+    let iae = |m: &str| Err(format!("scalars: java.lang.IllegalArgumentException: {m}"));
+    let draw = |f: &mut dyn FnMut(&mut crate::jrandom::JRandom) -> Result<Value, String>| {
+        HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+            Some(HeapVal::Random(r)) => f(r),
+            _ => Err("scalars: expected a Random".to_string()),
+        })
+    };
+    let int = |v: Option<i32>, m: &str| match v {
+        Some(n) => Ok(Value::Int(i64::from(n))),
+        None => iae(m),
+    };
+    Some(match (name, args) {
+        ("nextInt", []) => draw(&mut |r| Ok(Value::Int(i64::from(r.next_int())))),
+        ("nextInt", [b]) => {
+            let bound = num_of(b)
+                .unwrap_or(0)
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+            draw(&mut |r| int(r.next_int_bound(bound as i32), "bound must be positive"))
+        }
+        ("nextLong", []) => draw(&mut |r| Ok(Value::Int(r.next_long()))),
+        ("nextLong", [n]) => {
+            let n = num_of(n).unwrap_or(0);
+            draw(&mut |r| match r.next_long_bound(n) {
+                Some(v) => Ok(Value::Int(v)),
+                None => iae("requirement failed: n must be positive"),
+            })
+        }
+        ("nextDouble", []) => draw(&mut |r| Ok(Value::Float(r.next_double()))),
+        ("nextBoolean", []) => draw(&mut |r| Ok(Value::Bool(r.next_boolean()))),
+        ("nextGaussian", []) => draw(&mut |r| Ok(Value::Float(r.next_gaussian()))),
+        ("setSeed", [s]) => {
+            let seed = num_of(s).unwrap_or(0);
+            draw(&mut |r| {
+                r.set_seed(seed);
+                Ok(Value::Undef)
+            })
+        }
+        ("between", [lo, hi]) => {
+            if matches!(lo, Value::Float(_)) || matches!(hi, Value::Float(_)) {
+                let (lo, hi) = (num_f64(lo), num_f64(hi));
+                draw(&mut |r| match r.between_double(lo, hi) {
+                    Some(v) => Ok(Value::Float(v)),
+                    None => iae("requirement failed: Invalid bounds"),
+                })
+            } else {
+                let (lo, hi) = (num_of(lo).unwrap_or(0), num_of(hi).unwrap_or(0));
+                let fits = |n: i64| i32::try_from(n).is_ok();
+                if fits(lo) && fits(hi) {
+                    draw(&mut |r| {
+                        int(
+                            r.between_int(lo as i32, hi as i32),
+                            "requirement failed: Invalid bounds",
+                        )
+                    })
+                } else {
+                    draw(&mut |r| match r.between_long(lo, hi) {
+                        Some(v) => Ok(Value::Int(v)),
+                        None => iae("requirement failed: Invalid bounds"),
+                    })
+                }
+            }
+        }
+        ("shuffle", [xs]) => {
+            let (kind, mut items) = seq_kind_items(xs)?;
+            let kind = match kind {
+                SeqKind::Range { .. } | SeqKind::CharRange { .. } => SeqKind::Vector,
+                k => k,
+            };
+            // The arena is borrowed while the generator advances, so the new
+            // collection is allocated only after the draw returns.
+            draw(&mut |r| {
+                r.shuffle(&mut items);
+                Ok(Value::Undef)
+            })
+            .map(|_| new_seq(kind, items))
+        }
+        _ => return None,
+    })
 }
 
 /// Scala's `toChar`: the value truncated to 16 bits. An unpaired surrogate is
@@ -5106,6 +5235,7 @@ fn obj_to_string(v: &Value) -> String {
             Some(HeapVal::Char(c)) => c.to_string(),
             Some(HeapVal::BigInt(b)) => b.to_string(),
             Some(HeapVal::BigDec(d)) => d.render(),
+            Some(HeapVal::Random(_)) => "scala.util.Random".to_string(),
             // A boxed `var` is compiler-internal — every access goes through
             // `CELL_GET`/`CELL_SET`, so a cell handle never reaches user code.
             // Rendering the value it holds keeps a diagnostic dump readable.
@@ -7543,6 +7673,13 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
         };
     }
 
+    if let Some(r) = random_method(&recv, &name, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(e) => fault(vm, e),
+        };
+    }
+
     // An `Ordering`'s surface. Dispatched here rather than in `obj_method`
     // because `compare`/`lt`/… may run the key function, which needs the VM.
     if let Some(r) = ordering_method(vm, &recv, &name, &args) {
@@ -7717,6 +7854,8 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 // A `BigInt` is answered by `big_method`, like a `Char`.
                 HeapVal::BigInt(_) => 11,
                 HeapVal::BigDec(_) => 12,
+                // A `Random` is answered by `random_method`, like an `Ordering`.
+                HeapVal::Random(_) => 13,
             })
         })
     } else {

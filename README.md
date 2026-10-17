@@ -1061,7 +1061,7 @@ Next waves, in priority order:
 
 1. **Lazy views** — `.view`. (`Iterator` and `LazyList` are done: `Iterator` is a
    real consumable iterator, not a strict `Iterable`.)
-2. **The broader standard library** — `scala.io` and `scala.util.Random`. (`scala.util.Try` is done, and `Either`'s right-biased
+2. **The broader standard library** — `scala.io`. (`scala.util.Try` is done, and `Either`'s right-biased
    surface with `Either.left`'s `LeftProjection` beside it. Package-QUALIFIED
    spellings now resolve too: `scala.util.Try(e)`, `scala.Some(1)` and
    `scala.collection.immutable.List(1)` are the same expressions their bare

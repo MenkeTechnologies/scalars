@@ -3119,6 +3119,13 @@ impl Compiler {
                 .emit(Op::CallBuiltin(crate::host::MAKE_ORDERING, 0), 0);
             return Ok(());
         }
+        // The `Random` companion used as a value: `Random.nextInt(10)`,
+        // `Random.shuffle(xs)`. It is the one process-wide generator.
+        if name == "Random" {
+            self.b
+                .emit(Op::CallBuiltin(crate::host::RANDOM_GLOBAL, 0), 0);
+            return Ok(());
+        }
         // An `import`'s named selector — see [`Compiler::imported`]. Placed
         // after every binding so a definition shadows the import, and before the
         // global fallback so an imported name is not read as an unbound one,
@@ -4117,6 +4124,22 @@ impl Compiler {
                 self.b.emit(Op::LoadFalse, line);
                 self.b.emit(Op::LoadFalse, line);
                 self.b.emit(Op::CallBuiltin(crate::host::OBJ_NEW, 4), line);
+                return Ok(());
+            }
+            // `new Random()` / `new Random(seed)` — `scala.util.Random` and
+            // `java.util.Random` share one generator.
+            if matches!(
+                name,
+                "Random" | "java.util.Random" | "scala.util.Random" | "util.Random"
+            ) && args.len() <= 1
+            {
+                for a in args {
+                    self.expr(a)?;
+                }
+                self.b.emit(
+                    Op::CallBuiltin(crate::host::RANDOM_NEW, args.len() as u8),
+                    line,
+                );
                 return Ok(());
             }
             if name == "Regex" && args.len() == 1 {

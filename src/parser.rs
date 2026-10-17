@@ -4275,6 +4275,12 @@ impl Parser {
             self.advance();
             name = self.ident()?;
         }
+        // `new java.util.Random(…)` / `new scala.util.Random(…)`: the JDK and
+        // `scala.util` package prefixes name where the type lives, nothing more.
+        while self.is(&Tok::Dot) && matches!(name.as_str(), "java" | "util") {
+            self.advance();
+            name = self.ident()?;
+        }
         // `new Outer.Inner(…)` — a type declared inside an `object`/`class`
         // lives in the one flat type namespace, so the qualifier names where it
         // was written and nothing else.

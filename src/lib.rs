@@ -14,6 +14,7 @@ pub mod compiler;
 pub mod corpus;
 pub mod dap;
 pub mod host;
+pub mod jrandom;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
