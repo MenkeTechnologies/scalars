@@ -482,7 +482,7 @@ pub const MAKE_SORTEDSET: u16 = 795;
 pub const MAKE_SORTEDMAP: u16 = 796;
 /// Builtin id registering a user-declared implicit `Ordering[C]`: pops the element
 /// class name and the ordering, and makes the ordering the default one for
-/// instances of `C` (see [`cmp_vm`]).
+/// instances of `C` (see `cmp_vm`).
 pub const ORD_REG: u16 = 812;
 /// The method name `"…".format(xs: _*)` lowers to: one argument, the sequence
 /// whose elements are the format arguments.
