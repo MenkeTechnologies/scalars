@@ -5263,7 +5263,11 @@ fn replace_placeholders(e: &mut Expr, n: &mut usize) {
                 replace_placeholders(e, n);
             }
         }
-        // Placeholders do not reach across a block/match/comprehension boundary
+        // `_ match { case … }` is `x => x match { case … }`: the scrutinee is an
+        // operand of the match expression. The arms are separate expressions,
+        // so a placeholder inside one belongs to that arm, not to this lambda.
+        Expr::Match { scrut, .. } => replace_placeholders(scrut, n),
+        // Placeholders do not reach across a block/comprehension boundary
         // (Scala's placeholder scope is the enclosing expression), and the other
         // arms carry no sub-expressions.
         _ => {}

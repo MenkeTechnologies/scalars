@@ -6367,3 +6367,18 @@ object T extends App {
     assert!(ok, "{out}");
     assert_eq!(out, "true\ntrue\ntrue\n");
 }
+
+#[test]
+fn placeholder_scrutinee_makes_a_lambda_over_the_match() {
+    let src = r#"
+object T extends App {
+  println(List(1, 2, 3).map(_ match { case x if x % 2 == 0 => "e"; case _ => "o" }))
+  val f: Int => String = _ match { case 0 => "zero"; case n => s"n$n" }
+  println(f(0) + f(5))
+  println(List((1, "a"), (2, "b")).map(_._2 match { case "a" => 10; case _ => 20 }))
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "List(o, e, o)\nzeron5\nList(10, 20)\n");
+}
