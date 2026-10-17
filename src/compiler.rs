@@ -8083,10 +8083,7 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
             rebuild(m(
                 defined,
                 "map",
-                vec![lam(
-                    "_$ug",
-                    m(m(var("_$ug"), "get", vec![]), "_1", vec![]),
-                )],
+                vec![lam("_$ug", m(m(var("_$ug"), "get", vec![]), "_1", vec![]))],
             ))
         }
         ("concat", [first, rest @ ..]) => rebuild(
@@ -8626,12 +8623,10 @@ fn math_method_arity(name: &str) -> Option<usize> {
     match name {
         "abs" | "signum" | "sqrt" | "cbrt" | "exp" | "expm1" | "log" | "log10" | "log1p"
         | "floor" | "ceil" | "rint" | "round" | "sin" | "cos" | "tan" | "asin" | "acos"
-        | "atan" | "sinh" | "cosh" | "tanh" | "toRadians" | "toDegrees" | "ulp" | "incrementExact" | "decrementExact" | "negateExact"
-        | "toIntExact" => Some(1),
-        "max" | "min" | "pow" | "hypot" | "atan2" | "floorDiv" | "floorMod" | "IEEEremainder" | "addExact" | "subtractExact"
-        | "multiplyExact" => {
-            Some(2)
-        }
+        | "atan" | "sinh" | "cosh" | "tanh" | "toRadians" | "toDegrees" | "ulp"
+        | "incrementExact" | "decrementExact" | "negateExact" | "toIntExact" => Some(1),
+        "max" | "min" | "pow" | "hypot" | "atan2" | "floorDiv" | "floorMod" | "IEEEremainder"
+        | "addExact" | "subtractExact" | "multiplyExact" => Some(2),
         _ => None,
     }
 }

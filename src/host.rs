@@ -1846,8 +1846,10 @@ fn iterator_partial_method(
 ) -> Option<Result<Value, String>> {
     if !matches!(
         (name, args.len()),
-        ("take" | "drop" | "takeWhile" | "dropWhile" | "find" | "exists" | "forall", 1)
-            | ("indexWhere" | "contains" | "indexOf", 1)
+        (
+            "take" | "drop" | "takeWhile" | "dropWhile" | "find" | "exists" | "forall",
+            1
+        ) | ("indexWhere" | "contains" | "indexOf", 1)
             | ("slice", 2)
             | ("buffered" | "head" | "headOption" | "duplicate", 0)
     ) {
@@ -14294,12 +14296,10 @@ fn expand_replacement(
     let mut it = repl.chars().peekable();
     while let Some(c) = it.next() {
         match c {
-            '\\' => {
-                match it.next() {
-                    Some(esc) => out.push(esc),
-                    None => return Err(iae("character to be escaped is missing")),
-                }
-            }
+            '\\' => match it.next() {
+                Some(esc) => out.push(esc),
+                None => return Err(iae("character to be escaped is missing")),
+            },
             '$' if it.peek().is_some_and(char::is_ascii_digit) => {
                 // Java grows the group number while the longer number is still a
                 // real group, so `$12` is group 12 when it exists and group 1
