@@ -1236,6 +1236,9 @@ impl Compiler {
                     if let (Some(c), true) = (conv.as_ref(), init.is_some()) {
                         self.emit_conv(c, s.line);
                     }
+                    if init.is_some() {
+                        self.emit_ordering_registration(name, ty.as_deref(), s.line);
+                    }
                     self.unwind_check_dropping(1);
                     self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
                     self.emit_store(place);
@@ -1246,6 +1249,7 @@ impl Compiler {
                     if let Some(c) = &conv {
                         self.emit_conv(c, s.line);
                     }
+                    self.emit_ordering_registration(name, ty.as_deref(), s.line);
                     self.unwind_check_dropping(1);
                     self.emit_store(place);
                 }
@@ -4100,6 +4104,57 @@ impl Compiler {
         Ok(())
     }
 
+    /// After a binding's initializer is on the stack: when the binding is an
+    /// implicit `Ordering[C]`, register it as `C`'s default ordering, so the
+    /// collection methods that take an implicit ordering (`sorted`, `max`, `min`,
+    /// `sortBy`'s key aside) use it. The value stays on the stack.
+    fn emit_ordering_registration(&mut self, name: &str, ty: Option<&str>, line: u32) {
+        let Some(elem) = ty.and_then(crate::parser::ordering_elem) else {
+            return;
+        };
+        if !self.implicits.iter().any(|(n, _)| n == name) {
+            return;
+        }
+        self.b.emit(Op::Dup, line);
+        let k = self.b.add_constant(Value::str(elem));
+        self.b.emit(Op::LoadConst(k), line);
+        self.b.emit(Op::CallBuiltin(crate::host::ORD_REG, 2), line);
+        self.b.emit(Op::Pop, line);
+    }
+
+    /// Whether `name` is free for the library: no class or object of the
+    /// program declares it.
+    fn is_library_name(&self, name: &str) -> bool {
+        !self.classes.contains_key(name) && !self.objects.contains_key(name)
+    }
+
+    /// The bulk method a varargs call on a library collection with a trailing
+    /// `xs: _*` argument lowers to, and its arguments with the spread unwrapped.
+    fn library_spread(&self, name: &str, args: &[Expr]) -> Option<(&'static str, Vec<Expr>)> {
+        let bulk = match name {
+            "append" => "appendAll",
+            "prepend" => "prependAll",
+            "enqueue" => "++=",
+            "format" => crate::host::FORMAT_SPREAD,
+            _ => return None,
+        };
+        let (last, init) = args.split_last()?;
+        let operand = spread_operand(std::slice::from_ref(last))?;
+        // `String.format(fmt, xs: _*)` reaches here with the format among the
+        // leading arguments; its own lowering re-enters with `fmt` as receiver.
+        if bulk == crate::host::FORMAT_SPREAD && !init.is_empty() {
+            return None;
+        }
+        let user_declared = self.classes.values().any(|c| c.responds.contains(name))
+            || self.objects.values().any(|o| o.methods.contains(name));
+        if user_declared {
+            return None;
+        }
+        let mut out = init.to_vec();
+        out.push(operand);
+        Some((bulk, out))
+    }
+
     /// Lower `new Class(args)` / a `case class` companion `apply` — both invoke
     /// the class's `Class$new` constructor subroutine, which builds the record.
     fn construct(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
@@ -4811,6 +4866,13 @@ impl Compiler {
     /// the narrowing covers EVERY lowering path — the math builtin, the operator
     /// spellings, and the generic `SMETHOD` fallback all funnel through here.
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        // `buf.append(xs: _*)`, `q.enqueue(xs: _*)` — a spread into a library
+        // collection's varargs method is that collection's bulk form taking the
+        // sequence itself. Only when no class or object in the program declares a
+        // method of the name, which would own the repeated parameter.
+        if let Some((bulk, spread)) = self.library_spread(name, args) {
+            return self.method(recv, bulk, &spread, line);
+        }
         // `sys.error(msg)` is `throw new RuntimeException(msg)`.
         if args.len() == 1 && name == "error" && matches!(recv, Expr::Var(s) if s == "sys") {
             return self.expr(&Expr::Throw {
@@ -5305,6 +5367,39 @@ impl Compiler {
                 if let Some(ctor) = mutable_ctor(kind) {
                     return self.collection(ctor, &[]);
                 }
+            }
+        }
+        // `ArrayBuffer.empty[Int]` / `Queue.from(xs)` through a selector import
+        // of the mutable collection, and `mutable.Queue.from(xs)` through the
+        // package: the factory's `empty` and `from`.
+        let factory_kind = match recv {
+            Expr::Var(k) if self.is_library_name(k) => Some(k.as_str()),
+            Expr::Method {
+                recv: pkg,
+                name: k,
+                args: none,
+                ..
+            } if none.is_empty() && mutable_module(pkg) => Some(k.as_str()),
+            _ => None,
+        };
+        if let Some(ctor) = factory_kind.and_then(bare_mutable_ctor).or_else(|| {
+            // The package spelling also covers `Set`/`Map`, which a bare name
+            // does not (it is the immutable one there).
+            match recv {
+                Expr::Method { name: k, .. } if name == "from" => mutable_ctor(k),
+                _ => None,
+            }
+        }) {
+            match (name, args) {
+                ("empty", []) => return self.collection(ctor, &[]),
+                ("from", [xs]) => {
+                    let spread = Expr::Collection {
+                        ctor: crate::parser::SPREAD.to_string(),
+                        elems: vec![xs.clone()],
+                    };
+                    return self.collection(ctor, &[spread]);
+                }
+                _ => {}
             }
         }
         // `String.format(fmt, args…)` — the JDK static, which is a namespace
@@ -6263,6 +6358,15 @@ impl Compiler {
                 self.expr(ty)?;
                 self.b.emit(Op::LoadInt(i64::from(user)), line);
                 self.b.emit(Op::CallBuiltin(crate::host::CLASS_OF, 2), line);
+                return Ok(());
+            }
+        }
+        if name == crate::parser::ORDERING_REG {
+            if let [inst, Expr::Str(class)] = args {
+                self.expr(inst)?;
+                let k = self.b.add_constant(Value::str(class.clone()));
+                self.b.emit(Op::LoadConst(k), line);
+                self.b.emit(Op::CallBuiltin(crate::host::ORD_REG, 2), line);
                 return Ok(());
             }
         }
@@ -8699,6 +8803,16 @@ fn mutable_module(e: &Expr) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// The constructor a BARE collection name denotes when it was brought in by a
+/// selector import of the mutable package. `Set` and `Map` are excluded: bare,
+/// they are the immutable ones.
+fn bare_mutable_ctor(name: &str) -> Option<&'static str> {
+    match name {
+        "Set" | "HashSet" | "Map" | "HashMap" => None,
+        other => mutable_ctor(other),
     }
 }
 

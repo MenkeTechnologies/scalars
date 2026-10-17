@@ -53,6 +53,24 @@ reported as parse/compile errors, never silently mis-run.
   bits, else `Long`; a `Long` literal that fits an `Int` therefore draws as the
   `Int` form. `nextFloat`, `nextBytes`, `nextString` and `alphanumeric` are not
   modelled.
+- **A program-declared implicit `Ordering[C]` is `C`'s default ordering.**
+  `implicit val o: Ordering[C] = Ordering.by(…)`, `given Ordering[C] = …` and
+  `given Ordering[C] with { def compare … }` make `sorted`, `max`, `min`,
+  `maxBy`/`minBy` over `C` itself and a `PriorityQueue[C]` order by it, as
+  Scala's implicit search would. The ordering is found by the RUNTIME class of
+  the elements being compared, not by static type, so two different `Ordering[C]`
+  values in different scopes collapse to the last one registered. An ordering
+  whose body compares two instances of `C` again (`Ordering.by(identity)`) falls
+  back to the structural order for that inner comparison rather than recursing.
+  A `TreeSet`/`TreeMap` of class instances is still not modelled.
+- **Varargs spread into a library collection's bulk form.** `buf.append(xs: _*)`,
+  `buf.prepend(xs: _*)`, `pq.enqueue(xs: _*)` and `"…".format(xs: _*)` (also
+  `printf` and `String.format`) take the sequence as the argument list, unless
+  the program declares a method of that name. `append(a, b, …)` / `prepend(a, b,
+  …)` with several elements work on the buffers.
+- **`empty` and `from` on the mutable collection factories** reached through a
+  selector import: `ArrayBuffer.empty[Int]`, `Queue.from(xs)`,
+  `PriorityQueue.from(xs)`, and `mutable.Queue.from(xs)` through the package.
 - **Scala 3 optional braces.** A pass over the token stream turns each
   indentation region into the `{ … }` block the parser already reads. A region
   opens after a token that ends its line — `=`, `=>`, `match`, `try`, `catch`,

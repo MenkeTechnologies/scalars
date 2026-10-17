@@ -480,6 +480,13 @@ pub const OBJ_ADOPT: u16 = 794;
 /// ordered representation, `HashRep::Sorted`.
 pub const MAKE_SORTEDSET: u16 = 795;
 pub const MAKE_SORTEDMAP: u16 = 796;
+/// Builtin id registering a user-declared implicit `Ordering[C]`: pops the element
+/// class name and the ordering, and makes the ordering the default one for
+/// instances of `C` (see [`cmp_vm`]).
+pub const ORD_REG: u16 = 812;
+/// The method name `"…".format(xs: _*)` lowers to: one argument, the sequence
+/// whose elements are the format arguments.
+pub const FORMAT_SPREAD: &str = "format$spread";
 /// Builtin id for `new Random(seed)` / `new java.util.Random(seed)`: pops 0 or 1
 /// operand (the seed) and builds a [`crate::jrandom::JRandom`].
 pub const RANDOM_NEW: u16 = 810;
@@ -781,6 +788,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(OBJ_ADOPT, b_obj_adopt);
     vm.register_builtin(MAKE_SORTEDSET, b_make_sortedset);
     vm.register_builtin(MAKE_SORTEDMAP, b_make_sortedmap);
+    vm.register_builtin(ORD_REG, b_ord_reg);
     vm.register_builtin(RANDOM_NEW, b_random_new);
     vm.register_builtin(RANDOM_GLOBAL, b_random_global);
     vm.register_builtin(SEQ_VM, b_eq_vm);
@@ -2261,6 +2269,7 @@ pub fn reset_heap() {
     // compiles its own, so a stale hit would jump into unrelated bytecode.
     METHOD_ENTRIES.with(|t| t.borrow_mut().clear());
     USER_TOSTRING.with(|t| t.set(None));
+    ORDERINGS.with(|t| t.borrow_mut().clear());
     RANDOM_SINGLETON.with(|s| s.set(None));
     USER_EQUALS.with(|t| t.set(None));
     // The table-order ledger is keyed by arena index, which the clear above
@@ -2292,6 +2301,12 @@ thread_local! {
     /// a loop over a long string would allocate one entry per character read.
     /// Arena handle of the process-wide generator behind the `Random` companion.
     static RANDOM_SINGLETON: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// Element class name to the implicit `Ordering` the program declared for it.
+    static ORDERINGS: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    /// Set while a registered ordering runs, so one that itself compares
+    /// instances of its own class (`Ordering.by(identity)`) falls back to the
+    /// structural order instead of recursing.
+    static IN_ORDERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CHARS: RefCell<HashMap<char, u32>> = RefCell::new(HashMap::new());
     /// The one record per singleton `object`, by name. Every mention of `O`
     /// materializes it, and Scala has exactly one instance — so `O eq O`, `O ==
@@ -3552,7 +3567,7 @@ fn b_from_seq(vm: &mut VM, _argc: u8) -> Value {
         "immutable.Queue" => new_seq(SeqKind::ImmQueue, items),
         "Stack" => new_seq(SeqKind::Stack, items),
         "ArrayDeque" => new_seq(SeqKind::ArrayDeque, items),
-        "PriorityQueue" => new_priority_queue(items),
+        "PriorityQueue" => new_priority_queue_vm(vm, items),
         "StringBuilder" => new_seq(SeqKind::StrBuf, items.iter().flat_map(str_chars).collect()),
         "Set" => new_set(HashRep::Small, items),
         "LinkedHashSet" => new_set(HashRep::Linked, items),
@@ -7795,6 +7810,20 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
     if name == "toString" && args.is_empty() {
         return Value::str(scala_str_vm(vm, &recv));
     }
+    // `"…".format(xs: _*)` — the arguments are the elements of a sequence only
+    // known at run time.
+    if name == FORMAT_SPREAD {
+        if let (Value::Str(fmt), [xs]) = (&recv, args.as_slice()) {
+            let fmt = fmt.to_string();
+            let items = seq_kind_items(xs)
+                .map(|(_, items)| items)
+                .unwrap_or_default();
+            return match format_all(&fmt, &items, Some(vm)) {
+                Ok(s) => Value::str(s),
+                Err(e) => fault(vm, e),
+            };
+        }
+    }
     if name == "format" {
         if let Value::Str(fmt) = &recv {
             let fmt = fmt.to_string();
@@ -8486,6 +8515,19 @@ fn mut_seq_method(
             }
             let mut out = items.to_vec();
             out.extend(adds);
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
+        // `append(e1, e2, es*)` / `prepend(e1, e2, es*)` — the varargs overloads.
+        ("append", _) if buffer && !strbuf && args.len() >= 2 => {
+            let mut out = items.to_vec();
+            out.extend_from_slice(args);
+            set_seq_items(recv, kind, out);
+            Some(me())
+        }
+        ("prepend", _) if buffer && !strbuf && args.len() >= 2 => {
+            let mut out = args.to_vec();
+            out.extend_from_slice(items);
             set_seq_items(recv, kind, out);
             Some(me())
         }
@@ -11420,6 +11462,37 @@ fn user_cmp(vm: &mut VM, a: &Value, b: &Value) -> Option<Result<Ordering, String
     Some(r.map(|v| v.to_int().cmp(&0)))
 }
 
+/// `ORD_REG` builtin — see [`ORD_REG`].
+fn b_ord_reg(vm: &mut VM, _argc: u8) -> Value {
+    let class = vm.pop().as_str_cow().into_owned();
+    let ord = vm.pop();
+    ORDERINGS.with(|t| t.borrow_mut().insert(class, ord));
+    Value::Undef
+}
+
+/// The comparison a program-declared implicit `Ordering[C]` gives two instances
+/// of `C`. `None` when `a` is not a record of a class with one registered, or
+/// while that ordering is itself running.
+fn declared_ordering_cmp(vm: &mut VM, a: &Value, b: &Value) -> Option<Result<Ordering, String>> {
+    if IN_ORDERING.with(|f| f.get()) || ORDERINGS.with(|t| t.borrow().is_empty()) {
+        return None;
+    }
+    let class = with_obj(a, |o| o.class.to_string())?;
+    let ord = ORDERINGS.with(|t| t.borrow().get(&class).cloned())?;
+    IN_ORDERING.with(|f| f.set(true));
+    let r = if as_ordering(&ord).is_some() {
+        ordering_cmp(vm, &ord, a, b)
+    } else {
+        // A `given Ordering[C] with { def compare … }` instance.
+        let args = [a.clone(), b.clone()];
+        call_user_method(vm, &ord, "compare", &args)
+            .unwrap_or_else(|| Err("scalars: Ordering instance has no compare".into()))
+            .map(|v| v.to_int().cmp(&0))
+    };
+    IN_ORDERING.with(|f| f.set(false));
+    Some(r)
+}
+
 /// [`value_cmp`], plus the `compare` a user class defines. Takes the VM because
 /// running that `compare` re-enters the interpreter.
 ///
@@ -11428,6 +11501,9 @@ fn user_cmp(vm: &mut VM, a: &Value, b: &Value) -> Option<Result<Ordering, String
 /// consulting the user's `compare` all the way down: `List((1, V(2)))` sorts by
 /// `V`'s order in its second position.
 fn cmp_vm(vm: &mut VM, a: &Value, b: &Value) -> Result<Ordering, String> {
+    if let Some(r) = declared_ordering_cmp(vm, a, b) {
+        return r;
+    }
     if let Some(r) = user_cmp(vm, a, b) {
         return r;
     }

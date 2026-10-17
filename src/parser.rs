@@ -2205,7 +2205,16 @@ impl Parser {
                 super_args: Vec::new(),
                 methods,
             });
-            self.implicits.push((name, ty));
+            self.implicits.push((name.clone(), ty.clone()));
+            // A `given Ordering[C] with { def compare … }` is `C`'s default
+            // ordering from here on; the statement registers the instance.
+            if let Some(elem) = ordering_elem(&ty) {
+                return Ok(StmtKind::Expr(Expr::Call {
+                    name: ORDERING_REG.to_string(),
+                    args: vec![Expr::Var(name), Expr::Str(elem)],
+                    line: self.line(),
+                }));
+            }
             // The object is a declaration, not a statement.
             return Ok(StmtKind::Expr(Expr::Tuple(Vec::new())));
         }
@@ -5447,6 +5456,18 @@ fn conversion_args(ty: &str) -> Option<(String, String)> {
 /// The synthetic call `summon[T]` parses to: one argument, the type's name,
 /// resolved against the implicit scope by [`crate::compiler`].
 pub const SUMMON: &str = "summon$";
+
+/// The synthetic call a `given Ordering[C] with { … }` declaration parses to:
+/// two arguments, the instance and the element class name, answered by
+/// `crate::host::ORD_REG`. It makes the instance `C`'s default ordering.
+pub const ORDERING_REG: &str = "ordering$reg";
+
+/// The element type `C` of an `Ordering[C]` type, or `None` for any other type.
+pub fn ordering_elem(ty: &str) -> Option<String> {
+    let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    let inner = ty.strip_prefix("Ordering[")?.strip_suffix(']')?;
+    (!inner.is_empty() && !inner.contains('[') && !inner.contains(',')).then(|| inner.to_string())
+}
 
 /// The synthetic call `classOf[T]` parses to: one argument, the type's source
 /// text, answered by `crate::host::CLASS_OF`.
