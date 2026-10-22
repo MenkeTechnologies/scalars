@@ -6382,3 +6382,135 @@ object T extends App {
     assert!(ok, "{out}");
     assert_eq!(out, "List(o, e, o)\nzeron5\nList(10, 20)\n");
 }
+
+// ── Map remapping, bulk removal and the PartialFunction surface ──────────────
+// Byte-verified against Scala 3.10.0 (scala-cli 1.18.0, JVM 27).
+
+#[test]
+fn map_updated_with_puts_removes_or_keeps_by_the_functions_option() {
+    let src = r#"
+object T extends App {
+  val m = Map("a" -> 1, "b" -> 2, "c" -> 3)
+  println(m.updatedWith("a")(_.map(_ + 10)))
+  println(m.updatedWith("a")(_ => None))
+  println(m.updatedWith("q")(_ => Some(5)))
+  println(m.updatedWith("q")(_ => None))
+  println(m.updatedWith("b") { case Some(v) => Some(v * 2); case None => Some(0) })
+  val counts = "abca".foldLeft(Map.empty[Char, Int])((acc, c) => acc.updatedWith(c)(o => Some(o.getOrElse(0) + 1)))
+  println(counts)
+  println(m)
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "Map(a -> 11, b -> 2, c -> 3)\nMap(b -> 2, c -> 3)\nMap(a -> 1, b -> 2, c -> 3, q -> 5)\nMap(a -> 1, b -> 2, c -> 3)\nMap(a -> 1, b -> 4, c -> 3)\nMap(a -> 2, b -> 1, c -> 1)\nMap(a -> 1, b -> 2, c -> 3)\n"
+    );
+}
+
+#[test]
+fn mutable_map_update_with_writes_in_place_and_answers_the_option() {
+    let src = r#"
+import scala.collection.mutable
+object T extends App {
+  val mm = mutable.Map("a" -> 1, "b" -> 2)
+  println(mm.updateWith("a")(_.map(_ + 1)))
+  println(mm.updateWith("b")(_ => None))
+  println(mm.updateWith("z")(_ => Some(9)))
+  println(mm.updateWith("y")(_ => None))
+  println(mm)
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "Some(2)\nNone\nSome(9)\nNone\nHashMap(a -> 2, z -> 9)\n"
+    );
+}
+
+#[test]
+fn updated_with_is_the_immutable_spelling_and_update_with_the_mutable_one() {
+    rejects(
+        &wrap("val m = Map(\"a\" -> 1)\nprintln(m.updateWith(\"a\")(_ => None))"),
+        "updateWith is not a member",
+    );
+    rejects(
+        "import scala.collection.mutable\nobject T extends App { val m = mutable.Map(\"a\" -> 1)\nprintln(m.updatedWith(\"a\")(_ => None)) }",
+        "updatedWith is not a member",
+    );
+}
+
+#[test]
+fn map_minus_minus_foreach_entry_and_apply_or_else() {
+    let src = r#"
+import scala.collection.mutable
+object T extends App {
+  val m = Map("a" -> 1, "b" -> 2, "c" -> 3)
+  println(m -- List("a", "c"))
+  println(m -- Set("b"))
+  println(m -- Nil)
+  println(m.removedAll(List("a")))
+  val mm = mutable.Map("a" -> 2, "z" -> 9)
+  println(mm -- List("a"))
+  println(mm)
+  m.foreachEntry((k, v) => println(s"$k=$v"))
+  mm.foreachEntry((k, v) => println(s"$k=$v"))
+  println(m.applyOrElse("a", (k: String) => -1))
+  println(m.applyOrElse("z", (k: String) => k.length))
+  println(mm.applyOrElse("z", (k: String) => -1))
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "Map(b -> 2)\nMap(a -> 1, c -> 3)\nMap(a -> 1, b -> 2, c -> 3)\nMap(b -> 2, c -> 3)\nHashMap(z -> 9)\nHashMap(a -> 2, z -> 9)\na=1\nb=2\nc=3\na=2\nz=9\n1\n1\n9\n"
+    );
+}
+
+#[test]
+fn size_is_length_is_size_compare_and_empty_on_an_instance() {
+    let src = r#"
+import scala.collection.mutable
+object T extends App {
+  val m = Map("a" -> 1, "b" -> 2, "c" -> 3)
+  println(List(1,2,3).sizeIs > 2)
+  println(List(1,2,3).sizeIs == 3)
+  println(List(1,2,3).lengthIs < 3)
+  println(List(1,2,3).lengthIs >= 3)
+  println(Vector(1).sizeIs != 1)
+  println(m.sizeIs <= 3)
+  println(Set(1,2).sizeIs > 1)
+  println(mutable.ArrayBuffer(1,2).sizeIs > 1)
+  println(m.sizeCompare(1))
+  println(m.sizeCompare(List(1,2,3)))
+  println(List(1,2,3).empty)
+  println(Vector(1).empty)
+  println(Set(1).empty)
+  println(m.empty)
+  println(mutable.Map(1 -> 2).empty)
+}
+"#;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "true\ntrue\nfalse\ntrue\nfalse\ntrue\ntrue\ntrue\n1\n0\nList()\nVector()\nSet()\nMap()\nHashMap()\n"
+    );
+    // `lengthIs` is `Seq`'s; a `Set` has only `sizeIs`.
+    rejects(
+        &wrap("println(Set(1).lengthIs > 0)"),
+        "lengthIs is not a member",
+    );
+}
+
+#[test]
+fn to_boolean_option_is_case_insensitive_and_never_throws() {
+    let (out, ok) = run(&wrap(
+        "println(\"true\".toBooleanOption)\nprintln(\"TRUE\".toBooleanOption)\nprintln(\"False\".toBooleanOption)\nprintln(\"ab\".toBooleanOption)\nprintln(\" true\".toBooleanOption)",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "Some(true)\nSome(true)\nSome(false)\nNone\nNone\n");
+}

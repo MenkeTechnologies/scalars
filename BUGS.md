@@ -1189,8 +1189,12 @@ reported as parse/compile errors, never silently mis-run.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
   namespace, and the many `String`/numeric methods beyond the wired subset
   above. Members a differential sweep reached and found missing (each an
-  honest `not a member` error, never a wrong answer): `Map.foreachEntry`,
-  `empty`/`applyOrElse`/`prefixLength` on a sequence instance.
+  honest `not a member` error, never a wrong answer): `prefixLength` on a
+  sequence instance, `Ordering.Tuple2(o1, o2)`, and the JDK `String` members
+  `lines`/`chars`. `Map.foreachEntry`, `Map.applyOrElse`, `Map.updatedWith`
+  (`updateWith` on the mutable one), `Map --`/`removedAll`, `sizeIs`/`lengthIs`,
+  an instance's `empty` and `toBooleanOption` were found the same way and are
+  now modelled.
 - **`getClass` on a function, an `Array`, an `Iterator` or a `Range`.** The
   representation classes of those (`Range$Inclusive`, `[I`, the lambda's
   synthetic name) are not modelled, and `getClass` on them answers `value
@@ -1285,6 +1289,20 @@ reported as parse/compile errors, never silently mis-run.
   reference compiler rejects it, so scalars does not implement it either.
 
 ## Modeled with a documented simplification
+
+- **`sizeIs`/`lengthIs` answer the size itself.** Scala's `xs.sizeIs > n`
+  builds a `SizeCompareOps` wrapper whose six comparison operators each call
+  `sizeCompare(n)` — a short-circuit that lets a `LazyList` or a `List` stop
+  counting at `n + 1`. Here the receiver's elements are already materialized
+  (see *A `Range` value is materialized* below), so there is nothing to
+  short-circuit, and the wrapper is replaced by the `Int` it would compare: the
+  six comparisons answer as Scala's do because they are the same comparisons.
+  What differs is unobservable except by printing the wrapper itself
+  (`println(xs.sizeIs)` is `3` here and a `SizeCompareOps` identity in Scala)
+  or by handing it to a method expecting one, neither of which a program does.
+  `lengthIs` is `Seq`'s and is refused on a `Set`, as the reference refuses it.
+  `Map.updatedWith` keeps the other identity Scala documents: an absent key
+  whose function answers `None` hands back the receiver itself.
 
 - **`eq`/`ne` answer reference identity for class instances, singleton
   `object`s and throwables only.** Those are heap records whose handle IS their

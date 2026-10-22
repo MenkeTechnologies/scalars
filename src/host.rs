@@ -4400,6 +4400,51 @@ fn map_put(entries: &mut Vec<(Value, Value)>, k: Value, v: Value) {
     }
 }
 
+/// The entries without `key`, each survivor in its position.
+fn map_without(entries: &[(Value, Value)], key: &Value) -> Vec<(Value, Value)> {
+    entries
+        .iter()
+        .filter(|(k, _)| !value_eq(k, key))
+        .cloned()
+        .collect()
+}
+
+/// What `Map.updatedWith` / `mutable.Map.updateWith` decided for one key.
+enum Remap {
+    /// `f` answered `Some(v)`: the key maps to `v`.
+    Put(Value),
+    /// The key was present and `f` answered `None`.
+    Remove,
+    /// The key was absent and `f` answered `None`: the map is unchanged.
+    Keep,
+}
+
+/// Run the remapping function of `updatedWith`/`updateWith`: `f(m.get(key))`,
+/// an `Option` to an `Option`. Answers the decision and `f`'s result (what the
+/// mutable form returns). The result must be an `Option` — Scala's type
+/// checker guarantees that, so anything else is reported, never guessed at.
+fn map_remap(
+    vm: &mut VM,
+    entries: &[(Value, Value)],
+    key: &Value,
+    f: &Value,
+) -> Result<(Remap, Value), String> {
+    let old = map_get(entries, key);
+    let result = invoke_closure(vm, f, &[opt(old.clone())])?;
+    let Some(new) = as_option(&result) else {
+        return Err(format!(
+            "scalars: updatedWith: the remapping function must answer an Option, not {}",
+            scala_str(&result)
+        ));
+    };
+    let remap = match (old, new) {
+        (_, Some(v)) => Remap::Put(v),
+        (Some(_), None) => Remap::Remove,
+        (None, None) => Remap::Keep,
+    };
+    Ok((remap, result))
+}
+
 /// `APPLY` builtin — the universal `receiver(args)` dispatch (Scala `apply`).
 /// The stack holds the receiver (deepest) then the `argc` args. A closure is
 /// invoked; a `List`/`Tuple` is indexed; a `Map` is keyed.
@@ -9575,6 +9620,14 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             Ok(first)
         }
         ("length" | "size", 0) => Ok(Value::int(items.len() as i64)),
+        // `xs.sizeIs > n` / `xs.lengthIs < n` — Scala's `SizeCompareOps` only
+        // ever meets a comparison operator, so the size itself stands in for it
+        // (see *`sizeIs`/`lengthIs`* in BUGS.md). `lengthIs` is `Seq`'s; a `Set`
+        // has only `sizeIs`.
+        ("sizeIs", 0) => Ok(Value::int(items.len() as i64)),
+        ("lengthIs", 0) if !matches!(kind, SeqKind::Set(_)) => Ok(Value::int(items.len() as i64)),
+        // `xs.empty` — an empty collection of the receiver's kind.
+        ("empty", 0) => Ok(same(Vec::new())),
         ("isEmpty", 0) => Ok(Value::bool(items.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!items.is_empty())),
         // The four empty-receiver accesses. Each kind words its own failure —
@@ -10695,6 +10748,64 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 .cloned()
                 .collect(),
         )),
+        // `m -- keys` / `m.removedAll(keys)`: the survivors, in their positions.
+        // On a `mutable.Map` too this is a NEW map (`--=` is the in-place one,
+        // handled in `mut_map_method` above).
+        ("--" | "removedAll", 1) => {
+            let drop = iterable_arg_forced(vm, &args[0], None)?;
+            Ok(new_map(
+                rep,
+                entries
+                    .iter()
+                    .filter(|(k, _)| !drop.iter().any(|d| value_eq(d, k)))
+                    .cloned()
+                    .collect(),
+            ))
+        }
+        // `m.updatedWith(k)(f)` on an immutable `Map`: `f(m.get(k))` decides
+        // the entry — `Some(v)` puts it (in place when present), `None` removes
+        // it. When `k` is absent and `f` answers `None` nothing changed, and
+        // Scala answers the receiver ITSELF, which `eq` can observe.
+        ("updatedWith", 2) if !matches!(rep, HashRep::Mutable(_) | HashRep::Linked) => {
+            let (remap, _) = map_remap(vm, &entries, &args[0], &args[1])?;
+            Ok(match remap {
+                Remap::Keep => recv.clone(),
+                Remap::Put(v) => {
+                    let mut out = entries.clone();
+                    map_put(&mut out, args[0].clone(), v);
+                    new_map(rep, out)
+                }
+                Remap::Remove => new_map(rep, map_without(&entries, &args[0])),
+            })
+        }
+        // `m.updateWith(k)(f)` is the `mutable.Map` spelling: the same remap,
+        // written into the receiver, answering `f`'s result rather than a map.
+        ("updateWith", 2) if matches!(rep, HashRep::Mutable(_) | HashRep::Linked) => {
+            let (remap, result) = map_remap(vm, &entries, &args[0], &args[1])?;
+            match remap {
+                Remap::Keep => {}
+                Remap::Put(v) => {
+                    mut_map_put(recv, rep, &entries, &[(args[0].clone(), v)], None);
+                }
+                Remap::Remove => set_map_entries(recv, rep, map_without(&entries, &args[0])),
+            }
+            Ok(result)
+        }
+        // `m.foreachEntry((k, v) => …)` — `foreach` without the `Tuple2` per
+        // entry; the function takes the key and the value as two arguments.
+        ("foreachEntry", 1) => {
+            for (k, v) in &entries {
+                invoke_closure(vm, &args[0], &[k.clone(), v.clone()])?;
+            }
+            Ok(unit_value())
+        }
+        // A `Map` is a `PartialFunction[K, V]`: `applyOrElse(k, default)` is the
+        // value at `k`, or `default(k)` — the default is a function of the key,
+        // called only on a miss.
+        ("applyOrElse", 2) => match map_get(&entries, &args[0]) {
+            Some(v) => Ok(v),
+            None => invoke_closure(vm, &args[1], &args[..1]),
+        },
         ("++" | "concat", 1) => {
             let mut out = entries.clone();
             for p in as_seq_or_tuple(&args[0]).unwrap_or_default() {
@@ -10927,6 +11038,22 @@ fn map_read_method(
         ("size", 0) => Ok(Value::int(entries.len() as i64)),
         ("isEmpty", 0) => Ok(Value::bool(entries.is_empty())),
         ("nonEmpty", 0) => Ok(Value::bool(!entries.is_empty())),
+        // `m.sizeIs > n` — Scala's `SizeCompareOps` is a thin wrapper that only
+        // ever meets a comparison operator, so the size itself stands in for it
+        // (see *`sizeIs`/`lengthIs`* in BUGS.md).
+        ("sizeIs", 0) => Ok(Value::int(entries.len() as i64)),
+        // `sizeCompare(n)` / `sizeCompare(that)` — the sign of the difference,
+        // as the sequence form answers.
+        ("sizeCompare", 1) => {
+            let other =
+                as_iterable_once(&args[0]).map_or_else(|| args[0].to_int(), |o| o.len() as i64);
+            Ok(Value::int((entries.len() as i64).cmp(&other) as i64))
+        }
+        // `m.empty` — an empty map of the receiver's kind.
+        ("empty", 0) => Ok(new_map(
+            map_rep_entries(recv).map_or(HashRep::Small, |(rep, _)| rep),
+            Vec::new(),
+        )),
         // A `Map` is a `PartialFunction[K, V]`: `isDefinedAt` is `contains` and
         // `lift` is `get`.
         ("contains" | "isDefinedAt", 1) => Ok(Value::bool(map_get(entries, &args[0]).is_some())),
@@ -14113,6 +14240,14 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 ))
             }
         }
+        // `toBooleanOption` — `toBoolean`'s test, `None` in place of its throw.
+        ("toBooleanOption", 0) => Ok(if s.eq_ignore_ascii_case("true") {
+            make_some(Value::Bool(true))
+        } else if s.eq_ignore_ascii_case("false") {
+            make_some(Value::Bool(false))
+        } else {
+            make_none()
+        }),
         // `String.intern` — the canonical instance; the value is the same string.
         ("intern", 0) => Ok(Value::str(s.to_string())),
         ("charAt", 1) => {

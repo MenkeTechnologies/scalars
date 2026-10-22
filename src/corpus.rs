@@ -956,6 +956,24 @@ pub const CORPUS: &[Entry] = &[
         "xs.lengthCompare(n: Int): Int\nprintln(List(1, 2, 3).lengthCompare(5))   // => -1",
     ),
     (
+        "sizeIs",
+        "Sequence Methods",
+        "`xs.sizeIs > n` and the other five comparisons, on any collection including `Set` and `Map`. Scala's `SizeCompareOps` only ever meets a comparison operator, so here the size itself stands in for it.",
+        "xs.sizeIs > n: Boolean\nprintln(List(1, 2, 3).sizeIs > 2)   // => true",
+    ),
+    (
+        "lengthIs",
+        "Sequence Methods",
+        "`sizeIs` under its `Seq` name; a `Set` has only `sizeIs`.",
+        "xs.lengthIs < n: Boolean\nprintln(List(1, 2, 3).lengthIs < 3)   // => false",
+    ),
+    (
+        "empty",
+        "Sequence Methods",
+        "An empty collection of the receiver's kind, from an INSTANCE — `IterableOps.empty`. A `Map` answers an empty map of its representation.",
+        "xs.empty: Repr[A]\nprintln(Vector(1, 2).empty)   // => Vector()",
+    ),
+    (
         "tapEach",
         "Sequence Methods",
         "Run `f` on every element for its effect and answer the receiver's elements unchanged. Strict collections only — on an `Iterator` or a view Scala's `tapEach` is lazy and is not modeled.",
@@ -1451,6 +1469,42 @@ pub const CORPUS: &[Entry] = &[
         "m.removed(k: K): Map[K, V]\nprintln(Map(\"a\" -> 1, \"b\" -> 2).removed(\"a\"))   // => Map(b -> 2)",
     ),
     (
+        "--",
+        "Map Methods",
+        "A copy with every key in the argument dropped — `removedAll` under its symbolic name. The survivors keep their positions; on a `mutable.Map` this is still a new map (`--=` removes in place).",
+        "m -- (keys: IterableOnce[K]): Map[K, V]\nprintln(Map(\"a\" -> 1, \"b\" -> 2, \"c\" -> 3) -- List(\"a\", \"c\"))   // => Map(b -> 2)",
+    ),
+    (
+        "removedAll",
+        "Map Methods",
+        "The named form of `m -- keys`.",
+        "m.removedAll(keys: IterableOnce[K]): Map[K, V]\nprintln(Map(\"a\" -> 1, \"b\" -> 2).removedAll(List(\"a\")))   // => Map(b -> 2)",
+    ),
+    (
+        "updatedWith",
+        "Map Methods",
+        "A copy with one key remapped by `f(m.get(k))`: `Some(v)` sets the key (in place when it is present), `None` removes it. When the key is absent and `f` answers `None` the receiver itself is the result, as in Scala. Immutable `Map` only — the mutable spelling is `updateWith`.",
+        "m.updatedWith(k: K)(f: Option[V] => Option[V]): Map[K, V]\nval m = Map(\"a\" -> 1, \"b\" -> 2)\nprintln(m.updatedWith(\"a\")(_.map(_ + 10)))   // => Map(a -> 11, b -> 2)\nprintln(m.updatedWith(\"b\")(_ => None))   // => Map(a -> 1)",
+    ),
+    (
+        "updateWith",
+        "Map Methods",
+        "`mutable.Map`'s `updatedWith`: the same remap written into the receiver, answering `f`'s result rather than a map.",
+        "m.updateWith(k: K)(f: Option[V] => Option[V]): Option[V]\nval m = mutable.Map(\"a\" -> 1)\nprintln(m.updateWith(\"a\")(_.map(_ + 1)))   // => Some(2)\nprintln(m.updateWith(\"a\")(_ => None))   // => None",
+    ),
+    (
+        "foreachEntry",
+        "Map Methods",
+        "`foreach` with the key and the value as two arguments rather than one `Tuple2` per entry.",
+        "m.foreachEntry(f: (K, V) => U): Unit\nMap(\"a\" -> 1).foreachEntry((k, v) => println(s\"$k=$v\"))   // prints a=1",
+    ),
+    (
+        "applyOrElse",
+        "Map Methods",
+        "The value at the key, or `default(k)` on a miss — a `Map` is a `PartialFunction[K, V]`. The default is a function of the key and runs only when the key is absent.",
+        "m.applyOrElse(k: K, default: K => V): V\nprintln(Map(\"a\" -> 1).applyOrElse(\"zz\", (k: String) => k.length))   // => 2",
+    ),
+    (
         "+",
         "Map Methods",
         "A copy with one `k -> v` pair added. The argument must be a pair; adding a bare key is an error.",
@@ -1943,6 +1997,12 @@ pub const CORPUS: &[Entry] = &[
         "String Methods",
         "Parse `\"true\"` or `\"false\"`, ignoring case and WITHOUT trimming. Anything else raises `java.lang.IllegalArgumentException: For input string: \"…\"` — not the `NumberFormatException` the numeric conversions raise.",
         "s.toBoolean: Boolean\nprintln(\"TRUE\".toBoolean)   // => true",
+    ),
+    (
+        "toBooleanOption",
+        "String Methods",
+        "`toBoolean`'s test — `\"true\"`/`\"false\"` ignoring case, no trimming — answering `None` where `toBoolean` throws.",
+        "s.toBooleanOption: Option[Boolean]\nprintln(\"False\".toBooleanOption)   // => Some(false)\nprintln(\"yes\".toBooleanOption)   // => None",
     ),
     (
         "toDouble",

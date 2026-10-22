@@ -474,12 +474,15 @@ Implemented and checked against the reference `scala`:
   `groupMapReduce`, `transpose`, `patch`, `distinctBy`, `scan`, `indices`,
   `search` (`Found`/`InsertionPoint`),
   `lift`/`isDefinedAt`, the `Option`-valued `minOption`/`maxOption`/
-  `minByOption`/`maxByOption`, `sizeCompare`/`lengthCompare`, `tapEach`,
+  `minByOption`/`maxByOption`, `sizeCompare`/`lengthCompare`, `sizeIs`/`lengthIs`
+  (the size stands in for `SizeCompareOps`), an instance's `empty`, `tapEach`,
   `mkString`, the `to*` conversions, the set
   algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`; on a
   sequence or `String`, `diff`/`intersect` are multiset operations), `:::`
   and `++:`, and
-  `Map`'s `apply`/`get`/`getOrElse`/`keys`/`values`/`updated`/`transform`, and the
+  `Map`'s `apply`/`get`/`getOrElse`/`applyOrElse`/`keys`/`values`/`updated`/
+  `updatedWith` (`updateWith` on `mutable.Map`)/`--`/`removedAll`/`transform`/
+  `foreachEntry`, and the
   companions' `IterableFactory` members — `List.empty` (including the applied
   `List.empty[Int](0)` and `Map.empty[String, Int]("k")`, which are an
   application of the empty collection rather than a factory taking arguments),
@@ -882,7 +885,7 @@ machine, and the run dies starting its compilation server.
 Probing the collection and `String` surfaces against that oracle closed a cluster
 of members the reference answers and this frontend refused: `sliding(size, step)`
 on sequences and on `String`, `tails`, `inits`, `padTo`, and
-`toIntOption`/`toLongOption`/`toDoubleOption`. `grouped`/`sliding` are now one
+`toIntOption`/`toLongOption`/`toDoubleOption`/`toBooleanOption`. `grouped`/`sliding` are now one
 walk rather than three special cases, because the trailing-window rule is subtle
 enough to be worth writing once and wrong to guess at:
 
