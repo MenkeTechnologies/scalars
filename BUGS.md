@@ -1394,9 +1394,17 @@ reported as parse/compile errors, never silently mis-run.
   downstream])`/`toMap(kf, vf)` into a `HashMap` printed `{k=v, …}` (with
   `get`/`getOrDefault`/`containsKey`/`size`/`isEmpty`). A Java set or map
   iterates in its table order of the JDK `hashCode` (`Long` and `Double` fold
-  their bits). Not modelled: the `java.util.List`/`Map` beyond the members
-  listed, `Collectors.partitioningBy`/`mapping`/`reducing`, a `toMap` merge
-  function, and `LongStream`/`DoubleStream`. A stream's `toString` is the JVM identity form,
+  their bits). `LongStream`/`DoubleStream` (and their `IntStream`/`Stream`
+  factories `range`/`rangeClosed`/`of`/`iterate`/`empty`) carry their own
+  width: `LongStream.sum` wraps at 64 bits, `DoubleStream.sum`/`average` use the
+  JDK's compensated (Kahan) summation, `mapToInt`/`mapToLong`/`mapToDouble`/
+  `asLongStream`/`asDoubleStream` convert. `Collectors.partitioningBy`/
+  `mapping`/`reducing` and a `toMap` merge function are modelled, as are a
+  collected list's `lastIndexOf`/`subList`/`containsAll`, a collected map's
+  `keySet`/`values`/`entrySet` (entries with `getKey`/`getValue`)/
+  `containsValue`/`forEach`, and `java.util.List.of`. Not modelled: the rest of
+  the `java.util` collection API, `LongSummaryStatistics`/
+  `DoubleSummaryStatistics`, and `Stream.generate`/`concat`. A stream's `toString` is the JVM identity form,
   which is not reproducible.
 - **Found by the second October 2026 differential round, still open.** These
   raise a catchable `java.lang.NullPointerException` where Scala runs, so a

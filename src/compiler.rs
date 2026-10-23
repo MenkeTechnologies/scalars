@@ -5293,6 +5293,58 @@ impl Compiler {
                 .emit(Op::CallBuiltin(crate::host::STREAM_OF, argc), line);
             return Ok(());
         }
+        // `IntStream`/`LongStream`/`DoubleStream` factories (`range`,
+        // `rangeClosed`, `of`, `iterate`, `empty`), and `Stream.iterate`/`empty`.
+        let java_class = |c: &str| match recv {
+            Expr::Var(n) => {
+                n == c
+                    && !self.vals.contains_key(n)
+                    && self
+                        .imports
+                        .get(n)
+                        .is_some_and(|p| p.join(".") == format!("java.util.stream.{c}"))
+            }
+            Expr::Method {
+                recv: pkg,
+                name: n,
+                args: a,
+                ..
+            } => n == c && a.is_empty() && is_package_path(pkg, &["java", "util", "stream"]),
+            _ => false,
+        };
+        let factory_class = ["IntStream", "LongStream", "DoubleStream", "Stream"]
+            .into_iter()
+            .find(|c| java_class(c));
+        // `java.util.List.of(…)` — an immutable `java.util.List`.
+        if name == "of"
+            && matches!(recv, Expr::Method { recv: pkg, name: n, args: a, .. }
+                if n == "List" && a.is_empty() && is_package_path(pkg, &["java", "util"]))
+        {
+            for a in args {
+                self.expr(a)?;
+            }
+            let k = self.b.add_constant(Value::str("JList.of".to_string()));
+            self.b.emit(Op::LoadConst(k), line);
+            let argc = u8::try_from(args.len() + 1)
+                .map_err(|_| format!("scalars: too many arguments on line {line}"))?;
+            self.b
+                .emit(Op::CallBuiltin(crate::host::STREAM_FACTORY, argc), line);
+            return Ok(());
+        }
+        if let Some(class) = factory_class {
+            if matches!(name, "range" | "rangeClosed" | "of" | "iterate" | "empty") {
+                for a in args {
+                    self.expr(a)?;
+                }
+                let k = self.b.add_constant(Value::str(format!("{class}.{name}")));
+                self.b.emit(Op::LoadConst(k), line);
+                let argc = u8::try_from(args.len() + 1)
+                    .map_err(|_| format!("scalars: too many arguments on line {line}"))?;
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::STREAM_FACTORY, argc), line);
+                return Ok(());
+            }
+        }
         // `Collectors.toList()` / `java.util.stream.Collectors.joining(", ")` —
         // the JDK collector factories a stream's `collect` takes.
         let collectors = match recv {
