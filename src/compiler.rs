@@ -3662,6 +3662,31 @@ impl Compiler {
     /// implementation directly with the current `this`.
     fn super_call(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
         let Some((cname, _)) = self.current_class.clone() else {
+            // `super.m` in a singleton `object`'s method: the first supertype in
+            // its linearization that implements `m`, called with the singleton
+            // as `this` (an object method has no receiver slot of its own).
+            if let Some(obj) = self.current_object.clone() {
+                let supers = self
+                    .objects
+                    .get(&obj)
+                    .map(|m| m.supers.clone())
+                    .unwrap_or_default();
+                let owner = supers
+                    .iter()
+                    .find(|s| self.type_declares_method(s, name))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("scalars: no supertype of {obj} defines `{name}` (line {line})")
+                    })?;
+                self.materialize_object(&obj)?;
+                for a in args {
+                    self.expr(a)?;
+                }
+                let sub = self.sub_name(&owner, name, args.len())?;
+                let nidx = self.b.add_name(&sub);
+                self.b.emit(Op::Call(nidx, args.len() as u8 + 1), line);
+                return Ok(());
+            }
             return Err(format!("scalars: `super` outside a class (line {line})"));
         };
         // Inside a TRAIT, `super` is the next implementation in the

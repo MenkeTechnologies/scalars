@@ -16078,6 +16078,24 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
         ("regex" | "toString", 0) => Ok(Value::str(pat.to_string())),
         // `Regex.matches` (2.13+) is the anchored test, like `String.matches`.
         ("matches", 1) => regex_full_match(&pat, &target()),
+        // `unapplySeq(s)` — the extractor itself: `Some` of every group of a
+        // WHOLE-input match (a group that did not take part is `null`), `None`
+        // otherwise.
+        ("unapplySeq", 1) => {
+            let s = target();
+            let whole = match regex_compile(&format!("\\A(?:{pat})\\z")) {
+                Ok(re) => re,
+                Err(e) => return Some(Err(e)),
+            };
+            Ok(match whole.captures(&s) {
+                Ok(Some(caps)) => make_some(new_list(
+                    (1..caps.len())
+                        .map(|i| caps.get(i).map_or(Value::Undef, |m| Value::str(m.as_str())))
+                        .collect(),
+                )),
+                _ => make_none(),
+            })
+        }
         ("findFirstIn", 1) => {
             let s = target();
             Ok(match regex_matches(&re, &s).first() {

@@ -1393,12 +1393,14 @@ reported as parse/compile errors, never silently mis-run.
   (Scala answers `Unit1$`), `Function.tupled(f)`, `mutable.TreeMap(…)` and
   `mutable.BitSet(…)`. These are compile/parse errors: `import
   scala.util.boundary.break` then a bare `break(v)` inside `boundary { … }`,
-  and `collection.immutable.ListMap`; `BigDecimal.underlying`,
-  and `Regex.unapplySeq` are not members. (The buffer/`Map` `…InPlace`
-  transformers, `keysIterator`/`valuesIterator`, and the `String` members
+  `collection.immutable.ListMap`, and a `case class` with a SECOND parameter
+  list (`case class P(x: Int)(val tag: String)`); `BigDecimal.underlying` and
+  `MatchIterator.matchData` (on a `findAllIn` result) are not members.
+  (`Regex.unapplySeq` and `super.m` inside a singleton `object` are now
+  modelled, as are the buffer/`Map` `…InPlace` transformers, `keysIterator`/`valuesIterator`, and the `String` members
   `indexOfSlice`/`lastIndexOfSlice`/`containsSlice`/`inits`/`tails`/
   `reverseIterator`/`sameElements`/`distinctBy`/`union`/`regionMatches`/
-  `indent`/`getBytes(charset)` this round listed are now modelled;
+  `indent`/`getBytes(charset)` this round listed;
   `getBytes` knows UTF-8, ISO-8859-1, US-ASCII and the UTF-16 forms, by name or
   `StandardCharsets` constant.)
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
