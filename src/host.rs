@@ -13247,8 +13247,10 @@ fn java_parse_int(s: &str, radix: i64) -> Result<i64, String> {
 /// have their own messages; everything else is `For input string: "<s>"`. A `Float`
 /// answers the single-precision value [`make_f32`] carries.
 fn java_parse_float(s: &str, single: bool) -> Result<Value, String> {
-    let bad = || format!("For input string: \"{s}\"");
     let t = s.trim_matches(|c: char| c <= ' ');
+    // JDK 21's `FloatingDecimal` reports the TRIMMED string (JDK 27 reports
+    // the input as given; the reference here is pinned to 21).
+    let bad = || format!("For input string: \"{t}\"");
     if t.is_empty() {
         return Err("empty String".to_string());
     }
