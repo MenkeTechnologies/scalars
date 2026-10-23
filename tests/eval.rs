@@ -6514,3 +6514,20 @@ fn to_boolean_option_is_case_insensitive_and_never_throws() {
     assert!(ok, "{out}");
     assert_eq!(out, "Some(true)\nSome(true)\nSome(false)\nNone\nNone\n");
 }
+
+#[test]
+fn boundary_break_needs_an_enclosing_boundary() {
+    // Scala resolves `break`'s `Label` from the lexically enclosing `boundary`;
+    // with none in scope there is no given `Label`, a compile error.
+    rejects(
+        "import scala.util.boundary.break\nobject T extends App { def f(x: Int): Int = { if (x > 0) break(x); 0 }; println(f(1)) }",
+        "`break` outside any `boundary`",
+    );
+    // The `Breaks` spelling keeps its own meaning when `boundary.break` is not
+    // imported: `break()` leaves the enclosing `breakable`.
+    let (out, ok) = run(
+        "import scala.util.control.Breaks._\nobject T extends App { breakable { for (i <- 1 to 5) { if (i == 3) break(); print(i) } }; println() }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "12\n");
+}

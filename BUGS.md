@@ -1369,8 +1369,7 @@ reported as parse/compile errors, never silently mis-run.
   Only the block rule is unchecked. Found by running the `appmember` mode under
   `--entry mainsig`, which no `app` run could have reached.
 - **Found missing by a differential sweep, each an honest error rather than a
-  wrong answer:** `mutable.SortedSet`/`mutable.TreeMap` (`value collection is
-  not a member of Null`), the composite `Ordering.Tuple2(o1, o2)` instance, and
+  wrong answer:** the composite `Ordering.Tuple2(o1, o2)` instance, and
   SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
   Double) => …` then `s.show(x)`).
 - **An integer's box is kept only where it is WIDENED to `Any` with a static
@@ -1437,12 +1436,22 @@ reported as parse/compile errors, never silently mis-run.
   called, where the JDK defers that to the terminal op). Not modelled: the rest of
   the `java.util` collection API. A stream's `toString` is the JVM identity form,
   which is not reproducible.
-- **Found by the second October 2026 differential round, still open.** These
-  raise a catchable `java.lang.NullPointerException` where Scala runs, so a
-  `catch` that matches it would hide the gap: `getClass` on a `case object`
-  (Scala answers `Unit1$`), `Function.tupled(f)`, `mutable.TreeMap(…)` and
-  `mutable.BitSet(…)`. These are compile/parse errors: `import
-  scala.util.boundary.break` then a bare `break(v)` inside `boundary { … }`.
+- **Found by the second October 2026 differential round.** Each raised a
+  catchable `java.lang.NullPointerException` where Scala runs, and is now
+  modelled: a bare `getClass` inside an `object`/`case object` body (a trait
+  method inherited into `case object Unit1` answers `Unit1$`), `this` and
+  `getClass` inside the ENTRY object (`this.h`, `this.v`, `getClass.getName`
+  answering `Main$`), `Function.tupled(f)`, `mutable.TreeMap`/`TreeSet`/
+  `SortedMap`/`SortedSet` and `mutable.BitSet`, and `scala.util.boundary` with
+  `break(v)` (bare through `import scala.util.boundary.break` or the relative
+  `import scala.util.boundary, boundary.break`, or as `boundary.break(v)`).
+  Still open: a bare `getClass` inside a TOP-LEVEL `def` (Scala answers
+  `scala.Predef$` there) still reads `null`; a `break` whose `Label` arrives
+  through a `using` parameter rather than lexically is refused; `println(this)`
+  in the entry object prints `Main@0` where Scala prints the unreproducible
+  identity form `Main$@<hash>`; and `Function.untupled`/`Function.const`/
+  `Function.chain` still read `null` (the same catchable
+  `NullPointerException`).
   (`Regex.unapplySeq`, `super.m` inside a singleton `object`, the immutable
   `ListMap`, a `case class` with a SECOND parameter list — whose product is the
   first list only —, `BigDecimal.underlying` (a `java.math.BigDecimal` with

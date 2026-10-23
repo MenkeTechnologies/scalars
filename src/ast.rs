@@ -6,7 +6,7 @@
 //! `case class`, `object` and `trait` declarations, all of which are modeled
 //! here (see `BUGS.md` for what is not).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The marker collection constructor wrapping a by-reference capture argument
 /// (see [`ParamSig::by_ref`]): `$ref(n)` passes `n`'s cell, not its value.
@@ -32,6 +32,13 @@ pub struct Program {
     /// The name of the object that declares the entry point (informational; used
     /// by the `--dump-ast` output and error messages).
     pub object_name: String,
+    /// Whether the entry point is an `object` (`extends App` or `def main`),
+    /// whose members see `this` as that singleton. False for a `@main def`.
+    pub entry_is_object: bool,
+    /// The names of the TOP-LEVEL `def`s. They share the flat function
+    /// namespace with the entry object's helpers but belong to the synthetic
+    /// package object, so `this` inside one is not the entry.
+    pub top_level_defs: HashSet<String>,
     /// The statements of the entry point.
     pub main: Vec<Stmt>,
     /// User-defined methods (every `def` other than `main`), hoisted to a flat

@@ -12,7 +12,7 @@
 
 use crate::ast::*;
 use crate::lexer::{Tok, Token};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The synthetic call `new Array[T](n)` desugars to; lowered by
 /// [`crate::compiler`] to the zero-filling array builtin.
@@ -40,6 +40,9 @@ pub const SGLOB_PATTERN: &str = "$sglob$";
 /// The collection-constructor name of `scala.collection.immutable.Queue`, which
 /// a bare `Queue` (the mutable one) cannot spell.
 pub const IMMUTABLE_QUEUE: &str = "immutable.Queue";
+/// The throwable a `scala.util.boundary` `break` raises — `scala.util.boundary$Break`,
+/// a `RuntimeException`. Spelled with the `$` so no program name can collide.
+pub const BOUNDARY_BREAK: &str = "boundary$Break";
 
 /// Parse Scala `src` into a [`Program`].
 pub fn parse(src: &str) -> Result<Program, String> {
@@ -63,6 +66,12 @@ struct Parser {
     objects: Vec<ObjectDecl>,
     /// What each `import`'s named selectors bind — see [`Program::imports`].
     imports: HashMap<String, Vec<String>>,
+    /// The labels of the `scala.util.boundary { … }` blocks enclosing the
+    /// token being parsed, innermost last. A `break(v)` targets the last one,
+    /// as the `Label` given Scala resolves lexically does.
+    boundaries: Vec<i64>,
+    /// The label the next `boundary` takes.
+    boundary_seq: i64,
     /// The package paths a WILDCARD `import` opened — see
     /// [`Program::import_wildcards`].
     wildcards: Vec<Vec<String>>,
@@ -109,6 +118,8 @@ impl Parser {
             classes: Vec::new(),
             objects: Vec::new(),
             imports: HashMap::new(),
+            boundaries: Vec::new(),
+            boundary_seq: 0,
             wildcards: Vec::new(),
             implicits: Vec::new(),
             extensions: Vec::new(),
@@ -289,6 +300,7 @@ impl Parser {
         // must run before whichever entry point this unit has.
         let mut main_fn: Option<String> = None;
         let mut top_stmts: Vec<Stmt> = Vec::new();
+        let mut top_level_defs = HashSet::new();
         loop {
             self.skip_seps();
             if self.is(&Tok::Eof) {
@@ -359,6 +371,7 @@ impl Parser {
                     }
                     main_fn = Some(f.name.clone());
                 }
+                top_level_defs.insert(f.name.clone());
                 self.funcs.push(f);
                 continue;
             }
@@ -402,6 +415,7 @@ impl Parser {
             }
         }
 
+        let entry_is_object = entry.is_some();
         let (object_name, body) = match (entry, main_fn) {
             (Some(_), Some(_)) => {
                 return Err(
@@ -429,6 +443,8 @@ impl Parser {
         top_stmts.extend(body);
         Ok(Program {
             object_name,
+            entry_is_object,
+            top_level_defs,
             main: top_stmts,
             functions: {
                 let mut fs = std::mem::take(&mut self.funcs);
@@ -1968,7 +1984,7 @@ impl Parser {
     fn skip_import_clause(&mut self) {
         let importing = matches!(self.peek(), Tok::Ident(w) if w == "import");
         self.advance(); // package/import/export
-        let start = self.pos;
+        let mut start = self.pos;
         let mut depth = 0u32;
         loop {
             match self.peek() {
@@ -1976,6 +1992,13 @@ impl Parser {
                 Tok::RBrace if depth == 0 => break,
                 Tok::RBrace => depth -= 1,
                 Tok::Newline | Tok::Semi | Tok::Eof if depth == 0 => break,
+                // `import a.b, c.d` is two import clauses; `c.d` may be
+                // relative to the first (`import scala.util.boundary,
+                // boundary.break`).
+                Tok::Comma if depth == 0 && importing => {
+                    self.record_import(start, self.pos);
+                    start = self.pos + 1;
+                }
                 _ if depth == 0 && self.at_declaration_start() => break,
                 _ => {}
             }
@@ -2044,6 +2067,113 @@ impl Parser {
     /// Read off the tokens rather than parsed into a clause type because an
     /// import has no runtime meaning here beyond this mapping — see
     /// [`Program::imports`].
+    /// Whether the bare name `local` was imported as a path ending in `tail`
+    /// — `import scala.util.boundary.break` and the relative
+    /// `import scala.util.boundary, boundary.break` both end in
+    /// `boundary.break`.
+    fn import_names(&self, local: &str, tail: &[&str]) -> bool {
+        self.imports
+            .get(local)
+            .is_some_and(|p| p.len() >= tail.len() && p[p.len() - tail.len()..] == *tail)
+    }
+
+    /// Whether `boundary` names `scala.util.boundary` — imported by name, or
+    /// opened by `import scala.util._`.
+    fn boundary_imported(&self) -> bool {
+        self.import_names("boundary", &["util", "boundary"])
+            || self.wildcards.iter().any(|w| w == &["scala", "util"])
+    }
+
+    /// `boundary { body }` — Scala 3's `scala.util.boundary`. The library
+    /// implements it with an exception: the block's `Label` is a fresh object,
+    /// `break(v)` throws a `boundary.Break(label, v)`, and `boundary` catches
+    /// a `Break` whose label is its own and answers its value. That is exactly
+    /// the desugar here, with an integer label standing for the object:
+    ///
+    /// `try { body } catch { case b: Break if b.label == N => b.value }`
+    ///
+    /// The label and value ride in the throwable's `cause` slot as a pair, so
+    /// a `Break` that is not this block's own (an inner block's label leaving
+    /// through a lambda) fails the guard and keeps unwinding. Because `Break`
+    /// is a `RuntimeException`, an intervening `catch { case e: Exception }`
+    /// catches it, and a `finally` on the way out runs — both as in Scala.
+    fn boundary_block(&mut self) -> Result<Expr, String> {
+        self.advance(); // boundary
+        self.advance(); // {
+        let label = self.boundary_seq;
+        self.boundary_seq += 1;
+        self.boundaries.push(label);
+        let body = self.block();
+        self.boundaries.pop();
+        let body = body?;
+        let caught = format!("$break{label}");
+        let payload = |field: &str| Expr::Method {
+            recv: Box::new(Expr::Method {
+                recv: Box::new(Expr::Var(caught.clone())),
+                name: "getCause".to_string(),
+                args: Vec::new(),
+                line: 0,
+            }),
+            name: field.to_string(),
+            args: Vec::new(),
+            line: 0,
+        };
+        let guard = Expr::Binary {
+            op: BinOp::Eq,
+            lhs: Box::new(payload("_1")),
+            rhs: Box::new(Expr::Int(label)),
+        };
+        Ok(Expr::Try {
+            body,
+            catches: vec![MatchArm {
+                pat: Pattern::Typed {
+                    name: caught.clone(),
+                    ty: BOUNDARY_BREAK.to_string(),
+                },
+                guard: Some(guard),
+                body: vec![Stmt {
+                    line: 0,
+                    kind: StmtKind::Expr(payload("_2")),
+                }],
+            }],
+            finalizer: None,
+        })
+    }
+
+    /// `break(v)` / `break()` / `break` at the `break` token: throw the
+    /// innermost enclosing `boundary`'s `Break` carrying `v` (`()` when
+    /// absent). Outside any `boundary` there is no `Label` in scope, which is
+    /// Scala's compile error too.
+    fn boundary_break(&mut self) -> Result<Expr, String> {
+        let line = self.line();
+        self.advance(); // break
+        let Some(&label) = self.boundaries.last() else {
+            return Err(format!(
+                "scalars: `break` outside any `boundary` (no given Label) on line {line}"
+            ));
+        };
+        let mut args = if self.is(&Tok::LParen) {
+            self.arg_list()?
+        } else {
+            Vec::new()
+        };
+        if args.len() > 1 {
+            return Err(format!(
+                "scalars: `break` takes at most one argument, found {} on line {line}",
+                args.len()
+            ));
+        }
+        let value = args.pop().unwrap_or(Expr::Tuple(Vec::new()));
+        Ok(Expr::Throw {
+            value: Box::new(Expr::New {
+                name: BOUNDARY_BREAK.to_string(),
+                args: vec![Expr::Null, Expr::Tuple(vec![Expr::Int(label), value])],
+                line,
+            }),
+            line,
+        })
+    }
+
     fn record_import(&mut self, start: usize, end: usize) {
         let mut path: Vec<String> = Vec::new();
         let mut i = start;
@@ -4254,6 +4384,26 @@ impl Parser {
                 // inside a nested `def` still unwinds to the enclosing
                 // `breakable`, and an intervening `catch { case e: Exception }`
                 // still lets it through.
+                // `scala.util.boundary`: `boundary { … }` with `break(v)` (or
+                // `boundary.break(v)`) inside it. See [`Self::boundary_block`].
+                if name == "boundary" && self.boundary_imported() {
+                    if matches!(next, Some(Tok::LBrace)) {
+                        return self.boundary_block();
+                    }
+                    if matches!(next, Some(Tok::Dot))
+                        && matches!(self.peek_at(2), Tok::Ident(w) if w == "break")
+                    {
+                        self.advance(); // boundary
+                        self.advance(); // .
+                        return self.boundary_break();
+                    }
+                }
+                if name == "break"
+                    && !matches!(next, Some(Tok::Dot))
+                    && self.import_names("break", &["boundary", "break"])
+                {
+                    return self.boundary_break();
+                }
                 if name == "breakable" && matches!(next, Some(Tok::LBrace)) {
                     self.advance(); // breakable
                     self.advance(); // {

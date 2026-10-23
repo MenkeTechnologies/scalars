@@ -536,6 +536,13 @@ pub const STREAM_FACTORY: u16 = 823;
 /// `MathContext.DECIMAL32`/`64`/`128`/`UNLIMITED` constants: pops the
 /// precision and the mode name.
 pub const MATH_CTX: u16 = 824;
+/// Builtin ids for a `mutable.TreeSet(...)` / `mutable.TreeMap(...)` literal
+/// (`mutable.SortedSet` / `mutable.SortedMap` too), ordered like
+/// [`MAKE_SORTEDSET`]'s and updated in place: `HashRep::MutSorted`.
+pub const MAKE_MUTSORTEDSET: u16 = 825;
+pub const MAKE_MUTSORTEDMAP: u16 = 826;
+/// Builtin id for a `mutable.BitSet(...)` literal: `HashRep::BitSet`.
+pub const MAKE_BITSET: u16 = 827;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -860,6 +867,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(OBJ_ADOPT, b_obj_adopt);
     vm.register_builtin(MAKE_SORTEDSET, b_make_sortedset);
     vm.register_builtin(MAKE_SORTEDMAP, b_make_sortedmap);
+    vm.register_builtin(MAKE_MUTSORTEDSET, b_make_mutsortedset);
+    vm.register_builtin(MAKE_MUTSORTEDMAP, b_make_mutsortedmap);
+    vm.register_builtin(MAKE_BITSET, b_make_bitset);
     vm.register_builtin(ORD_REG, b_ord_reg);
     vm.register_builtin(RANDOM_NEW, b_random_new);
     vm.register_builtin(RANDOM_GLOBAL, b_random_global);
@@ -1092,6 +1102,8 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     ("TimeoutException", "java.util.concurrent.TimeoutException"),
     ("ControlThrowable", "scala.util.control.ControlThrowable"),
     ("BreakControl", "scala.util.control.BreakControl"),
+    // `scala.util.boundary`'s `break(v)` (see the desugar in [`crate::parser`]).
+    ("boundary$Break", "scala.util.boundary$Break"),
 ];
 
 /// The JVM throwable hierarchy scalars models, as `(class, superclass)` simple
@@ -1151,6 +1163,9 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     // caught by ordinary `case e: Exception` handlers.
     ("ControlThrowable", "Throwable"),
     ("BreakControl", "ControlThrowable"),
+    // Unlike `BreakControl`, a `RuntimeException`: `case e: Exception` inside a
+    // `boundary` catches its `break`, as in Scala.
+    ("boundary$Break", "RuntimeException"),
 ];
 
 /// The fully-qualified name of a built-in throwable's simple name.
@@ -1268,6 +1283,7 @@ pub fn throwable_takes_cause(fqn: &str) -> bool {
             | "IllegalStateException"
             | "UnsupportedOperationException"
             | "NoSuchElementException"
+            | "boundary$Break"
     )
 }
 
@@ -1550,10 +1566,39 @@ enum HashRep {
     /// same one (`compare == 0`, not `equals`). The stored `Vec` is kept in
     /// that order. It prints `TreeSet(…)`/`TreeMap(…)` at every size.
     Sorted,
+    /// A `scala.collection.mutable.TreeSet`/`TreeMap` (also `mutable.SortedSet`/
+    /// `SortedMap`): [`Self::Sorted`]'s order and key identity, updated IN
+    /// PLACE. It prints `TreeSet(…)`/`TreeMap(…)`, as the immutable one does.
+    MutSorted,
+    /// A `scala.collection.mutable.BitSet` — a mutable set of non-negative
+    /// `Int`s, iterated ascending. Stored and updated as [`Self::MutSorted`];
+    /// only its name differs. It prints `BitSet(…)`.
+    BitSet,
+    /// The `keys`/`keySet` of a [`Self::MutSorted`] map — a sorted, read-only
+    /// view of its keys, which prints `SortedSet(…)`.
+    SortedKeys,
     /// A `scala.collection.immutable.ListMap` — immutable, iterated in
     /// INSERTION order (an update keeps the key's position, a removal drops
     /// it). The stored `Vec` is that order. It prints `ListMap(…)`.
     ListMap,
+}
+
+impl HashRep {
+    /// Whether the collection is kept in ascending key order (a tree).
+    fn is_sorted(self) -> bool {
+        matches!(
+            self,
+            HashRep::Sorted | HashRep::MutSorted | HashRep::BitSet | HashRep::SortedKeys
+        )
+    }
+
+    /// Whether `+=`/`-=`/`update`/`clear` write into the receiver itself.
+    fn is_in_place(self) -> bool {
+        matches!(
+            self,
+            HashRep::Mutable(_) | HashRep::Linked | HashRep::MutSorted | HashRep::BitSet
+        )
+    }
 }
 
 /// The rendered prefix of a [`HeapVal::Seq`].
@@ -1714,7 +1759,9 @@ impl SeqKind {
             SeqKind::Set(HashRep::Small) => "Set",
             SeqKind::Set(HashRep::Hashed | HashRep::Mutable(_)) => "HashSet",
             SeqKind::Set(HashRep::Linked) => "LinkedHashSet",
-            SeqKind::Set(HashRep::Sorted) => "TreeSet",
+            SeqKind::Set(HashRep::Sorted | HashRep::MutSorted) => "TreeSet",
+            SeqKind::Set(HashRep::BitSet) => "BitSet",
+            SeqKind::Set(HashRep::SortedKeys) => "SortedSet",
             // There is no `ListSet` here: only a map takes this representation.
             SeqKind::Set(HashRep::ListMap) => "ListSet",
             SeqKind::Iterable => "Iterable",
@@ -1903,7 +1950,10 @@ impl SeqKind {
     fn is_mutable(self) -> bool {
         matches!(
             self,
-            SeqKind::Array | SeqKind::Set(HashRep::Mutable(_) | HashRep::Linked)
+            SeqKind::Array
+                | SeqKind::Set(
+                    HashRep::Mutable(_) | HashRep::Linked | HashRep::MutSorted | HashRep::BitSet
+                )
         ) || self.is_buffer()
     }
 
@@ -4235,15 +4285,48 @@ fn b_make_linkedset(vm: &mut VM, argc: u8) -> Value {
 /// `MAKE_LINKEDMAP` builtin — the `mutable.LinkedHashMap` counterpart.
 /// `MAKE_SORTEDSET` builtin — see [`MAKE_SORTEDSET`].
 fn b_make_sortedset(vm: &mut VM, argc: u8) -> Value {
+    make_sorted_set(vm, argc, HashRep::Sorted)
+}
+
+/// `MAKE_MUTSORTEDSET` builtin — see [`MAKE_MUTSORTEDSET`].
+fn b_make_mutsortedset(vm: &mut VM, argc: u8) -> Value {
+    make_sorted_set(vm, argc, HashRep::MutSorted)
+}
+
+/// `MAKE_BITSET` builtin — see [`MAKE_BITSET`]. Scala's `BitSet` stores bit
+/// `i` of a word array, so a negative element is its `require` failure.
+fn b_make_bitset(vm: &mut VM, argc: u8) -> Value {
+    let items = pop_n(vm, argc);
+    if items.iter().any(|v| v.to_int() < 0) {
+        return fault(vm, bitset_negative());
+    }
+    new_set(HashRep::BitSet, items)
+}
+
+/// `BitSet`'s `require(elem >= 0)` failure, which carries no message.
+fn bitset_negative() -> String {
+    "scalars: java.lang.IllegalArgumentException: requirement failed".to_string()
+}
+
+fn make_sorted_set(vm: &mut VM, argc: u8, rep: HashRep) -> Value {
     let items = pop_n(vm, argc);
     if let Err(e) = sorted_keys_modelled(&items) {
         return fault(vm, e);
     }
-    new_set(HashRep::Sorted, items)
+    new_set(rep, items)
 }
 
 /// `MAKE_SORTEDMAP` builtin — see [`MAKE_SORTEDMAP`].
 fn b_make_sortedmap(vm: &mut VM, argc: u8) -> Value {
+    make_sorted_map(vm, argc, HashRep::Sorted)
+}
+
+/// `MAKE_MUTSORTEDMAP` builtin — see [`MAKE_MUTSORTEDMAP`].
+fn b_make_mutsortedmap(vm: &mut VM, argc: u8) -> Value {
+    make_sorted_map(vm, argc, HashRep::MutSorted)
+}
+
+fn make_sorted_map(vm: &mut VM, argc: u8, rep: HashRep) -> Value {
     let pairs = pop_n(vm, argc);
     let mut entries: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
     for p in &pairs {
@@ -4256,7 +4339,7 @@ fn b_make_sortedmap(vm: &mut VM, argc: u8) -> Value {
     if let Err(e) = sorted_keys_modelled(&keys) {
         return fault(vm, e);
     }
-    new_map(HashRep::Sorted, entries)
+    new_map(rep, entries)
 }
 
 /// A `TreeSet`/`TreeMap` orders its keys by their natural `Ordering`, which
@@ -4280,8 +4363,9 @@ fn sorted_keys_modelled(keys: &[Value]) -> Result<(), String> {
 /// and the neighbour searches `minAfter`/`maxBefore`. A map's `keySet`/`keys`
 /// is a `TreeSet`. `None` for any other receiver or member.
 fn sorted_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
-    let (is_map, entries) = match seq_kind_items(recv) {
-        Some((SeqKind::Set(HashRep::Sorted), items)) => (
+    let (rep, is_map, entries) = match seq_kind_items(recv) {
+        Some((SeqKind::Set(rep), items)) if rep.is_sorted() => (
+            rep,
             false,
             items
                 .into_iter()
@@ -4289,16 +4373,16 @@ fn sorted_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Valu
                 .collect::<Vec<_>>(),
         ),
         _ => match map_rep_entries(recv) {
-            Some((HashRep::Sorted, entries)) => (true, entries),
+            Some((rep, entries)) if rep.is_sorted() => (rep, true, entries),
             _ => return None,
         },
     };
     let rebuild = |kept: Vec<(Value, Value)>| {
         if is_map {
-            heap_push(HeapVal::Map(HashRep::Sorted, kept))
+            heap_push(HeapVal::Map(rep, kept))
         } else {
             let keys = kept.into_iter().map(|(k, _)| k).collect();
-            heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), keys))
+            heap_push(HeapVal::Seq(SeqKind::Set(rep), keys))
         }
     };
     let entry = |(k, v): &(Value, Value)| {
@@ -4351,7 +4435,11 @@ fn sorted_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Valu
             .find(|(k, _)| value_cmp(k, &args[0]) == Ordering::Less)
             .map(entry))),
         ("keySet" | "keys", 0) if is_map => Ok(heap_push(HeapVal::Seq(
-            SeqKind::Set(HashRep::Sorted),
+            SeqKind::Set(if rep == HashRep::MutSorted {
+                HashRep::SortedKeys
+            } else {
+                HashRep::Sorted
+            }),
             entries.into_iter().map(|(k, _)| k).collect(),
         ))),
         _ => return None,
@@ -4428,10 +4516,7 @@ fn b_make_mutmap(vm: &mut VM, argc: u8) -> Value {
 fn b_is_growable(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
     let mutable_seq = with_seq(&v, |k, _| k.is_mutable()).unwrap_or(false);
-    let mutable_map = with_map(&v, |rep, _| {
-        matches!(rep, HashRep::Mutable(_) | HashRep::Linked)
-    })
-    .unwrap_or(false);
+    let mutable_map = with_map(&v, |rep, _| rep.is_in_place()).unwrap_or(false);
     Value::bool(mutable_seq || mutable_map)
 }
 
@@ -6919,7 +7004,7 @@ fn keyed_user_method(
     args: &[Value],
 ) -> Option<Result<Value, String>> {
     if let Some((SeqKind::Set(rep), items)) = seq_kind_items(recv) {
-        if matches!(rep, HashRep::Mutable(_) | HashRep::Sorted) {
+        if matches!(rep, HashRep::Mutable(_)) || rep.is_sorted() {
             return None;
         }
         let hashed = keyed_hashed(rep, items.len());
@@ -6964,7 +7049,7 @@ fn keyed_user_method(
         return Some(r);
     }
     let (rep, entries) = map_rep_entries(recv)?;
-    if matches!(rep, HashRep::Mutable(_) | HashRep::Sorted) || map_default(recv).is_some() {
+    if matches!(rep, HashRep::Mutable(_)) || rep.is_sorted() || map_default(recv).is_some() {
         return None;
     }
     let hashed = keyed_hashed(rep, entries.len());
@@ -8958,7 +9043,7 @@ fn map_label(id: usize, rep: HashRep) -> &'static str {
     match rep {
         HashRep::Hashed | HashRep::Mutable(_) => "HashMap",
         HashRep::Linked => "LinkedHashMap",
-        HashRep::Sorted => "TreeMap",
+        HashRep::Sorted | HashRep::MutSorted | HashRep::BitSet | HashRep::SortedKeys => "TreeMap",
         HashRep::Small => "Map",
         HashRep::ListMap => "ListMap",
     }
@@ -9152,7 +9237,7 @@ fn map_default_method(
         _ => return None,
     };
     let (rep, entries) = map_rep_entries(recv)?;
-    let target = if matches!(rep, HashRep::Mutable(_) | HashRep::Linked) {
+    let target = if rep.is_in_place() {
         recv.clone()
     } else {
         heap_push(HeapVal::Map(rep, entries))
@@ -9179,6 +9264,10 @@ fn set_seq_items(recv: &Value, kind: SeqKind, items: Vec<Value>) {
     // that establishes the order re-asserts it right after. Fail-safe: a lost
     // claim costs a rebuild, a wrong one would misplace an element.
     mut_note_sorted(recv, false);
+    let items = match kind {
+        SeqKind::Set(rep) if rep.is_sorted() => sorted_insert_all(items, |v| v, false),
+        _ => items,
+    };
     if let Value::Obj(id) = recv {
         HEAP.with(|h| {
             if let Some(HeapVal::Seq(k, xs)) = h.borrow_mut().get_mut(*id as usize) {
@@ -9426,7 +9515,12 @@ fn mut_seq_method(
     };
     // A `LinkedHashSet` is mutable but has no table order to replay: it iterates
     // its insertion list, so an add appends and a remove unlinks.
-    let linked_set = matches!(kind, SeqKind::Set(HashRep::Linked));
+    // A mutable TreeSet/BitSet takes the same path: [`set_seq_items`] puts the
+    // result back in key order.
+    let linked_set = matches!(
+        kind,
+        SeqKind::Set(HashRep::Linked | HashRep::MutSorted | HashRep::BitSet)
+    );
     let is_set = set_len.is_some() || linked_set;
     let buffer = kind.is_buffer();
     let strbuf = kind == SeqKind::StrBuf;
@@ -9459,6 +9553,9 @@ fn mut_seq_method(
                 spread(&args[0], all)
             };
             if is_set {
+                if kind == SeqKind::Set(HashRep::BitSet) && adds.iter().any(|v| v.to_int() < 0) {
+                    return Some(Err(bitset_negative()));
+                }
                 let absent = !items.iter().any(|u| value_eq(u, &args[0]));
                 match set_len {
                     Some(len) => {
@@ -9729,6 +9826,8 @@ fn set_map_entries(recv: &Value, into: HashRep, entries: Vec<(Value, Value)>) {
             Some(o) => (o, true),
             None => (entries, false),
         },
+        // `put` appended a new key; a tree keeps ascending key order.
+        rep if rep.is_sorted() => (sorted_insert_all(entries, |(k, _)| k, true), false),
         _ => (entries, false),
     };
     if let Value::Obj(id) = recv {
@@ -11671,7 +11770,7 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     };
     // In-place mutation, before the pure paths: on a `mutable.Map` the names
     // `+`/`-`/`++` still build a new map, but `+=`/`-=`/`update`/`put` mutate.
-    if matches!(rep, HashRep::Mutable(_) | HashRep::Linked) {
+    if rep.is_in_place() {
         if let Some(r) = mut_map_method(recv, rep, &entries, name, args) {
             return r;
         }
@@ -11713,7 +11812,7 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // `m.transform((k, v) => …)` — the same keys, in the same positions,
         // each value replaced by `f(k, v)`. Only the immutable `Map`'s; the
         // mutable one transforms in place.
-        ("transform", 1) if !matches!(rep, HashRep::Mutable(_) | HashRep::Linked) => {
+        ("transform", 1) if !rep.is_in_place() => {
             let mut out = Vec::with_capacity(entries.len());
             for (k, v) in &entries {
                 let nv = invoke_closure(vm, &args[0], &[k.clone(), v.clone()])?;
@@ -11765,7 +11864,7 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // the entry — `Some(v)` puts it (in place when present), `None` removes
         // it. When `k` is absent and `f` answers `None` nothing changed, and
         // Scala answers the receiver ITSELF, which `eq` can observe.
-        ("updatedWith", 2) if !matches!(rep, HashRep::Mutable(_) | HashRep::Linked) => {
+        ("updatedWith", 2) if !rep.is_in_place() => {
             let (remap, _) = map_remap(vm, &entries, &args[0], &args[1])?;
             Ok(match remap {
                 Remap::Keep => recv.clone(),
@@ -11779,7 +11878,7 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         // `m.updateWith(k)(f)` is the `mutable.Map` spelling: the same remap,
         // written into the receiver, answering `f`'s result rather than a map.
-        ("updateWith", 2) if matches!(rep, HashRep::Mutable(_) | HashRep::Linked) => {
+        ("updateWith", 2) if rep.is_in_place() => {
             let (remap, result) = map_remap(vm, &entries, &args[0], &args[1])?;
             match remap {
                 Remap::Keep => {}
@@ -14072,7 +14171,14 @@ fn new_seq(kind: SeqKind, items: Vec<Value>) -> Value {
 /// representation upgraded to a `HashSet` when `rep` already was one or the
 /// result exceeds four elements, and a `HashSet`'s elements put in trie order.
 fn new_set(rep: HashRep, items: Vec<Value>) -> Value {
-    if rep == HashRep::Sorted {
+    // A `BitSet` holds `Int`s; mapped to anything else it is the
+    // `SortedSet` Scala's `map` falls back to, which prints `TreeSet(…)`.
+    let rep = if rep == HashRep::BitSet && !items.iter().all(|v| matches!(v, Value::Int(_))) {
+        HashRep::MutSorted
+    } else {
+        rep
+    };
+    if rep.is_sorted() {
         let sorted = sorted_insert_all(items, |v| v, false);
         return heap_push(HeapVal::Seq(SeqKind::Set(rep), sorted));
     }
@@ -14152,7 +14258,7 @@ fn mut_map_from(len: usize, entries: Vec<(Value, Value)>) -> Value {
 /// treatment of [`new_set`], keyed by the entry key.
 fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
     // `TreeMap.updated` overwrites both the key and the value it finds.
-    if rep == HashRep::Sorted {
+    if rep.is_sorted() {
         let sorted = sorted_insert_all(entries, |(k, _)| k, true);
         return heap_push(HeapVal::Map(rep, sorted));
     }
@@ -14187,7 +14293,7 @@ fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
 /// A mutable receiver stays mutable — [`new_set`]/[`new_map`] intercept it
 /// before this is reached.
 fn hash_rep(rep: HashRep, len: usize) -> HashRep {
-    if rep == HashRep::Linked || rep == HashRep::Sorted {
+    if rep == HashRep::Linked || rep.is_sorted() {
         return rep;
     }
     if rep == HashRep::Hashed || len > 4 {

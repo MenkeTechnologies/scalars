@@ -218,6 +218,13 @@ struct Compiler {
     /// a bare identifier naming one of the object's `val`s resolves to the
     /// `Name.val` global and a bare method call to `Name$method`.
     current_object: Option<String>,
+    /// The entry `object`'s name when the code being lowered is one of ITS
+    /// members — the `extends App` body, `def main`, or a helper `def` declared
+    /// inside it — so `this` there is that singleton. `None` for a top-level
+    /// `def` (a member of the synthetic package object, not the entry), for a
+    /// `@main` entry, and wherever [`Self::current_class`] or
+    /// [`Self::current_object`] names a closer receiver.
+    entry_this: Option<String>,
     /// Distinguishes synthetic method-dispatch / constructor-pattern temporaries.
     obj_counter: u32,
     /// Where the VALUE of the compound assignment being lowered must be left —
@@ -300,6 +307,7 @@ struct PendingClosure {
     body: Expr,
     current_class: Option<(String, HashSet<String>)>,
     current_object: Option<String>,
+    entry_this: Option<String>,
     /// The enclosing body's by-name parameters. A closure written inside a `def`
     /// can read one, and the read must still force the thunk, so the set travels
     /// with the queued body instead of being read from the compiler's cursor
@@ -923,6 +931,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             .any(|m| m.name == "equals" && m.params.len() == 1),
         current_class: None,
         current_object: None,
+        entry_this: None,
         obj_counter: 0,
         assign_result: None,
         pending_closures: VecDeque::new(),
@@ -988,6 +997,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
 
     // Main body runs first after the object inits (the VM starts at ip 0), so the
     // tracing JIT's early anchor still fires on real work.
+    c.entry_this = prog.entry_is_object.then(|| prog.object_name.clone());
     for stmt in &prog.main {
         c.stmt(stmt)?;
     }
@@ -1004,8 +1014,11 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     if has_subs {
         let skip = c.b.emit(Op::Jump(0), 0);
         for func in &prog.functions {
+            c.entry_this = (prog.entry_is_object && !prog.top_level_defs.contains(&func.name))
+                .then(|| prog.object_name.clone());
             c.function_body(func)?;
         }
+        c.entry_this = None;
         for cd in &classes {
             // A trait has no constructor — only the concrete methods a mixing
             // class dispatches into.
@@ -1973,6 +1986,9 @@ impl Compiler {
             "TreeSet" => crate::host::MAKE_SORTEDSET,
             "TreeMap" => crate::host::MAKE_SORTEDMAP,
             "ListMap" => crate::host::MAKE_LISTMAP,
+            "mutable.TreeSet" => crate::host::MAKE_MUTSORTEDSET,
+            "mutable.TreeMap" => crate::host::MAKE_MUTSORTEDMAP,
+            "mutable.BitSet" => crate::host::MAKE_BITSET,
             _ => return Err(format!("scalars: unknown collection constructor `{ctor}`")),
         };
         self.b.emit(Op::CallBuiltin(id, elems.len() as u8), 0);
@@ -2061,6 +2077,7 @@ impl Compiler {
                     body: test,
                     current_class: self.current_class.clone(),
                     current_object: self.current_object.clone(),
+                    entry_this: self.entry_this.clone(),
                     by_name: self.by_name.clone(),
                     lazies: self.lazies.clone(),
                     widths: self.widths.clone(),
@@ -2101,6 +2118,7 @@ impl Compiler {
             body: body.clone(),
             current_class: self.current_class.clone(),
             current_object: self.current_object.clone(),
+            entry_this: self.entry_this.clone(),
             by_name: self.by_name.clone(),
             lazies: self.lazies.clone(),
             widths: self.widths.clone(),
@@ -2177,6 +2195,7 @@ impl Compiler {
         }
         let saved_class = std::mem::replace(&mut self.current_class, pc.current_class);
         let saved_object = std::mem::replace(&mut self.current_object, pc.current_object);
+        let saved_entry = std::mem::replace(&mut self.entry_this, pc.entry_this);
         // A parameter of this closure shadows an enclosing by-name parameter of
         // the same name, and is an ordinary value.
         let mut by_name = pc.by_name;
@@ -2206,6 +2225,7 @@ impl Compiler {
         self.widths = saved_widths;
         self.current_class = saved_class;
         self.current_object = saved_object;
+        self.entry_this = saved_entry;
         self.by_name = saved_by_name;
         self.implicits = saved_implicits;
         self.implicit_floor = saved_floor;
@@ -3015,6 +3035,23 @@ impl Compiler {
         Ok(())
     }
 
+    /// The entry object, when `this` in the code being lowered is it: see
+    /// [`Self::entry_this`]. A class or object body, and a local named `this`
+    /// (a lambda capture inside a class), always win.
+    fn entry_receiver(&self) -> Option<String> {
+        if self.current_class.is_some() || self.current_object.is_some() {
+            return None;
+        }
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|s| s.slots.contains_key("this"))
+        {
+            return None;
+        }
+        self.entry_this.clone()
+    }
+
     /// Push a singleton `object`/`case object` value (e.g. `None`) — a zero-field
     /// host-heap record tagged with the object's name.
     fn materialize_object(&mut self, name: &str) -> Result<(), String> {
@@ -3022,6 +3059,13 @@ impl Compiler {
             Some(meta) => meta.is_case,
             None => return Err(format!("scalars: not found: value {name}")),
         };
+        self.emit_singleton(name, is_case);
+        Ok(())
+    }
+
+    /// Push the record standing for the singleton `name` (rendered as its bare
+    /// name, `getClass` answering `name$`).
+    fn emit_singleton(&mut self, name: &str, is_case: bool) {
         let cn = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(cn), 0);
         let csv = self.b.add_constant(Value::str(String::new()));
@@ -3031,7 +3075,6 @@ impl Compiler {
         // A singleton object — render as its bare name.
         self.b.emit(Op::LoadTrue, 0);
         self.b.emit(Op::CallBuiltin(crate::host::OBJ_NEW, 4), 0);
-        Ok(())
     }
 
     /// Read a bare identifier. Resolution order: function-local slot, enclosing
@@ -3133,6 +3176,22 @@ impl Compiler {
             // was false on `Red` itself.
             if name == "this" {
                 return self.materialize_object(&obj);
+            }
+            // A bare `getClass` in a singleton's body is the singleton's own
+            // class (`Name$`), as `this.getClass` is.
+            if name == "getClass" {
+                return self.emit_smethod(&Expr::Var("this".to_string()), name, &[], 0);
+            }
+        }
+        // The entry object's own body and helper `def`s: `this` is the entry
+        // singleton, so `getClass` there answers `Main$`.
+        if let Some(entry) = self.entry_receiver() {
+            if name == "this" {
+                self.emit_singleton(&entry, false);
+                return Ok(());
+            }
+            if name == "getClass" {
+                return self.emit_smethod(&Expr::Var("this".to_string()), name, &[], 0);
             }
         }
         // A bare `toString` / `hashCode` inside a class or object body is the
@@ -5331,6 +5390,30 @@ impl Compiler {
     /// the narrowing covers EVERY lowering path — the math builtin, the operator
     /// spellings, and the generic `SMETHOD` fallback all funnel through here.
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        // `Function.tupled(f)` is the library spelling of `f.tupled`.
+        if matches!(recv, Expr::Var(v) if v == "Function")
+            && name == "tupled"
+            && args.len() == 1
+            && !self.objects.contains_key("Function")
+        {
+            return self.method(&args[0], "tupled", &[], line);
+        }
+        // `this.h` / `this.v` / `this.f(x)` inside the entry object names the
+        // entry's own member, which is lowered as the bare name. Only a member
+        // of `Any` (`getClass`, `toString`, …) is a call on the singleton.
+        if matches!(recv, Expr::Var(v) if v == "this")
+            && self.entry_receiver().is_some()
+            && !matches!(
+                name,
+                "getClass" | "toString" | "hashCode" | "equals" | "==" | "!=" | "eq" | "ne"
+            )
+        {
+            return if args.is_empty() {
+                self.expr(&Expr::Var(name.to_string()))
+            } else {
+                self.call(name, args, line)
+            };
+        }
         // `buf.append(xs: _*)`, `q.enqueue(xs: _*)` — a spread into a library
         // collection's varargs method is that collection's bulk form taking the
         // sequence itself. Only when no class or object in the program declares a
@@ -6176,7 +6259,11 @@ impl Compiler {
                 | ("iterate", [_, _, _])
                     if !matches!(
                         ctor,
-                        "mutable.Map" | "LinkedHashMap" | "StringBuilder" | "PriorityQueue"
+                        "mutable.Map"
+                            | "LinkedHashMap"
+                            | "mutable.TreeMap"
+                            | "StringBuilder"
+                            | "PriorityQueue"
                     ) =>
                 {
                     if let Some(list) = companion_factory("List", name, args, line) {
@@ -9142,6 +9229,9 @@ fn mutable_buffer_literal(ctor: &str) -> bool {
             | "StringBuilder"
             | "LinkedHashSet"
             | "LinkedHashMap"
+            | "mutable.TreeSet"
+            | "mutable.TreeMap"
+            | "mutable.BitSet"
     )
 }
 
@@ -10172,6 +10262,8 @@ fn mutable_module(e: &Expr) -> bool {
 fn bare_mutable_ctor(name: &str) -> Option<&'static str> {
     match name {
         "Set" | "HashSet" | "Map" | "HashMap" => None,
+        // Bare, a tree name is the immutable one this frontend has always built.
+        "TreeSet" | "SortedSet" | "TreeMap" | "SortedMap" | "BitSet" => None,
         other => mutable_ctor(other),
     }
 }
@@ -10196,6 +10288,11 @@ fn mutable_ctor(name: &str) -> Option<&'static str> {
         // and never an alias for the table-ordered ones.
         "LinkedHashSet" => "LinkedHashSet",
         "LinkedHashMap" => "LinkedHashMap",
+        // The trees keep KEY order and are updated in place: `HashRep::MutSorted`
+        // (`HashRep::BitSet` for a `BitSet`), never the immutable `TreeSet`.
+        "TreeSet" | "SortedSet" => "mutable.TreeSet",
+        "TreeMap" | "SortedMap" => "mutable.TreeMap",
+        "BitSet" => "mutable.BitSet",
         _ => return None,
     })
 }

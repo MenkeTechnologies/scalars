@@ -337,6 +337,13 @@ Implemented and checked against the reference `scala`:
   catches. A `finally` between the two still runs, a `catch { case e: Exception }`
   between them does not swallow it, and a `break` inside a nested `def` unwinds
   out of that frame.
+- **`boundary` / `break(v)`** — Scala 3's `scala.util.boundary`, with `break`
+  imported (`import scala.util.boundary, boundary.break`) or written
+  `boundary.break(v)`. Lowered as the library implements it: `break(v)` throws
+  a `boundary.Break` carrying its block's label and `v`, and the lexically
+  innermost `boundary` catches its own label and answers `v`. `Break` is a
+  `RuntimeException`, so a `catch { case e: Exception }` between the two DOES
+  catch it, as in Scala; a `break` with no enclosing `boundary` is refused.
 - **Expressions** — integer / floating / string (including the triple-quoted
   `"""…"""` form, taken verbatim) / char / boolean / `null`
   literals and the unit literal `()`; the binary operators `+ - * / %`,
@@ -531,6 +538,12 @@ Implemented and checked against the reference `scala`:
 - **`scala.collection.immutable.TreeSet`/`TreeMap`** (and the `SortedSet`/
   `SortedMap` factories) — kept in key order, with `firstKey`/`lastKey`,
   `range`/`rangeFrom`/`rangeUntil`/`rangeTo` and `minAfter`/`maxBefore`.
+  `mutable.TreeSet`/`TreeMap` (also `mutable.SortedSet`/`SortedMap`) keep the
+  same order and update in place (`+=`/`-=`/`update`/`put`/`remove`/
+  `getOrElseUpdate`/`clear`/`filterInPlace`/`updateWith`); a mutable map's
+  `keys`/`keySet` prints `SortedSet(…)`. `mutable.BitSet` is the ascending
+  set of non-negative `Int`s, with `|`/`&`/`&~`, printed `BitSet(…)`; a
+  negative element is the library's `requirement failed`.
 - **`scala.collection.mutable`** — `ListBuffer`, `ArrayBuffer`, `Queue`,
   `PriorityQueue` (a binary max-heap whose `toString` and iteration expose the
   raw heap array, ported from the library's own `fixUp`/`fixDown`/`heapify`),
