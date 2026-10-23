@@ -519,6 +519,9 @@ pub const HAS_MEMBER: u16 = 816;
 pub const BOX_ANY: u16 = 817;
 /// Builtin id opening a widened box (see `b_unbox`); pops one value.
 pub const UNBOX: u16 = 818;
+/// Builtin id for a `java.util.stream.Collectors` factory: pops the factory
+/// name and its arguments (see `b_collector`).
+pub const COLLECTOR: u16 = 819;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -781,6 +784,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(HAS_MEMBER, b_has_member);
     vm.register_builtin(BOX_ANY, b_box_any);
     vm.register_builtin(UNBOX, b_unbox);
+    vm.register_builtin(COLLECTOR, b_collector);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -1616,13 +1620,19 @@ enum SeqKind {
     /// op that may change the element type (`map`) builds an `IndexedSeq`,
     /// which is a `Vector`.
     WrappedStr,
-    /// A `java.util.stream.IntStream` (`"abc".chars`): its elements are the
-    /// stream's SOURCE, and its lazy pipeline lives in `INT_STREAMS`.
-    IntStream,
-    /// A `java.util.OptionalInt` (`false`) or `OptionalDouble` (`true`) — what
-    /// an `IntStream`'s `max`/`min`/`average`/`findFirst` answer: zero or one
-    /// element, printed `OptionalInt[3]` / `OptionalInt.empty`.
-    JavaOptional(bool),
+    /// A `java.util.stream.IntStream` (`"abc".chars`) or object `Stream`: its
+    /// elements are the stream's SOURCE, and its lazy pipeline and single-use
+    /// state live in `JSTREAMS`.
+    JStream,
+    /// A `java.util.Optional`/`OptionalInt`/`OptionalDouble` — what a stream's
+    /// `max`/`min`/`average`/`findFirst`/`reduce(op)` answer: zero or one
+    /// element, printed `OptionalInt[3]` / `Optional.empty`.
+    JavaOptional(JOpt),
+    /// A `java.util.List` a stream collected into, printed `[a, b]`.
+    JavaList,
+    /// A `java.util.stream.Collectors` collector; its elements are the
+    /// factory's arguments (`joining`'s delimiter, prefix and suffix).
+    JCollector(Coll),
     /// An integer `Range` as a first-class value. Its elements are materialized
     /// like any other sequence; the bounds are kept because `Range.toString`
     /// prints them (`Range 1 to 10 by 3`) rather than the elements.
@@ -1695,9 +1705,10 @@ impl SeqKind {
             SeqKind::PriorityQueue => "PriorityQueue",
             SeqKind::StrBuf => "StringBuilder",
             SeqKind::WrappedStr => "WrappedString",
-            SeqKind::IntStream => "IntStream",
-            SeqKind::JavaOptional(false) => "OptionalInt",
-            SeqKind::JavaOptional(true) => "OptionalDouble",
+            SeqKind::JStream => "Stream",
+            SeqKind::JavaOptional(k) => k.label(),
+            SeqKind::JavaList => "List",
+            SeqKind::JCollector(_) => "Collector",
             SeqKind::Range { .. } => "Range",
             SeqKind::CharRange { .. } => "NumericRange",
         }
@@ -1791,8 +1802,10 @@ impl SeqKind {
             SeqKind::List
             | SeqKind::Iterable
             | SeqKind::Iterator
-            | SeqKind::IntStream
-            | SeqKind::JavaOptional(_) => Some(format!("{} of empty list", op.word())),
+            | SeqKind::JStream
+            | SeqKind::JavaOptional(_)
+            | SeqKind::JavaList
+            | SeqKind::JCollector(_) => Some(format!("{} of empty list", op.word())),
             // `NumericRange` reports an empty access through `Nil`, and both its
             // `head` and its `last` (so `min`/`max` too) are `Nil.head`.
             SeqKind::CharRange { .. } => Some(match op {
@@ -2357,7 +2370,7 @@ pub fn reset_heap() {
     MAP_DEFAULTS.with(|t| t.borrow_mut().clear());
     LIST_ITERS.with(|t| t.borrow_mut().clear());
     LAZY_ZIPS.with(|t| t.borrow_mut().clear());
-    INT_STREAMS.with(|t| t.borrow_mut().clear());
+    JSTREAMS.with(|t| t.borrow_mut().clear());
     CHAR_ARRAYS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
@@ -5568,6 +5581,12 @@ fn obj_to_string(v: &Value) -> String {
                 },
                 items,
             )) => char_range_to_string(*start, *end, *inclusive, *step, items.is_empty()),
+            Some(HeapVal::Seq(SeqKind::JavaList, items)) => {
+                format!(
+                    "[{}]",
+                    items.iter().map(scala_str).collect::<Vec<_>>().join(", ")
+                )
+            }
             Some(HeapVal::Seq(kind @ SeqKind::JavaOptional(_), items)) => match items.first() {
                 Some(v) => format!("{}[{}]", kind.label(), scala_str(v)),
                 None => format!("{}.empty", kind.label()),
@@ -8810,6 +8829,7 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
         Some(0) => {
             let list_iter = list_iter_len(recv);
             let out = seq_method(vm, recv, name, args)?;
+            carry_char_array(recv, name, &out);
             if let Some(len) = list_iter {
                 derive_list_iter(&out, name, args, len);
             }
@@ -10113,11 +10133,17 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // representation already costs. Measured on `v = v :+ i` 10 000 times:
     // 40.3G instructions retired with the clone, 21.4G without it.
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
-    if kind == SeqKind::IntStream {
+    if kind == SeqKind::JStream {
         return int_stream_method(vm, recv, &items, name, args);
     }
-    if let SeqKind::JavaOptional(double) = kind {
-        return java_optional_method(recv, double, items.first(), name, args);
+    if let SeqKind::JavaOptional(opt) = kind {
+        return java_optional_method(recv, opt, items.first(), name, args);
+    }
+    if kind == SeqKind::JavaList {
+        return java_list_method(vm, recv, &items, name, args);
+    }
+    if let SeqKind::JCollector(_) = kind {
+        return Err(no_such_method(recv, name));
     }
     if kind == SeqKind::Iterator {
         if let Some(r) = iterator_partial_method(vm, recv, &items, name, args) {
@@ -15217,6 +15243,27 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             s.chars().map(make_char).collect(),
         )),
         ("reverse", 0) => Ok(Value::str(s.chars().rev().collect::<String>())),
+        // `union` of two strings is their concatenation (`SeqOps.concat`).
+        ("union", 1) if matches!(args[0], Value::Str(_)) => {
+            Ok(Value::str(format!("{s}{}", args[0].as_str_cow())))
+        }
+        ("regionMatches", 4 | 5) => Ok(Value::bool(region_matches(s, args))),
+        ("indent", 1) => Ok(Value::str(java_indent(s, args[0].to_int()))),
+        // `getBytes(charset)` — by name or `StandardCharsets` constant (carried
+        // as its name).
+        ("getBytes", 1) => {
+            let charset = args[0].as_str_cow().into_owned();
+            let bytes = java_encode(s, &charset).ok_or_else(|| {
+                format!("scalars: java.io.UnsupportedEncodingException: {charset}")
+            })?;
+            Ok(new_seq(
+                SeqKind::Array,
+                bytes
+                    .into_iter()
+                    .map(|b| Value::int(i64::from(b as i8)))
+                    .collect(),
+            ))
+        }
         // `tails`/`inits` iterate the suffixes / prefixes, longest first and
         // ending with `""`; `reverseIterator` the characters backwards.
         ("tails" | "inits", 0) => {
@@ -17174,7 +17221,8 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
                 | SeqKind::CharRange { .. }
                 | SeqKind::StrBuf
                 | SeqKind::WrappedStr
-                | SeqKind::JavaOptional(_),
+                | SeqKind::JavaOptional(_)
+                | SeqKind::JavaList,
                 _,
             )) => Renderable::Leaf,
             Some(HeapVal::Seq(kind, items)) => Renderable::Seq(kind.label(), items.clone()),
@@ -19673,19 +19721,27 @@ fn stream_evaluate_head(l: &mut LazyList) {
     }
 }
 
-// ── `java.util.stream.IntStream` ─────────────────────────────────────────────
+// ── `java.util.stream.IntStream` / `Stream` ─────────────────────────────────
 //
-// What `String.chars` and `codePoints` answer. A stream is a SOURCE (the
-// `IntStream`-kind sequence's elements) and a PIPELINE of intermediate ops kept
-// beside it in [`INT_STREAMS`]; nothing runs until a terminal op, and then each
-// element travels the whole pipeline before the next is pulled — so a `map`
-// with a side effect interleaves with a later `filter`'s exactly as the JDK's
-// does, and `limit`/`anyMatch` stop pulling the source early.
+// What `String.chars` and `codePoints` answer, and the object `Stream` its
+// `boxed`/`mapToObj` turn it into. A stream is a SOURCE (the `JStream`-kind
+// sequence's elements) and a PIPELINE of intermediate ops kept beside it in
+// [`JSTREAMS`]; nothing runs until a terminal op, and then each element travels
+// the whole pipeline before the next is pulled — so a `map` with a side effect
+// interleaves with a later `filter`'s exactly as the JDK's does, and
+// `limit`/`anyMatch` stop pulling the source early.
+//
+// A stream is single-use, as the JDK's is: an intermediate op LINKS it to the
+// stream it returns and a terminal op CONSUMES it, and either makes any further
+// op on it the `IllegalStateException` the JDK raises.
 
-/// One intermediate op of an [`IntStream`](SeqKind::IntStream) pipeline.
+/// One intermediate op of a [`JStream`](SeqKind::JStream) pipeline.
 #[derive(Clone)]
 enum StreamOp {
-    Map(Value),
+    /// `IntStream.map`: the result is an `int`, wrapped to 32 bits.
+    MapInt(Value),
+    /// `Stream.map` / `IntStream.mapToObj`: any value.
+    MapObj(Value),
     Filter(Value),
     Distinct,
     /// A stateful BARRIER: everything before it runs to completion first.
@@ -19694,37 +19750,90 @@ enum StreamOp {
     Skip(usize),
 }
 
+/// A stream's pipeline and state.
+#[derive(Clone, Default)]
+struct StreamState {
+    ops: Vec<StreamOp>,
+    /// An object `Stream` rather than an `IntStream`.
+    objects: bool,
+    /// Linked to a downstream stream or consumed by a terminal op.
+    used: bool,
+}
+
+/// The `java.util.Optional` family an op answers (see [`SeqKind::JavaOptional`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum JOpt {
+    Int,
+    Double,
+    Obj,
+}
+
+impl JOpt {
+    fn label(self) -> &'static str {
+        match self {
+            JOpt::Int => "OptionalInt",
+            JOpt::Double => "OptionalDouble",
+            JOpt::Obj => "Optional",
+        }
+    }
+}
+
+/// What a `java.util.stream.Collectors` factory builds (see
+/// [`SeqKind::JCollector`]); the collector's arguments are its elements.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Coll {
+    ToList,
+    ToSet,
+    Joining,
+    Counting,
+}
+
 thread_local! {
-    /// The pipeline of each live `IntStream` value, by heap id.
-    static INT_STREAMS: RefCell<HashMap<usize, Vec<StreamOp>>> = RefCell::new(HashMap::new());
-    /// The heap ids of the arrays built as `Array[Char]` (`new Array[Char](n)`,
-    /// `Array[Char]()`, `Array.empty[Char]`), which is what tells an EMPTY one
-    /// from any other empty array.
+    /// The state of each live stream value, by heap id.
+    static JSTREAMS: RefCell<HashMap<usize, StreamState>> = RefCell::new(HashMap::new());
+    /// The heap ids of the arrays known to be `Array[Char]` (built as one, or
+    /// derived from one), which is what tells an EMPTY one from any other.
     static CHAR_ARRAYS: RefCell<std::collections::HashSet<usize>> =
         RefCell::new(std::collections::HashSet::new());
 }
 
 /// A new `IntStream` over `src` with no pipeline.
 fn new_int_stream(src: Vec<Value>) -> Value {
-    new_seq(SeqKind::IntStream, src)
+    new_seq(SeqKind::JStream, src)
 }
 
-/// `stream` with `op` appended to its pipeline, as a NEW stream value.
-fn int_stream_then(stream: &Value, src: &[Value], op: StreamOp) -> Value {
-    let mut ops = as_obj_id(stream)
-        .and_then(|id| INT_STREAMS.with(|t| t.borrow().get(&id).cloned()))
-        .unwrap_or_default();
-    ops.push(op);
-    let out = new_int_stream(src.to_vec());
+fn stream_state(v: &Value) -> StreamState {
+    as_obj_id(v)
+        .and_then(|id| JSTREAMS.with(|t| t.borrow().get(&id).cloned()))
+        .unwrap_or_default()
+}
+
+/// Mark `stream` used: linked to the stream an intermediate op returned, or
+/// consumed by a terminal op.
+fn stream_mark_used(stream: &Value) {
+    if let Some(id) = as_obj_id(stream) {
+        JSTREAMS.with(|t| t.borrow_mut().entry(id).or_default().used = true);
+    }
+}
+
+/// `stream` with `op` appended to its pipeline, as a NEW stream value of the
+/// given element kind.
+fn stream_then(stream: &Value, src: &[Value], op: Option<StreamOp>, objects: bool) -> Value {
+    let mut state = stream_state(stream);
+    state.ops.extend(op);
+    state.objects = objects;
+    state.used = false;
+    stream_mark_used(stream);
+    let out = new_seq(SeqKind::JStream, src.to_vec());
     if let Some(id) = as_obj_id(&out) {
-        INT_STREAMS.with(|t| t.borrow_mut().insert(id, ops));
+        JSTREAMS.with(|t| t.borrow_mut().insert(id, state));
     }
     out
 }
 
 /// Run the pipeline of `ops` over `src`, handing each surviving element to
 /// `sink`, which answers `false` to stop pulling (a short-circuiting terminal).
-fn int_stream_run(
+fn stream_run(
     vm: &mut VM,
     src: &[Value],
     ops: &[StreamOp],
@@ -19734,15 +19843,14 @@ fn int_stream_run(
     // before it are run to completion first, which is what a barrier means.
     if let Some(cut) = ops.iter().rposition(|o| matches!(o, StreamOp::Sorted)) {
         let mut buffered = Vec::new();
-        int_stream_run(vm, src, &ops[..cut], &mut |_, v| {
+        stream_run(vm, src, &ops[..cut], &mut |_, v| {
             buffered.push(v);
             Ok(true)
         })?;
-        buffered.sort_by_key(Value::to_int);
-        return int_stream_run(vm, &buffered, &ops[cut + 1..], sink);
+        buffered.sort_by(value_cmp);
+        return stream_run(vm, &buffered, &ops[cut + 1..], sink);
     }
-    let mut seen: Vec<std::collections::HashSet<i64>> =
-        vec![std::collections::HashSet::new(); ops.len()];
+    let mut seen: Vec<Vec<Value>> = vec![Vec::new(); ops.len()];
     let mut counts: Vec<usize> = vec![0; ops.len()];
     'pull: for x in src {
         // A `limit` that has passed its quota CANCELS the pull: the next source
@@ -19757,18 +19865,20 @@ fn int_stream_run(
         let mut v = x.clone();
         for (i, op) in ops.iter().enumerate() {
             match op {
-                StreamOp::Map(f) => {
+                StreamOp::MapInt(f) => {
                     v = Value::int(i64::from(invoke_closure(vm, f, &[v])?.to_int() as i32))
                 }
+                StreamOp::MapObj(f) => v = invoke_closure(vm, f, &[v])?,
                 StreamOp::Filter(p) => {
                     if !truthy(&invoke_closure(vm, p, std::slice::from_ref(&v))?) {
                         continue 'pull;
                     }
                 }
                 StreamOp::Distinct => {
-                    if !seen[i].insert(v.to_int()) {
+                    if seen[i].iter().any(|s| value_eq(s, &v)) {
                         continue 'pull;
                     }
+                    seen[i].push(v.clone());
                 }
                 StreamOp::Limit(n) => {
                     if counts[i] >= *n {
@@ -19792,8 +19902,8 @@ fn int_stream_run(
     Ok(())
 }
 
-/// The `IntStream` members. Anything else is not a member — an `IntStream` is
-/// not a Scala collection, so none of `Seq`'s methods apply to it.
+/// The `IntStream`/`Stream` members. Anything else is not a member — a stream
+/// is not a Scala collection, so none of `Seq`'s methods apply to it.
 fn int_stream_method(
     vm: &mut VM,
     recv: &Value,
@@ -19801,28 +19911,42 @@ fn int_stream_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, String> {
-    let ops = as_obj_id(recv)
-        .and_then(|id| INT_STREAMS.with(|t| t.borrow().get(&id).cloned()))
-        .unwrap_or_default();
-    let then = |op| Ok(int_stream_then(recv, src, op));
+    let state = stream_state(recv);
+    if state.used {
+        return Err("scalars: java.lang.IllegalStateException: \
+                    stream has already been operated upon or closed"
+            .to_string());
+    }
+    let objects = state.objects;
+    let ops = state.ops;
+    let class = if objects { "Stream" } else { "IntStream" };
+    let then = |op, objects| Ok(stream_then(recv, src, op, objects));
     let count_of = |a: &Value| usize::try_from(a.to_int()).unwrap_or(0);
     let collect = |vm: &mut VM| -> Result<Vec<Value>, String> {
+        stream_mark_used(recv);
         let mut out = Vec::new();
-        int_stream_run(vm, src, &ops, &mut |_, v| {
+        stream_run(vm, src, &ops, &mut |_, v| {
             out.push(v);
             Ok(true)
         })?;
         Ok(out)
     };
+    let optional = |kind: JOpt, v: Option<Value>| {
+        new_seq(SeqKind::JavaOptional(kind), v.into_iter().collect())
+    };
+    let elem_opt = if objects { JOpt::Obj } else { JOpt::Int };
     match (name, args.len()) {
-        ("map", 1) => then(StreamOp::Map(args[0].clone())),
-        ("filter", 1) => then(StreamOp::Filter(args[0].clone())),
-        ("distinct", 0) => then(StreamOp::Distinct),
-        ("sorted", 0) => then(StreamOp::Sorted),
-        ("limit", 1) => then(StreamOp::Limit(count_of(&args[0]))),
-        ("skip", 1) => then(StreamOp::Skip(count_of(&args[0]))),
+        ("map", 1) if objects => then(Some(StreamOp::MapObj(args[0].clone())), true),
+        ("map", 1) => then(Some(StreamOp::MapInt(args[0].clone())), false),
+        ("mapToObj", 1) if !objects => then(Some(StreamOp::MapObj(args[0].clone())), true),
+        ("boxed", 0) if !objects => then(None, true),
+        ("filter", 1) => then(Some(StreamOp::Filter(args[0].clone())), objects),
+        ("distinct", 0) => then(Some(StreamOp::Distinct), objects),
+        ("sorted", 0) => then(Some(StreamOp::Sorted), objects),
+        ("limit", 1) => then(Some(StreamOp::Limit(count_of(&args[0]))), objects),
+        ("skip", 1) => then(Some(StreamOp::Skip(count_of(&args[0]))), objects),
         // `sum` is `int` addition, wrapping at 32 bits.
-        ("sum", 0) => Ok(Value::int(i64::from(
+        ("sum", 0) if !objects => Ok(Value::int(i64::from(
             collect(vm)?
                 .iter()
                 .fold(0i32, |acc, v| acc.wrapping_add(v.to_int() as i32)),
@@ -19834,10 +19958,15 @@ fn int_stream_method(
             if ops.iter().all(|o| {
                 matches!(
                     o,
-                    StreamOp::Map(_) | StreamOp::Sorted | StreamOp::Skip(_) | StreamOp::Limit(_)
+                    StreamOp::MapInt(_)
+                        | StreamOp::MapObj(_)
+                        | StreamOp::Sorted
+                        | StreamOp::Skip(_)
+                        | StreamOp::Limit(_)
                 )
             }) =>
         {
+            stream_mark_used(recv);
             let size = ops.iter().fold(src.len(), |n, o| match o {
                 StreamOp::Skip(k) => n.saturating_sub(*k),
                 StreamOp::Limit(k) => n.min(*k),
@@ -19847,32 +19976,53 @@ fn int_stream_method(
         }
         ("count", 0) => Ok(Value::int(collect(vm)?.len() as i64)),
         ("toArray", 0) => Ok(new_seq(SeqKind::Array, collect(vm)?)),
-        ("max" | "min" | "findFirst" | "findAny", 0) => {
+        // `Stream.toList` (JDK 16) is an unmodifiable `java.util.List`.
+        ("toList", 0) if objects => Ok(new_seq(SeqKind::JavaList, collect(vm)?)),
+        ("collect", 1) => {
+            let Some((coll, params)) = as_collector(&args[0]) else {
+                return Err(format!("scalars: value collect is not a member of {class}"));
+            };
+            let all = collect(vm)?;
+            Ok(match coll {
+                Coll::ToList => new_seq(SeqKind::JavaList, all),
+                Coll::ToSet => new_seq(SeqKind::JavaList, java_hash_set_order(all)),
+                Coll::Counting => Value::int(all.len() as i64),
+                Coll::Joining => {
+                    let text = |i: usize| params.get(i).map(scala_str).unwrap_or_default();
+                    let body: Vec<String> = all.iter().map(|v| scala_str_vm(vm, v)).collect();
+                    Value::str(format!("{}{}{}", text(1), body.join(&text(0)), text(2)))
+                }
+            })
+        }
+        ("max" | "min", 0) if !objects => {
             let all = collect(vm)?;
             let pick = match name {
                 "max" => all.iter().max_by_key(|v| v.to_int()),
-                "min" => all.iter().min_by_key(|v| v.to_int()),
-                _ => all.first(),
+                _ => all.iter().min_by_key(|v| v.to_int()),
             };
-            Ok(new_seq(
-                SeqKind::JavaOptional(false),
-                pick.cloned().into_iter().collect(),
-            ))
+            Ok(optional(JOpt::Int, pick.cloned()))
         }
-        ("average", 0) => {
+        ("findFirst" | "findAny", 0) => {
+            let mut first = None;
+            stream_mark_used(recv);
+            stream_run(vm, src, &ops, &mut |_, v| {
+                first = Some(v);
+                Ok(false)
+            })?;
+            Ok(optional(elem_opt, first))
+        }
+        ("average", 0) if !objects => {
             let all = collect(vm)?;
             let avg = (!all.is_empty()).then(|| {
                 let sum: i64 = all.iter().map(Value::to_int).sum();
                 Value::float(sum as f64 / all.len() as f64)
             });
-            Ok(new_seq(
-                SeqKind::JavaOptional(true),
-                avg.into_iter().collect(),
-            ))
+            Ok(optional(JOpt::Double, avg))
         }
         ("forEach", 1) => {
             let f = args[0].clone();
-            int_stream_run(vm, src, &ops, &mut |vm, v| {
+            stream_mark_used(recv);
+            stream_run(vm, src, &ops, &mut |vm, v| {
                 invoke_closure(vm, &f, &[v]).map(|_| true)
             })?;
             Ok(unit_value())
@@ -19882,7 +20032,8 @@ fn int_stream_method(
             // The answer when no element decides it: `anyMatch` of nothing is
             // false, the other two true.
             let mut answer = name != "anyMatch";
-            int_stream_run(vm, src, &ops, &mut |vm, v| {
+            stream_mark_used(recv);
+            stream_run(vm, src, &ops, &mut |vm, v| {
                 let hit = truthy(&invoke_closure(vm, &p, &[v])?);
                 let decided = match name {
                     "anyMatch" => hit,
@@ -19896,34 +20047,52 @@ fn int_stream_method(
             })?;
             Ok(Value::bool(answer))
         }
-        ("reduce", 2) => {
-            let f = args[1].clone();
-            let mut acc = args[0].clone();
-            int_stream_run(vm, src, &ops, &mut |vm, v| {
-                acc = Value::int(i64::from(
-                    invoke_closure(vm, &f, &[acc.clone(), v])?.to_int() as i32,
-                ));
+        // `reduce(identity, op)` folds from the identity; `reduce(op)` from the
+        // first element, answering an empty `Optional` for an empty stream.
+        ("reduce", 1 | 2) => {
+            let f = args[args.len() - 1].clone();
+            let mut acc = (args.len() == 2).then(|| args[0].clone());
+            stream_mark_used(recv);
+            stream_run(vm, src, &ops, &mut |vm, v| {
+                acc = Some(match acc.take() {
+                    None => v,
+                    Some(a) => {
+                        let r = invoke_closure(vm, &f, &[a, v])?;
+                        if objects {
+                            r
+                        } else {
+                            Value::int(i64::from(r.to_int() as i32))
+                        }
+                    }
+                });
                 Ok(true)
             })?;
-            Ok(acc)
+            Ok(match (args.len(), acc) {
+                (2, Some(a)) => a,
+                (_, a) => optional(elem_opt, a),
+            })
         }
         _ => Err(format!(
-            "scalars: value {name} is not a member of java.util.stream.IntStream"
+            "scalars: value {name} is not a member of java.util.stream.{class}"
         )),
     }
 }
 
-/// The `java.util.OptionalInt`/`OptionalDouble` members (see
-/// [`SeqKind::JavaOptional`]). An empty one's `getAsInt` is the JDK's
+/// The `java.util.Optional`/`OptionalInt`/`OptionalDouble` members (see
+/// [`SeqKind::JavaOptional`]). An empty one's `get`/`getAsInt` is the JDK's
 /// `NoSuchElementException: No value present`.
 fn java_optional_method(
     recv: &Value,
-    double: bool,
+    kind: JOpt,
     value: Option<&Value>,
     name: &str,
     args: &[Value],
 ) -> Result<Value, String> {
-    let get = if double { "getAsDouble" } else { "getAsInt" };
+    let get = match kind {
+        JOpt::Int => "getAsInt",
+        JOpt::Double => "getAsDouble",
+        JOpt::Obj => "get",
+    };
     match (name, args.len(), value) {
         (n, 0, Some(v)) if n == get || n == "orElseThrow" => Ok(v.clone()),
         (n, 0, None) if n == get || n == "orElseThrow" => {
@@ -19935,6 +20104,111 @@ fn java_optional_method(
         ("orElse", 1, None) => Ok(args[0].clone()),
         _ => Err(no_such_method(recv, name)),
     }
+}
+
+/// The `java.util.List` members a collected list answers (see
+/// [`SeqKind::JavaList`]).
+fn java_list_method(
+    vm: &mut VM,
+    recv: &Value,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    match (name, args.len()) {
+        ("size", 0) => Ok(Value::int(items.len() as i64)),
+        ("isEmpty", 0) => Ok(Value::bool(items.is_empty())),
+        ("get", 1) => {
+            let i = args[0].to_int();
+            usize::try_from(i)
+                .ok()
+                .and_then(|k| items.get(k).cloned())
+                .ok_or_else(|| {
+                    format!(
+                        "scalars: java.lang.IndexOutOfBoundsException: Index {i} out of bounds for length {}",
+                        items.len()
+                    )
+                })
+        }
+        ("contains", 1) => Ok(Value::bool(items.iter().any(|x| value_eq(x, &args[0])))),
+        ("indexOf", 1) => Ok(Value::int(
+            items
+                .iter()
+                .position(|x| value_eq(x, &args[0]))
+                .map_or(-1, |p| p as i64),
+        )),
+        ("forEach", 1) => {
+            for x in items {
+                invoke_closure(vm, &args[0], std::slice::from_ref(x))?;
+            }
+            Ok(unit_value())
+        }
+        ("stream", 0) => Ok(stream_then(&Value::Undef, items, None, true)),
+        _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// The collector and its arguments, when `v` is a `Collectors` factory's result.
+fn as_collector(v: &Value) -> Option<(Coll, Vec<Value>)> {
+    with_seq(v, |k, xs| match k {
+        SeqKind::JCollector(c) => Some((c, xs.to_vec())),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// `COLLECTOR` builtin: pops the factory name and its arguments, and answers the
+/// `java.util.stream.Collectors` collector (see [`SeqKind::JCollector`]).
+fn b_collector(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().as_str_cow().into_owned();
+    let n = (argc as usize).saturating_sub(1);
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let coll = match (name.as_str(), args.len()) {
+        ("toList" | "toUnmodifiableList", 0) => Coll::ToList,
+        ("toSet" | "toUnmodifiableSet", 0) => Coll::ToSet,
+        ("joining", 0..=3) if args.len() != 2 => Coll::Joining,
+        ("counting", 0) => Coll::Counting,
+        _ => {
+            return fault(
+                vm,
+                format!("scalars: value {name} is not a member of java.util.stream.Collectors"),
+            )
+        }
+    };
+    new_seq(SeqKind::JCollector(coll), args)
+}
+
+/// The iteration order of a `java.util.HashSet` holding `items` (duplicates
+/// dropped, first occurrence kept): by bucket of the spread hash in a table of
+/// the default capacity grown at the 0.75 load factor, insertion order within a
+/// bucket. The hash is `##`, which is `hashCode` for every `Int`, `Char` and
+/// `String` element.
+fn java_hash_set_order(items: Vec<Value>) -> Vec<Value> {
+    let mut uniq: Vec<Value> = Vec::new();
+    for x in items {
+        if !uniq.iter().any(|u| value_eq(u, &x)) {
+            uniq.push(x);
+        }
+    }
+    let mut cap = 16usize;
+    while uniq.len() as f64 > cap as f64 * 0.75 {
+        cap *= 2;
+    }
+    let bucket = |v: &Value| {
+        let h = scala_hash(v).unwrap_or(0) as u32;
+        ((h ^ (h >> 16)) as usize) & (cap - 1)
+    };
+    let mut keyed: Vec<(usize, usize, Value)> = uniq
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (bucket(&v), i, v))
+        .collect();
+    keyed.sort_by_key(|(b, i, _)| (*b, *i));
+    keyed.into_iter().map(|(_, _, v)| v).collect()
 }
 
 /// The new contents an `…InPlace` transformer gives a mutable collection of
@@ -20421,7 +20695,10 @@ fn class_has_member(recv: &Value, name: &str) -> Option<bool> {
         let common = ITERABLE_MEMBERS.contains(&name);
         return Some(match kind {
             SeqKind::Array => is_own_member(recv, name),
-            SeqKind::IntStream | SeqKind::JavaOptional(_) => return None,
+            SeqKind::JStream
+            | SeqKind::JavaOptional(_)
+            | SeqKind::JavaList
+            | SeqKind::JCollector(_) => return None,
             k if k.is_set() => common || SET_MEMBERS.contains(&name),
             k => {
                 common
@@ -20526,4 +20803,170 @@ fn boxed_is_type(b: IntBox, ty: &str) -> bool {
             simple,
             "Any" | "AnyVal" | "Matchable" | "Object" | "AnyRef" | "Number" | "Comparable"
         )
+}
+
+/// Whether `v` is an `Array[Char]`: built as one, or non-empty with every
+/// element a `Char`.
+fn is_char_array(v: &Value) -> bool {
+    let typed = as_obj_id(v).is_some_and(|id| CHAR_ARRAYS.with(|t| t.borrow().contains(&id)));
+    with_seq(v, |k, xs| {
+        k == SeqKind::Array
+            && (typed || (!xs.is_empty() && xs.iter().all(|x| as_char(x).is_some())))
+    })
+    .unwrap_or(false)
+}
+
+/// Record `out` as an `Array[Char]` when an element-preserving op derived it
+/// from one — so `chars.filter(_ => false)` is still a `char[]` to
+/// `String.valueOf`, which an empty array could not otherwise show.
+fn carry_char_array(recv: &Value, name: &str, out: &Value) {
+    const PRESERVING: &[&str] = &[
+        "filter",
+        "filterNot",
+        "take",
+        "drop",
+        "takeRight",
+        "dropRight",
+        "slice",
+        "takeWhile",
+        "dropWhile",
+        "tail",
+        "init",
+        "reverse",
+        "sorted",
+        "sortBy",
+        "sortWith",
+        "distinct",
+        "distinctBy",
+        "diff",
+        "intersect",
+        "clone",
+    ];
+    if !PRESERVING.contains(&name) || !is_char_array(recv) {
+        return;
+    }
+    let is_array = with_seq(out, |k, _| k == SeqKind::Array).unwrap_or(false);
+    if let (true, Some(id)) = (is_array, as_obj_id(out)) {
+        CHAR_ARRAYS.with(|t| t.borrow_mut().insert(id));
+    }
+}
+
+/// `String.regionMatches([ignoreCase,] toffset, other, ooffset, len)`, as the
+/// JDK defines it: false for a negative offset or a region running past either
+/// string; with `ignoreCase`, two chars match when equal after `toUpperCase` or
+/// after `toLowerCase`.
+fn region_matches(s: &str, args: &[Value]) -> bool {
+    let (ignore, rest) = match args {
+        [Value::Bool(b), rest @ ..] => (*b, rest),
+        rest => (false, rest),
+    };
+    let [toff, other, ooff, len] = rest else {
+        return false;
+    };
+    let (toff, ooff, len) = (toff.to_int(), ooff.to_int(), len.to_int());
+    let a: Vec<u16> = s.encode_utf16().collect();
+    let b: Vec<u16> = other.as_str_cow().encode_utf16().collect();
+    if toff < 0 || ooff < 0 || toff + len > a.len() as i64 || ooff + len > b.len() as i64 {
+        return false;
+    }
+    if len <= 0 {
+        return true;
+    }
+    let (toff, ooff) = (toff as usize, ooff as usize);
+    (0..len as usize).all(|i| {
+        let (x, y) = (a[toff + i], b[ooff + i]);
+        if x == y {
+            return true;
+        }
+        if !ignore {
+            return false;
+        }
+        match (char::from_u32(u32::from(x)), char::from_u32(u32::from(y))) {
+            (Some(x), Some(y)) => {
+                java_to_upper(x) == java_to_upper(y) || java_to_lower(x) == java_to_lower(y)
+            }
+            _ => false,
+        }
+    })
+}
+
+/// `String.indent(n)` (JDK 12): each line gains `n` spaces, or loses up to
+/// `-n` leading whitespace characters, and every line — the last included —
+/// ends in `\n`. An empty string stays empty.
+fn java_indent(s: &str, n: i64) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for line in java_lines(s) {
+        if n > 0 {
+            out.push_str(&" ".repeat(n as usize));
+            out.push_str(line);
+        } else if n < 0 {
+            let lead = line
+                .chars()
+                .take((-n) as usize)
+                .take_while(|c| java_is_whitespace(*c))
+                .map(char::len_utf8)
+                .sum::<usize>();
+            out.push_str(&line[lead..]);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// `String.lines()`: split at `\n`, `\r` or `\r\n`, with no empty trailing line.
+fn java_lines(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\n' || b[i] == b'\r' {
+            out.push(&s[start..i]);
+            if b[i] == b'\r' && b.get(i + 1) == Some(&b'\n') {
+                i += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+/// `String.getBytes(charset)` for the standard charsets (by name, any case,
+/// with the common aliases); `None` for one the JDK would not know. An
+/// unmappable character becomes `?`, as the JDK's encoders replace it.
+fn java_encode(s: &str, charset: &str) -> Option<Vec<u8>> {
+    let units = || s.encode_utf16().collect::<Vec<u16>>();
+    let narrow = |max: u32| {
+        s.chars()
+            .map(|c| {
+                if (c as u32) <= max {
+                    c as u32 as u8
+                } else {
+                    b'?'
+                }
+            })
+            .collect::<Vec<u8>>()
+    };
+    Some(match charset.to_ascii_uppercase().as_str() {
+        "UTF-8" | "UTF8" => s.as_bytes().to_vec(),
+        "ISO-8859-1" | "ISO8859_1" | "ISO_8859_1" | "LATIN1" | "ISO8859-1" => narrow(0xff),
+        "US-ASCII" | "ASCII" => narrow(0x7f),
+        "UTF-16" => {
+            let mut out = vec![0xfe, 0xff];
+            out.extend(units().into_iter().flat_map(u16::to_be_bytes));
+            out
+        }
+        "UTF-16BE" => units().into_iter().flat_map(u16::to_be_bytes).collect(),
+        "UTF-16LE" => units().into_iter().flat_map(u16::to_le_bytes).collect(),
+        _ => return None,
+    })
 }

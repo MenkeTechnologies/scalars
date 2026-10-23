@@ -5139,6 +5139,59 @@ impl Compiler {
         if let Some((bulk, spread)) = self.library_spread(name, args) {
             return self.method(recv, bulk, &spread, line);
         }
+        // `Collectors.toList()` / `java.util.stream.Collectors.joining(", ")` —
+        // the JDK collector factories a stream's `collect` takes.
+        let collectors = match recv {
+            Expr::Var(n) => {
+                n == "Collectors" && self.is_library_name(n) && !self.vals.contains_key(n)
+            }
+            Expr::Method {
+                recv: pkg,
+                name: n,
+                args: a,
+                ..
+            } => {
+                n == "Collectors"
+                    && a.is_empty()
+                    && is_package_path(pkg, &["java", "util", "stream"])
+            }
+            _ => false,
+        };
+        // `StandardCharsets.UTF_8` — a `java.nio.charset.Charset`, carried as its
+        // canonical name (which is also what it prints as).
+        let charsets = match recv {
+            Expr::Var(n) => {
+                n == "StandardCharsets" && self.is_library_name(n) && !self.vals.contains_key(n)
+            }
+            Expr::Method {
+                recv: pkg,
+                name: n,
+                args: a,
+                ..
+            } => {
+                n == "StandardCharsets"
+                    && a.is_empty()
+                    && is_package_path(pkg, &["java", "nio", "charset"])
+            }
+            _ => false,
+        };
+        if charsets && args.is_empty() {
+            let k = self.b.add_constant(Value::str(name.replace('_', "-")));
+            self.b.emit(Op::LoadConst(k), line);
+            return Ok(());
+        }
+        if collectors {
+            for a in args {
+                self.expr(a)?;
+            }
+            let k = self.b.add_constant(Value::str(name.to_string()));
+            self.b.emit(Op::LoadConst(k), line);
+            let argc = u8::try_from(args.len() + 1)
+                .map_err(|_| format!("scalars: too many arguments on line {line}"))?;
+            self.b
+                .emit(Op::CallBuiltin(crate::host::COLLECTOR, argc), line);
+            return Ok(());
+        }
         // `a.equals(b)` is `Object.equals(Object)`: both sides are BOXED, and
         // boxes of different classes are unequal (`7L.equals(7)` is false, where
         // `==` is numeric). Widened here so the host sees both boxes.
@@ -10750,4 +10803,26 @@ fn compound_op(op: AssignOp) -> Op {
         AssignOp::Mod => Op::Mod,
         AssignOp::Assign => unreachable!("plain assign never lowers through compound_op"),
     }
+}
+
+/// Whether `e` is the package path `path` (`java.util.stream`).
+fn is_package_path(e: &Expr, path: &[&str]) -> bool {
+    let mut segs = Vec::new();
+    let mut cur = e;
+    while let Expr::Method {
+        recv, name, args, ..
+    } = cur
+    {
+        if !args.is_empty() {
+            return false;
+        }
+        segs.push(name.as_str());
+        cur = recv;
+    }
+    let Expr::Var(root) = cur else {
+        return false;
+    };
+    segs.push(root.as_str());
+    segs.reverse();
+    segs == path
 }

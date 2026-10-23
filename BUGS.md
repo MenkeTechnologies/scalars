@@ -1375,10 +1375,18 @@ reported as parse/compile errors, never silently mis-run.
   `reduce(identity, op)`, with `max`/`min`/`findFirst`/`findAny`/`average` as
   `OptionalInt`/`OptionalDouble`. Each element runs the whole pipeline before
   the next is pulled, `limit` stops the pull, and a size-preserving pipeline
-  answers `count` without running, as on JDK 21. Not modelled: `boxed`,
-  `mapToObj`, `reduce(op)`, `collect`, `summaryStatistics`, and the
-  `IllegalStateException` of reusing a consumed stream; an `IntStream`'s
-  `toString` is the JVM identity form, which is not reproducible.
+  answers `count` without running, as on JDK 21. `boxed`/`mapToObj` turn it
+  into an object `Stream` (with `map`/`filter`/`sorted`/`distinct`/`limit`/
+  `skip`, `toList`, `findFirst` as an `Optional`, `reduce` in both forms, and
+  `collect` with `Collectors.toList`/`toSet`/`joining`/`counting`, a
+  collected list printing `[a, b]`), and a stream is single-use: an op on one
+  already linked or consumed is the JDK's `IllegalStateException`. Not
+  modelled: `summaryStatistics`, `Stream.max`/`min` with a `Comparator`,
+  `flatMap`, `Collectors.groupingBy`/`toMap`, and the `java.util.List` beyond
+  `size`/`get`/`contains`/`indexOf`/`isEmpty`/`forEach`/`stream`; a
+  `toSet` orders by `##`, which differs from `hashCode` for a `Long` outside
+  `Int` range or a `Double`. A stream's `toString` is the JVM identity form,
+  which is not reproducible.
 - **Found by the second October 2026 differential round, still open.** These
   raise a catchable `java.lang.NullPointerException` where Scala runs, so a
   `catch` that matches it would hide the gap: `getClass` on a `case object`
@@ -1386,12 +1394,13 @@ reported as parse/compile errors, never silently mis-run.
   `mutable.BitSet(…)`. These are compile/parse errors: `import
   scala.util.boundary.break` then a bare `break(v)` inside `boundary { … }`,
   and `collection.immutable.ListMap`; `BigDecimal.underlying`,
-  `Regex.unapplySeq`, and the `String` members `union`, `regionMatches`,
-  `indent` and `getBytes(charset)` are not members. (The buffer/`Map`
-  `…InPlace` transformers, `keysIterator`/`valuesIterator`, and the `String`
-  members `indexOfSlice`/`lastIndexOfSlice`/`containsSlice`/`inits`/`tails`/
-  `reverseIterator`/`sameElements`/`distinctBy` this round listed are now
-  modelled.)
+  and `Regex.unapplySeq` are not members. (The buffer/`Map` `…InPlace`
+  transformers, `keysIterator`/`valuesIterator`, and the `String` members
+  `indexOfSlice`/`lastIndexOfSlice`/`containsSlice`/`inits`/`tails`/
+  `reverseIterator`/`sameElements`/`distinctBy`/`union`/`regionMatches`/
+  `indent`/`getBytes(charset)` this round listed are now modelled;
+  `getBytes` knows UTF-8, ISO-8859-1, US-ASCII and the UTF-16 forms, by name or
+  `StandardCharsets` constant.)
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
 
@@ -1404,8 +1413,10 @@ reported as parse/compile errors, never silently mis-run.
   null`) names bytecode slots and accessors this frontend does not have.
 - **`String.valueOf` of an EMPTY `Array[Char]`** answers `""` when the array was
   BUILT as one (`Array[Char]()`, `Array.empty[Char]`, `new Array[Char](0)`,
-  `Array.ofDim[Char](0)`). An empty array reached any other way (`Array('a')
-  .filter(_ => false)`) has no element to tell it from any other empty array and
+  `Array.ofDim[Char](0)`) or DERIVED from an `Array[Char]` by an
+  element-preserving op (`filter`, `take`, `drop`, `slice`, `tail`, …). One
+  that is empty for any other reason (`Array[Any]()` cast, a `map` whose result
+  happens to be empty) has no element to tell it from any other empty array and
   still renders `Array()`.
 - **`math.sin` and `math.cos` round as the platform libm does, not as the
   JVM.** On JDK 21 aarch64 they are HotSpot intrinsics that disagree with
