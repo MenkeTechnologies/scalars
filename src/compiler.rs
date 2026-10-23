@@ -115,6 +115,11 @@ struct Compiler {
     /// restored afterwards, so a nested traversal does not leak its element type
     /// into the enclosing one.
     lambda_param_widths: Vec<NumTy>,
+    /// Lambda parameters bound for a static read of the lambda's BODY (see
+    /// [`Compiler::method_elem_ty`]): consulted by [`Compiler::num_ty`] ahead
+    /// of the bindings, innermost last. Interior mutability because the width
+    /// analysis is otherwise a read-only walk.
+    body_params: std::cell::RefCell<Vec<(String, NumTy)>>,
     /// Every user `def`'s declared return width, by name. Scala infers a `def`'s
     /// result type from its body when the annotation is omitted; this frontend
     /// does not, so an unannotated `def` is absent here and its calls stay
@@ -847,6 +852,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         vals: HashMap::new(),
         widths: HashMap::new(),
         lambda_param_widths: Vec::new(),
+        body_params: std::cell::RefCell::new(Vec::new()),
         def_widths: prog
             .functions
             .iter()
@@ -7661,6 +7667,31 @@ impl Compiler {
         {
             return self.elem_ty(recv);
         }
+        // `xs.map(x => body)` — the width of the BODY with `x` bound to the
+        // receiver's element width; `flatMap`'s body is a collection, so its
+        // ELEMENT width. A body this cannot type (a block, a call it cannot
+        // see into) answers `Unknown`, as before.
+        if let (
+            [Expr::Lambda {
+                params,
+                body,
+                partial: false,
+            }],
+            "map" | "flatMap",
+        ) = (args, name)
+        {
+            if let [p] = params.as_slice() {
+                let pw = self.elem_ty(recv);
+                self.body_params.borrow_mut().push((p.clone(), pw));
+                let r = if name == "map" {
+                    self.num_ty(body)
+                } else {
+                    self.elem_ty(body)
+                };
+                self.body_params.borrow_mut().pop();
+                return r;
+            }
+        }
         NumTy::Unknown
     }
 
@@ -7674,7 +7705,16 @@ impl Compiler {
             // A `Char` widens to `Int` the moment it enters arithmetic: `'a' + 1`
             // is the `Int` 98, and `Char` itself has no arithmetic of its own.
             Expr::Char(_) => NumTy::Int,
-            Expr::Var(n) => self.widths.get(n).map_or(NumTy::Unknown, |w| w.num),
+            Expr::Var(n) => {
+                let bound = self
+                    .body_params
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|(p, _)| p == n)
+                    .map(|(_, w)| *w);
+                bound.unwrap_or_else(|| self.widths.get(n).map_or(NumTy::Unknown, |w| w.num))
+            }
             // `-x` and `~x` keep their operand's width.
             Expr::Unary {
                 op: UnOp::Neg | UnOp::Complement,
@@ -7744,6 +7784,25 @@ impl Compiler {
         };
         let to = to.trim();
         if is_any_type(to) {
+            // The expected type reaches into each branch of an `if`, so each keeps
+            // its OWN box: `val v: Any = if (c) 1 else 2L` is an `Integer` or a
+            // `Long`, never a harmonized one.
+            if let Expr::If {
+                cond,
+                then,
+                els: Some(els),
+            } = e
+            {
+                let (t, f) = (self.widened(then, to), self.widened(els, to));
+                if t.is_some() || f.is_some() {
+                    return Some(Expr::If {
+                        cond: cond.clone(),
+                        then: Box::new(t.unwrap_or_else(|| (**then).clone())),
+                        els: Some(Box::new(f.unwrap_or_else(|| (**els).clone()))),
+                    });
+                }
+                return None;
+            }
             return self.any_box(e).map(|_| widen(e));
         }
         let Expr::Collection { ctor, elems } = e else {

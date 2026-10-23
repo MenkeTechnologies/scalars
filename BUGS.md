@@ -1364,10 +1364,11 @@ reported as parse/compile errors, never silently mis-run.
   `asInstanceOf` (a `ClassCastException` across boxes), `getClass`, `equals`
   and format argument checks read the box; printing, `==`, `##`, hashing and
   arithmetic read the number, and a typed pattern binds the number. A value
-  whose box was never recorded — one that reached `Any` through a path above
-  the compiler could not type, such as the element of a mapped collection —
-  still passes every integral type test: Scala types a `map`'s result from the
-  function's body, which this frontend does not analyse. A box is an INLINE
+  whose box was never recorded — one that reached `Any` through a path the
+  compiler could not type, such as a `map` whose function body is a block or
+  an `if` with branches of different widths (Scala keeps each branch's own box
+  there) — still passes every integral type test. An `if` WIDENED to `Any`
+  directly (`val v: Any = if (c) 1 else 2L`) boxes each branch on its own. A box is an INLINE
   value (a `Value::Ref` whose payload variant names the box), not an arena
   entry, so it is freed with its last copy. Measured (debug build, instructions
   retired, peak RSS), against the build before boxes existed: a numeric loop
@@ -1635,10 +1636,13 @@ reported as parse/compile errors, never silently mis-run.
   `(1 to 100000).sum` answers `705082704`. A collection's element width comes
   from a literal's elements, a declared `List[Int]`, a range's endpoints, or an
   element-preserving combinator (`filter`, `take`, `sorted`, …).
-  The residual gap is **`map`'s result element type**: `xs.map(f).sum` does not
-  know what `f` returns, because that would mean analysing the lambda body with
-  its parameter already bound. The elements themselves are still correct (the
-  body wraps); only a later `sum`/`product` over them stays 64-bit.
+  A `map`/`flatMap` result is typed by its function's BODY, read with the
+  parameter bound to the receiver's element width (`(1 to 100000).map(_ *
+  2).sum` wraps at 32 bits, `xs.map(_.toLong)` is a `List[Long]`); a body this
+  cannot type (a block, an `if` of mixed widths) leaves the result unproven, so
+  a later `sum`/`product` over it stays 64-bit. Measured cost: compiling the
+  first 120 corpus programs, 3.75G instructions before and 3.70G–3.76G after
+  (within run-to-run noise).
   A `def` with no return annotation is also unproven — Scala infers one from the
   body and this frontend does not.
 - **The `%x`/`%X`/`%o` format conversions take their width from the static type
