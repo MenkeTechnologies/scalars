@@ -567,6 +567,14 @@ impl Parser {
                 self.skip_seps();
                 continue;
             }
+            // `type T = …` / `opaque type T = …` — the alias is recorded so the
+            // object's members (an `extension (m: T)` above all) and an
+            // `import O._` user read `T` as what it stands for.
+            if self.at_type_decl() {
+                self.type_decl()?;
+                self.skip_seps();
+                continue;
+            }
             // A class, trait or object declared inside the object is a member
             // type; it joins the flat namespace the way one declared in an
             // `extends App` body or a block does. It was skipped, so a
@@ -2481,6 +2489,30 @@ impl Parser {
         self.eat(&Tok::Colon)?;
         let recv_ty = self.type_ref()?;
         self.eat(&Tok::RParen)?;
+        // `extension [A](xs: List[A])(using s: Show[A])` — the extension's own
+        // `using` clause, which every method it declares takes as well.
+        let mut using: Vec<(String, String)> = Vec::new();
+        while self.is(&Tok::LParen) && matches!(self.peek_at(1), Tok::Ident(w) if w == "using") {
+            self.advance();
+            self.advance();
+            loop {
+                let pname = if matches!(self.peek(), Tok::Ident(_))
+                    && matches!(self.peek_at(1), Tok::Colon)
+                {
+                    let p = self.ident()?;
+                    self.advance();
+                    p
+                } else {
+                    format!("ext$using{}", using.len())
+                };
+                using.push((pname, self.type_ref()?));
+                if !self.is(&Tok::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            self.eat(&Tok::RParen)?;
+        }
         let braced = self.is(&Tok::LBrace);
         if braced {
             self.advance();
@@ -2508,6 +2540,30 @@ impl Parser {
                     ..ParamSig::default()
                 },
             );
+            // The extension's `using` instances follow the method's explicit
+            // parameters (ahead of its own `using` clause), so an implicit fill
+            // at the call site supplies them after the written arguments.
+            let at = f
+                .sig
+                .iter()
+                .position(|p| p.implicit_clause)
+                .unwrap_or(f.sig.len());
+            for (k, (p, ty)) in using.iter().enumerate() {
+                f.params.insert(at + k, p.clone());
+                f.sig.insert(
+                    at + k,
+                    ParamSig {
+                        ty: Some(ty.clone()),
+                        implicit_clause: true,
+                        ..ParamSig::default()
+                    },
+                );
+            }
+            for tp in &tparams {
+                if !f.type_params.contains(tp) {
+                    f.type_params.push(tp.clone());
+                }
+            }
             f.name = hoisted;
             self.funcs.push(f);
             if !braced {

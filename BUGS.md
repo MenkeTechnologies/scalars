@@ -1175,8 +1175,13 @@ reported as parse/compile errors, never silently mis-run.
   `==`/`compare`/`hashCode`. `setScale(n[, RoundingMode.X])`, `scale`,
   `precision`, `abs`, `signum`, `max`/`min`, `toInt`/`toLong`/`toDouble`/
   `toBigInt`, `floor`/`ceil`, `sum`/`product` and `Int`/`Double`/`BigInt`
-  operands on either side are modelled; `MathContext`-taking members (`sqrt`,
-  `round(mc)`, `BigDecimal(x, mc)`) are not.
+  operands on either side are modelled. A value carries its `MathContext`, as
+  Scala's does: `BigDecimal(x, mc)` rounds to `mc` and every `a op b` rounds in
+  `a`'s, by its mode; `new MathContext(n[, mode])` (`HALF_UP` by default),
+  `MathContext.DECIMAL32`/`64`/`128`/`UNLIMITED` (an UNLIMITED `/` must
+  terminate, else the JDK's `ArithmeticException`), `round(mc)`, `mc`, and
+  `bigDecimal`/`underlying`'s `stripTrailingZeros`/`toPlainString` are
+  modelled; `sqrt` is not.
 
   `BigInt` is a host-heap value (`Value::Obj` carrying a `num_bigint::BigInt`),
   the same shape a `Char` has, so every operator on one reaches the numeric hook
@@ -1304,6 +1309,10 @@ reported as parse/compile errors, never silently mis-run.
   `xs.headOption`/`lastOption`/`find`, `filter`/`take`/`sorted`/…, an
   `Option`'s `get`/`getOrElse`) on a receiver of known type. Not a type
   argument the parser drops (`List.empty[Int].headOption` finds no `A`).
+  An `extension [A](xs: List[A])(using s: Show[A])` clause is a `using`
+  parameter of every method the extension declares, resolved at the call from
+  the receiver's type. An `opaque type`/`type` alias declared in an `object`
+  body is in force for the object's members and its importers.
 
   What follows from text-matching: no subtyping (a `given Animal` does not
   satisfy a `using Dog`, nor the reverse), no variance, no implicit priority

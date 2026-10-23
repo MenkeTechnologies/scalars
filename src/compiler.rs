@@ -4496,6 +4496,22 @@ impl Compiler {
             // `new String(chars)` / `new String(s)` / `new String()` — the
             // copy constructors, which answer the same text `String.valueOf`
             // does for an `Array[Char]` or a `String`.
+            // `new MathContext(precision[, mode])` — `HALF_UP` unless given.
+            if matches!(name, "MathContext" | "java.math.MathContext")
+                && matches!(args.len(), 1 | 2)
+                && self.is_library_name("MathContext")
+            {
+                self.expr(&args[0])?;
+                match args.get(1) {
+                    Some(m) => self.expr(m)?,
+                    None => {
+                        let k = self.b.add_constant(Value::str("HALF_UP".to_string()));
+                        self.b.emit(Op::LoadConst(k), line);
+                    }
+                }
+                self.b.emit(Op::CallBuiltin(crate::host::MATH_CTX, 2), line);
+                return Ok(());
+            }
             if matches!(name, "String" | "java.lang.String") && args.len() <= 1 {
                 let text = match args.first() {
                     Some(a) => Expr::Method {
@@ -4827,8 +4843,23 @@ impl Compiler {
         let Some((params, sig, _)) = self.func_sig.get(name) else {
             return Vec::new();
         };
-        let mut out = Vec::new();
+        let mut out: Vec<(String, String)> = Vec::new();
+        // An argument whose static type is nameable binds every type parameter
+        // its declared type mentions, at any depth (`xs: List[A]` against a
+        // `List[Int]`, `p: (A, B)` against an `(Int, String)`).
+        for (i, p) in sig.iter().enumerate().take(params.len().min(args.len())) {
+            let (Some(pty), Some(st)) = (p.ty.as_deref(), self.static_type_name(&args[i])) else {
+                continue;
+            };
+            let mut local = out.clone();
+            if unify_type(&normalize_type(pty), &normalize_type(&st), f, &mut local) {
+                out = local;
+            }
+        }
         for tp in f {
+            if out.iter().any(|(t, _)| t == tp) {
+                continue;
+            }
             for (i, p) in sig.iter().enumerate().take(params.len().min(args.len())) {
                 let Some(pty) = p.ty.as_deref().map(str::trim) else {
                     continue;
@@ -5342,6 +5373,35 @@ impl Compiler {
             };
             if let Some(e) = joined {
                 return self.expr(&e);
+            }
+        }
+        // `MathContext.DECIMAL32` / `DECIMAL64` / `DECIMAL128` / `UNLIMITED`.
+        let math_ctx = match recv {
+            Expr::Var(n) => {
+                n == "MathContext" && self.is_library_name(n) && !self.vals.contains_key(n)
+            }
+            Expr::Method {
+                recv: pkg,
+                name: n,
+                args: a,
+                ..
+            } => n == "MathContext" && a.is_empty() && is_package_path(pkg, &["java", "math"]),
+            _ => false,
+        };
+        if math_ctx && args.is_empty() {
+            let (precision, mode) = match name {
+                "DECIMAL32" => (7, "HALF_EVEN"),
+                "DECIMAL64" => (16, "HALF_EVEN"),
+                "DECIMAL128" => (34, "HALF_EVEN"),
+                "UNLIMITED" => (0, "HALF_UP"),
+                _ => (-1, ""),
+            };
+            if precision >= 0 {
+                self.b.emit(Op::LoadInt(precision), line);
+                let k = self.b.add_constant(Value::str(mode.to_string()));
+                self.b.emit(Op::LoadConst(k), line);
+                self.b.emit(Op::CallBuiltin(crate::host::MATH_CTX, 2), line);
+                return Ok(());
             }
         }
         // `java.util.Comparator.naturalOrder()` / `reverseOrder()` — the natural

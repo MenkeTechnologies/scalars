@@ -532,6 +532,10 @@ pub const STREAM_OF: u16 = 822;
 /// Builtin id for a `java.util.stream` stream factory (`IntStream.range`, …):
 /// pops `"Class.member"` and the arguments.
 pub const STREAM_FACTORY: u16 = 823;
+/// Builtin id for `new MathContext(precision[, mode])` and the
+/// `MathContext.DECIMAL32`/`64`/`128`/`UNLIMITED` constants: pops the
+/// precision and the mode name.
+pub const MATH_CTX: u16 = 824;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -799,6 +803,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_LISTMAP, b_make_listmap);
     vm.register_builtin(STREAM_OF, b_stream_of);
     vm.register_builtin(STREAM_FACTORY, b_stream_factory);
+    vm.register_builtin(MATH_CTX, b_math_ctx);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -1648,6 +1653,9 @@ enum SeqKind {
     /// A `java.util.Map.Entry` of a collected map's `entrySet`: `[key, value]`,
     /// printed `k=v`.
     JavaEntry,
+    /// A `java.math.MathContext`: `[precision, rounding mode name]`, printed
+    /// `precision=4 roundingMode=HALF_UP`.
+    MathCtx,
     /// A `java.util.stream.Collectors` collector; its elements are the
     /// factory's arguments (`joining`'s delimiter, prefix and suffix).
     JCollector(Coll),
@@ -1731,6 +1739,7 @@ impl SeqKind {
             SeqKind::JavaMap => "Map",
             SeqKind::JavaStats => "IntSummaryStatistics",
             SeqKind::JavaEntry => "Entry",
+            SeqKind::MathCtx => "MathContext",
             SeqKind::JCollector(_) => "Collector",
             SeqKind::Range { .. } => "Range",
             SeqKind::CharRange { .. } => "NumericRange",
@@ -1831,6 +1840,7 @@ impl SeqKind {
             | SeqKind::JavaMap
             | SeqKind::JavaStats
             | SeqKind::JavaEntry
+            | SeqKind::MathCtx
             | SeqKind::JCollector(_) => Some(format!("{} of empty list", op.word())),
             // `NumericRange` reports an empty access through `Nil`, and both its
             // `head` and its `last` (so `min`/`max` too) are `Nil.head`.
@@ -5649,6 +5659,11 @@ fn obj_to_string(v: &Value) -> String {
                 )
             }
             Some(HeapVal::Seq(SeqKind::JavaStats, items)) => java_stats_string(items),
+            Some(HeapVal::Seq(SeqKind::MathCtx, items)) => format!(
+                "precision={} roundingMode={}",
+                items.first().map_or(0, Value::to_int),
+                items.get(1).map(scala_str).unwrap_or_default()
+            ),
             Some(HeapVal::Seq(SeqKind::JavaEntry, items)) => format!(
                 "{}={}",
                 items.first().map(scala_str).unwrap_or_default(),
@@ -10227,6 +10242,13 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     }
     if kind == SeqKind::JavaStats {
         return java_stats_method(recv, &items, name, args);
+    }
+    if kind == SeqKind::MathCtx {
+        return match (name, args.len()) {
+            ("getPrecision", 0) => Ok(items.first().cloned().unwrap_or(Value::Undef)),
+            ("getRoundingMode", 0) => Ok(items.get(1).cloned().unwrap_or(Value::Undef)),
+            _ => Err(no_such_method(recv, name)),
+        };
     }
     if kind == SeqKind::JavaEntry {
         return match (name, args.len()) {
@@ -17345,7 +17367,8 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
                 | SeqKind::JavaOptional(_)
                 | SeqKind::JavaList
                 | SeqKind::JavaMap
-                | SeqKind::JavaStats,
+                | SeqKind::JavaStats
+                | SeqKind::MathCtx,
                 _,
             )) => Renderable::Leaf,
             Some(HeapVal::Seq(kind, items)) => Renderable::Seq(kind.label(), items.clone()),
@@ -19635,6 +19658,25 @@ fn dec_apply(args: &[Value]) -> Result<Value, String> {
         [v] => dec_operand(v)
             .map(make_dec)
             .ok_or_else(|| format!("scalars: BigDecimal.apply cannot take {}", scala_str(v))),
+        // `BigDecimal(x, mc)` — rounded to `mc`, which it then carries.
+        [v, mc] if as_math_ctx(mc).is_some() => {
+            let ctx = as_math_ctx(mc).expect("just matched");
+            let d = match v {
+                Value::Str(s) => BigDec::parse(s).map_err(|_| {
+                    format!(
+                        "scalars: java.lang.NumberFormatException: {}",
+                        number_format_text(s)
+                    )
+                })?,
+                _ => dec_operand(v).ok_or_else(|| {
+                    format!("scalars: BigDecimal.apply cannot take {}", scala_str(v))
+                })?,
+            };
+            d.with_ctx(ctx)
+                .round_to(ctx)
+                .map(|r| make_dec(r.with_ctx(ctx)))
+                .map_err(dec_fault)
+        }
         [v, _scale_or_mc] => dec_operand(v)
             .map(make_dec)
             .ok_or_else(|| format!("scalars: BigDecimal.apply cannot take {}", scala_str(v))),
@@ -21622,6 +21664,15 @@ fn java_dec_method(
             Ok(u)
         }
         ("toPlainString", 0) if java => Ok(Value::str(dec_plain_string(d))),
+        // `bigDecimal` is `underlying`'s other name.
+        ("bigDecimal", 0) if !java => return java_dec_method(recv, d, "underlying", args),
+        ("stripTrailingZeros", 0) if java => Ok(java_dec(dec_strip_zeros(d))),
+        // `round(mc)` rounds to that context; the value keeps its own.
+        ("round", 1) => d
+            .round_to(as_math_ctx(&args[0])?)
+            .map(make_dec)
+            .map_err(dec_fault),
+        ("mc", 0) if !java => Ok(make_math_ctx(d.ctx)),
         _ => return None,
     })
 }
@@ -22072,4 +22123,79 @@ fn java_map_mutate(
         Err(e) => Some(Err(e)),
         Ok(v) => Some(Ok((out, v))),
     }
+}
+
+/// A `MathContext` value (see [`SeqKind::MathCtx`]).
+fn make_math_ctx(ctx: crate::bigdec::MathCtx) -> Value {
+    let mode = format!("{:?}", ctx.mode);
+    // `HalfEven` -> `HALF_EVEN`: the JDK's enum constant names.
+    let mut name = String::new();
+    for (i, c) in mode.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            name.push('_');
+        }
+        name.push(c.to_ascii_uppercase());
+    }
+    new_seq(
+        SeqKind::MathCtx,
+        vec![Value::int(ctx.precision as i64), Value::str(name)],
+    )
+}
+
+/// The context a `MathContext` value names.
+fn as_math_ctx(v: &Value) -> Option<crate::bigdec::MathCtx> {
+    let (kind, items) = seq_kind_items(v)?;
+    if kind != SeqKind::MathCtx {
+        return None;
+    }
+    Some(crate::bigdec::MathCtx {
+        precision: usize::try_from(items.first()?.to_int()).ok()?,
+        mode: Round::parse(&scala_str(items.get(1)?))?,
+    })
+}
+
+/// `MATH_CTX` builtin — see [`MATH_CTX`].
+fn b_math_ctx(vm: &mut VM, _argc: u8) -> Value {
+    let mode = vm.pop();
+    let precision = vm.pop().to_int();
+    if precision < 0 {
+        return fault(
+            vm,
+            "scalars: java.lang.IllegalArgumentException: Digits < 0".to_string(),
+        );
+    }
+    match Round::parse(&scala_str(&mode)) {
+        Some(m) => make_math_ctx(crate::bigdec::MathCtx {
+            precision: precision as usize,
+            mode: m,
+        }),
+        None => fault(
+            vm,
+            format!("scalars: no rounding mode {}", scala_str(&mode)),
+        ),
+    }
+}
+
+/// A `java.math.BigDecimal` value (see [`JAVA_DECS`]).
+fn java_dec(d: BigDec) -> Value {
+    let v = make_dec(d);
+    if let Some(id) = as_obj_id(&v) {
+        JAVA_DECS.with(|t| t.borrow_mut().insert(id));
+    }
+    v
+}
+
+/// `stripTrailingZeros`: the same number at the smallest scale that holds it
+/// (zero is `0`, scale 0).
+fn dec_strip_zeros(d: &BigDec) -> BigDec {
+    use num_traits::Zero;
+    if d.unscaled.is_zero() {
+        return BigDec::new(d.unscaled.clone(), 0).with_ctx(d.ctx);
+    }
+    let ten = BigInt::from(10);
+    let mut out = d.clone();
+    while (&out.unscaled % &ten).is_zero() {
+        out = BigDec::new(&out.unscaled / &ten, out.scale - 1).with_ctx(d.ctx);
+    }
+    out
 }

@@ -12,14 +12,31 @@ use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use std::cmp::Ordering;
 
-/// `MathContext.DECIMAL128`'s precision.
-const PRECISION: usize = 34;
+/// A `java.math.MathContext`: a precision in significant digits (0 is
+/// UNLIMITED — exact results only) and the rounding mode applied past it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MathCtx {
+    pub precision: usize,
+    pub mode: Round,
+}
+
+impl MathCtx {
+    /// `MathContext.DECIMAL128`, which every Scala `BigDecimal` carries unless
+    /// it was built with another.
+    pub const DECIMAL128: MathCtx = MathCtx {
+        precision: 34,
+        mode: Round::HalfEven,
+    };
+}
 
 /// A decimal number: `unscaled * 10^-scale`.
 #[derive(Clone, Debug)]
 pub struct BigDec {
     pub unscaled: BigInt,
     pub scale: i32,
+    /// The context this value's own arithmetic rounds in: Scala's
+    /// `BigDecimal` carries one, and `a op b` uses `a`'s.
+    pub ctx: MathCtx,
 }
 
 /// `java.math.RoundingMode`.
@@ -104,7 +121,23 @@ fn divide_round(num: &BigInt, den: &BigInt, mode: Round) -> Result<BigInt, Strin
 
 impl BigDec {
     pub fn new(unscaled: BigInt, scale: i32) -> BigDec {
-        BigDec { unscaled, scale }
+        BigDec {
+            unscaled,
+            scale,
+            ctx: MathCtx::DECIMAL128,
+        }
+    }
+
+    /// This value under the context `ctx` (not rounded to it).
+    pub fn with_ctx(mut self, ctx: MathCtx) -> BigDec {
+        self.ctx = ctx;
+        self
+    }
+
+    /// `round(mc)`: rounded to `ctx`, keeping this value's own context.
+    pub fn round_to(&self, ctx: MathCtx) -> Result<BigDec, String> {
+        let own = self.ctx;
+        Ok(self.clone().with_ctx(ctx).try_rounded()?.with_ctx(own))
     }
 
     pub fn from_int(n: impl Into<BigInt>) -> BigDec {
@@ -208,21 +241,28 @@ impl BigDec {
         }
     }
 
-    /// Round to at most `PRECISION` significant digits, half-even.
+    /// Round to this value's context: at most `ctx.precision` significant
+    /// digits (none dropped when it is 0), by `ctx.mode`.
     fn rounded(self) -> BigDec {
+        let keep = self.clone();
+        self.try_rounded().unwrap_or(keep)
+    }
+
+    /// [`BigDec::rounded`], reporting `UNNECESSARY` rounding as an error.
+    fn try_rounded(self) -> Result<BigDec, String> {
+        let (prec, ctx) = (self.ctx.precision, self.ctx);
         let p = self.precision();
-        if p <= PRECISION {
-            return self;
+        if prec == 0 || p <= prec {
+            return Ok(self);
         }
-        let drop = p - PRECISION;
-        let q = divide_round(&self.unscaled, &pow10(drop), Round::HalfEven)
-            .unwrap_or_else(|_| self.unscaled.clone());
-        let r = BigDec::new(q, self.scale - drop as i32);
-        // Rounding up can carry into a 35th digit (999… -> 1000…).
-        if r.precision() > PRECISION {
-            return BigDec::new(&r.unscaled / 10, r.scale - 1);
+        let drop = p - prec;
+        let q = divide_round(&self.unscaled, &pow10(drop), ctx.mode)?;
+        let r = BigDec::new(q, self.scale - drop as i32).with_ctx(ctx);
+        // Rounding up can carry into one digit more (999… -> 1000…).
+        if r.precision() > prec {
+            return Ok(BigDec::new(&r.unscaled / 10, r.scale - 1).with_ctx(ctx));
         }
-        r
+        Ok(r)
     }
 
     /// Both operands at the larger of their scales.
@@ -234,29 +274,32 @@ impl BigDec {
 
     pub fn add(&self, other: &BigDec) -> BigDec {
         let (a, b, scale) = self.align(other);
-        BigDec::new(a + b, scale).rounded()
+        BigDec::new(a + b, scale).with_ctx(self.ctx).rounded()
     }
 
     pub fn sub(&self, other: &BigDec) -> BigDec {
         let (a, b, scale) = self.align(other);
-        BigDec::new(a - b, scale).rounded()
+        BigDec::new(a - b, scale).with_ctx(self.ctx).rounded()
     }
 
     pub fn mul(&self, other: &BigDec) -> BigDec {
-        BigDec::new(&self.unscaled * &other.unscaled, self.scale + other.scale).rounded()
+        BigDec::new(&self.unscaled * &other.unscaled, self.scale + other.scale)
+            .with_ctx(self.ctx)
+            .rounded()
     }
 
     pub fn neg(&self) -> BigDec {
-        BigDec::new(-&self.unscaled, self.scale)
+        BigDec::new(-&self.unscaled, self.scale).with_ctx(self.ctx)
     }
 
     pub fn abs(&self) -> BigDec {
-        BigDec::new(self.unscaled.abs(), self.scale)
+        BigDec::new(self.unscaled.abs(), self.scale).with_ctx(self.ctx)
     }
 
-    /// `divide(that, MathContext.DECIMAL128)`: the quotient to 34 significant
-    /// digits, with trailing zeros stripped down to the preferred scale
-    /// (`this.scale - that.scale`) when it is exact.
+    /// `divide(that, this.mc)`: the quotient to the context's precision (by its
+    /// rounding mode), with trailing zeros stripped down to the preferred scale
+    /// (`this.scale - that.scale`) when it is exact. Under an UNLIMITED context
+    /// the quotient must terminate, or it is the JDK's `ArithmeticException`.
     pub fn div(&self, other: &BigDec) -> Result<BigDec, String> {
         if other.unscaled.is_zero() {
             return Err(if self.unscaled.is_zero() {
@@ -265,66 +308,78 @@ impl BigDec {
                 "Division by zero".to_string()
             });
         }
+        let ctx = self.ctx;
         let preferred = self.scale as i64 - other.scale as i64;
         if self.unscaled.is_zero() {
             let s = preferred.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            return Ok(BigDec::new(BigInt::zero(), s));
+            return Ok(BigDec::new(BigInt::zero(), s).with_ctx(ctx));
         }
-        // Enough extra digits that the integer quotient has more than
-        // PRECISION of them, so one rounding step finishes the job.
-        let extra =
-            (PRECISION + 1 + digits(&other.unscaled)).saturating_sub(digits(&self.unscaled)) + 1;
+        let ten = BigInt::from(10);
+        let strip = |mut out: BigDec| {
+            while (out.scale as i64) > preferred && out.unscaled.is_multiple_of(&ten) {
+                out = BigDec::new(&out.unscaled / &ten, out.scale - 1).with_ctx(ctx);
+            }
+            out
+        };
+        if ctx.precision == 0 {
+            // Exact: a terminating quotient has a denominator of only 2s and 5s.
+            let g = self.unscaled.gcd(&other.unscaled);
+            let mut den = (&other.unscaled / &g).abs();
+            let mut k = 0usize;
+            for p in [2u32, 5] {
+                let mut n = 0usize;
+                while den.is_multiple_of(&BigInt::from(p)) {
+                    den /= p;
+                    n += 1;
+                }
+                k = k.max(n);
+            }
+            if !den.is_one() {
+                return Err(
+                    "Non-terminating decimal expansion; no exact representable decimal result."
+                        .to_string(),
+                );
+            }
+            let q = (&self.unscaled * pow10(k)) / &other.unscaled;
+            let scale = (self.scale as i64 - other.scale as i64 + k as i64)
+                .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            return Ok(strip(BigDec::new(q, scale).with_ctx(ctx)));
+        }
+        let prec = ctx.precision;
+        // Enough extra digits that the integer quotient has more than `prec`
+        // of them, so one rounding step finishes the job.
+        let extra = (prec + 1 + digits(&other.unscaled)).saturating_sub(digits(&self.unscaled)) + 1;
         let numerator = &self.unscaled * pow10(extra);
         let (q0, rem) = numerator.div_rem(&other.unscaled);
         let mut scale = self.scale as i64 - other.scale as i64 + extra as i64;
         let mut q = q0;
         let mut exact = rem.is_zero();
         let have = digits(&q);
-        if have > PRECISION {
-            let drop = have - PRECISION;
-            let divisor = pow10(drop);
-            let (q1, r1) = q.div_rem(&divisor);
-            let negative = q.is_negative();
-            // The remainder of the first division is a sticky "more" below
-            // whatever the second one discarded.
-            let cmp_half = if r1.is_zero() && rem.is_zero() {
-                Ordering::Less
+        if have > prec {
+            let drop = have - prec;
+            // One STICKY digit below what is kept carries "the remainder was not
+            // zero", so the rounding sees a value strictly between neighbours —
+            // never a false exact half.
+            let negative = q.is_negative() != (rem.is_negative() && q.is_zero());
+            let sticky = if exact {
+                BigInt::zero()
+            } else if negative {
+                -BigInt::one()
             } else {
-                (r1.abs() * 2u32).cmp(&divisor).then(if rem.is_zero() {
-                    Ordering::Equal
-                } else {
-                    Ordering::Greater
-                })
+                BigInt::one()
             };
-            let round_away = match cmp_half {
-                Ordering::Greater => !(r1.is_zero() && rem.is_zero()),
-                Ordering::Less => false,
-                Ordering::Equal => q1.is_odd(),
-            };
-            exact = exact && r1.is_zero();
-            q = if round_away {
-                if negative {
-                    q1 - BigInt::one()
-                } else {
-                    q1 + BigInt::one()
-                }
-            } else {
-                q1
-            };
+            let ext = &q * &ten + sticky;
+            exact = exact && (&q % pow10(drop)).is_zero();
+            q = divide_round(&ext, &pow10(drop + 1), ctx.mode)?;
             scale -= drop as i64;
-            if digits(&q) > PRECISION {
+            if digits(&q) > prec {
                 q /= 10;
                 scale -= 1;
             }
         }
-        let mut out = BigDec::new(q, scale.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
-        if exact {
-            let ten = BigInt::from(10);
-            while (out.scale as i64) > preferred && out.unscaled.is_multiple_of(&ten) {
-                out = BigDec::new(&out.unscaled / &ten, out.scale - 1);
-            }
-        }
-        Ok(out)
+        let out =
+            BigDec::new(q, scale.clamp(i32::MIN as i64, i32::MAX as i64) as i32).with_ctx(ctx);
+        Ok(if exact { strip(out) } else { out })
     }
 
     /// `this % that` (`remainder`): `this - this.divideToIntegralValue(that) *
@@ -339,7 +394,9 @@ impl BigDec {
 
     /// `this.pow(n)` for a non-negative `n`, rounded like every other result.
     pub fn pow(&self, n: u32) -> BigDec {
-        BigDec::new(self.unscaled.pow(n), self.scale.saturating_mul(n as i32)).rounded()
+        BigDec::new(self.unscaled.pow(n), self.scale.saturating_mul(n as i32))
+            .with_ctx(self.ctx)
+            .rounded()
     }
 
     pub fn compare(&self, other: &BigDec) -> Ordering {

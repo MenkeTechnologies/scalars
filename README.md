@@ -580,7 +580,8 @@ Implemented and checked against the reference `scala`:
   collection of them, and `val b: BigInt = 7` widening as Scala's `int2bigInt`
   does.
 - **`BigDecimal`** — `java.math.BigDecimal`'s unscaled-value-and-scale model under
-  `MathContext.DECIMAL128`: exact `+ - *`, a 34-digit `/`, `setScale` with a
+  `MathContext.DECIMAL128` — or the `MathContext` a value was built with:
+  `+ - * /` rounded to its precision and mode, `setScale`/`round` with a
   `RoundingMode`, scale-insensitive `==`, and `toString` in plain or scientific
   form as the JDK writes it.
 - **`scala.Enumeration`** — `val A, B = Value`, named and numbered values,
