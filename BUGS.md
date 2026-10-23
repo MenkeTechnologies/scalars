@@ -1351,13 +1351,24 @@ reported as parse/compile errors, never silently mis-run.
   not a member of Null`), the composite `Ordering.Tuple2(o1, o2)` instance, and
   SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
   Double) => …` then `s.show(x)`).
-- **Found by the third October 2026 differential round, still open.** A boxed
-  integral type is not kept at run time: `Int`, `Long`, `Short` and `Byte`
-  values are one representation, so `(7L: Any) match { case i: Int => … }`
-  takes the `Int` arm and `(Long.MaxValue: Any).isInstanceOf[Int]` is `true`,
-  where Scala tests the box (`java.lang.Long`). Telling them apart needs the
-  static type carried into the value wherever one is widened to `Any`, which
-  the `i64` value model does not have.
+- **An integer's box is kept only where it is WIDENED to `Any` with a static
+  type the compiler knows.** Every integer is one `i64`, so the box
+  (`java.lang.Integer`/`Long`/`Short`/`Byte`) is recorded at the widening:
+  a `val`/argument declared `Any` (or `AnyVal`/`Matchable`/`AnyRef`), an
+  ascription `e: Any`, an argument to a parameter typed by a type parameter
+  (`def f[T](x: T)`), the elements of a literal declared `C[Any]` and the values
+  of one declared `Map[K, Any]` (after Scala 3's literal harmonization:
+  `Vector(1, 2L)` is all `Long`), and both sides of `equals`. Type tests,
+  `asInstanceOf` (a `ClassCastException` across boxes), `getClass`, `equals`
+  and format argument checks read the box; printing, `==`, `##`, hashing and
+  arithmetic read the number, and a typed pattern binds the number. A value
+  whose box was never recorded — one that reached `Any` through a path above
+  the compiler could not type, such as the element of a mapped collection —
+  still passes every integral type test. Boxes are interned per value, like
+  `Char`s. Measured cost (debug build, instructions retired): a numeric loop
+  with no widening 127.38G → 127.48G (+0.08%); a loop widening two integers to
+  `Any` per iteration 13.57G → 20.79G (+53%), and peak RSS 14 MB → 138 MB at
+  400 000 distinct boxes, since the arena is append-only.
 - **`String.chars`/`codePoints` are a lazy `IntStream` of the members a
   program reaches for** — `map`/`filter`/`distinct`/`sorted`/`skip`/`limit`,
   and `sum`/`count`/`toArray`/`forEach`/`anyMatch`/`allMatch`/`noneMatch`/

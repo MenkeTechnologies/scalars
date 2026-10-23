@@ -2457,7 +2457,22 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(crate::host::SISTYPE, 2), 0);
                 fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
                 if name != "_" {
-                    self.bind_pattern_name(name, vplace);
+                    // A typed pattern on an integral type binds the NUMBER: a box
+                    // widened to `Any` is opened (`case l: Long => l * 2`).
+                    if matches!(
+                        simple_type_name_of(ty),
+                        "Int" | "Integer" | "Long" | "Short" | "Byte"
+                    ) {
+                        self.match_counter += 1;
+                        let t = format!(" unboxed_{}", self.match_counter);
+                        let tp = self.declare_place(&t);
+                        self.emit_load(vplace);
+                        self.b.emit(Op::CallBuiltin(crate::host::UNBOX, 1), 0);
+                        self.emit_store(tp);
+                        self.bind_pattern_name(name, tp);
+                    } else {
+                        self.bind_pattern_name(name, vplace);
+                    }
                 }
             }
             Pattern::Stable(name) => {
@@ -3192,6 +3207,9 @@ impl Compiler {
     /// static type must not be converted, because a wrong conversion is a wrong
     /// VALUE rather than an error.
     fn converted(&self, e: &Expr, to: Option<&str>) -> Option<Expr> {
+        if let Some(w) = to.and_then(|t| self.widened(e, t)) {
+            return Some(w);
+        }
         // Predef's `wrapString`: a `String` where a `Seq[Char]` is expected is
         // the `WrappedString` view, so `val s: Seq[Char] = "hi"; s.map(f)`
         // builds a `Vector` rather than a `String`.
@@ -4866,7 +4884,22 @@ impl Compiler {
             .iter()
             .enumerate()
             .map(|(i, a)| match sig.get(i) {
-                Some(p) if !p.vararg => self.converted(a, p.ty.as_deref()).unwrap_or(a.clone()),
+                // A parameter typed by one of the callee's TYPE PARAMETERS is a
+                // widening to `Any` as far as the box goes: `def f[T](x: T)`
+                // called `f(5L)` receives a `java.lang.Long`.
+                Some(p) if !p.vararg => {
+                    let generic = p.ty.as_deref().is_some_and(|t| {
+                        self.func_type_params
+                            .get(name)
+                            .is_some_and(|tps| tps.iter().any(|tp| tp == t.trim()))
+                    });
+                    let to = if generic {
+                        Some("Any")
+                    } else {
+                        p.ty.as_deref()
+                    };
+                    self.converted(a, to).unwrap_or(a.clone())
+                }
                 _ => a.clone(),
             })
             .collect();
@@ -5105,6 +5138,20 @@ impl Compiler {
         // method of the name, which would own the repeated parameter.
         if let Some((bulk, spread)) = self.library_spread(name, args) {
             return self.method(recv, bulk, &spread, line);
+        }
+        // `a.equals(b)` is `Object.equals(Object)`: both sides are BOXED, and
+        // boxes of different classes are unequal (`7L.equals(7)` is false, where
+        // `==` is numeric). Widened here so the host sees both boxes.
+        if name == "equals"
+            && args.len() == 1
+            && !self.method_index.contains_key(name)
+            && (self.any_box(recv).is_some() || self.any_box(&args[0]).is_some())
+        {
+            let w = |e: &Expr| self.widened(e, "Any").unwrap_or_else(|| e.clone());
+            let (r, a) = (w(recv), w(&args[0]));
+            if (&r, &a) != (recv, &args[0]) {
+                return self.method(&r, name, &[a], line);
+            }
         }
         // `s.toList(1)` / `xs.reverse(0)` — a PARAMETERLESS library member
         // followed by an argument list is that member's result APPLIED to it.
@@ -5711,7 +5758,7 @@ impl Compiler {
         {
             let codes: String = args
                 .iter()
-                .map(|a| self.int_box(a).map_or('I', crate::host::IntBox::code))
+                .map(|a| self.int_box(a).map_or('?', crate::host::IntBox::code))
                 .collect();
             self.expr(recv)?;
             let k = self.b.add_constant(Value::str(codes));
@@ -6698,6 +6745,17 @@ impl Compiler {
                 );
             }
         }
+        if name == crate::parser::ANY_WIDEN {
+            if let [e] = args {
+                self.expr(e)?;
+                if let Some(b) = self.any_box(e) {
+                    let k = self.b.add_constant(Value::str(b.code().to_string()));
+                    self.b.emit(Op::LoadConst(k), line);
+                    self.b.emit(Op::CallBuiltin(crate::host::BOX_ANY, 2), line);
+                }
+                return Ok(());
+            }
+        }
         if name == MEMBER_HAS_CALL {
             if let [recv, member @ Expr::Str(_)] = args {
                 self.expr(recv)?;
@@ -7450,6 +7508,93 @@ impl Compiler {
             },
             _ => None,
         }
+    }
+
+    /// The box an integer of statically known type keeps when it is WIDENED to
+    /// `Any`: `Long`/`Short`/`Byte` from [`Compiler::int_box`], and `Int` for an
+    /// expression proven 32-bit. `None` where the static type is not known —
+    /// that value stays a plain integer, which every integral type test accepts.
+    fn any_box(&self, e: &Expr) -> Option<crate::host::IntBox> {
+        if matches!(e, Expr::Char(_)) {
+            return None;
+        }
+        self.int_box(e)
+            .or_else(|| (self.num_ty(e) == NumTy::Int).then_some(crate::host::IntBox::Int))
+    }
+
+    /// `e` reaching a position of declared type `to`, rewritten to keep integer
+    /// boxes where `to` widens them: `Any` itself (and its aliases), the
+    /// elements of a collection literal declared `C[Any]`, and the values of a
+    /// `Map` literal declared `Map[K, Any]`. `None` when nothing is widened.
+    fn widened(&self, e: &Expr, to: &str) -> Option<Expr> {
+        let widen = |x: &Expr| Expr::Call {
+            name: crate::parser::ANY_WIDEN.to_string(),
+            args: vec![x.clone()],
+            line: 0,
+        };
+        let to = to.trim();
+        if is_any_type(to) {
+            return self.any_box(e).map(|_| widen(e));
+        }
+        let Expr::Collection { ctor, elems } = e else {
+            return None;
+        };
+        let (base, targs) = to.split_once('[')?;
+        let targs = targs.strip_suffix(']')?;
+        let parts: Vec<&str> = split_type_args(targs);
+        let elems: Vec<Expr> = match (simple_type_name_of(base), parts.as_slice()) {
+            ("Map", [_, v]) if is_any_type(v) => elems
+                .iter()
+                .map(|x| match x {
+                    Expr::Tuple(kv) if kv.len() == 2 && self.any_box(&kv[1]).is_some() => {
+                        Expr::Tuple(vec![kv[0].clone(), widen(&kv[1])])
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+            (_, [t]) if is_any_type(t) => {
+                // Scala 3 HARMONIZES a list of numeric literals to the widest of
+                // them before the expected type is consulted: `Vector(1, 2L)` is
+                // a `Vector[Long]` even where a `Seq[Any]` is expected, so its
+                // `1` is a `java.lang.Long`. A non-literal element turns that off.
+                let int_lit = |x: &Expr| match x {
+                    Expr::Int(_) => true,
+                    Expr::Unary { op: UnOp::Neg, rhs } => matches!(**rhs, Expr::Int(_)),
+                    _ => false,
+                };
+                let long_lit = |x: &Expr| match x {
+                    Expr::Long(_) => true,
+                    Expr::Unary { op: UnOp::Neg, rhs } => matches!(**rhs, Expr::Long(_)),
+                    _ => false,
+                };
+                let harmonize = elems.iter().all(|x| int_lit(x) || long_lit(x))
+                    && elems.iter().any(long_lit)
+                    && elems.iter().any(int_lit);
+                elems
+                    .iter()
+                    .map(|x| {
+                        if harmonize && int_lit(x) {
+                            let as_long = Expr::Method {
+                                recv: Box::new(x.clone()),
+                                name: "toLong".to_string(),
+                                args: Vec::new(),
+                                line: 0,
+                            };
+                            widen(&as_long)
+                        } else if self.any_box(x).is_some() {
+                            widen(x)
+                        } else {
+                            x.clone()
+                        }
+                    })
+                    .collect()
+            }
+            _ => return None,
+        };
+        Some(Expr::Collection {
+            ctor: ctor.clone(),
+            elems,
+        })
     }
 
     /// The boxed integral class a `java.util.Formatter` argument would carry,
@@ -8630,6 +8775,40 @@ fn range_factory(name: &str, args: &[Expr], line: u32) -> Option<Expr> {
         [a, b, step] => m(m(a.clone(), preposition, b.clone()), "by", step.clone()),
         _ => return None,
     })
+}
+
+/// Whether a declared type is `Any` or one of the supertypes an integer is
+/// widened to on the way there.
+fn is_any_type(ty: &str) -> bool {
+    matches!(
+        ty.trim(),
+        "Any" | "AnyVal" | "Matchable" | "AnyRef" | "Object" | "java.lang.Object"
+    )
+}
+
+/// A type name's last dotted segment (`collection.immutable.List` is `List`).
+fn simple_type_name_of(ty: &str) -> &str {
+    let t = ty.trim();
+    t.rsplit('.').next().unwrap_or(t)
+}
+
+/// The top-level comma-separated parts of a type-argument list (`String, Map[A,
+/// B]` is two parts).
+fn split_type_args(s: &str) -> Vec<&str> {
+    let (mut depth, mut start, mut out) = (0usize, 0usize, Vec::new());
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out
 }
 
 /// The internal call [`Compiler::extension_by_runtime_type`] probes a real

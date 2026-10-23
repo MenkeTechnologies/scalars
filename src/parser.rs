@@ -4322,6 +4322,13 @@ impl Parser {
                 args: Vec::new(),
                 line,
             },
+            // A widening to `Any` keeps an integer's box (see
+            // `Compiler::widened_to_any`).
+            "Any" | "AnyVal" | "Matchable" | "AnyRef" | "Object" => Expr::Call {
+                name: ANY_WIDEN.to_string(),
+                args: vec![e],
+                line,
+            },
             _ => e,
         })
     }
@@ -5623,6 +5630,9 @@ fn conversion_args(ty: &str) -> Option<(String, String)> {
 /// The synthetic call `summon[T]` parses to: one argument, the type's name,
 /// resolved against the implicit scope by [`crate::compiler`].
 pub const SUMMON: &str = "summon$";
+/// The synthetic call an expression WIDENED to `Any` is wrapped in, so the
+/// compiler can keep the box of an integer whose static type it knows.
+pub const ANY_WIDEN: &str = "any$widen";
 
 /// The synthetic call a `given Ordering[C] with { … }` declaration parses to:
 /// two arguments, the instance and the element class name, answered by

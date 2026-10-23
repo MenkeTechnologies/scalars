@@ -514,6 +514,11 @@ pub const NO_MEMBER_TEST: u16 = 815;
 /// Builtin id answering whether a receiver's CLASS has a member, without
 /// calling it (see `b_has_member`); pops the name and the receiver.
 pub const HAS_MEMBER: u16 = 816;
+/// Builtin id widening an integral value to `Any` with its box kept: pops the
+/// box code and the value (see `b_box_any`).
+pub const BOX_ANY: u16 = 817;
+/// Builtin id opening a widened box (see `b_unbox`); pops one value.
+pub const UNBOX: u16 = 818;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -774,6 +779,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MEMBER_SOFT, b_member_soft);
     vm.register_builtin(NO_MEMBER_TEST, b_no_member_test);
     vm.register_builtin(HAS_MEMBER, b_has_member);
+    vm.register_builtin(BOX_ANY, b_box_any);
+    vm.register_builtin(UNBOX, b_unbox);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -1482,6 +1489,15 @@ enum HeapVal {
     /// Handles are interned by [`make_char`], so this costs no arena growth in a
     /// per-character loop and makes handle identity match value equality.
     Char(char),
+    /// An integral value WIDENED to `Any` (`val x: Any = 7L`, a `List[Any]`
+    /// element, an `Any` argument), keeping the box its static type gave it.
+    /// Every integer is one `i64` in the value model, so this is the only place
+    /// `java.lang.Long` and `java.lang.Integer` are told apart — by a type test,
+    /// `asInstanceOf`, `getClass` or a format argument check. Everything that only
+    /// READS the number (printing, `==`, hashing, arithmetic after a cast)
+    /// sees it through [`unboxed`]. A plain `Value::Int` whose box was never
+    /// recorded keeps the permissive answer every integral type test gave it.
+    Boxed(IntBox, i64),
     /// A `scala.math.BigInt` — see [`make_big`].
     BigInt(BigInt),
     /// A `scala.math.BigDecimal` — see [`make_dec`].
@@ -2325,6 +2341,7 @@ pub fn reset_heap() {
     HEAP.with(|h| h.borrow_mut().clear());
     // The intern table holds arena indices, which the clear above invalidates.
     CHARS.with(|t| t.borrow_mut().clear());
+    BOXES.with(|t| t.borrow_mut().clear());
     SINGLETONS.with(|t| t.borrow_mut().clear());
     CLASSES.with(|t| t.borrow_mut().clear());
     // Method entries are offsets into the OUTGOING chunk; the next program
@@ -2372,6 +2389,10 @@ thread_local! {
     /// structural order instead of recursing.
     static IN_ORDERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CHARS: RefCell<HashMap<char, u32>> = RefCell::new(HashMap::new());
+    /// The interned arena handle of each widened integral box, as [`CHARS`] is
+    /// for a `Char`: a loop that widens the same values to `Any` again and again
+    /// must not grow the append-only arena by one entry per widening.
+    static BOXES: RefCell<HashMap<(IntBox, i64), u32>> = RefCell::new(HashMap::new());
     /// The one record per singleton `object`, by name. Every mention of `O`
     /// materializes it, and Scala has exactly one instance — so `O eq O`, `O ==
     /// O` and a stable `O.hashCode` all depend on answering the same handle.
@@ -5316,6 +5337,11 @@ fn class_of(recv: &Value) -> Result<Value, String> {
             "BigDecimal".to_string(),
             false,
         ),
+        Value::Obj(_) if as_boxed(recv).is_some() => {
+            let class = as_boxed(recv).map_or("", |(b, _)| b.class()).to_string();
+            let simple = class.rsplit('.').next().unwrap_or(&class).to_string();
+            (class, simple, false)
+        }
         // A built-in throwable knows its own fully-qualified JDK name.
         Value::Obj(_) if as_exc(recv).is_some() => {
             let n = as_exc(recv).expect("just matched").class.to_string();
@@ -5603,6 +5629,7 @@ fn obj_to_string(v: &Value) -> String {
             // `Regex.toString` is the source pattern; `Match.toString` is the
             // matched text (both as in Scala/`java.util.regex`).
             Some(HeapVal::Regex(p)) => p.to_string(),
+            Some(HeapVal::Boxed(_, n)) => n.to_string(),
             // Scala renders an `Ordering` as an anonymous-class identity string
             // (`scala.math.Ordering$$anon$1@1b6d3586`), which is unreproducible
             // and never depended on; name the class without the address.
@@ -5797,6 +5824,7 @@ fn scala_hash(v: &Value) -> Option<i32> {
                 // is — so a `Char` and its `Int` code point hash alike.
                 HeapVal::Char(c) => Some(c as u32 as i32),
                 HeapVal::BigInt(b) => Some(big_hash(&b)),
+                HeapVal::Boxed(_, n) => scala_hash(&Value::int(n)),
                 HeapVal::BigDec(d) => Some(dec_hash(&d)),
                 HeapVal::Tuple(items) => product_hash(&format!("Tuple{}", items.len()), &items),
                 HeapVal::Record(o) if o.is_case => {
@@ -6237,6 +6265,9 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
 
 /// Structural equality of two field values (recurses into nested objects).
 fn value_eq(a: &Value, b: &Value) -> bool {
+    if as_boxed(a).is_some() || as_boxed(b).is_some() {
+        return value_eq(&unboxed(a), &unboxed(b));
+    }
     if let Some((x, y)) = dec_pair(a, b) {
         return x.compare(&y) == Ordering::Equal;
     }
@@ -7072,10 +7103,11 @@ fn b_format_typed(vm: &mut VM, argc: u8) -> Value {
 /// things this frontend's `i64` value cannot: the width `%x`/`%o` render the
 /// two's complement at (`(-1: Byte)` is `ff`, `-1L` is `ffffffffffffffff`),
 /// and the class an `IllegalFormatConversionException` names.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IntBox {
     Byte,
     Short,
+    Int,
     Long,
 }
 
@@ -7086,6 +7118,7 @@ impl IntBox {
         match self {
             IntBox::Byte => 'B',
             IntBox::Short => 'S',
+            IntBox::Int => 'I',
             IntBox::Long => 'J',
         }
     }
@@ -7094,6 +7127,7 @@ impl IntBox {
         match c? {
             'B' => Some(IntBox::Byte),
             'S' => Some(IntBox::Short),
+            'I' => Some(IntBox::Int),
             'J' => Some(IntBox::Long),
             _ => None,
         }
@@ -7104,6 +7138,7 @@ impl IntBox {
         match self {
             IntBox::Byte => u64::from(n as u8),
             IntBox::Short => u64::from(n as u16),
+            IntBox::Int => u64::from(n as u32),
             IntBox::Long => n as u64,
         }
     }
@@ -7112,6 +7147,7 @@ impl IntBox {
         match self {
             IntBox::Byte => "java.lang.Byte",
             IntBox::Short => "java.lang.Short",
+            IntBox::Int => "java.lang.Integer",
             IntBox::Long => "java.lang.Long",
         }
     }
@@ -7151,6 +7187,9 @@ fn jvm_qualified(class: &str) -> String {
 /// answers on an `Any`-typed receiver, and what a `MatchError` reports.
 fn boxed_class_name(v: &Value) -> String {
     match v {
+        Value::Obj(_) if as_boxed(v).is_some() => {
+            as_boxed(v).map_or_else(String::new, |(b, _)| b.class().to_string())
+        }
         Value::Int(_) => "java.lang.Integer".to_string(),
         Value::Float(_) => "java.lang.Double".to_string(),
         Value::Status(_) => "java.lang.Float".to_string(),
@@ -7257,6 +7296,9 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
     // prefix is not part of any answer here, and carrying it only stopped the
     // name from being recognised — `case t: scala.util.Try[Int]` on a `Success`
     // silently took the default arm where the reference takes the `Try` one.
+    if let Some((b, _)) = as_boxed(v) {
+        return boxed_is_type(b, ty);
+    }
     let ty = simple_name(ty);
     match ty {
         "String" | "CharSequence" => matches!(v, Value::Str(_)),
@@ -7469,7 +7511,11 @@ fn format_all_typed(
                     ));
                 };
                 last = slot;
-                let bx = slot.and_then(|k| boxes.get(k).copied().flatten());
+                // A widened box carries its own static type.
+                let (v, bx) = match as_boxed(v) {
+                    Some((b, n)) => (&Value::int(n), Some(b)),
+                    None => (v, slot.and_then(|k| boxes.get(k).copied().flatten())),
+                };
                 format_arg_check(conv, v, bx)?;
                 let spec = format!("%{inner}{conv}");
                 out.push_str(&format_one(&spec, v, bx, vm.as_deref_mut())?);
@@ -8369,6 +8415,18 @@ fn b_no_member_test(_vm: &mut VM, _argc: u8) -> Value {
 
 /// The dispatch behind [`b_method`], with its operands already popped.
 fn method_call(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value>) -> Value {
+    // A widened box answers every member as its number does, except `getClass`,
+    // which reports the box.
+    // `equals` between two boxes is the JDK's: same class and same value.
+    if name == "equals" && args.len() == 1 {
+        if let (Some((a, x)), Some((b, y))) = (as_boxed(&recv), as_boxed(&args[0])) {
+            return Value::bool(a == b && x == y);
+        }
+    }
+    let recv = match as_boxed(&recv) {
+        Some((_, n)) if name != "getClass" => Value::int(n),
+        _ => recv,
+    };
     // A range `for … yield` result is a fusevm `Value::Array` (rendered as
     // `Vector`); promote it to a heap `Vector` seq so the collection methods
     // (`map`, `toList`, …) apply uniformly.
@@ -8655,6 +8713,8 @@ fn heap_kind(v: &Value) -> Option<u8> {
                 // A `Char` is answered by `char_method` ahead of the routed
                 // dispatchers, so it needs no kind of its own.
                 HeapVal::Char(_) => 8,
+                // A widened box is opened before dispatch (see `method_call`).
+                HeapVal::Boxed(..) => 8,
                 // Likewise an `Ordering`, which `ordering_method` answers.
                 HeapVal::Ordering { .. } => 9,
                 HeapVal::Lazy(_) => 10,
@@ -18916,6 +18976,10 @@ fn render_plain(digits: &str, exp: i32) -> String {
 /// All-`Float` arithmetic, and mixed arithmetic with a small integer, stay on
 /// the native fast path and the JIT and never reach here.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    // A widened box is read as its number.
+    if as_boxed(a).is_some() || as_boxed(b).is_some() {
+        return numeric_hook(op, &unboxed(a), &unboxed(b));
+    }
     // Suppressed while unwinding: an operand is the `Undef` a raise left behind,
     // and Scala 3's strict `+`/comparison rules would reject it as a type error,
     // displacing the real exception (see `Exception unwinding`).
@@ -19529,6 +19593,14 @@ fn b_as_instance(vm: &mut VM, _argc: u8) -> Value {
             "Int" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Char"
         )
     };
+    // A widened box casts only to its own type (and the supertypes), and the
+    // cast opens it: `(7L: Any).asInstanceOf[Int]` is the JDK's
+    // `ClassCastException`, not a conversion.
+    if let Some((b, n)) = as_boxed(&v) {
+        if boxed_is_type(b, &ty) {
+            return if numeric(base) { Value::int(n) } else { v };
+        }
+    }
     let value_numeric = matches!(v, Value::Int(_) | Value::Float(_) | Value::Status(_))
         || as_char(&v).is_some()
         || as_big(&v).is_some()
@@ -20389,4 +20461,69 @@ fn b_has_member(vm: &mut VM, _argc: u8) -> Value {
     let name = vm.pop().as_str_cow().into_owned();
     let recv = vm.pop();
     Value::bool(class_has_member(&recv, &name).unwrap_or(false))
+}
+
+// ── Integral boxes widened to `Any` ──────────────────────────────────────────
+
+/// The box and value of a [`HeapVal::Boxed`] handle.
+fn as_boxed(v: &Value) -> Option<(IntBox, i64)> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::Boxed(b, n)) => Some((*b, *n)),
+        _ => None,
+    })
+}
+
+/// `v` with a widened integral box opened: the plain number every reader of the
+/// VALUE (printing, `==`, hashing, arithmetic) sees. Anything else is `v`.
+fn unboxed(v: &Value) -> Value {
+    as_boxed(v).map_or_else(|| v.clone(), |(_, n)| Value::int(n))
+}
+
+/// `BOX_ANY` builtin: pops the box code and the value, and answers the value
+/// widened to `Any` with that box kept (see [`HeapVal::Boxed`]). A value that
+/// is not an integer (or already boxed) passes through.
+fn b_box_any(vm: &mut VM, _argc: u8) -> Value {
+    let code = vm.pop().as_str_cow().chars().next();
+    let v = vm.pop();
+    match (v, IntBox::from_code(code)) {
+        (Value::Int(n), Some(b)) => {
+            if let Some(id) = BOXES.with(|t| t.borrow().get(&(b, n)).copied()) {
+                return Value::Obj(id);
+            }
+            let v = heap_push(HeapVal::Boxed(b, n));
+            if let Some(id) = as_obj_id(&v) {
+                BOXES.with(|t| t.borrow_mut().insert((b, n), id as u32));
+            }
+            v
+        }
+        (v, _) => v,
+    }
+}
+
+/// `UNBOX` builtin: pops a value and answers it [`unboxed`] — what a typed
+/// pattern binds (`case l: Long => l * 2`).
+fn b_unbox(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    unboxed(&v)
+}
+
+/// Whether a widened box conforms to the type named `ty`: its own primitive and
+/// boxed class, `java.lang.Number`, and the universal supertypes.
+fn boxed_is_type(b: IntBox, ty: &str) -> bool {
+    let own = match b {
+        IntBox::Byte => ["Byte", "java.lang.Byte"],
+        IntBox::Short => ["Short", "java.lang.Short"],
+        IntBox::Int => ["Int", "Integer"],
+        IntBox::Long => ["Long", "java.lang.Long"],
+    };
+    let simple = simple_name(ty);
+    own.contains(&ty)
+        || own.contains(&simple)
+        || matches!(
+            simple,
+            "Any" | "AnyVal" | "Matchable" | "Object" | "AnyRef" | "Number" | "Comparable"
+        )
 }
