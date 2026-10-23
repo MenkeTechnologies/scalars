@@ -511,6 +511,9 @@ pub const MEMBER_SOFT: u16 = 814;
 /// Builtin id answering whether the `MEMBER_SOFT` probe just before it found no
 /// member; `argc` is 0.
 pub const NO_MEMBER_TEST: u16 = 815;
+/// Builtin id answering whether a receiver's CLASS has a member, without
+/// calling it (see `b_has_member`); pops the name and the receiver.
+pub const HAS_MEMBER: u16 = 816;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -770,6 +773,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(FORMAT_TYPED, b_format_typed);
     vm.register_builtin(MEMBER_SOFT, b_member_soft);
     vm.register_builtin(NO_MEMBER_TEST, b_no_member_test);
+    vm.register_builtin(HAS_MEMBER, b_has_member);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -19905,4 +19909,484 @@ fn in_place_contents(
         }
         _ => return Ok(None),
     }))
+}
+
+// ── Member existence from the receiver's class alone ─────────────────────────
+//
+// [`b_member_soft`] decides "does the receiver have this member" by TRYING it,
+// which needs the arguments evaluated. A runtime-selected extension whose
+// parameter is BY NAME cannot afford that: evaluating the argument for the
+// probe would run it when the extension would not, or run it twice. For that
+// case the question is answered from the receiver's class, off the tables
+// below — the public members of the standard-library classes a receiver here
+// can be (`IterableOps`/`SeqOps`/`MapOps`/`SetOps` and the buffers,
+// `Option`/`Either`/`Try`, the tuples), plus the own-class tables of
+// [`own_member_of`].
+
+/// `IterableOnceOps` and `IterableOps`, which every collection has.
+const ITERABLE_MEMBERS: &[&str] = &[
+    "++",
+    "concat",
+    "map",
+    "flatMap",
+    "flatten",
+    "filter",
+    "filterNot",
+    "withFilter",
+    "collect",
+    "collectFirst",
+    "foreach",
+    "forall",
+    "exists",
+    "count",
+    "find",
+    "fold",
+    "foldLeft",
+    "foldRight",
+    "reduce",
+    "reduceLeft",
+    "reduceRight",
+    "reduceOption",
+    "reduceLeftOption",
+    "reduceRightOption",
+    "scan",
+    "scanLeft",
+    "scanRight",
+    "sum",
+    "product",
+    "min",
+    "max",
+    "minBy",
+    "maxBy",
+    "minOption",
+    "maxOption",
+    "minByOption",
+    "maxByOption",
+    "head",
+    "headOption",
+    "last",
+    "lastOption",
+    "tail",
+    "init",
+    "tails",
+    "inits",
+    "take",
+    "takeRight",
+    "takeWhile",
+    "drop",
+    "dropRight",
+    "dropWhile",
+    "slice",
+    "splitAt",
+    "span",
+    "partition",
+    "partitionMap",
+    "groupBy",
+    "groupMap",
+    "groupMapReduce",
+    "grouped",
+    "sliding",
+    "zip",
+    "zipAll",
+    "zipWithIndex",
+    "unzip",
+    "unzip3",
+    "transpose",
+    "isEmpty",
+    "nonEmpty",
+    "size",
+    "knownSize",
+    "sizeCompare",
+    "sizeIs",
+    "toList",
+    "toVector",
+    "toSeq",
+    "toIndexedSeq",
+    "toSet",
+    "toMap",
+    "toArray",
+    "toBuffer",
+    "toIterable",
+    "iterator",
+    "view",
+    "mkString",
+    "addString",
+    "copyToArray",
+    "empty",
+    "tapEach",
+    "to",
+    "lazyZip",
+    "corresponds",
+    "aggregate",
+    "stepper",
+    "iterableFactory",
+    "isTraversableAgain",
+];
+
+/// `SeqOps` (and the `PartialFunction` a `Seq` is), beyond [`ITERABLE_MEMBERS`].
+const SEQ_MEMBERS: &[&str] = &[
+    "apply",
+    "length",
+    "lengthCompare",
+    "lengthIs",
+    "isDefinedAt",
+    "lift",
+    "indexOf",
+    "lastIndexOf",
+    "indexWhere",
+    "lastIndexWhere",
+    "indexOfSlice",
+    "lastIndexOfSlice",
+    "containsSlice",
+    "contains",
+    "startsWith",
+    "endsWith",
+    "reverse",
+    "reverseIterator",
+    "sorted",
+    "sortBy",
+    "sortWith",
+    "distinct",
+    "distinctBy",
+    "diff",
+    "intersect",
+    "updated",
+    "patch",
+    "padTo",
+    "appended",
+    "prepended",
+    "appendedAll",
+    "prependedAll",
+    ":+",
+    "+:",
+    ":++",
+    "++:",
+    "permutations",
+    "combinations",
+    "indices",
+    "segmentLength",
+    "sameElements",
+    "search",
+    "applyOrElse",
+    "andThen",
+    "compose",
+    "orElse",
+    "runWith",
+    "elementWith",
+];
+
+/// The members `List` adds.
+const LIST_MEMBERS: &[&str] = &["::", ":::", "reverse_:::", "mapConserve"];
+
+/// The mutable-sequence members (`ArrayBuffer`, `ListBuffer`, `ArrayDeque`, …).
+const BUFFER_MEMBERS: &[&str] = &[
+    "+=",
+    "-=",
+    "++=",
+    "--=",
+    "+=:",
+    "++=:",
+    "append",
+    "prepend",
+    "appendAll",
+    "prependAll",
+    "insert",
+    "insertAll",
+    "remove",
+    "clear",
+    "update",
+    "addOne",
+    "addAll",
+    "subtractOne",
+    "subtractAll",
+    "filterInPlace",
+    "mapInPlace",
+    "dropInPlace",
+    "dropRightInPlace",
+    "takeInPlace",
+    "takeRightInPlace",
+    "sliceInPlace",
+    "patchInPlace",
+    "padToInPlace",
+    "sortInPlace",
+    "sortInPlaceBy",
+    "sortInPlaceWith",
+    "trimStart",
+    "trimEnd",
+    "result",
+];
+
+/// `SetOps` (and the `Set` function), beyond [`ITERABLE_MEMBERS`].
+const SET_MEMBERS: &[&str] = &[
+    "contains",
+    "apply",
+    "+",
+    "-",
+    "incl",
+    "excl",
+    "union",
+    "intersect",
+    "diff",
+    "&",
+    "|",
+    "&~",
+    "subsetOf",
+    "subsets",
+    "removedAll",
+    "--",
+    "andThen",
+    "compose",
+];
+
+/// `MapOps` (and the `PartialFunction` a `Map` is), beyond [`ITERABLE_MEMBERS`].
+const MAP_MEMBERS: &[&str] = &[
+    "get",
+    "getOrElse",
+    "apply",
+    "contains",
+    "keys",
+    "keySet",
+    "values",
+    "keysIterator",
+    "valuesIterator",
+    "updated",
+    "+",
+    "-",
+    "removed",
+    "removedAll",
+    "--",
+    "mapValues",
+    "filterKeys",
+    "transform",
+    "foreachEntry",
+    "applyOrElse",
+    "isDefinedAt",
+    "default",
+    "withDefault",
+    "withDefaultValue",
+    "updatedWith",
+    "lift",
+    "andThen",
+    "compose",
+    "orElse",
+    "runWith",
+    "put",
+    "getOrElseUpdate",
+    "update",
+    "+=",
+    "-=",
+    "++=",
+    "--=",
+    "clear",
+    "filterInPlace",
+    "mapValuesInPlace",
+    "remove",
+    "updateWith",
+    "addOne",
+    "subtractOne",
+];
+
+/// `Option`'s members.
+const OPTION_MEMBERS: &[&str] = &[
+    "get",
+    "getOrElse",
+    "orElse",
+    "orNull",
+    "isEmpty",
+    "isDefined",
+    "nonEmpty",
+    "map",
+    "flatMap",
+    "flatten",
+    "filter",
+    "filterNot",
+    "withFilter",
+    "foreach",
+    "fold",
+    "exists",
+    "forall",
+    "contains",
+    "collect",
+    "zip",
+    "unzip",
+    "unzip3",
+    "toList",
+    "toRight",
+    "toLeft",
+    "iterator",
+    "knownSize",
+    "value",
+    "productArity",
+    "productElement",
+    "productIterator",
+    "productPrefix",
+    "copy",
+    "canEqual",
+];
+
+/// `Either`'s members.
+const EITHER_MEMBERS: &[&str] = &[
+    "isLeft",
+    "isRight",
+    "left",
+    "fold",
+    "swap",
+    "foreach",
+    "getOrElse",
+    "orElse",
+    "contains",
+    "forall",
+    "exists",
+    "flatMap",
+    "flatten",
+    "map",
+    "filterOrElse",
+    "toSeq",
+    "toOption",
+    "toTry",
+    "joinLeft",
+    "joinRight",
+    "value",
+    "productArity",
+    "productElement",
+    "productIterator",
+    "productPrefix",
+    "copy",
+    "canEqual",
+];
+
+/// `Try`'s members.
+const TRY_MEMBERS: &[&str] = &[
+    "isSuccess",
+    "isFailure",
+    "get",
+    "getOrElse",
+    "orElse",
+    "toOption",
+    "toEither",
+    "map",
+    "flatMap",
+    "flatten",
+    "filter",
+    "withFilter",
+    "foreach",
+    "recover",
+    "recoverWith",
+    "fold",
+    "transform",
+    "failed",
+    "collect",
+    "value",
+    "exception",
+    "productArity",
+    "productElement",
+    "productIterator",
+    "productPrefix",
+    "copy",
+    "canEqual",
+];
+
+/// `TupleN`'s members, beyond the `_1`..`_N` accessors.
+const TUPLE_MEMBERS: &[&str] = &[
+    "swap",
+    "productArity",
+    "productElement",
+    "productIterator",
+    "productPrefix",
+    "productElementName",
+    "productElementNames",
+    "copy",
+    "canEqual",
+    "++",
+    "toList",
+    "size",
+    "apply",
+    "head",
+    "last",
+    "tail",
+    "init",
+    "drop",
+    "take",
+    "splitAt",
+    "zip",
+    "map",
+    "toArray",
+    "toIArray",
+    ":*",
+    "*:",
+    "reverse",
+];
+
+/// Whether `recv`'s class has a member `name`, decided from its class alone;
+/// `None` for a receiver this cannot classify (a user instance — the compiler
+/// already declines whenever a user class declares the name).
+fn class_has_member(recv: &Value, name: &str) -> Option<bool> {
+    const ANY: &[&str] = &[
+        "==",
+        "!=",
+        "equals",
+        "hashCode",
+        "toString",
+        "##",
+        "getClass",
+        "isInstanceOf",
+        "asInstanceOf",
+        "eq",
+        "ne",
+        "synchronized",
+    ];
+    if ANY.contains(&name) {
+        return Some(true);
+    }
+    match recv {
+        Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::Status(_) | Value::Bool(_) => {
+            return Some(is_own_member(recv, name));
+        }
+        _ if as_char(recv).is_some() => return Some(is_own_member(recv, name)),
+        _ => {}
+    }
+    if let Some(kind) = seq_kind(recv) {
+        let common = ITERABLE_MEMBERS.contains(&name);
+        return Some(match kind {
+            SeqKind::Array => is_own_member(recv, name),
+            SeqKind::IntStream | SeqKind::JavaOptional(_) => return None,
+            k if k.is_set() => common || SET_MEMBERS.contains(&name),
+            k => {
+                common
+                    || SEQ_MEMBERS.contains(&name)
+                    || (k == SeqKind::List && LIST_MEMBERS.contains(&name))
+                    || (k.is_mutable() && BUFFER_MEMBERS.contains(&name))
+            }
+        });
+    }
+    if is_map(recv) {
+        return Some(ITERABLE_MEMBERS.contains(&name) || MAP_MEMBERS.contains(&name));
+    }
+    if let Some(items) = as_tuple_items(recv) {
+        let accessor = name
+            .strip_prefix('_')
+            .and_then(|d| d.parse::<usize>().ok())
+            .is_some_and(|i| (1..=items.len()).contains(&i));
+        return Some(accessor || TUPLE_MEMBERS.contains(&name));
+    }
+    if as_option(recv).is_some() {
+        return Some(OPTION_MEMBERS.contains(&name));
+    }
+    if as_either(recv).is_some() {
+        return Some(EITHER_MEMBERS.contains(&name));
+    }
+    if as_try(recv).is_some() {
+        return Some(TRY_MEMBERS.contains(&name));
+    }
+    None
+}
+
+/// `HAS_MEMBER` builtin: pops the member name and the receiver and answers
+/// whether the receiver's class has that member ([`class_has_member`]). A
+/// receiver it cannot classify answers `false`, which leaves the extension
+/// chosen — the behavior before this question could be asked at all.
+fn b_has_member(vm: &mut VM, _argc: u8) -> Value {
+    let name = vm.pop().as_str_cow().into_owned();
+    let recv = vm.pop();
+    Value::bool(class_has_member(&recv, &name).unwrap_or(false))
 }

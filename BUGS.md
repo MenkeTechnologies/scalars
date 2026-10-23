@@ -1305,10 +1305,14 @@ reported as parse/compile errors, never silently mis-run.
   not members, and an extension shadows them (`s.reverse` under `extension (s:
   String) def reverse` is the extension), which is also Scala's rule. A
   receiver selected by its run-time type tries the member first and falls back
-  to the extension only when the receiver has none. One residual: when such a
-  call passes an argument with side effects to an extension that takes a
-  parameter BY NAME, the member probe is skipped (it would have to evaluate the
-  argument) and the extension is chosen outright.
+  to the extension only when the receiver has none; where the extension takes
+  a parameter BY NAME and the argument has side effects, member existence is
+  decided from the receiver's class alone (a table of the standard-library
+  classes' members), so the argument is evaluated only by the call taken. One
+  residual: Scala keeps a member only when it TYPE-CHECKS against the
+  arguments, and falls back to the extension otherwise (`xs.exists(b)` with a
+  `Boolean` `b` under `extension (xs: List[A]) def exists(f: => Boolean)` is the
+  extension); this frontend has no types to check with and takes the member.
 
   A `given`, an `extension`, an `implicit val`/`def` and an `implicit object`
   declared as a member of a `def main` entry object enter the implicit scope as

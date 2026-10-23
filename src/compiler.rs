@@ -3445,8 +3445,8 @@ impl Compiler {
         // probe, once for the extension — which is harmless when they are
         // side-effect free and is avoided by binding them once otherwise. A
         // candidate that takes an argument BY NAME cannot be given a bound
-        // value, so there the probe is skipped and the extension is chosen
-        // outright (see `BUGS.md`).
+        // value, so there member existence is decided from the receiver's CLASS
+        // (`HAS_MEMBER`) and the arguments are evaluated only by the call taken.
         let by_name = candidates.iter().any(|(_, f)| {
             self.func_sig
                 .get(f)
@@ -3495,9 +3495,23 @@ impl Compiler {
             }
         });
         if !probe {
+            let member = Expr::Method {
+                recv: Box::new(r.clone()),
+                name: name.to_string(),
+                args: args.clone(),
+                line,
+            };
             stmts.push(Stmt {
                 line,
-                kind: StmtKind::Expr(chain),
+                kind: StmtKind::Expr(Expr::If {
+                    cond: Box::new(Expr::Call {
+                        name: MEMBER_HAS_CALL.to_string(),
+                        args: vec![r.clone(), Expr::Str(name.to_string())],
+                        line,
+                    }),
+                    then: Box::new(member),
+                    els: Some(Box::new(chain)),
+                }),
             });
             return Some(Expr::Block(stmts));
         }
@@ -6684,6 +6698,15 @@ impl Compiler {
                 );
             }
         }
+        if name == MEMBER_HAS_CALL {
+            if let [recv, member @ Expr::Str(_)] = args {
+                self.expr(recv)?;
+                self.expr(member)?;
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::HAS_MEMBER, 2), line);
+                return Ok(());
+            }
+        }
         if name == MEMBER_MISSED_CALL && args.is_empty() {
             self.b
                 .emit(Op::CallBuiltin(crate::host::NO_MEMBER_TEST, 0), line);
@@ -8615,6 +8638,9 @@ fn range_factory(name: &str, args: &[Expr], line: u32) -> Option<Expr> {
 const MEMBER_SOFT_CALL: &str = " member$soft";
 /// The internal call answering whether that probe found no member.
 const MEMBER_MISSED_CALL: &str = " member$missed";
+/// The internal call answering whether a receiver's class has a member,
+/// `(receiver, name)`, lowered to `HAS_MEMBER`.
+const MEMBER_HAS_CALL: &str = " member$has";
 
 /// Whether evaluating `e` twice is indistinguishable from evaluating it once:
 /// a name, a literal, a function literal, or a tuple of those.
