@@ -144,13 +144,13 @@ fn frozen_corpus_matches_reference_scala() {
     // frozen corpus's only defence against silent shrinkage is a number that
     // moves with it, so raise both whenever the corpus grows.
     assert!(
-        n >= 1053,
-        "the frozen corpus has shrunk: {n} records, expected at least 1053"
+        n >= 1083,
+        "the frozen corpus has shrunk: {n} records, expected at least 1083"
     );
     // Without this the three-field form could be dropped from the data and the
     // whole failure axis would stop being exercised with the test still green.
     assert!(
-        failing >= 70,
+        failing >= 73,
         "the expected-FAILURE half of the corpus has thinned out: {failing} records"
     );
 }

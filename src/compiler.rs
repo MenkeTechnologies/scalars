@@ -38,6 +38,8 @@ struct Compiler {
     /// Distinguishes synthetic `match`-scrutinee locals so nested matches do not
     /// alias one another.
     match_counter: u32,
+    /// Names the receiver temporary of a runtime-selected extension call.
+    ext_counter: u32,
     /// Distinguishes synthetic `for … yield` result-array/length locals so
     /// nested comprehensions do not alias one another.
     yield_counter: u32,
@@ -139,6 +141,8 @@ struct Compiler {
     func_type_params: HashMap<String, Vec<String>>,
     /// `extension` declarations — see [`Program::extensions`].
     extensions: Vec<(String, String, String)>,
+    /// See [`Program::implicit_classes`].
+    implicit_classes: HashSet<String>,
     /// Implicit conversions — see [`Program::conversions`].
     conversions: Vec<Conversion>,
     /// Each user `def`'s declared return TYPE NAME, where it has one. Distinct
@@ -828,6 +832,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         b: ChunkBuilder::new(),
         for_counter: 0,
         match_counter: 0,
+        ext_counter: 0,
         yield_counter: 0,
         debug,
         has_ffi,
@@ -862,6 +867,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         implicits: prog.implicits.clone(),
         implicit_floor: 0,
         extensions: prog.extensions.clone(),
+        implicit_classes: prog.implicit_classes.iter().cloned().collect(),
         conversions: prog.conversions.clone(),
         func_ret_ty: prog
             .functions
@@ -1793,7 +1799,18 @@ impl Compiler {
                 }
                 let c = self.b.add_constant(Value::str(spec.clone()));
                 self.b.emit(Op::LoadConst(c), *line);
-                self.b.emit(Op::CallBuiltin(crate::host::SFORMAT, 2), *line);
+                // The splice's static integral type, when it is not `Int`:
+                // `f"$b%x"` of a `Byte` renders 8 bits, of a `Long` 64.
+                match self.int_box(value) {
+                    Some(bx) => {
+                        let k = self.b.add_constant(Value::str(bx.code().to_string()));
+                        self.b.emit(Op::LoadConst(k), *line);
+                        self.b.emit(Op::CallBuiltin(crate::host::SFORMAT, 3), *line);
+                    }
+                    None => {
+                        self.b.emit(Op::CallBuiltin(crate::host::SFORMAT, 2), *line);
+                    }
+                }
             }
             Expr::ForYield { enums, body } => {
                 // A collection generator (`x <- List(…)`) desugars to a
@@ -3345,6 +3362,92 @@ impl Compiler {
             .iter()
             .find(|(rt, m, _)| m == name && base_type(rt) == ty)
             .map(|(_, _, f)| f.clone())
+    }
+
+    /// An extension call whose receiver's static type this frontend cannot name
+    /// exactly — `xs.tot` on a `val xs = List(…)`, `(1, 2).swapped`, or any
+    /// receiver of a GENERIC extension (`extension [A](a: A)`, registered under
+    /// `Any`). Selected by a runtime type test of the receiver against each
+    /// candidate's declared receiver type, in declaration order; with no
+    /// candidate matching, the call is the ordinary member call it was.
+    ///
+    /// The runtime type is a subtype of the static one, so a candidate the test
+    /// accepts is one Scala's static resolution would accept too. Declined
+    /// whenever a user class or object declares a member of the same name,
+    /// since that member wins over any extension and the receiver may be one.
+    fn extension_by_runtime_type(
+        &mut self,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Option<Expr> {
+        let candidates: Vec<(String, String)> = self
+            .extensions
+            .iter()
+            .filter(|(_, m, _)| m == name)
+            .map(|(rt, _, f)| (rt.clone(), f.clone()))
+            .collect();
+        // The fallback member call this builds re-enters here with the
+        // temporary as its receiver, and must stay a member call.
+        let reentry = matches!(recv, Expr::Var(v) if v.starts_with(" ext_recv_"));
+        if candidates.is_empty()
+            || reentry
+            || self
+                .classes
+                .iter()
+                .any(|(n, c)| !self.implicit_classes.contains(n) && c.responds.contains(name))
+            || self.objects.values().any(|o| o.methods.contains(name))
+        {
+            return None;
+        }
+        self.ext_counter += 1;
+        let tmp = format!(" ext_recv_{}", self.ext_counter);
+        let r = Expr::Var(tmp.clone());
+        let member = Expr::Method {
+            recv: Box::new(r.clone()),
+            name: name.to_string(),
+            args: args.to_vec(),
+            line,
+        };
+        let chain = candidates.iter().rev().fold(member, |els, (rt, f)| {
+            let mut full = vec![r.clone()];
+            full.extend_from_slice(args);
+            let call = Expr::Call {
+                name: f.clone(),
+                args: full,
+                line,
+            };
+            if rt == "Any" {
+                return call;
+            }
+            Expr::If {
+                cond: Box::new(Expr::Method {
+                    recv: Box::new(r.clone()),
+                    name: "isInstanceOf".to_string(),
+                    args: vec![Expr::Str(rt.clone())],
+                    line,
+                }),
+                then: Box::new(call),
+                els: Some(Box::new(els)),
+            }
+        });
+        Some(Expr::Block(vec![
+            Stmt {
+                line,
+                kind: StmtKind::Local {
+                    is_val: true,
+                    is_lazy: false,
+                    ty: None,
+                    name: tmp,
+                    init: Some(recv.clone()),
+                },
+            },
+            Stmt {
+                line,
+                kind: StmtKind::Expr(chain),
+            },
+        ]))
     }
 
     /// The qualified expression an imported bare name stands for, when the name
@@ -5047,6 +5150,9 @@ impl Compiler {
             full.extend_from_slice(args);
             return self.call(&f, &full, line);
         }
+        if let Some(e) = self.extension_by_runtime_type(recv, name, args, line) {
+            return self.expr(&e);
+        }
         // A METHOD used as a VALUE — `xs.map(o.f)`. Eta-expansion, the same
         // rewrite `var_ref` gives a bare `def` name, and it has to come after
         // every rule above that reads a receiver of its own: those all name
@@ -5466,6 +5572,32 @@ impl Compiler {
         if name == "format" && matches!(recv, Expr::Var(n) if n == "String") && !args.is_empty() {
             let (fmt, rest) = args.split_first().expect("non-empty");
             return self.method(fmt, "format", rest, line);
+        }
+        // `fmt.format(args…)` where some argument's boxed class is provably
+        // `Byte`/`Short`/`Long`: the class is a static fact the runtime value
+        // does not carry, so it travels beside the arguments.
+        if name == "format"
+            && self.static_type_name(recv).as_deref() == Some("String")
+            && spread_operand(args).is_none()
+            && args.iter().any(|a| self.int_box(a).is_some())
+            && !self.classes.values().any(|c| c.responds.contains(name))
+            && !self.objects.values().any(|o| o.methods.contains(name))
+        {
+            let codes: String = args
+                .iter()
+                .map(|a| self.int_box(a).map_or('I', crate::host::IntBox::code))
+                .collect();
+            self.expr(recv)?;
+            let k = self.b.add_constant(Value::str(codes));
+            self.b.emit(Op::LoadConst(k), line);
+            for a in args {
+                self.expr(a)?;
+            }
+            let argc = u8::try_from(args.len() + 2)
+                .map_err(|_| format!("scalars: too many format arguments on line {line}"))?;
+            self.b
+                .emit(Op::CallBuiltin(crate::host::FORMAT_TYPED, argc), line);
+            return Ok(());
         }
         // `Ordering.Int` / `Ordering.by(f)` / `Ordering[Int].compare(a, b)` —
         // the `scala.math.Ordering` companion. A FACTORY member builds the
@@ -7030,6 +7162,10 @@ impl Compiler {
             elem,
             cls: declared_cls.or_else(|| init.and_then(|e| self.class_of(e))),
             conv: declared_conv(ty),
+            narrow: match ty {
+                Some(t) => declared_narrow(t),
+                None => init.and_then(|e| self.narrow_of(e)),
+            },
         }
     }
 
@@ -7140,6 +7276,28 @@ impl Compiler {
         }
     }
 
+    /// Whether `e` is statically a `Byte` or a `Short`: a binding declared at
+    /// one, or a `toByte`/`toShort` result. Any arithmetic on one is an `Int`,
+    /// so nothing compound qualifies.
+    fn narrow_of(&self, e: &Expr) -> Option<crate::host::IntBox> {
+        match e {
+            Expr::Var(n) => self.widths.get(n).and_then(|w| w.narrow),
+            Expr::Method { name, args, .. } if args.is_empty() => match name.as_str() {
+                "toByte" => Some(crate::host::IntBox::Byte),
+                "toShort" => Some(crate::host::IntBox::Short),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The boxed integral class a `java.util.Formatter` argument would carry,
+    /// where it is not `Integer` and this frontend can prove it.
+    fn int_box(&self, e: &Expr) -> Option<crate::host::IntBox> {
+        self.narrow_of(e)
+            .or_else(|| (self.num_ty(e) == NumTy::Long).then_some(crate::host::IntBox::Long))
+    }
+
     /// The widths a class's own body sees by bare name: every field of the class,
     /// own and inherited. A constructor body and every method body start from
     /// these, because a bare field reference in either resolves to `this.field`.
@@ -7219,6 +7377,9 @@ impl Compiler {
                 }
                 _ => NumTy::Unknown,
             };
+        }
+        if let Some(w) = boxed_module(recv).and_then(|m| java_box_member_width(&m, name)) {
+            return w;
         }
         if name == "toLong" {
             return NumTy::Long;
@@ -8310,6 +8471,63 @@ fn range_factory(name: &str, args: &[Expr], line: u32) -> Option<Expr> {
     })
 }
 
+/// The result width of an integral member of a `java.lang` box — the JDK
+/// declares each as `int` or `long`, so `Integer.MAX_VALUE + 1` wraps at 32
+/// bits exactly as `Int.MaxValue + 1` does. `None` for every member that does
+/// not answer an integer (`toHexString`, `valueOf`'s box, …), which leaves its
+/// width unproven rather than typing a `String` as an `Int`.
+fn java_box_member_width(module: &str, member: &str) -> Option<NumTy> {
+    // Answered as `int` by every integral box.
+    const INT_EVERYWHERE: &[&str] = &[
+        "SIZE",
+        "BYTES",
+        "bitCount",
+        "numberOfLeadingZeros",
+        "numberOfTrailingZeros",
+        "signum",
+        "compare",
+        "compareUnsigned",
+        "hashCode",
+    ];
+    // Answered at the box's own width (`int` on `Integer`, `long` on `Long`).
+    const OWN_WIDTH: &[&str] = &[
+        "MAX_VALUE",
+        "MIN_VALUE",
+        "sum",
+        "max",
+        "min",
+        "reverse",
+        "reverseBytes",
+        "highestOneBit",
+        "lowestOneBit",
+        "rotateLeft",
+        "rotateRight",
+        "divideUnsigned",
+        "remainderUnsigned",
+    ];
+    let own = match module {
+        "java.Integer" => NumTy::Int,
+        "java.Long" => NumTy::Long,
+        // `Short`/`Byte` values widen to `Int` in any arithmetic.
+        "java.Short" | "java.Byte" => {
+            return matches!(
+                member,
+                "MAX_VALUE" | "MIN_VALUE" | "SIZE" | "BYTES" | "compare"
+            )
+            .then_some(NumTy::Int);
+        }
+        _ => return None,
+    };
+    if INT_EVERYWHERE.contains(&member) {
+        return Some(NumTy::Int);
+    }
+    match member {
+        "parseInt" if own == NumTy::Int => Some(NumTy::Int),
+        "parseLong" if own == NumTy::Long => Some(NumTy::Long),
+        _ => OWN_WIDTH.contains(&member).then_some(own),
+    }
+}
+
 /// The bound named by a numeric companion object — `Int.MaxValue`,
 /// `Long.MinValue`, and the sub-`Int` widths Scala also exposes. Returns `None`
 /// for anything else, which leaves the access on the ordinary dispatch path.
@@ -8393,6 +8611,11 @@ struct Width {
     /// `var d: Double = 0.0; d = 0.1f` has to widen at the assignment exactly
     /// as the declaration did.
     conv: Option<Conv>,
+    /// `Byte` or `Short` for a binding of one of the two narrow integral types,
+    /// which [`NumTy`] folds into `Int` because their arithmetic IS `Int`
+    /// arithmetic. What still tells them apart is the boxed class a
+    /// `java.util.Formatter` argument carries (see [`crate::host::IntBox`]).
+    narrow: Option<crate::host::IntBox>,
 }
 
 impl Width {
@@ -8743,6 +8966,15 @@ fn declared_conv(ty: Option<&str>) -> Option<Conv> {
         .any(|w| w == "Double" || w == "Float");
     // A function type converts nothing: its result widens inside the body.
     (structured && floating && !ty.contains("=>")).then(|| Conv::Shape(ty.to_string()))
+}
+
+/// The narrow integral type a declared type names, if it names one.
+fn declared_narrow(ty: &str) -> Option<crate::host::IntBox> {
+    match ty.trim_start_matches("=>").trim() {
+        "Byte" => Some(crate::host::IntBox::Byte),
+        "Short" => Some(crate::host::IntBox::Short),
+        _ => None,
+    }
 }
 
 fn declared_width(ty: &str) -> NumTy {

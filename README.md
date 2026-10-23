@@ -122,8 +122,9 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   or anonymous, `(using Sh[A])`, and visible inside the lambdas the body
   writes),
   `summon[T]` and Predef's `implicitly[T]` (an `Ordering[T]` with no given in
-  scope resolving to the standard library's), context bounds (`[A: Sh]`), `extension` methods dispatched on
-  the receiver's type, and implicit conversions applied where Scala applies
+  scope resolving to the standard library's), context bounds (`[A: Sh]`), `extension` methods and
+  `implicit class`es dispatched on the receiver's type — a generic receiver
+  (`extension [A](a: A)`), a tuple or a collection receiver included — and implicit conversions applied where Scala applies
   them. A type-class instance is a singleton `object`, which already works as a
   value, so `def show[A: Sh](x: A)` resolves to the right instance from the
   argument's type. Two candidates of one type is an error, not a pick. All four
@@ -465,7 +466,8 @@ Implemented and checked against the reference `scala`:
   (`take`/`drop`/`slice`/`splitAt`/`span`/`partition`/`partitionMap`/
   `takeWhile`/`dropWhile`/`init`/`tail`/`headOption`), in-place sorting
   (`sortInPlace`/`sortInPlaceBy`/`sortInPlaceWith`, `scala.util.Sorting.quickSort`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/
-  `grouped`/`sliding`, and `lazyZip` — chained up to any width, with its
+  `grouped`/`sliding`, and `lazyZip` — chained up to any width, as is the
+  deprecated `(xs, ys).zipped` — with its
   multi-parameter `map`/`flatMap`/`filter`/`foreach`/`exists`/`forall` and its
   `xs.lazyZip(ys)` rendering), arrangement (`permutations`/`combinations`/`updated`),
   lockstep comparison (`corresponds`), the sequential `aggregate(z)(seqop,

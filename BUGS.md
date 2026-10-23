@@ -465,7 +465,13 @@ reported as parse/compile errors, never silently mis-run.
 - **`implicit class`.** `implicit class Rich(n: Int) { def squared = n * n }`
   registers each method as the Scala 3 extension `extension (n: Int)` it is
   equivalent to, so `4.squared` resolves; the class stays declared for an
-  explicit `new Rich(4)`. A method that calls a SIBLING method of the class
+  explicit `new Rich(4)`. The class's own type parameters are read, so a
+  receiver that IS one (`implicit class Twice[A](a: A)`) accepts any value, and
+  one that mentions them (`(A, A)`, `List[A]`, `Seq[A]`) keeps its shape — the
+  same as `extension [A](…)`. A receiver whose static type the compiler cannot
+  name (`(1, 2).swapped`, a `val xs = List(…)`, the element in `ps.map(_.m)`)
+  is selected at run time by a type test against each candidate's declared
+  receiver type, which after erasure is all the test can see. A method that calls a SIBLING method of the class
   without a receiver is not rewritten to the extension form.
 - **Anonymous classes.** `new T { def m = … }`, `new C(args) { … }` and
   `new C(args) with M1 with M2` declare a fresh class extending the named
@@ -659,7 +665,8 @@ reported as parse/compile errors, never silently mis-run.
   and `MAX_VALUE`/`MIN_VALUE`;
   `Double.parseDouble`/`isNaN`/`isInfinite`/`toString`; `Boolean.parseBoolean`;
   `Character.isDigit`/`isLetter`/`isLetterOrDigit`/`isWhitespace`/`isUpperCase`/
-  `isLowerCase`/`toUpperCase`/`toLowerCase`/`getNumericValue`; and
+  `isLowerCase`/`toUpperCase`/`toLowerCase`/`toTitleCase`/`isTitleCase`/
+  `getNumericValue`; and
   `String.valueOf`. The two namespaces stay APART, exactly as Scala's do —
   `Double.parseDouble` really is "not a member of object Double" there — and a
   fixed-width rendering follows its box, so `Integer.toHexString(-1)` is
@@ -1291,7 +1298,10 @@ reported as parse/compile errors, never silently mis-run.
   receiver wins, where Scala keeps the member and warns that the extension
   "will never be selected". The member-wins rule IS enforced for a user class,
   which is the case the reference demonstrates; the stdlib is dispatched at run
-  time here, so there is no compile-time list of its names to consult.
+  time here, so there is no compile-time list of its names to consult. The same
+  holds for a receiver selected by its RUN-TIME type (any receiver of a generic
+  `extension [A](a: A)`, or one whose static type is not nameable here): the
+  extension is chosen over a stdlib member of the same name.
 
   A `given`, an `extension`, an `implicit val`/`def` and an `implicit object`
   declared as a member of a `def main` entry object enter the implicit scope as
@@ -1330,11 +1340,19 @@ reported as parse/compile errors, never silently mis-run.
   not a member of Null`), the composite `Ordering.Tuple2(o1, o2)` instance, and
   SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
   Double) => …` then `s.show(x)`).
-- **Found by the October 2026 differential round, still open:** an `implicit
-  class` whose receiver is a tuple or a type parameter (`implicit class
-  Ops[A, B, C](t: (A, B, C))`) — extension selection goes by the receiver's
-  static type NAME and a tuple has none (`value swap2 is not a member of
-  value`); the deprecated `(xs, ys).zipped`; `String.chars` (an `IntStream`).
+- **Found by the October 2026 differential round, still open:** `String.chars`
+  and `codePoints` (an `IntStream`). The implicit-class receivers that round
+  found (a tuple, a type parameter) and the deprecated `(xs, ys).zipped` are now
+  modelled.
+- **Found by the third October 2026 differential round, still open.** A boxed
+  integral type is not kept at run time: `Int`, `Long`, `Short` and `Byte`
+  values are one representation, so `(7L: Any) match { case i: Int => … }`
+  takes the `Int` arm and `(Long.MaxValue: Any).isInstanceOf[Int]` is `true`,
+  where Scala tests the box (`java.lang.Long`). A tuple's component ordering
+  ignores a program-declared `implicit Ordering[String]` — `List((2, "b"), (2,
+  "a")).sorted` under a length ordering answers `(2,a), (2,b)` where Scala's
+  `Ordering.Tuple2(Ordering.Int, ord)` keeps `(2,b), (2,a)`. `"hey".toSeq.map(f)`
+  answers a `String` where the `WrappedString` result is a `Vector(H, E, Y)`.
 - **Found by the second October 2026 differential round, still open.** These
   raise a catchable `java.lang.NullPointerException` where Scala runs, so a
   `catch` that matches it would hide the gap: `getClass` on a `case object`
@@ -1372,9 +1390,11 @@ reported as parse/compile errors, never silently mis-run.
   are Java's general-category rules (a sweep of the whole BMP agrees with the
   reference on all but 18 chars). Those 18 are characters Unicode 16 added or
   re-cased (`U+A7CB`..`U+A7DC`, `U+1C89`, `U+1C8A`, `U+019B`, `U+0264`,
-  `U+0295`); JDK 21 implements Unicode 15. `Character.getNumericValue` of a
-  numeric char that is not a decimal digit (`Ⅻ` is 12, `½` is -2 in Java)
-  answers -1, and `toTitleCase` is not provided.
+  `U+0295`); JDK 21 implements Unicode 15, and `toTitleCase`, which is
+  `toUpper` outside the Latin digraphs and the Georgian Mkhedruli letters,
+  inherits the same 18. `Character.getNumericValue` is exact over the whole
+  BMP: its non-digit values (`Ⅻ` is 12, `½` is -2) are a table extracted from
+  JDK 21.
 - **`sizeIs`/`lengthIs` answer the size itself.** Scala's `xs.sizeIs > n`
   builds a `SizeCompareOps` wrapper whose six comparison operators each call
   `sizeCompare(n)` — a short-circuit that lets a `LazyList` or a `List` stop
@@ -1568,21 +1588,19 @@ reported as parse/compile errors, never silently mis-run.
   body wraps); only a later `sum`/`product` over them stays 64-bit.
   A `def` with no return annotation is also unproven — Scala infers one from the
   body and this frontend does not.
-- **The `%x`/`%X`/`%o` format conversions pick their width from the VALUE, not
-  the static type.** Java writes the two's-complement bit pattern at the width of
-  the operand's type — `Int` is 32 bits (`"%x".format(-1)` is `ffffffff`), `Long`
-  is 64 (`ffffffffffffffff`). With no static types, this frontend uses the
-  narrowest width that holds the value, which is right for every `Int` and for
-  any `Long` outside `Int` range. A `Long` variable holding a small negative
-  number is the residual gap: it renders 32-bit where Scala renders 64.
-  The same holds one width down: Java formats a `Byte` at 8 bits and a `Short`
-  at 16 (`"%x".format(255.toByte)` is `ff`), where this renders the 32-bit
-  pattern (`ffffffff`). A `Long` literal in an `f` interpolator
-  (`f"${-1L}%x"`) is affected too, though its width is static.
-  The same missing static type names the class in `format`'s argument check:
-  `"%.2f".format(2L)` raises `IllegalFormatConversionException: f !=
-  java.lang.Integer` where Scala names `java.lang.Long` (the exception and its
-  catchability are right; only the class in the message differs). A collection
+- **The `%x`/`%X`/`%o` format conversions take their width from the static type
+  only where the compiler can prove it.** Java writes the two's-complement bit
+  pattern at the width of the operand's boxed type — `Byte` 8 bits, `Short` 16,
+  `Int` 32 (`"%x".format(-1)` is `ffffffff`), `Long` 64 (`ffffffffffffffff`) —
+  and that box also names the class in `format`'s argument check
+  (`"%.2f".format(2L)` is `f != java.lang.Long`, `"%c".format(65L)` an
+  `IllegalFormatConversionException` because `%c` takes no `Long`). The type
+  travels with the argument for `"…".format(…)` and the `f` interpolator when
+  it is a binding declared `Long`/`Short`/`Byte`, a `Long` literal or
+  arithmetic, a `toLong`/`toShort`/`toByte` result, or a traversal element of a
+  proven `List[Long]`. Anywhere else the value alone decides: the narrowest
+  width that holds it, which is right for every `Int` and for any `Long` outside
+  `Int` range, and `Integer` in an argument-check message. A collection
   or function argument to a numeric conversion is refused outright rather than
   named, since its runtime class (`scala.collection.immutable.$colon$colon`) is
   the private name `getClass` also refuses.

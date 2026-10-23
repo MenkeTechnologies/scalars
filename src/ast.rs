@@ -74,6 +74,10 @@ pub struct Program {
     /// this only after every member and stdlib rule has missed, and only with a
     /// receiver whose static type it can name.
     pub extensions: Vec<(String, String, String)>,
+    /// The names of the `implicit class`es, whose methods are also registered
+    /// as [`Self::extensions`]. Their own `responds` set is not a member a
+    /// receiver can have: nothing is an instance of one but its own `new`.
+    pub implicit_classes: Vec<String>,
     /// Implicit CONVERSIONS, as `(from type, to type, how to apply it)`.
     ///
     /// Both spellings land here: `implicit def i2s(i: Int): String` records the

@@ -70,6 +70,8 @@ struct Parser {
     implicits: Vec<(String, String)>,
     /// `extension` declarations — see [`Program::extensions`].
     extensions: Vec<(String, String, String)>,
+    /// See [`Program::implicit_classes`].
+    implicit_classes: Vec<String>,
     /// Implicit conversions — see [`Program::conversions`].
     conversions: Vec<Conversion>,
     /// The enclosing `object`/`class` names while a body is parsed.
@@ -108,6 +110,7 @@ impl Parser {
             wildcards: Vec::new(),
             implicits: Vec::new(),
             extensions: Vec::new(),
+            implicit_classes: Vec::new(),
             conversions: Vec::new(),
             type_path: Vec::new(),
             jvm_prefixes: HashMap::new(),
@@ -432,6 +435,7 @@ impl Parser {
             import_wildcards: std::mem::take(&mut self.wildcards),
             implicits: std::mem::take(&mut self.implicits),
             extensions: std::mem::take(&mut self.extensions),
+            implicit_classes: std::mem::take(&mut self.implicit_classes),
             conversions: std::mem::take(&mut self.conversions),
             jvm_prefixes: std::mem::take(&mut self.jvm_prefixes),
         })
@@ -650,9 +654,20 @@ impl Parser {
     /// constructor) and its `def`s become methods.
     fn class_decl(&mut self, is_case: bool, is_trait: bool) -> Result<ClassDecl, String> {
         let start = self.pos;
+        // The class's own type parameters, read ahead without consuming them: an
+        // implicit class's receiver may be one (`implicit class Twice[A](a: A)`).
+        let tparams = if self.preceded_by_implicit(start) {
+            self.advance(); // `class`
+            self.advance(); // its name
+            let (names, _) = self.type_param_clause()?;
+            self.pos = start;
+            names
+        } else {
+            Vec::new()
+        };
         let decl = self.class_decl_inner(is_case, is_trait)?;
         if self.preceded_by_implicit(start) {
-            self.implicit_class_extensions(&decl);
+            self.implicit_class_extensions(&decl, &tparams);
         }
         Ok(decl)
     }
@@ -676,7 +691,8 @@ impl Parser {
     /// declares in Scala 3. Each method is registered as that extension, with
     /// the constructor parameter as its receiver; the class itself stays
     /// declared, so `new Rich(4).m` works too.
-    fn implicit_class_extensions(&mut self, decl: &ClassDecl) {
+    fn implicit_class_extensions(&mut self, decl: &ClassDecl, tparams: &[String]) {
+        self.implicit_classes.push(decl.name.clone());
         let ([recv_name], [Some(recv_ty)]) = (decl.params.as_slice(), decl.param_tys.as_slice())
         else {
             return;
@@ -684,8 +700,11 @@ impl Parser {
         for m in &decl.methods {
             let mut f = m.clone();
             let hoisted = format!("extension${}${}", base_type_name(recv_ty), f.name);
-            self.extensions
-                .push((recv_ty.clone(), f.name.clone(), hoisted.clone()));
+            self.extensions.push((
+                extension_receiver_key(recv_ty, tparams),
+                f.name.clone(),
+                hoisted.clone(),
+            ));
             f.params.insert(0, recv_name.clone());
             f.sig.insert(
                 0,
@@ -2335,7 +2354,7 @@ impl Parser {
     fn extension_decl(&mut self) -> Result<StmtKind, String> {
         self.advance(); // `extension`
                         // An extension may itself be generic (`extension [A](xs: List[A])`).
-        let _ = self.type_param_clause()?;
+        let (tparams, _) = self.type_param_clause()?;
         self.eat(&Tok::LParen)?;
         let recv_name = self.ident()?;
         self.eat(&Tok::Colon)?;
@@ -2353,8 +2372,11 @@ impl Parser {
             }
             let mut f = self.parse_def()?;
             let hoisted = format!("extension${}${}", base_type_name(&recv_ty), f.name);
-            self.extensions
-                .push((recv_ty.clone(), f.name.clone(), hoisted.clone()));
+            self.extensions.push((
+                extension_receiver_key(&recv_ty, &tparams),
+                f.name.clone(),
+                hoisted.clone(),
+            ));
             // The receiver is prepended as the first parameter, so the body's
             // reference to it resolves like any other.
             f.params.insert(0, recv_name.clone());
@@ -5071,6 +5093,19 @@ impl Parser {
                 self.line()
             )),
         }
+    }
+}
+
+/// The receiver type an extension is registered under. A receiver that is
+/// itself one of the extension's type parameters (`extension [A](a: A)`)
+/// accepts a receiver of ANY type, so it is registered as `Any`; one that
+/// merely MENTIONS a parameter (`List[A]`, `(A, A)`) keeps its shape, which
+/// is all a runtime type test can check after erasure anyway.
+fn extension_receiver_key(recv_ty: &str, tparams: &[String]) -> String {
+    if tparams.iter().any(|t| t == recv_ty.trim()) {
+        "Any".to_string()
+    } else {
+        recv_ty.to_string()
     }
 }
 

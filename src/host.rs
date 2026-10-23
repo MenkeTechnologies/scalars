@@ -494,6 +494,16 @@ pub const RANDOM_NEW: u16 = 810;
 /// Builtin id for the bare `Random` companion — the one process-wide generator
 /// `scala.util.Random.nextInt(n)` and friends draw from.
 pub const RANDOM_GLOBAL: u16 = 811;
+/// Builtin id for `"…".format(args…)` when the compiler can name the static
+/// integral type of at least one argument. The stack holds the format string
+/// (deepest), a `Str` with one [`IntBox::code`] per argument, then the
+/// arguments; `argc` is their count plus two.
+///
+/// The value model keeps every integer as an `i64`, so the boxed class
+/// `java.util.Formatter` sees — which decides the width `%x`/`%o` render the
+/// two's complement at, and the class an `IllegalFormatConversionException`
+/// names — is only knowable at compile time.
+pub const FORMAT_TYPED: u16 = 813;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -733,6 +743,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(FFI_CALL, b_ffi_call);
     vm.register_builtin(SMETHOD, b_method);
     vm.register_builtin(SFORMAT, b_format);
+    vm.register_builtin(FORMAT_TYPED, b_format_typed);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -2995,6 +3006,111 @@ fn java_is_digit(c: char) -> bool {
     c.is_ascii_digit() || (!c.is_ascii() && in_general_category(c, "Nd"))
 }
 
+/// `Character.getNumericValue(char)` for every BMP char whose answer is NOT
+/// `Character.digit(c, 36)`: the numeric letters and numbers outside the
+/// decimal digits (`'Ⅻ'` is 12, `'௱'` 100), with `-2` for a value that is not
+/// a non-negative integer (the vulgar fractions). Each entry is
+/// `(first char, run length, value of the first, step)` — a step of 1 is a run
+/// counting up (`'Ⅰ'..'Ⅻ'`), 0 a run sharing one value.
+///
+/// Extracted from JDK 21.0.12.1 by enumerating `0..=0xFFFF` and keeping each
+/// char where `getNumericValue` and `digit(c, 36)` disagree; every one of
+/// those has `digit(c, 36) == -1`.
+const JAVA_NUMERIC_RUNS: &[(u16, u16, i32, i32)] = &[
+    (0x00b2, 2, 2, 1),
+    (0x00b9, 1, 1, 0),
+    (0x00bc, 3, -2, 0),
+    (0x09f4, 5, -2, 0),
+    (0x09f9, 1, 16, 0),
+    (0x0b72, 6, -2, 0),
+    (0x0bf0, 1, 10, 0),
+    (0x0bf1, 1, 100, 0),
+    (0x0bf2, 1, 1000, 0),
+    (0x0c78, 4, 0, 1),
+    (0x0c7c, 3, 1, 1),
+    (0x0d58, 7, -2, 0),
+    (0x0d70, 1, 10, 0),
+    (0x0d71, 1, 100, 0),
+    (0x0d72, 1, 1000, 0),
+    (0x0d73, 6, -2, 0),
+    (0x0f2a, 10, -2, 0),
+    (0x1369, 10, 1, 1),
+    (0x1373, 1, 20, 0),
+    (0x1374, 1, 30, 0),
+    (0x1375, 1, 40, 0),
+    (0x1376, 1, 50, 0),
+    (0x1377, 1, 60, 0),
+    (0x1378, 1, 70, 0),
+    (0x1379, 1, 80, 0),
+    (0x137a, 1, 90, 0),
+    (0x137b, 1, 100, 0),
+    (0x137c, 1, 10000, 0),
+    (0x16ee, 3, 17, 1),
+    (0x17f0, 10, 0, 1),
+    (0x19da, 1, 1, 0),
+    (0x2070, 1, 0, 0),
+    (0x2074, 6, 4, 1),
+    (0x2080, 10, 0, 1),
+    (0x2150, 15, -2, 0),
+    (0x215f, 2, 1, 0),
+    (0x2161, 11, 2, 1),
+    (0x216c, 1, 50, 0),
+    (0x216d, 1, 100, 0),
+    (0x216e, 1, 500, 0),
+    (0x216f, 1, 1000, 0),
+    (0x2170, 12, 1, 1),
+    (0x217c, 1, 50, 0),
+    (0x217d, 1, 100, 0),
+    (0x217e, 1, 500, 0),
+    (0x217f, 2, 1000, 0),
+    (0x2181, 1, 5000, 0),
+    (0x2182, 1, 10000, 0),
+    (0x2185, 1, 6, 0),
+    (0x2186, 1, 50, 0),
+    (0x2187, 1, 50000, 0),
+    (0x2188, 1, 100000, 0),
+    (0x2189, 1, 0, 0),
+    (0x2460, 20, 1, 1),
+    (0x2474, 20, 1, 1),
+    (0x2488, 20, 1, 1),
+    (0x24ea, 1, 0, 0),
+    (0x24eb, 10, 11, 1),
+    (0x24f5, 10, 1, 1),
+    (0x24ff, 1, 0, 0),
+    (0x2776, 10, 1, 1),
+    (0x2780, 10, 1, 1),
+    (0x278a, 10, 1, 1),
+    (0x2cfd, 1, -2, 0),
+    (0x3007, 1, 0, 0),
+    (0x3021, 9, 1, 1),
+    (0x3038, 1, 10, 0),
+    (0x3039, 1, 20, 0),
+    (0x303a, 1, 30, 0),
+    (0x3192, 4, 1, 1),
+    (0x3220, 10, 1, 1),
+    (0x3248, 1, 10, 0),
+    (0x3249, 1, 20, 0),
+    (0x324a, 1, 30, 0),
+    (0x324b, 1, 40, 0),
+    (0x324c, 1, 50, 0),
+    (0x324d, 1, 60, 0),
+    (0x324e, 1, 70, 0),
+    (0x324f, 1, 80, 0),
+    (0x3251, 15, 21, 1),
+    (0x3280, 10, 1, 1),
+    (0x32b1, 15, 36, 1),
+    (0xa6e6, 9, 1, 1),
+    (0xa6ef, 1, 0, 0),
+    (0xa830, 6, -2, 0),
+    (0xf96b, 1, 3, 0),
+    (0xf973, 1, 10, 0),
+    (0xf978, 1, 2, 0),
+    (0xf9b2, 1, 0, 0),
+    (0xf9d1, 1, 6, 0),
+    (0xf9d3, 1, 6, 0),
+    (0xf9fd, 1, 10, 0),
+];
+
 /// `Character.digit(c, 36)`, which `RichChar.asDigit` is: a decimal digit's
 /// value in any script, `10..35` for the Latin letters in their ASCII and
 /// fullwidth forms, `-1` otherwise. Every `Nd` run is a whole `0..9` block, so
@@ -3014,6 +3130,37 @@ fn java_digit36(c: char) -> i64 {
         start -= 1;
     }
     i64::from((c as u32 - start) % 10)
+}
+
+/// `Character.getNumericValue(char)`: a decimal digit's value in any script,
+/// 10..35 for the Latin letters, and the JDK's value for every other numeric
+/// char ([`JAVA_NUMERIC_RUNS`]).
+fn java_numeric_value(c: char) -> i64 {
+    let code = c as u32;
+    let run = JAVA_NUMERIC_RUNS.iter().find(|&&(first, len, _, _)| {
+        (u32::from(first)..u32::from(first) + u32::from(len)).contains(&code)
+    });
+    match run {
+        Some(&(first, _, value, step)) => {
+            i64::from(value + step * (code - u32::from(first)) as i32)
+        }
+        None => java_digit36(c),
+    }
+}
+
+/// `Character.toTitleCase(char)`: the simple titlecase mapping, which is the
+/// simple uppercase one except for the four Latin digraph triples (each of
+/// `Ǆ ǅ ǆ` titlecases to `ǅ`) and the Georgian Mkhedruli letters, which have
+/// an uppercase (Mtavruli) form but titlecase to themselves.
+fn java_to_title(c: char) -> char {
+    match c {
+        '\u{1c4}'..='\u{1c6}' => '\u{1c5}',
+        '\u{1c7}'..='\u{1c9}' => '\u{1c8}',
+        '\u{1ca}'..='\u{1cc}' => '\u{1cb}',
+        '\u{1f1}'..='\u{1f3}' => '\u{1f2}',
+        '\u{10d0}'..='\u{10fa}' | '\u{10fd}'..='\u{10ff}' => c,
+        _ => java_to_upper(c),
+    }
 }
 
 /// `Character.toUpperCase(char)`: the SIMPLE case mapping, one char to one
@@ -6826,12 +6973,88 @@ fn eq_builtin(vm: &mut VM, negate: bool) -> Value {
 /// `SFORMAT` builtin: pop the format spec (top) and the value, and format the
 /// value per the Java-`Formatter` subset. A malformed/unsupported spec halts the
 /// VM with the message parked for the runner.
-fn b_format(vm: &mut VM, _argc: u8) -> Value {
+fn b_format(vm: &mut VM, argc: u8) -> Value {
+    // A third operand, on top, is the splice's static integral type when the
+    // compiler could name one (see [`FORMAT_TYPED`]).
+    let bx = if argc == 3 {
+        IntBox::from_code(vm.pop().as_str_cow().chars().next())
+    } else {
+        None
+    };
     let spec = vm.pop().as_str_cow().into_owned();
     let v = vm.pop();
-    match format_one(&spec, &v, Some(vm)) {
+    match format_one(&spec, &v, bx, Some(vm)) {
         Ok(s) => Value::str(s),
         Err(e) => fault(vm, e),
+    }
+}
+
+/// `FORMAT_TYPED` builtin: `fmt.format(args…)` with the arguments' static
+/// integral types alongside (see [`FORMAT_TYPED`]).
+fn b_format_typed(vm: &mut VM, argc: u8) -> Value {
+    let n = (argc as usize).saturating_sub(2);
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let codes = vm.pop().as_str_cow().into_owned();
+    let boxes: Vec<Option<IntBox>> = codes.chars().map(|c| IntBox::from_code(Some(c))).collect();
+    let fmt = vm.pop().as_str_cow().into_owned();
+    match format_all_typed(&fmt, &args, &boxes, Some(vm)) {
+        Ok(s) => Value::str(s),
+        Err(e) => fault(vm, e),
+    }
+}
+
+/// The static type of an integral format argument, where it is not `Int`.
+///
+/// `java.util.Formatter` receives its arguments BOXED, and the box decides two
+/// things this frontend's `i64` value cannot: the width `%x`/`%o` render the
+/// two's complement at (`(-1: Byte)` is `ff`, `-1L` is `ffffffffffffffff`),
+/// and the class an `IllegalFormatConversionException` names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntBox {
+    Byte,
+    Short,
+    Long,
+}
+
+impl IntBox {
+    /// The one-letter code the compiler passes a box as: the JVM descriptor
+    /// letter of the primitive. Any other letter is "not statically known".
+    pub fn code(self) -> char {
+        match self {
+            IntBox::Byte => 'B',
+            IntBox::Short => 'S',
+            IntBox::Long => 'J',
+        }
+    }
+
+    fn from_code(c: Option<char>) -> Option<IntBox> {
+        match c? {
+            'B' => Some(IntBox::Byte),
+            'S' => Some(IntBox::Short),
+            'J' => Some(IntBox::Long),
+            _ => None,
+        }
+    }
+
+    /// The two's-complement bit pattern of `n` at this type's width.
+    fn bits(self, n: i64) -> u64 {
+        match self {
+            IntBox::Byte => u64::from(n as u8),
+            IntBox::Short => u64::from(n as u16),
+            IntBox::Long => n as u64,
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            IntBox::Byte => "java.lang.Byte",
+            IntBox::Short => "java.lang.Short",
+            IntBox::Long => "java.lang.Long",
+        }
     }
 }
 
@@ -6981,6 +7204,7 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Int" | "Integer" | "Long" | "Short" | "Byte" => matches!(v, Value::Int(_)),
         "Double" => matches!(v, Value::Float(_)),
         "Float" => matches!(v, Value::Status(_)),
+        "Char" | "Character" => as_char(v).is_some(),
         "Boolean" => matches!(v, Value::Bool(_)),
         "BigInt" => as_big(v).is_some(),
         "BigDecimal" => as_dec(v).is_some(),
@@ -7120,7 +7344,18 @@ fn array_elems_are(items: &[Value], elem: &str) -> bool {
 /// conversion to [`format_one`]. `%%` is a literal percent and `%n` a newline;
 /// neither consumes an argument. A conversion with no argument left is Java's
 /// `MissingFormatArgumentException`, which a Scala program can catch.
-fn format_all(fmt: &str, args: &[Value], mut vm: Option<&mut VM>) -> Result<String, String> {
+fn format_all(fmt: &str, args: &[Value], vm: Option<&mut VM>) -> Result<String, String> {
+    format_all_typed(fmt, args, &[], vm)
+}
+
+/// [`format_all`] with the static integral type of each argument that has a
+/// non-`Int` one (`boxes[k]` for `args[k]`; a short slice means "unknown").
+fn format_all_typed(
+    fmt: &str,
+    args: &[Value],
+    boxes: &[Option<IntBox>],
+    mut vm: Option<&mut VM>,
+) -> Result<String, String> {
     let b = fmt.as_bytes();
     let mut out = String::with_capacity(fmt.len());
     let (mut i, mut next) = (0usize, 0usize);
@@ -7174,16 +7409,22 @@ fn format_all(fmt: &str, args: &[Value], mut vm: Option<&mut VM>) -> Result<Stri
                     ));
                 };
                 last = slot;
-                format_arg_check(conv, v)?;
+                let bx = slot.and_then(|k| boxes.get(k).copied().flatten());
+                format_arg_check(conv, v, bx)?;
                 let spec = format!("%{inner}{conv}");
-                out.push_str(&format_one(&spec, v, vm.as_deref_mut())?);
+                out.push_str(&format_one(&spec, v, bx, vm.as_deref_mut())?);
             }
         }
     }
     Ok(out)
 }
 
-fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, String> {
+fn format_one(
+    spec: &str,
+    v: &Value,
+    bx: Option<IntBox>,
+    vm: Option<&mut VM>,
+) -> Result<String, String> {
     let sb = spec.as_bytes();
     if sb.first() != Some(&b'%') || sb.len() < 2 {
         return Err(format!("scalars: malformed format spec `{spec}`"));
@@ -7328,16 +7569,20 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
         // no sign, at the WIDTH OF THE STATIC TYPE: `Int` is 32 bits
         // (`-1` is `ffffffff`) and `Long` is 64 (`ffffffffffffffff`).
         //
-        // This frontend models every integer as `i64` and so has no static type
-        // to consult. It picks the narrowest width that holds the value, which
-        // is right for every `Int` — the overwhelmingly common case, and the one
-        // a literal like `-1` has. A `Long` variable holding a small negative
-        // number is the residual gap (see `BUGS.md`); it renders 32-bit.
+        // A `Byte` is 8 and a `Short` 16 (`(-1: Byte)` is `ff`).
+        //
+        // This frontend models every integer as `i64`; the static type arrives
+        // as `bx` where the compiler could name it (a binding declared `Long`,
+        // `Byte` or `Short`, a `toLong`/`toByte`/`toShort` result). Without one
+        // it picks the narrowest width that holds the value, which is right for
+        // every `Int` — the overwhelmingly common case, and the one a literal
+        // like `-1` has.
         'x' | 'X' | 'o' => {
             let n = format_int_arg(v);
-            let bits = match i32::try_from(n) {
-                Ok(narrow) => narrow as u32 as u64,
-                Err(_) => n as u64,
+            let bits = match (bx, i32::try_from(n)) {
+                (Some(b), _) => b.bits(n),
+                (None, Ok(narrow)) => narrow as u32 as u64,
+                (None, Err(_)) => n as u64,
             };
             let body = match conv {
                 'x' => format!("{bits:x}"),
@@ -7562,20 +7807,23 @@ fn format_int_arg(v: &Value) -> i64 {
 ///
 /// NOT applied to the `f` interpolator, which converts at compile time instead
 /// — `f"$i%.2f"` of an `Int` is `3.00` and `f"$c%d"` of a `Char` its code.
-fn format_arg_check(conv: char, v: &Value) -> Result<(), String> {
+fn format_arg_check(conv: char, v: &Value, bx: Option<IntBox>) -> Result<(), String> {
     let integral = matches!(v, Value::Int(_));
+    // `%c` takes a `Byte`, `Short` or `Integer` code point but not a `Long`.
+    let code_point = integral && bx != Some(IntBox::Long);
     let accepts = match conv {
         'd' | 'o' | 'x' | 'X' => integral,
         'e' | 'E' | 'f' | 'g' | 'G' | 'a' | 'A' => {
             matches!(v, Value::Float(_)) || f32_of(v).is_some()
         }
-        'c' | 'C' => integral || as_char(v).is_some(),
+        'c' | 'C' => code_point || as_char(v).is_some(),
         _ => true,
     };
     if accepts || matches!(v, Value::Undef) {
         return Ok(());
     }
-    Err(match format_arg_class(v) {
+    let boxed = bx.filter(|_| integral).map(|b| b.class().to_string());
+    Err(match boxed.or_else(|| format_arg_class(v)) {
         Some(class) => {
             format!("scalars: java.util.IllegalFormatConversionException: {conv} != {class}")
         }
@@ -7591,7 +7839,8 @@ fn format_arg_check(conv: char, v: &Value) -> Result<(), String> {
 /// class is not reproducible here (a collection, a function).
 ///
 /// An integer that fits 32 bits is named `Integer`: the value model does not
-/// keep a `Long`'s static type, the same residual `%x` documents.
+/// keep a `Long`'s static type. Where the compiler knew it, the caller names
+/// the class from the [`IntBox`] instead.
 fn format_arg_class(v: &Value) -> Option<String> {
     Some(match v {
         Value::Str(_) => "java.lang.String".to_string(),
@@ -8260,6 +8509,21 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
                     .map(|(i, v)| new_pair(v, Value::int(i as i64)))
                     .collect();
                 return Ok(new_set(HashRep::Small, pairs));
+            }
+        }
+    }
+    // `(xs, ys).zipped` / `(xs, ys, zs).zipped` — the deprecated
+    // `Tuple2Zipped`/`Tuple3Zipped`, whose every member is the `lazyZip` one:
+    // `map`/`foreach`/`exists` take an N-argument function and build the
+    // FIRST collection's kind.
+    if name == "zipped" && args.is_empty() {
+        if let Some(parts) = as_tuple_items(recv).filter(|p| matches!(p.len(), 2 | 3)) {
+            if parts.iter().all(|p| heap_kind(p) == Some(0)) {
+                let mut out = lazy_zip(vm, &parts[0], &parts[1])?;
+                if let Some(third) = parts.get(2) {
+                    out = lazy_zip(vm, &out, third)?;
+                }
+                return Ok(out);
             }
         }
     }
@@ -9872,6 +10136,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             },
             items.to_vec(),
         )),
+        // `view.force` — deprecated since 2.13 but still declared on `View`, where
+        // it is `toIndexedSeq`: a `Vector` whatever the view was taken of.
+        ("force", 0) if matches!(kind, SeqKind::View(_) | SeqKind::ArrayView) => {
+            Ok(new_seq(SeqKind::Vector, items.to_vec()))
+        }
         ("hasNext", 0) if kind == SeqKind::Iterator => Ok(Value::bool(!items.is_empty())),
         ("next", 0) if kind == SeqKind::Iterator => {
             let Some(first) = items.first().cloned() else {
@@ -10775,6 +11044,13 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // the RIGHT operand, and its collection kind is the result's.
         (":::" | "++:" | "prependedAll", 1) => {
             let mut out = iterable_arg_forced(vm, &args[0], None)?;
+            out.extend(items);
+            Ok(same(out))
+        }
+        // `xs.reverse_:::(prefix)` — `List` only: `prefix.reverse ::: xs`.
+        ("reverse_:::", 1) if kind == SeqKind::List => {
+            let mut out = iterable_arg_forced(vm, &args[0], None)?;
+            out.reverse();
             out.extend(items);
             Ok(same(out))
         }
@@ -13027,7 +13303,11 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         })),
         ("java.Integer" | "java.Long", "max", 2) => Ok(Value::int(i(0).max(i(1)))),
         ("java.Integer" | "java.Long", "min", 2) => Ok(Value::int(i(0).min(i(1)))),
-        ("java.Integer" | "java.Long", "sum", 2) => Ok(Value::int(i(0) + i(1))),
+        // `Integer.sum` is `int` addition and wraps at 32 bits; `Long.sum` at 64.
+        ("java.Integer", "sum", 2) => Ok(Value::int(i64::from(
+            (i(0) as i32).wrapping_add(i(1) as i32),
+        ))),
+        ("java.Long", "sum", 2) => Ok(Value::int(i(0).wrapping_add(i(1)))),
         ("java.Integer" | "java.Long", "signum", 1) => Ok(Value::int(i(0).signum())),
         ("java.Integer", "bitCount", 1) => Ok(Value::int(i64::from((i(0) as i32).count_ones()))),
         ("java.Long", "bitCount", 1) => Ok(Value::int(i64::from(i(0).count_ones()))),
@@ -13160,11 +13440,9 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
                 "isLowerCase" => Ok(Value::bool(c.is_lowercase())),
                 "toUpperCase" => Ok(make_char(java_to_upper(c))),
                 "toLowerCase" => Ok(make_char(java_to_lower(c))),
-                // `getNumericValue` answers a decimal digit's value in any script
-                // and 10..35 for `a`..`z`, as the JDK does. The JDK also gives the
-                // other numeric chars a value (`'Ⅻ'` is 12, a fraction -2); those
-                // are not modelled and answer -1.
-                "getNumericValue" => Ok(Value::int(java_digit36(c))),
+                "toTitleCase" => Ok(make_char(java_to_title(c))),
+                "isTitleCase" => Ok(Value::bool(!c.is_ascii() && in_general_category(c, "Lt"))),
+                "getNumericValue" => Ok(Value::int(java_numeric_value(c))),
                 _ => unknown(),
             }
         }
@@ -13733,7 +14011,17 @@ fn try_method(
                 Err(e) => Err(e),
             }
         }
-        ("map" | "flatMap" | "filter" | "withFilter", 1, Err(_)) => Ok(recv.clone()),
+        // `collect` is `filter` and `map` through one partial function: where it
+        // is not defined, the same `Failure` `filter` builds.
+        ("collect", 1, Ok(v)) => match is_defined_at(vm, &args[0], v) {
+            Ok(true) => invoke_closure(vm, &args[0], std::slice::from_ref(v)).map(make_try_success),
+            Ok(false) => Ok(make_try_failure(new_throwable(
+                "java.util.NoSuchElementException",
+                Some(&format!("Predicate does not hold for {}", scala_str(v))),
+            ))),
+            Err(e) => Err(e),
+        },
+        ("map" | "flatMap" | "filter" | "withFilter" | "collect", 1, Err(_)) => Ok(recv.clone()),
         // `recover` takes a PartialFunction and only applies where it is
         // defined, so an arm-less exception stays a `Failure`.
         ("recover", 1, Err(e)) => match is_defined_at(vm, &args[0], e) {
@@ -13997,8 +14285,10 @@ fn char_method(c: char, name: &str, args: &[Value]) -> Result<Value, String> {
         // `asDigit` is the *numeric value* of a digit character, so '5' is 5;
         // it also accepts the hex letters, as `Character.digit(c, 36)` does.
         ("asDigit", 0) => Ok(Value::int(java_digit36(c))),
+        ("getNumericValue", 0) => Ok(Value::int(java_numeric_value(c))),
         ("toUpper", 0) => Ok(make_char(java_to_upper(c))),
         ("toLower", 0) => Ok(make_char(java_to_lower(c))),
+        ("toTitleCase", 0) => Ok(make_char(java_to_title(c))),
         ("isDigit", 0) => cls(java_is_digit(c)),
         ("isLetter", 0) => cls(java_is_letter(c)),
         ("isLetterOrDigit", 0) => cls(java_is_letter(c) || java_is_digit(c)),
