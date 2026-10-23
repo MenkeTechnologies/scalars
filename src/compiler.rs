@@ -4221,6 +4221,21 @@ impl Compiler {
                 );
                 return Ok(());
             }
+            // `new String(chars)` / `new String(s)` / `new String()` — the
+            // copy constructors, which answer the same text `String.valueOf`
+            // does for an `Array[Char]` or a `String`.
+            if matches!(name, "String" | "java.lang.String") && args.len() <= 1 {
+                let text = match args.first() {
+                    Some(a) => Expr::Method {
+                        recv: Box::new(Expr::Var("String".to_string())),
+                        name: "valueOf".to_string(),
+                        args: vec![a.clone()],
+                        line,
+                    },
+                    None => Expr::Str(String::new()),
+                };
+                return self.expr(&text);
+            }
             if name == "Regex" && args.len() == 1 {
                 self.expr(&args[0])?;
                 let m = self.b.add_constant(Value::str("r".to_string()));
@@ -5406,14 +5421,13 @@ impl Compiler {
             } if none.is_empty() && mutable_module(pkg) => Some(k.as_str()),
             _ => None,
         };
-        if let Some(ctor) = factory_kind.and_then(bare_mutable_ctor).or_else(|| {
-            // The package spelling also covers `Set`/`Map`, which a bare name
-            // does not (it is the immutable one there).
-            match recv {
-                Expr::Method { name: k, .. } if name == "from" => mutable_ctor(k),
-                _ => None,
-            }
-        }) {
+        // The package spelling also covers `Set`/`Map`, which a bare name does
+        // not (it is the immutable one there).
+        let ctor = match recv {
+            Expr::Var(_) => factory_kind.and_then(bare_mutable_ctor),
+            _ => factory_kind.and_then(mutable_ctor),
+        };
+        if let Some(ctor) = ctor {
             match (name, args) {
                 ("empty", []) => return self.collection(ctor, &[]),
                 ("from", [xs]) => {
@@ -5422,6 +5436,26 @@ impl Compiler {
                         elems: vec![xs.clone()],
                     };
                     return self.collection(ctor, &[spread]);
+                }
+                // The one-dimensional element factories — `fill(n)(v)`,
+                // `tabulate(n)(f)`, `range`, `iterate`, `unfold` — are the
+                // `List` companion's, built into this collection. A keyed or
+                // text collection has no such members.
+                ("fill" | "tabulate" | "unfold", [_, _])
+                | ("range", [_, _] | [_, _, _])
+                | ("iterate", [_, _, _])
+                    if !matches!(
+                        ctor,
+                        "mutable.Map" | "LinkedHashMap" | "StringBuilder" | "PriorityQueue"
+                    ) =>
+                {
+                    if let Some(list) = companion_factory("List", name, args, line) {
+                        let spread = Expr::Collection {
+                            ctor: crate::parser::SPREAD.to_string(),
+                            elems: vec![list],
+                        };
+                        return self.collection(ctor, &[spread]);
+                    }
                 }
                 _ => {}
             }

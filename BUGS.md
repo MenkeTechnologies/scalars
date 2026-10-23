@@ -71,6 +71,10 @@ reported as parse/compile errors, never silently mis-run.
 - **`empty` and `from` on the mutable collection factories** reached through a
   selector import: `ArrayBuffer.empty[Int]`, `Queue.from(xs)`,
   `PriorityQueue.from(xs)`, and `mutable.Queue.from(xs)` through the package.
+  The one-dimensional element factories work on them too — `fill(n)(v)` (by
+  name, once per element), `tabulate`, `range`, `iterate` and `unfold` on
+  `ArrayBuffer`, `ListBuffer`, `Queue`, `Stack`, `ArrayDeque` and `mutable.Set`
+  — as do `empty`/`from` on `mutable.Set`/`mutable.Map` through the package.
 - **Scala 3 optional braces.** A pass over the token stream turns each
   indentation region into the `{ … }` block the parser already reads. A region
   opens after a token that ends its line — `=`, `=>`, `match`, `try`, `catch`,
@@ -148,6 +152,9 @@ reported as parse/compile errors, never silently mis-run.
   nothing larger contains it; as an OPERAND it belongs to the enclosing
   expression, so `xs.sortWith(_.compareTo(_) < 0)` is `(a, b) => a.compareTo(b)
   < 0` and `xs.map(f(_) + 1)` is `x => f(x) + 1`.
+  The right operand of a compound assignment is an operand as well:
+  `xs.foreach(t += _)` is `x => t += x`, for a `var`, an indexed place
+  (`a(i) += _`) and a buffer (`buf += _`).
 - **User-defined methods (`def`), lexically scoped.** Helper `def`s alongside
   `main` (or inside an `extends App` body) are compiled to fusevm's native
   `Op::Call` frame ABI: parameters bind to per-call frame slots, recursion and
@@ -784,6 +791,8 @@ reported as parse/compile errors, never silently mis-run.
   the remainder; `+:` binds tighter than `::`/`:+` and is right-associative,
   `:+` is left-associative (`case rest :+ y :+ z`), and both work in a `val`
   pattern definition.
+  A `val` whose binder is a lowercase identifier applied to arguments is an
+  extractor pattern too (`val date(y, m) = s` with `val date = "…".r`).
 - **`scala.Option`'s method surface.** `get`, `getOrElse`, `orNull`, `isEmpty`,
   `isDefined`, `nonEmpty`, `size`, `contains`, `map`, `flatMap`, `filter`,
   `filterNot`, `exists`, `forall`, `count`, `foreach`, `fold(ifEmpty)(f)`,
@@ -1325,6 +1334,14 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Modeled with a documented simplification
 
+- **A member access on `null` raises `NullPointerException` without the
+  JDK's message.** `s.length` on a `null` `String` is the catchable
+  `java.lang.NullPointerException`, but `getMessage` answers `null` where the
+  JDK's helpful message (`Cannot invoke "String.length()" because "<local1>" is
+  null`) names bytecode slots and accessors this frontend does not have.
+- **`String.valueOf` of an EMPTY `Array[Char]`** renders `Array()`: with no
+  element there is nothing to tell it from any other empty array, so the
+  `char[]` overload (which answers `""`) is chosen only for a non-empty one.
 - **`math.sin` and `math.cos` round as the platform libm does, not as the
   JVM.** On JDK 21 aarch64 they are HotSpot intrinsics that disagree with
   `StrictMath` on about 7% of inputs (measured: 14,323 of 200,000), and on
@@ -1541,6 +1558,10 @@ reported as parse/compile errors, never silently mis-run.
   narrowest width that holds the value, which is right for every `Int` and for
   any `Long` outside `Int` range. A `Long` variable holding a small negative
   number is the residual gap: it renders 32-bit where Scala renders 64.
+  The same holds one width down: Java formats a `Byte` at 8 bits and a `Short`
+  at 16 (`"%x".format(255.toByte)` is `ff`), where this renders the 32-bit
+  pattern (`ffffffff`). A `Long` literal in an `f` interpolator
+  (`f"${-1L}%x"`) is affected too, though its width is static.
   The same missing static type names the class in `format`'s argument check:
   `"%.2f".format(2L)` raises `IllegalFormatConversionException: f !=
   java.lang.Integer` where Scala names `java.lang.Long` (the exception and its

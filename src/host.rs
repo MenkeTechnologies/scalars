@@ -2950,6 +2950,17 @@ fn char_of_code(code: i64) -> char {
     char::from_u32(code as u32 & 0xFFFF).unwrap_or('\u{FFFD}')
 }
 
+/// The text of a non-empty `Array[Char]` — what `String.valueOf(char[])` and
+/// `new String(char[])` answer — or `None` for any other value.
+fn char_array_text(v: &Value) -> Option<String> {
+    with_seq(v, |k, xs| {
+        (k == SeqKind::Array && !xs.is_empty())
+            .then(|| xs.iter().map(as_char).collect::<Option<String>>())
+            .flatten()
+    })
+    .flatten()
+}
+
 /// `Character.isSpaceChar`: the Unicode space separators `Zs`, `Zl` and `Zp` —
 /// [`java_is_whitespace`] without the ASCII controls (`'\t'` is not a space
 /// char) and with the three no-break spaces.
@@ -7611,10 +7622,13 @@ fn format_arg_class(v: &Value) -> Option<String> {
 /// itself inexact and moves the tie: `1234.5` at `%.3e` is `1.235e+03`, not
 /// `1.234e+03`.
 fn sci_parts(a: f64, p: usize) -> (String, i32) {
-    let full = format!("{a:e}");
-    let (mant, exp_s) = full.split_once('e').unwrap_or((full.as_str(), "0"));
-    let mut exp: i32 = exp_s.parse().unwrap_or(0);
-    let mut mantissa = round_half_up_str(mant, p);
+    let (digits, mut exp) = if a == 0.0 {
+        ("0".to_string(), 0)
+    } else {
+        java_decimal(a)
+    };
+    let mant = format!("{}.{}", &digits[..1], &digits[1..]);
+    let mut mantissa = round_half_up_str(&mant, p);
     // A carry out of the leading digit (`9.99` at `%.1e`) is one more power of
     // ten, renormalized back to a single leading digit.
     if mantissa.starts_with("10") {
@@ -7740,10 +7754,31 @@ fn nonfinite(x: f64, conv: char, plus: bool, space: bool) -> Option<String> {
 ///    exact expansion instead answers `1.00`/`0.1` — right by IEEE, wrong by
 ///    Java.
 ///
-/// Rust's `{}` for `f64` is that same shortest round-tripping form, so it is
-/// the correct input, and the rounding is then done on the digit string.
+/// Those digits are [`java_decimal`]'s — `FormattedFPDecimal` takes them from
+/// the same `DoubleToDecimal` `toString` uses, two-digit rule and even ties
+/// included — and the rounding is then done on the digit string. Rust's `{}`
+/// is NOT the same input where those rules apply: `Double.MinPositiveValue` is
+/// `5e-324` to Rust and `4.9E-324` to Java.
 fn round_half_up(a: f64, p: usize) -> String {
-    round_half_up_str(&format!("{a}"), p)
+    round_half_up_str(&java_plain(a), p)
+}
+
+/// [`java_decimal`]'s digits for a non-negative finite `a`, written out as a
+/// plain decimal with no exponent (`4.9E-324` as `0.000…049`).
+fn java_plain(a: f64) -> String {
+    if a == 0.0 {
+        return "0".to_string();
+    }
+    let (digits, exp) = java_decimal(a);
+    if exp < 0 {
+        return format!("0.{}{digits}", "0".repeat((-exp - 1) as usize));
+    }
+    let int_len = exp as usize + 1;
+    if digits.len() <= int_len {
+        format!("{digits}{}", "0".repeat(int_len - digits.len()))
+    } else {
+        format!("{}.{}", &digits[..int_len], &digits[int_len..])
+    }
 }
 
 /// Round a non-negative decimal STRING (`"12.345"`, no sign, no exponent) to `p`
@@ -12298,7 +12333,9 @@ fn b_boxed(vm: &mut VM, argc: u8) -> Value {
         .expect("the compiler always emits `Module.member`");
     // `String.valueOf(x)` IS `x.toString`, so a user override has to run — and
     // `boxed_member` has no VM to run it with.
-    if (module, member, args.len()) == ("java.String", "valueOf", 1) {
+    if (module, member, args.len()) == ("java.String", "valueOf", 1)
+        && char_array_text(&args[0]).is_none()
+    {
         if let Value::Obj(_) = &args[0] {
             return Value::str(scala_str_vm(vm, &args[0]));
         }
@@ -12888,11 +12925,35 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         ("java.Integer", "toUnsignedLong", 1) => Ok(Value::int(i64::from(i(0) as i32 as u32))),
         // `Double.toString(d)` is the same shortest-round-trip rendering the
         // implicit `"" + d` uses, so `-0.0` keeps its sign.
+        // The bit-pattern conversions. The non-raw ones canonicalize every NaN.
+        ("java.Double", "doubleToLongBits", 1) => {
+            Ok(Value::int(double_to_long_bits(num_f64(&args[0]))))
+        }
+        ("java.Double", "doubleToRawLongBits", 1) => {
+            Ok(Value::int(num_f64(&args[0]).to_bits() as i64))
+        }
+        ("java.Double", "longBitsToDouble", 1) => {
+            Ok(Value::float(f64::from_bits(args[0].to_int() as u64)))
+        }
+        ("java.Float", "floatToIntBits", 1) => Ok(Value::int(i64::from(float_to_int_bits(
+            f32_of(&args[0]).unwrap_or(num_f64(&args[0]) as f32),
+        )))),
+        ("java.Float", "floatToRawIntBits", 1) => Ok(Value::int(i64::from(
+            f32_of(&args[0])
+                .unwrap_or(num_f64(&args[0]) as f32)
+                .to_bits() as i32,
+        ))),
+        ("java.Float", "intBitsToFloat", 1) => {
+            Ok(make_f32(f32::from_bits(args[0].to_int() as u32)))
+        }
         ("java.Double", "toHexString", 1) => {
             Ok(Value::str(double_to_hex_string(num_f64(&args[0]))))
         }
         ("java.Double" | "java.Float", "toString", 1) => {
             Ok(Value::str(format_double(num_f64(&args[0]))))
+        }
+        ("java.String", "valueOf" | "copyValueOf", 1) if char_array_text(&args[0]).is_some() => {
+            Ok(Value::str(char_array_text(&args[0]).unwrap_or_default()))
         }
         ("java.String", "valueOf", 1) => Ok(Value::str(scala_str(&args[0]))),
         ("BigInt", "apply", _) => big_apply(args),
@@ -16018,14 +16079,21 @@ fn float_to_int_bits(f: f32) -> i32 {
 
 /// The Scala compile-error a bad member access resembles (a `value … is not a
 /// member of …`). slice-1 resolves methods at runtime, so it surfaces here.
+///
+/// A `null` receiver is not a compile error but the JVM's catchable
+/// `NullPointerException`. Its message is not reproduced: the JDK's helpful
+/// text (`Cannot invoke "String.length()" because "<local1>" is null`) names
+/// bytecode slots and accessor methods this frontend does not have.
 fn no_such_method(recv: &Value, name: &str) -> String {
+    if matches!(recv, Value::Undef) {
+        return "scalars: java.lang.NullPointerException".to_string();
+    }
     let ty = match recv {
         Value::Str(_) => "String",
         Value::Int(_) => "Int",
         Value::Float(_) => "Double",
         Value::Status(_) => "Float",
         Value::Bool(_) => "Boolean",
-        Value::Undef => "Null",
         _ => "value",
     };
     format!("scalars: value {name} is not a member of {ty}")

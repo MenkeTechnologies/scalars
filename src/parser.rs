@@ -2448,8 +2448,10 @@ impl Parser {
     /// Whether the token after `val`/`var` starts a PATTERN definition rather
     /// than a plain binder. `(` opens a tuple pattern; a capitalized identifier
     /// followed by more pattern is a constructor (`Some(x)`) pattern; any
-    /// identifier followed by `::`, `+:` or `:+` is an infix pattern. A bare identifier before
-    /// `=` or `:` is the ordinary `val x = …` — capitalized or not, since Scala
+    /// identifier followed by `(` is an extractor pattern whatever its case
+    /// (`val date(y, m, d) = s` with `val date = "…".r`), and any identifier
+    /// followed by `::`, `+:` or `:+` is an infix pattern. A bare identifier
+    /// before `=` or `:` is the ordinary `val x = …` — capitalized or not, since Scala
     /// reads a lone identifier in a `val` as a binder (`val Pat = "…".r`).
     fn starts_pattern_decl(&self) -> bool {
         match self.peek() {
@@ -2457,7 +2459,7 @@ impl Parser {
             Tok::Ident(n) => {
                 let binder = matches!(self.peek_at(1), Tok::Assign | Tok::Colon | Tok::Comma);
                 (n.chars().next().is_some_and(char::is_uppercase) && !binder)
-                    || matches!(self.peek_at(1), Tok::ColonColon | Tok::At)
+                    || matches!(self.peek_at(1), Tok::ColonColon | Tok::At | Tok::LParen)
                     || matches!(self.peek_at(1), Tok::Op(o) if o == "+:" || o == ":+")
             }
             _ => false,
@@ -5346,6 +5348,12 @@ fn replace_placeholders(e: &mut Expr, n: &mut usize, prefix: &str) {
             }
         }
         Expr::Println { arg: Some(a), .. } => replace_placeholders(a, n, prefix),
+        // `xs.foreach(t += _)` is `x => t += x`: the right operand of a
+        // compound assignment is an operand like any other.
+        Expr::CompoundAssign { target, value, .. } => {
+            replace_placeholders(target, n, prefix);
+            replace_placeholders(value, n, prefix);
+        }
         Expr::Format { value, .. } => replace_placeholders(value, n, prefix),
         // `_.copy(sal = 0)` — the receiver of a `copy` is an operand like any
         // method receiver.
