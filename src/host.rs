@@ -12132,30 +12132,79 @@ fn range_slice_method(
             make(at(n), end, inclusive)
         }
     };
+    let drop_right = |n: i64| {
+        if n <= 0 || len == 0 {
+            make(start, end, inclusive)
+        } else if n >= len {
+            make(end, end, false)
+        } else {
+            make(start, at(len - 1 - n), true)
+        }
+    };
+    let slice = |from: i64, until: i64| {
+        if from <= 0 {
+            take(until)
+        } else if until >= len {
+            drop(from)
+        } else if from >= until {
+            make(at(from), at(from), false)
+        } else {
+            make(at(from), at(until - 1), true)
+        }
+    };
+    // The window iterators `Range` answers with `Range`s rather than the
+    // `Vector`s of the generic `IndexedSeq` walk: `grouped` and `sliding` take
+    // each window as a `slice` (`Range$$anon$3`, `IndexedSeqSlidingIterator`),
+    // `tails` is `drop(i)` and `inits` is `dropRight(i)` for every `i` from 0 to
+    // the length inclusive, so both end in an empty range.
+    let windows = |ws: Vec<Result<Value, String>>| {
+        let out = ws.into_iter().collect::<Result<Vec<_>, _>>()?;
+        Ok(new_seq(SeqKind::Iterator, out))
+    };
+    let sliced = |size: i64, step: i64| {
+        windows(
+            window_starts(len as usize, size as usize, step as usize)
+                .map(|(a, b)| slice(a as i64, b as i64))
+                .collect(),
+        )
+    };
     let arg = |i: usize| args[i].to_int();
     Some(match (name, args.len()) {
         ("take", 1) => take(arg(0)),
         ("drop", 1) => drop(arg(0)),
-        ("takeRight", 1) if arg(0) <= 0 => make(start, start, false),
+        // `takeRight` and `dropRight` test emptiness FIRST, so an empty receiver
+        // answers `newEmptyRange(start)` and itself respectively whatever the
+        // count, and a `dropRight` that removes everything leaves the empty range
+        // at the END (`(1 to 3).dropRight(3)` is `empty Range 3 until 3`).
+        ("takeRight", 1) if arg(0) <= 0 || len == 0 => make(start, start, false),
         ("takeRight", 1) => drop(len - arg(0)),
-        ("dropRight", 1) if arg(0) <= 0 => make(start, end, inclusive),
-        ("dropRight", 1) => take(len - arg(0)),
+        ("dropRight", 1) => drop_right(arg(0)),
         ("tail", 0) if len == 1 => make(end, end, false),
         ("tail", 0) if len > 1 => make(start + step, end, inclusive),
-        ("init", 0) if len > 0 => take(len - 1),
-        ("slice", 2) => {
-            let (from, until) = (arg(0), arg(1));
-            if from <= 0 {
-                take(until)
-            } else if until >= len {
-                drop(from)
-            } else if from >= until {
-                make(at(from), at(from), false)
-            } else {
-                make(at(from), at(until - 1), true)
-            }
-        }
+        // `Range.init` is `dropRight(1)` once the empty receiver has faulted.
+        ("init", 0) if len > 0 => drop_right(1),
+        ("slice", 2) => slice(arg(0), arg(1)),
         ("splitAt", 1) => take(arg(0)).and_then(|a| Ok(new_pair(a, drop(arg(0))?))),
+        // `Range.grouped` has its own `require`, worded for one number.
+        ("grouped", 1) if arg(0) < 1 => Err(format!(
+            "scalars: java.lang.IllegalArgumentException: requirement failed: \
+             size={}, but size must be positive",
+            arg(0)
+        )),
+        ("grouped", 1) => sliced(arg(0), arg(0)),
+        ("sliding", 1) | ("sliding", 2) => {
+            let size = arg(0);
+            let step = if args.len() == 2 { arg(1) } else { 1 };
+            if size < 1 || step < 1 {
+                return Some(Err(format!(
+                    "scalars: java.lang.IllegalArgumentException: requirement failed: \
+                     size={size} and step={step}, but both must be positive"
+                )));
+            }
+            sliced(size, step)
+        }
+        ("tails", 0) => windows((0..=len).map(drop).collect()),
+        ("inits", 0) => windows((0..=len).map(drop_right).collect()),
         _ => return None,
     })
 }
@@ -14170,17 +14219,27 @@ fn operator_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Va
 /// the old code answered one empty window instead, which printed identically for
 /// a `String` (`List("")` and `List()` are both `List()` on the page) and
 /// differed only in `size`.
+///
+/// A step LONGER than the window skips the gap between windows, and the walk
+/// ends once the next start reaches the end — the position update of
+/// `IndexedSeqSlidingIterator` (`pos = if (end >= len) len else min(pos + step,
+/// len)`, then `hasNext` is `pos < len`). Testing only `start + size >= len`
+/// emitted one extra EMPTY window whenever the skipped gap ran to the end:
+/// `List(1,2,3,4,5,6,7,8).sliding(3, 4)` is `List(List(1, 2, 3), List(5, 6, 7))`
+/// in the reference and was answered with a trailing `List()`.
 fn window_starts(len: usize, size: usize, step: usize) -> impl Iterator<Item = (usize, usize)> {
-    let mut start = 0usize;
-    let mut done = len == 0;
+    let mut pos = 0usize;
     std::iter::from_fn(move || {
-        if done {
+        if pos >= len {
             return None;
         }
-        let end = (start + size).min(len);
-        done = start + size >= len;
-        let w = (start, end);
-        start += step;
+        let end = pos.saturating_add(size).min(len);
+        let w = (pos, end);
+        pos = if end >= len {
+            len
+        } else {
+            pos.saturating_add(step).min(len)
+        };
         Some(w)
     })
 }

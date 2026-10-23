@@ -936,8 +936,14 @@ reported as parse/compile errors, never silently mis-run.
   positional slices `take`/`drop`/`takeRight`/`dropRight`/`tail`/`init`/
   `slice`/`splitAt` yield a `Range` with the bounds `Range.scala` computes
   (`(1 to 5).take(2)` is `Range 1 to 2`, an empty slice `empty Range 3 until 3`), and `sum`/`length`/`head`/`last`/`toList`/`mkString`/`contains`/
-  `min`/`max` all work. Used as a `for` generator it still compiles to the
-  counted loop (no materialization).
+  `min`/`max` all work. A `dropRight` that removes everything (and so the
+  last `inits` window) leaves the empty range at the END, `empty Range 3 until
+  3` for `1 to 3`, as the library does. The window iterators answer `Range`s
+  too: `grouped` and `sliding` take each window as a `slice` (`(1 to 7).grouped(3)`
+  is `Range 1 to 3`, `Range 4 to 6`, `Range 7 to 7`), `tails` is `drop(i)` and
+  `inits` is `dropRight(i)` for every `i` up to the length, and `grouped(0)`
+  reports Range's own `size=0, but size must be positive`. Used as a `for`
+  generator it still compiles to the counted loop (no materialization).
 - **A `Char` range — `'a' to 'e'`, `'a' until 'z' by 2`.** Scala's
   `NumericRange[Char]`, a class of its own rather than a `Range`: it prints
   `NumericRange a to e` (`empty NumericRange e to a`, and `by` renders its step
@@ -1329,6 +1335,17 @@ reported as parse/compile errors, never silently mis-run.
   Ops[A, B, C](t: (A, B, C))`) — extension selection goes by the receiver's
   static type NAME and a tuple has none (`value swap2 is not a member of
   value`); the deprecated `(xs, ys).zipped`; `String.chars` (an `IntStream`).
+- **Found by the second October 2026 differential round, still open.** These
+  raise a catchable `java.lang.NullPointerException` where Scala runs, so a
+  `catch` that matches it would hide the gap: `getClass` on a `case object`
+  (Scala answers `Unit1$`), `Function.tupled(f)`, `mutable.TreeMap(…)` and
+  `mutable.BitSet(…)`. These are compile/parse errors: `import
+  scala.util.boundary.break` then a bare `break(v)` inside `boundary { … }`,
+  and `collection.immutable.ListMap`; `filterInPlace`/`mapInPlace`/`dropInPlace` on a
+  buffer, `keysIterator`/`valuesIterator` on a `Map`, `BigDecimal.underlying`,
+  `Regex.unapplySeq`, and the `String` members `indexOfSlice`, `containsSlice`,
+  `inits`, `tails`, `reverseIterator`, `sameElements`, `distinctBy`, `union`,
+  `regionMatches`, `indent` and `getBytes(charset)` are not members.
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
 
