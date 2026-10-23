@@ -1294,14 +1294,18 @@ reported as parse/compile errors, never silently mis-run.
   ordering beyond "exactly one candidate or it is ambiguous", and no
   companion-object search — a given must be in the program's own scope.
 
-  An `extension` whose name collides with a real STDLIB method on a primitive
-  receiver wins, where Scala keeps the member and warns that the extension
-  "will never be selected". The member-wins rule IS enforced for a user class,
-  which is the case the reference demonstrates; the stdlib is dispatched at run
-  time here, so there is no compile-time list of its names to consult. The same
-  holds for a receiver selected by its RUN-TIME type (any receiver of a generic
-  `extension [A](a: A)`, or one whose static type is not nameable here): the
-  extension is chosen over a stdlib member of the same name.
+  A real MEMBER of the receiver wins over an extension of the same name, as in
+  Scala: a user class's member, a library collection's (`xs.size` under
+  `extension (xs: List[Int]) def size`), and the own members of `String`
+  (`java.lang.String`'s), the numeric value classes, `Boolean`, `Char` and
+  `Array`. Their implicit ENRICHMENTS — `StringOps`, `RichInt`, `ArrayOps` — are
+  not members, and an extension shadows them (`s.reverse` under `extension (s:
+  String) def reverse` is the extension), which is also Scala's rule. A
+  receiver selected by its run-time type tries the member first and falls back
+  to the extension only when the receiver has none. One residual: when such a
+  call passes an argument with side effects to an extension that takes a
+  parameter BY NAME, the member probe is skipped (it would have to evaluate the
+  argument) and the extension is chosen outright.
 
   A `given`, an `extension`, an `implicit val`/`def` and an `implicit object`
   declared as a member of a `def main` entry object enter the implicit scope as

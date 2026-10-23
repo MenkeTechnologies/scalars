@@ -504,6 +504,13 @@ pub const RANDOM_GLOBAL: u16 = 811;
 /// two's complement at, and the class an `IllegalFormatConversionException`
 /// names — is only knowable at compile time.
 pub const FORMAT_TYPED: u16 = 813;
+/// Builtin id for a member call that answers `Undef` instead of faulting when
+/// the receiver has no such member (see `b_member_soft`). Same stack layout as
+/// [`SMETHOD`].
+pub const MEMBER_SOFT: u16 = 814;
+/// Builtin id answering whether the `MEMBER_SOFT` probe just before it found no
+/// member; `argc` is 0.
+pub const NO_MEMBER_TEST: u16 = 815;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -703,6 +710,13 @@ thread_local! {
     /// error) so the runner can surface it as an error after `VM::run` returns
     /// (a builtin can only return a `Value`, not an error).
     static FFI_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// While a [`MEMBER_SOFT`] probe runs: the fault-message prefix that means
+    /// "the receiver has no such member", and whether that fault was raised.
+    static SOFT_MEMBER: RefCell<Option<String>> = const { RefCell::new(None) };
+    static SOFT_MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the LAST [`MEMBER_SOFT`] probe found no member — read, and
+    /// cleared, by the [`NO_MEMBER_TEST`] the compiler emits right after it.
+    static LAST_SOFT_MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Take and clear any pending FFI-fault message.
@@ -721,6 +735,16 @@ pub fn take_error() -> Option<String> {
 /// it.
 fn fault(vm: &mut VM, msg: impl Into<String>) -> Value {
     let msg = msg.into();
+    // A [`MEMBER_SOFT`] probe's "no such member" is an answer, not a fault.
+    let soft = SOFT_MEMBER.with(|s| {
+        s.borrow()
+            .as_ref()
+            .is_some_and(|p| msg.starts_with(p.as_str()))
+    });
+    if soft {
+        SOFT_MISSED.with(|m| m.set(true));
+        return Value::Undef;
+    }
     let bare = msg.strip_prefix("scalars: ").unwrap_or(&msg);
     if let Some(exc) = throwable_from_message(bare) {
         return raise(vm, exc);
@@ -744,6 +768,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(SMETHOD, b_method);
     vm.register_builtin(SFORMAT, b_format);
     vm.register_builtin(FORMAT_TYPED, b_format_typed);
+    vm.register_builtin(MEMBER_SOFT, b_member_soft);
+    vm.register_builtin(NO_MEMBER_TEST, b_no_member_test);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -8151,6 +8177,164 @@ fn b_method(vm: &mut VM, argc: u8) -> Value {
     }
     args.reverse();
     let recv = vm.pop();
+    method_call(vm, recv, name, args)
+}
+
+/// `MEMBER_SOFT` builtin: [`b_method`]'s dispatch, except that a receiver with
+/// NO member of that name answers `Undef` and records the miss for
+/// [`b_no_member_test`] instead of faulting. A runtime-selected extension tries the member through this first,
+/// because Scala resolves a real member before any extension.
+fn b_member_soft(vm: &mut VM, argc: u8) -> Value {
+    let name = vm.pop().as_str_cow().into_owned();
+    let k = (argc as usize).saturating_sub(2);
+    let mut args = Vec::with_capacity(k);
+    for _ in 0..k {
+        args.push(vm.pop());
+    }
+    args.reverse();
+    let recv = vm.pop();
+    // Only a member of the receiver's OWN class counts. The `StringOps`,
+    // `RichInt` and `ArrayOps` methods arrive by implicit conversion, and an
+    // extension wins over a conversion: under `extension (s: String) def
+    // reverse`, `s.reverse` is the extension.
+    if !is_own_member(&recv, &name) {
+        LAST_SOFT_MISSED.with(|m| m.set(true));
+        return Value::Undef;
+    }
+    let prefix = format!("scalars: value {name} is not a member of");
+    let outer = SOFT_MEMBER.with(|s| s.replace(Some(prefix)));
+    let was = SOFT_MISSED.with(|m| m.replace(false));
+    let v = method_call(vm, recv, name, args);
+    let missed = SOFT_MISSED.with(|m| m.replace(was));
+    SOFT_MEMBER.with(|s| *s.borrow_mut() = outer);
+    LAST_SOFT_MISSED.with(|m| m.set(missed));
+    if missed {
+        Value::Undef
+    } else {
+        v
+    }
+}
+
+/// Whether `name` can be a member of `recv`'s own class rather than of an
+/// implicit enrichment of it. A `String` is `java.lang.String`, a number,
+/// `Boolean` or `Char` a Scala value class, and an `Array` the JVM array; every
+/// other receiver here is a Scala class whose methods are its members, so the
+/// dispatch itself decides.
+fn is_own_member(recv: &Value, name: &str) -> bool {
+    let ty = match recv {
+        Value::Str(_) => "String",
+        Value::Int(_) => "Int",
+        Value::Float(_) => "Double",
+        Value::Status(_) => "Float",
+        Value::Bool(_) => "Boolean",
+        _ if as_char(recv).is_some() => "Char",
+        _ if seq_kind(recv) == Some(SeqKind::Array) => "Array",
+        _ => return true,
+    };
+    own_member_of(ty, name).unwrap_or(true)
+}
+
+/// Whether `name` is a member of the class a STATIC type `ty` names, for the
+/// types whose everyday methods are mostly implicit enrichments (see
+/// [`is_own_member`]); `None` for any other type.
+pub fn own_member_of(ty: &str, name: &str) -> Option<bool> {
+    /// `Any`'s members, which every receiver has.
+    const ANY: &[&str] = &[
+        "==",
+        "!=",
+        "equals",
+        "hashCode",
+        "toString",
+        "##",
+        "getClass",
+        "isInstanceOf",
+        "asInstanceOf",
+        "eq",
+        "ne",
+        "synchronized",
+    ];
+    /// `java.lang.String`'s public instance methods (JDK 21).
+    const STRING: &[&str] = &[
+        "length",
+        "charAt",
+        "codePointAt",
+        "codePointBefore",
+        "codePointCount",
+        "offsetByCodePoints",
+        "getChars",
+        "getBytes",
+        "contentEquals",
+        "equalsIgnoreCase",
+        "compareTo",
+        "compareToIgnoreCase",
+        "regionMatches",
+        "startsWith",
+        "endsWith",
+        "indexOf",
+        "lastIndexOf",
+        "substring",
+        "subSequence",
+        "concat",
+        "replace",
+        "matches",
+        "contains",
+        "replaceFirst",
+        "replaceAll",
+        "split",
+        "splitWithDelimiters",
+        "toLowerCase",
+        "toUpperCase",
+        "trim",
+        "strip",
+        "stripLeading",
+        "stripTrailing",
+        "isBlank",
+        "isEmpty",
+        "lines",
+        "indent",
+        "stripIndent",
+        "translateEscapes",
+        "chars",
+        "codePoints",
+        "toCharArray",
+        "formatted",
+        "intern",
+        "repeat",
+        "describeConstable",
+        "resolveConstantDesc",
+        "transform",
+        "+",
+    ];
+    /// The integral value classes' members (`Int`, `Long`, `Short`, `Byte`, `Char`).
+    const INTEGRAL: &[&str] = &[
+        "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "&", "|", "^", "<<", ">>", ">>>", "unary_-",
+        "unary_+", "unary_~", "toByte", "toShort", "toChar", "toInt", "toLong", "toFloat",
+        "toDouble",
+    ];
+    /// `Double`'s and `Float`'s members.
+    const FLOATING: &[&str] = &[
+        "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "unary_-", "unary_+", "toByte", "toShort",
+        "toChar", "toInt", "toLong", "toFloat", "toDouble",
+    ];
+    let own = match ty {
+        "String" => STRING.contains(&name),
+        "Int" | "Long" | "Short" | "Byte" | "Char" => INTEGRAL.contains(&name),
+        "Double" | "Float" => FLOATING.contains(&name),
+        "Boolean" => matches!(name, "&&" | "||" | "&" | "|" | "^" | "unary_!"),
+        "Array" => matches!(name, "length" | "apply" | "update" | "clone"),
+        _ => return None,
+    };
+    Some(own || ANY.contains(&name))
+}
+
+/// `NO_MEMBER_TEST` builtin (no operands): whether the [`MEMBER_SOFT`] probe
+/// just before it found no member. Clears the answer.
+fn b_no_member_test(_vm: &mut VM, _argc: u8) -> Value {
+    Value::bool(LAST_SOFT_MISSED.with(|m| m.replace(false)))
+}
+
+/// The dispatch behind [`b_method`], with its operands already popped.
+fn method_call(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value>) -> Value {
     // A range `for … yield` result is a fusevm `Value::Array` (rendered as
     // `Vector`); promote it to a heap `Vector` seq so the collection methods
     // (`map`, `toList`, …) apply uniformly.

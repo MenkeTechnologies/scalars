@@ -3351,10 +3351,14 @@ impl Compiler {
             return None;
         }
         let ty = self.static_type_name(recv)?;
+        // A real member wins over an extension — a user class's, or one of the
+        // receiver class's own (`String.length`, `Int.toLong`; not the
+        // `StringOps`/`RichInt` enrichments, which an extension shadows).
         if self
             .classes
             .get(&ty)
             .is_some_and(|m| m.responds.contains(name))
+            || crate::host::own_member_of(&ty, name) == Some(true)
         {
             return None;
         }
@@ -3369,7 +3373,10 @@ impl Compiler {
     /// receiver of a GENERIC extension (`extension [A](a: A)`, registered under
     /// `Any`). Selected by a runtime type test of the receiver against each
     /// candidate's declared receiver type, in declaration order; with no
-    /// candidate matching, the call is the ordinary member call it was.
+    /// candidate matching, the call is the ordinary member call it was. A real
+    /// member of the receiver is tried FIRST and wins when it exists
+    /// (`xs.size` stays `List.size` under an `extension (xs: List[Int]) def
+    /// size`), because Scala resolves members before extensions.
     ///
     /// The runtime type is a subtype of the static one, so a candidate the test
     /// accepts is one Scala's static resolution would accept too. Declined
@@ -3404,15 +3411,53 @@ impl Compiler {
         self.ext_counter += 1;
         let tmp = format!(" ext_recv_{}", self.ext_counter);
         let r = Expr::Var(tmp.clone());
+        let local = |name: String, init: Expr| Stmt {
+            line,
+            kind: StmtKind::Local {
+                is_val: true,
+                is_lazy: false,
+                ty: None,
+                name,
+                init: Some(init),
+            },
+        };
+        let mut stmts = vec![local(tmp.clone(), recv.clone())];
+        // A real MEMBER of the receiver wins over every extension, so the member
+        // is tried first and the extension chain runs only when the receiver
+        // has none. The arguments may then be evaluated twice — once for the
+        // probe, once for the extension — which is harmless when they are
+        // side-effect free and is avoided by binding them once otherwise. A
+        // candidate that takes an argument BY NAME cannot be given a bound
+        // value, so there the probe is skipped and the extension is chosen
+        // outright (see `BUGS.md`).
+        let by_name = candidates.iter().any(|(_, f)| {
+            self.func_sig
+                .get(f)
+                .is_some_and(|(_, sig, _)| sig.iter().skip(1).any(|p| p.by_name))
+        });
+        let pure = args.iter().all(side_effect_free);
+        let probe = pure || !by_name;
+        let args: Vec<Expr> = if pure || by_name {
+            args.to_vec()
+        } else {
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let t = format!("{tmp}_a{i}");
+                    stmts.push(local(t.clone(), a.clone()));
+                    Expr::Var(t)
+                })
+                .collect()
+        };
         let member = Expr::Method {
             recv: Box::new(r.clone()),
             name: name.to_string(),
-            args: args.to_vec(),
+            args: args.clone(),
             line,
         };
         let chain = candidates.iter().rev().fold(member, |els, (rt, f)| {
             let mut full = vec![r.clone()];
-            full.extend_from_slice(args);
+            full.extend_from_slice(&args);
             let call = Expr::Call {
                 name: f.clone(),
                 args: full,
@@ -3432,22 +3477,37 @@ impl Compiler {
                 els: Some(Box::new(els)),
             }
         });
-        Some(Expr::Block(vec![
-            Stmt {
-                line,
-                kind: StmtKind::Local {
-                    is_val: true,
-                    is_lazy: false,
-                    ty: None,
-                    name: tmp,
-                    init: Some(recv.clone()),
-                },
-            },
-            Stmt {
+        if !probe {
+            stmts.push(Stmt {
                 line,
                 kind: StmtKind::Expr(chain),
+            });
+            return Some(Expr::Block(stmts));
+        }
+        let got = format!("{tmp}_m");
+        let mut soft = vec![r.clone(), Expr::Str(name.to_string())];
+        soft.extend(args.iter().cloned());
+        stmts.push(local(
+            got.clone(),
+            Expr::Call {
+                name: MEMBER_SOFT_CALL.to_string(),
+                args: soft,
+                line,
             },
-        ]))
+        ));
+        stmts.push(Stmt {
+            line,
+            kind: StmtKind::Expr(Expr::If {
+                cond: Box::new(Expr::Call {
+                    name: MEMBER_MISSED_CALL.to_string(),
+                    args: Vec::new(),
+                    line,
+                }),
+                then: Box::new(chain),
+                els: Some(Box::new(Expr::Var(got))),
+            }),
+        });
+        Some(Expr::Block(stmts))
     }
 
     /// The qualified expression an imported bare name stands for, when the name
@@ -5777,6 +5837,19 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<(), String> {
+        self.emit_method_builtin(recv, name, args, line, crate::host::SMETHOD)
+    }
+
+    /// [`Compiler::emit_smethod`] through the builtin `id`, which shares
+    /// `SMETHOD`'s stack layout (`MEMBER_SOFT`).
+    fn emit_method_builtin(
+        &mut self,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+        id: u16,
+    ) -> Result<(), String> {
         self.expr(recv)?;
         let by_name = library_by_name_arg(name, args.len());
         for (i, a) in args.iter().enumerate() {
@@ -5789,10 +5862,7 @@ impl Compiler {
         }
         let nc = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(nc), line);
-        self.b.emit(
-            Op::CallBuiltin(crate::host::SMETHOD, args.len() as u8 + 2),
-            line,
-        );
+        self.b.emit(Op::CallBuiltin(id, args.len() as u8 + 2), line);
         Ok(())
     }
 
@@ -6550,6 +6620,22 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(crate::host::CLASS_OF, 2), line);
                 return Ok(());
             }
+        }
+        if name == MEMBER_SOFT_CALL {
+            if let [recv, Expr::Str(member), rest @ ..] = args {
+                return self.emit_method_builtin(
+                    recv,
+                    member,
+                    rest,
+                    line,
+                    crate::host::MEMBER_SOFT,
+                );
+            }
+        }
+        if name == MEMBER_MISSED_CALL && args.is_empty() {
+            self.b
+                .emit(Op::CallBuiltin(crate::host::NO_MEMBER_TEST, 0), line);
+            return Ok(());
         }
         if name == crate::parser::ORDERING_REG {
             if let [inst, Expr::Str(class)] = args {
@@ -8469,6 +8555,31 @@ fn range_factory(name: &str, args: &[Expr], line: u32) -> Option<Expr> {
         [a, b, step] => m(m(a.clone(), preposition, b.clone()), "by", step.clone()),
         _ => return None,
     })
+}
+
+/// The internal call [`Compiler::extension_by_runtime_type`] probes a real
+/// member through: `(receiver, name, args…)`, lowered to `MEMBER_SOFT`. The
+/// leading space keeps it out of every name a program can write.
+const MEMBER_SOFT_CALL: &str = " member$soft";
+/// The internal call answering whether that probe found no member.
+const MEMBER_MISSED_CALL: &str = " member$missed";
+
+/// Whether evaluating `e` twice is indistinguishable from evaluating it once:
+/// a name, a literal, a function literal, or a tuple of those.
+fn side_effect_free(e: &Expr) -> bool {
+    match e {
+        Expr::Var(_)
+        | Expr::Int(_)
+        | Expr::Long(_)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Char(_)
+        | Expr::Lambda { .. } => true,
+        Expr::Tuple(xs) => xs.iter().all(side_effect_free),
+        _ => false,
+    }
 }
 
 /// The result width of an integral member of a `java.lang` box — the JDK
