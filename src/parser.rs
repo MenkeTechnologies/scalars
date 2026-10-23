@@ -5633,6 +5633,9 @@ pub const SUMMON: &str = "summon$";
 /// The synthetic call an expression WIDENED to `Any` is wrapped in, so the
 /// compiler can keep the box of an integer whose static type it knows.
 pub const ANY_WIDEN: &str = "any$widen";
+/// The synthetic call a NON-literal sequence of proven integral element type
+/// is wrapped in where it reaches `C[Any]`: `(seq, box code)`.
+pub const ANY_WIDEN_ELEMS: &str = "any$widen_elems";
 
 /// The synthetic call a `given Ordering[C] with { … }` declaration parses to:
 /// two arguments, the instance and the element class name, answered by

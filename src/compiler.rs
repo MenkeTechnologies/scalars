@@ -6827,10 +6827,19 @@ impl Compiler {
             if let [e] = args {
                 self.expr(e)?;
                 if let Some(b) = self.any_box(e) {
-                    let k = self.b.add_constant(Value::str(b.code().to_string()));
-                    self.b.emit(Op::LoadConst(k), line);
+                    self.b
+                        .emit(Op::LoadInt(i64::from(u32::from(b.code()))), line);
                     self.b.emit(Op::CallBuiltin(crate::host::BOX_ANY, 2), line);
                 }
+                return Ok(());
+            }
+        }
+        if name == crate::parser::ANY_WIDEN_ELEMS {
+            if let [e, code] = args {
+                self.expr(e)?;
+                self.expr(code)?;
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::BOX_ELEMS, 2), line);
                 return Ok(());
             }
         }
@@ -7615,7 +7624,28 @@ impl Compiler {
             return self.any_box(e).map(|_| widen(e));
         }
         let Expr::Collection { ctor, elems } = e else {
-            return None;
+            // A sequence that is not a literal, reaching `C[Any]`: its elements
+            // are boxed at run time when their static width is PROVEN (`val ys:
+            // List[Long] = …; val xs: List[Any] = ys`). An unproven element type —
+            // a `map` result — is left alone.
+            let (_, targs) = to.split_once('[')?;
+            let one = split_type_args(targs.strip_suffix(']')?);
+            let [t] = one.as_slice() else {
+                return None;
+            };
+            if !is_any_type(t) {
+                return None;
+            }
+            let code = match self.elem_ty(e) {
+                NumTy::Int => 'I',
+                NumTy::Long => 'J',
+                _ => return None,
+            };
+            return Some(Expr::Call {
+                name: crate::parser::ANY_WIDEN_ELEMS.to_string(),
+                args: vec![e.clone(), Expr::Int(i64::from(u32::from(code)))],
+                line: 0,
+            });
         };
         let (base, targs) = to.split_once('[')?;
         let targs = targs.strip_suffix(']')?;

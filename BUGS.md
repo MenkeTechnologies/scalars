@@ -1358,17 +1358,23 @@ reported as parse/compile errors, never silently mis-run.
   ascription `e: Any`, an argument to a parameter typed by a type parameter
   (`def f[T](x: T)`), the elements of a literal declared `C[Any]` and the values
   of one declared `Map[K, Any]` (after Scala 3's literal harmonization:
-  `Vector(1, 2L)` is all `Long`), and both sides of `equals`. Type tests,
+  `Vector(1, 2L)` is all `Long`), the elements of an immutable `List`/`Vector`
+  of PROVEN element width reaching `C[Any]` (`val xs: List[Any] = ys` with
+  `ys: List[Long]`), and both sides of `equals`. Type tests,
   `asInstanceOf` (a `ClassCastException` across boxes), `getClass`, `equals`
   and format argument checks read the box; printing, `==`, `##`, hashing and
   arithmetic read the number, and a typed pattern binds the number. A value
   whose box was never recorded — one that reached `Any` through a path above
   the compiler could not type, such as the element of a mapped collection —
-  still passes every integral type test. Boxes are interned per value, like
-  `Char`s. Measured cost (debug build, instructions retired): a numeric loop
-  with no widening 127.38G → 127.48G (+0.08%); a loop widening two integers to
-  `Any` per iteration 13.57G → 20.79G (+53%), and peak RSS 14 MB → 138 MB at
-  400 000 distinct boxes, since the arena is append-only.
+  still passes every integral type test: Scala types a `map`'s result from the
+  function's body, which this frontend does not analyse. A box is an INLINE
+  value (a `Value::Ref` whose payload variant names the box), not an arena
+  entry, so it is freed with its last copy. Measured (debug build, instructions
+  retired, peak RSS), against the build before boxes existed: a numeric loop
+  with no widening 127.38G → 127.41G; a loop widening two integers to `Any` and
+  type-testing both per iteration 13.57G / 14 MB → 17.59G / 14 MB (+30%: two
+  `BOX_ANY` builtin calls and the `Long` test the old permissive `Int` test used
+  to skip). The first, arena-interned representation cost 20.83G / 140 MB.
 - **`String.chars`/`codePoints` are a lazy `IntStream` of the members a
   program reaches for** — `map`/`filter`/`distinct`/`sorted`/`skip`/`limit`,
   and `sum`/`count`/`toArray`/`forEach`/`anyMatch`/`allMatch`/`noneMatch`/
