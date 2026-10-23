@@ -4876,6 +4876,14 @@ impl Compiler {
         if let Some(cls) = self.class_of(e) {
             return Some(cls);
         }
+        if let Expr::Var(n) = e {
+            if let Some(t) = self.widths.get(n).and_then(|w| w.ty.clone()) {
+                return Some(t);
+            }
+        }
+        if let Some(t) = self.method_result_type(e) {
+            return Some(t);
+        }
         // A tuple literal of nameable components is `(A, B)`, and `Option(x)` an
         // `Option[A]`: the shapes a `using` clause is resolved against.
         if let Expr::Tuple(xs) = e {
@@ -4931,6 +4939,44 @@ impl Compiler {
             }
             .to_string(),
         )
+    }
+
+    /// The static type of a library method call whose result type follows
+    /// from its receiver's: the element (`head`, `last`, `apply`, `max`,
+    /// `get`), an `Option` of it (`headOption`, `lastOption`, `find`), or the
+    /// receiver's own type (`filter`, `take`, `sorted`, …).
+    fn method_result_type(&self, e: &Expr) -> Option<String> {
+        let Expr::Method {
+            recv, name, args, ..
+        } = e
+        else {
+            return None;
+        };
+        let rt = normalize_type(&self.static_type_name(recv)?);
+        let (head, targs) = rt.split_once('[')?;
+        let parts = split_type_args(targs.strip_suffix(']')?);
+        let [elem] = parts.as_slice() else {
+            return None;
+        };
+        let seq = SEQ_CTORS.contains(&head) || matches!(head, "Seq" | "IndexedSeq");
+        let option = head == "Option";
+        Some(match (name.as_str(), args.len()) {
+            ("head" | "last" | "max" | "min", 0) if seq => elem.to_string(),
+            ("apply", 1) if seq => elem.to_string(),
+            ("headOption" | "lastOption" | "maxOption" | "minOption", 0) if seq => {
+                format!("Option[{elem}]")
+            }
+            ("find", 1) if seq => format!("Option[{elem}]"),
+            (
+                "filter" | "filterNot" | "take" | "drop" | "takeRight" | "dropRight" | "takeWhile"
+                | "dropWhile" | "sortBy" | "sortWith",
+                1,
+            ) if seq => rt.clone(),
+            ("tail" | "init" | "reverse" | "sorted" | "distinct", 0) if seq => rt.clone(),
+            ("get", 0) if option => elem.to_string(),
+            ("getOrElse", 1) if option => elem.to_string(),
+            _ => return None,
+        })
     }
 
     /// Whether any implicit this call needs is AMBIGUOUS, and its message.
@@ -5406,7 +5452,10 @@ impl Compiler {
             return Ok(());
         }
         if let Some(class) = factory_class {
-            if matches!(name, "range" | "rangeClosed" | "of" | "iterate" | "empty") {
+            if matches!(
+                name,
+                "range" | "rangeClosed" | "of" | "iterate" | "empty" | "generate" | "concat"
+            ) {
                 for a in args {
                     self.expr(a)?;
                 }
@@ -5471,6 +5520,15 @@ impl Compiler {
             self.b
                 .emit(Op::CallBuiltin(crate::host::COLLECTOR, argc), line);
             return Ok(());
+        }
+        // `list.remove(Integer.valueOf(x))` — Java's `remove(Object)` overload,
+        // chosen by the BOXED argument, where `remove(0)` is `remove(int index)`.
+        if name == "remove"
+            && args.len() == 1
+            && matches!(&args[0], Expr::Method { recv: m, name: v, .. }
+                if v == "valueOf" && boxed_module(m).is_some_and(|b| b.starts_with("java.")))
+        {
+            return self.emit_smethod(recv, "remove$object", args, line);
         }
         // `a.equals(b)` is `Object.equals(Object)`: both sides are BOXED, and
         // boxes of different classes are unequal (`7L.equals(7)` is false, where
@@ -7727,6 +7785,10 @@ impl Compiler {
                 Some(t) => declared_narrow(t),
                 None => init.and_then(|e| self.narrow_of(e)),
             },
+            ty: match ty {
+                Some(t) => Some(normalize_type(t)),
+                None => init.and_then(|e| self.static_type_name(e)),
+            },
         }
     }
 
@@ -7867,6 +7929,30 @@ impl Compiler {
                 None if args.len() == 1 => self.widths.get(name).map_or(NumTy::Unknown, |w| w.elem),
                 None => NumTy::Unknown,
             },
+            // A block is its LAST expression, read with the block's own `val`s
+            // bound to their widths (`{ val y = x * 3; y.toLong }` is a `Long`).
+            Expr::Block(stmts) => {
+                let Some((last, init)) = stmts.split_last() else {
+                    return NumTy::Unknown;
+                };
+                let StmtKind::Expr(result) = &last.kind else {
+                    return NumTy::Unknown;
+                };
+                let mark = self.body_params.borrow().len();
+                for s in init {
+                    if let StmtKind::Local { name, ty, init, .. } = &s.kind {
+                        let w = match (ty, init) {
+                            (Some(t), _) => declared_width(t),
+                            (None, Some(e)) => self.num_ty(e),
+                            (None, None) => NumTy::Unknown,
+                        };
+                        self.body_params.borrow_mut().push((name.clone(), w));
+                    }
+                }
+                let w = self.num_ty(result);
+                self.body_params.borrow_mut().truncate(mark);
+                w
+            }
             _ => NumTy::Unknown,
         }
     }
@@ -7910,6 +7996,80 @@ impl Compiler {
         };
         let to = to.trim();
         if is_any_type(to) {
+            // A block widens through its last expression.
+            let ends_in_expr =
+                |s: &[Stmt]| matches!(s.last().map(|x| &x.kind), Some(StmtKind::Expr(_)));
+            let block_ending_in_expr = match e {
+                Expr::Block(s) if ends_in_expr(s) => Some(s),
+                _ => None,
+            };
+            if let Some(stmts) = block_ending_in_expr {
+                let (last, init) = stmts.split_last()?;
+                let StmtKind::Expr(result) = &last.kind else {
+                    return None;
+                };
+                let mark = self.body_params.borrow().len();
+                for s in init {
+                    if let StmtKind::Local { name, ty, init, .. } = &s.kind {
+                        let w = match (ty, init) {
+                            (Some(t), _) => declared_width(t),
+                            (None, Some(x)) => self.num_ty(x),
+                            (None, None) => NumTy::Unknown,
+                        };
+                        self.body_params.borrow_mut().push((name.clone(), w));
+                    }
+                }
+                let w = self.widened(result, to);
+                self.body_params.borrow_mut().truncate(mark);
+                let mut out = init.to_vec();
+                out.push(Stmt {
+                    line: last.line,
+                    kind: StmtKind::Expr(w?),
+                });
+                return Some(Expr::Block(out));
+            }
+            // A block ending in an `if` STATEMENT widens through both of its
+            // branches, which are blocks themselves.
+            if let Expr::Block(stmts) = e {
+                let (last, init) = stmts.split_last()?;
+                let StmtKind::If { cond, then, els } = &last.kind else {
+                    return None;
+                };
+                if els.is_empty() {
+                    return None;
+                }
+                let mark = self.body_params.borrow().len();
+                for s in init {
+                    if let StmtKind::Local { name, ty, init, .. } = &s.kind {
+                        let w = match (ty, init) {
+                            (Some(t), _) => declared_width(t),
+                            (None, Some(x)) => self.num_ty(x),
+                            (None, None) => NumTy::Unknown,
+                        };
+                        self.body_params.borrow_mut().push((name.clone(), w));
+                    }
+                }
+                let unblock = |b: Option<Expr>, orig: &Vec<Stmt>| match b {
+                    Some(Expr::Block(s)) => (s, true),
+                    _ => (orig.clone(), false),
+                };
+                let (t, tw) = unblock(self.widened(&Expr::Block(then.clone()), to), then);
+                let (f, fw) = unblock(self.widened(&Expr::Block(els.clone()), to), els);
+                self.body_params.borrow_mut().truncate(mark);
+                if !tw && !fw {
+                    return None;
+                }
+                let mut out = init.to_vec();
+                out.push(Stmt {
+                    line: last.line,
+                    kind: StmtKind::If {
+                        cond: cond.clone(),
+                        then: t,
+                        els: f,
+                    },
+                });
+                return Some(Expr::Block(out));
+            }
             // The expected type reaches into each branch of an `if`, so each keeps
             // its OWN box: `val v: Any = if (c) 1 else 2L` is an `Integer` or a
             // `Long`, never a harmonized one.
@@ -7930,6 +8090,48 @@ impl Compiler {
                 return None;
             }
             return self.any_box(e).map(|_| widen(e));
+        }
+        // `xs.map(x => body)` reaching `C[Any]`: the BODY is what is widened, so
+        // each element keeps the box of the branch that made it
+        // (`if (even) i else i.toLong` gives `Integer`s and `Long`s).
+        if let Expr::Method {
+            recv,
+            name,
+            args,
+            line,
+        } = e
+        {
+            if let (
+                [Expr::Lambda {
+                    params,
+                    body,
+                    partial: false,
+                }],
+                "map",
+            ) = (args.as_slice(), name.as_str())
+            {
+                if let ([p], Some((_, targs))) = (params.as_slice(), to.split_once('[')) {
+                    let one = split_type_args(targs.strip_suffix(']')?);
+                    if matches!(one.as_slice(), [t] if is_any_type(t)) {
+                        let pw = self.elem_ty(recv);
+                        self.body_params.borrow_mut().push((p.clone(), pw));
+                        let wb = self.widened(body, "Any");
+                        self.body_params.borrow_mut().pop();
+                        if let Some(wb) = wb {
+                            return Some(Expr::Method {
+                                recv: recv.clone(),
+                                name: name.clone(),
+                                args: vec![Expr::Lambda {
+                                    params: params.clone(),
+                                    body: Box::new(wb),
+                                    partial: false,
+                                }],
+                                line: *line,
+                            });
+                        }
+                    }
+                }
+            }
         }
         let Expr::Collection { ctor, elems } = e else {
             // A sequence that is not a literal, reaching `C[Any]`: its elements
@@ -9411,6 +9613,11 @@ struct Width {
     /// arithmetic. What still tells them apart is the boxed class a
     /// `java.util.Formatter` argument carries (see [`crate::host::IntBox`]).
     narrow: Option<crate::host::IntBox>,
+    /// The binding's static type as text (`List[Int]`), from its annotation or
+    /// else its initializer, where [`Compiler::static_type_name`] can name
+    /// one: what types a method call on it (`xs.headOption` is `Option[Int]`)
+    /// for type-argument inference.
+    ty: Option<String>,
 }
 
 impl Width {

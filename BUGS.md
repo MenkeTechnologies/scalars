@@ -1299,9 +1299,11 @@ reported as parse/compile errors, never silently mis-run.
   `Show[List[Int]]`, tuple types `(A, B)` included) and each `using` instance is
   resolved in turn, recursively. A type argument is read off an argument whose
   static type is nameable: a literal, a binding, a sequence literal of one
-  element type (`List(1, 2)` is `List[Int]`), a tuple literal, `Option(x)`. Not
-  from a method's result (`p(xs.headOption)` finds no `A`), which is the same
-  return-position limit as above.
+  element type (`List(1, 2)` is `List[Int]`), a tuple literal, `Option(x)`, and
+  a library method whose result follows from its receiver's type (`xs.head`,
+  `xs.headOption`/`lastOption`/`find`, `filter`/`take`/`sorted`/…, an
+  `Option`'s `get`/`getOrElse`) on a receiver of known type. Not a type
+  argument the parser drops (`List.empty[Int].headOption` finds no `A`).
 
   What follows from text-matching: no subtyping (a `given Animal` does not
   satisfy a `using Dog`, nor the reverse), no variance, no implicit priority
@@ -1376,10 +1378,12 @@ reported as parse/compile errors, never silently mis-run.
   and format argument checks read the box; printing, `==`, `##`, hashing and
   arithmetic read the number, and a typed pattern binds the number. A value
   whose box was never recorded — one that reached `Any` through a path the
-  compiler could not type, such as a `map` whose function body is a block or
-  an `if` with branches of different widths (Scala keeps each branch's own box
-  there) — still passes every integral type test. An `if` WIDENED to `Any`
-  directly (`val v: Any = if (c) 1 else 2L`) boxes each branch on its own. A box is an INLINE
+  compiler could not type, such as a `map` whose body calls a `def` with no
+  declared result — still passes every integral type test. An `if` WIDENED to
+  `Any` (`val v: Any = if (c) 1 else 2L`, or a block ending in one) boxes each
+  branch on its own, and so does a `map` reaching `C[Any]`: its function body
+  is widened, so `xs.map(i => if (even) i else i.toLong)` yields `Integer`s and
+  `Long`s, as Scala's per-branch boxing does. A box is an INLINE
   value (a `Value::Ref` whose payload variant names the box), not an arena
   entry, so it is freed with its last copy. Measured (debug build, instructions
   retired, peak RSS), against the build before boxes existed: a numeric loop
@@ -1413,9 +1417,16 @@ reported as parse/compile errors, never silently mis-run.
   `mapping`/`reducing` and a `toMap` merge function are modelled, as are a
   collected list's `lastIndexOf`/`subList`/`containsAll`, a collected map's
   `keySet`/`values`/`entrySet` (entries with `getKey`/`getValue`)/
-  `containsValue`/`forEach`, and `java.util.List.of`. Not modelled: the rest of
-  the `java.util` collection API, `LongSummaryStatistics`/
-  `DoubleSummaryStatistics`, and `Stream.generate`/`concat`. A stream's `toString` is the JVM identity form,
+  `containsValue`/`forEach`, and `java.util.List.of`. A collected `ArrayList`
+  or `HashMap` is mutable (`add`/`add(i, x)`/`set`/`remove(int)`/
+  `remove(Integer.valueOf(x))`/`addAll`/`sort`/`clear`; `put`/`remove`/
+  `merge`/`computeIfAbsent`/`putIfAbsent`/`clear`, re-laid-out in table
+  order), and an unmodifiable one (`List.of`, `Stream.toList`) answers those with
+  `UnsupportedOperationException`; a collected `HashSet`'s mutators are not
+  modelled. `Long`/`DoubleSummaryStatistics` and `Stream`/`IntStream`
+  `.generate`/`.concat` are modelled (`concat` drains both streams when it is
+  called, where the JDK defers that to the terminal op). Not modelled: the rest of
+  the `java.util` collection API. A stream's `toString` is the JVM identity form,
   which is not reproducible.
 - **Found by the second October 2026 differential round, still open.** These
   raise a catchable `java.lang.NullPointerException` where Scala runs, so a

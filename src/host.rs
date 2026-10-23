@@ -2397,6 +2397,7 @@ pub fn reset_heap() {
     LAZY_ZIPS.with(|t| t.borrow_mut().clear());
     JSTREAMS.with(|t| t.borrow_mut().clear());
     MATCH_DATA.with(|t| t.borrow_mut().clear());
+    JAVA_MUT.with(|t| t.borrow_mut().clear());
     JAVA_DECS.with(|t| t.borrow_mut().clear());
     CHAR_ARRAYS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
@@ -19928,8 +19929,9 @@ struct StreamState {
     ops: Vec<StreamOp>,
     /// What the stream carries after its pipeline.
     elem: SElem,
-    /// An unbounded `iterate(seed, f)` SOURCE, in place of the sequence's
-    /// elements.
+    /// An unbounded SOURCE in place of the sequence's elements:
+    /// `iterate(seed, f)` as `(seed, f)`, or `generate(supplier)` as
+    /// `(supplier, Undef)` — no `iterate` step function is ever `Undef`.
     iterate: Option<(Value, Value)>,
     /// Linked to a downstream stream or consumed by a terminal op.
     used: bool,
@@ -19981,6 +19983,11 @@ thread_local! {
     /// The `Match` values behind each `findAllIn` result, by heap id: what its
     /// `matchData` iterates.
     static MATCH_DATA: RefCell<HashMap<usize, Vec<Value>>> = RefCell::new(HashMap::new());
+    /// Whether each collected `java.util` List/Map (by heap id) is MUTABLE
+    /// (`Collectors.toList`/`toMap`/`groupingBy` build an `ArrayList`/`HashMap`)
+    /// or not (`List.of`, `Stream.toList`). A value absent here is one whose
+    /// mutators are not modelled (a `toSet` `HashSet`).
+    static JAVA_MUT: RefCell<HashMap<usize, bool>> = RefCell::new(HashMap::new());
     /// The heap ids of the `java.math.BigDecimal`s `BigDecimal.underlying`
     /// answered — the same number, under the Java class and its own members.
     static JAVA_DECS: RefCell<std::collections::HashSet<usize>> =
@@ -20064,6 +20071,17 @@ fn stream_run(
         seen: vec![Vec::new(); ops.len()],
         counts: vec![0; ops.len()],
     };
+    if let Some((supplier, Value::Undef)) = iterate {
+        loop {
+            if state.quota_met(ops) {
+                return Ok(());
+            }
+            let v = invoke_closure(vm, supplier, &[])?;
+            if !stream_push(vm, v, 0, ops, &mut state, sink)? {
+                return Ok(());
+            }
+        }
+    }
     if let Some((seed, f)) = iterate {
         let mut v = seed.clone();
         loop {
@@ -20304,7 +20322,9 @@ fn int_stream_method(
         ("count", 0) => Ok(Value::int(collect(vm)?.len() as i64)),
         ("toArray", 0) => Ok(new_seq(SeqKind::Array, collect(vm)?)),
         // `Stream.toList` (JDK 16) is an unmodifiable `java.util.List`.
-        ("toList", 0) if objects => Ok(new_seq(SeqKind::JavaList, collect(vm)?)),
+        ("toList", 0) if objects => {
+            Ok(java_marked(new_seq(SeqKind::JavaList, collect(vm)?), false))
+        }
         ("collect", 1) => {
             let Some((coll, params)) = as_collector(&args[0]) else {
                 return Err(format!("scalars: value collect is not a member of {class}"));
@@ -20360,18 +20380,36 @@ fn int_stream_method(
             }
             Ok(optional(JOpt::Obj, best))
         }
-        ("summaryStatistics", 0) if elem == SElem::Int => {
+        // `[count, sum, min, max, kind]`, the empty statistics' min/max the
+        // JDK's identities (`MAX_VALUE`/`MIN_VALUE`, or the infinities).
+        ("summaryStatistics", 0) if prim(elem).is_some() => {
             let all = collect(vm)?;
-            let xs: Vec<i64> = all.iter().map(Value::to_int).collect();
-            Ok(new_seq(
-                SeqKind::JavaStats,
+            let count = Value::int(all.len() as i64);
+            let items = if elem == SElem::Double {
+                let xs: Vec<f64> = all.iter().map(num_f64).collect();
                 vec![
-                    Value::int(xs.len() as i64),
-                    Value::int(xs.iter().sum()),
-                    Value::int(xs.iter().copied().min().unwrap_or(i64::from(i32::MAX))),
-                    Value::int(xs.iter().copied().max().unwrap_or(i64::from(i32::MIN))),
-                ],
-            ))
+                    count,
+                    Value::float(java_double_sum(&xs)),
+                    Value::float(xs.iter().copied().fold(f64::INFINITY, f64::min)),
+                    Value::float(xs.iter().copied().fold(f64::NEG_INFINITY, f64::max)),
+                    Value::str("Double"),
+                ]
+            } else {
+                let xs: Vec<i64> = all.iter().map(Value::to_int).collect();
+                let (lo, hi) = if elem == SElem::Long {
+                    (i64::MAX, i64::MIN)
+                } else {
+                    (i64::from(i32::MAX), i64::from(i32::MIN))
+                };
+                vec![
+                    count,
+                    Value::int(xs.iter().fold(0i64, |a, x| a.wrapping_add(*x))),
+                    Value::int(xs.iter().copied().min().unwrap_or(lo)),
+                    Value::int(xs.iter().copied().max().unwrap_or(hi)),
+                    Value::str(if elem == SElem::Long { "Long" } else { "Int" }),
+                ]
+            };
+            Ok(new_seq(SeqKind::JavaStats, items))
         }
         ("findFirst" | "findAny", 0) => {
             let mut first = None;
@@ -20449,6 +20487,20 @@ fn int_stream_method(
 
 /// The result of `collector` (with its `params`) over the collected `all`.
 fn apply_collector(
+    vm: &mut VM,
+    coll: Coll,
+    params: &[Value],
+    all: Vec<Value>,
+) -> Result<Value, String> {
+    let out = apply_collector_inner(vm, coll, params, all)?;
+    // An `ArrayList`/`HashMap` result is mutable.
+    Ok(match coll {
+        Coll::ToList | Coll::ToMap | Coll::GroupingBy => java_marked(out, true),
+        _ => out,
+    })
+}
+
+fn apply_collector_inner(
     vm: &mut VM,
     coll: Coll,
     params: &[Value],
@@ -20604,6 +20656,12 @@ fn java_list_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, String> {
+    if let Some(r) = java_list_mutate(vm, items, name, args) {
+        java_mutable(recv, name)?;
+        let (out, answer) = r?;
+        set_seq_items(recv, SeqKind::JavaList, out);
+        return Ok(answer);
+    }
     let position = |x: &Value| items.iter().position(|i| value_eq(i, x));
     match (name, args.len()) {
         ("size", 0) => Ok(Value::int(items.len() as i64)),
@@ -21652,6 +21710,15 @@ fn java_map_method(
             Some((kv.first()?.clone(), kv.get(1)?.clone()))
         })
         .collect();
+    if let Some(r) = java_map_mutate(vm, &pairs, name, args) {
+        java_mutable(recv, name)?;
+        let (out, answer) = r?;
+        // Re-laid-out in the table order the JDK would iterate.
+        let fresh = java_map_value(out);
+        let items = seq_kind_items(&fresh).map(|(_, xs)| xs).unwrap_or_default();
+        set_seq_items(recv, SeqKind::JavaMap, items);
+        return Ok(answer);
+    }
     let find = |k: &Value| {
         pairs
             .iter()
@@ -21699,19 +21766,52 @@ fn java_map_method(
 /// places, `max` — with `Integer.MAX_VALUE`/`MIN_VALUE` as an empty one's
 /// min/max.
 fn java_stats_string(items: &[Value]) -> String {
+    let kind = items.get(4).map(scala_str).unwrap_or_default();
+    let count = items.first().map_or(0, Value::to_int);
+    let f = |i: usize| items.get(i).map_or(0.0, num_f64);
+    let avg = java_stats_average(items);
+    if kind == "Double" {
+        return format!(
+            "DoubleSummaryStatistics{{count={count}, sum={}, min={}, average={}, max={}}}",
+            java_fixed6(f(1)),
+            java_fixed6(f(2)),
+            java_fixed6(avg),
+            java_fixed6(f(3))
+        );
+    }
     let n = |i: usize| items.get(i).map_or(0, Value::to_int);
-    let avg = if n(0) == 0 {
-        0.0
+    let class = if kind == "Long" {
+        "LongSummaryStatistics"
     } else {
-        n(1) as f64 / n(0) as f64
+        "IntSummaryStatistics"
     };
     format!(
-        "IntSummaryStatistics{{count={}, sum={}, min={}, average={avg:.6}, max={}}}",
-        n(0),
+        "{class}{{count={count}, sum={}, min={}, average={}, max={}}}",
         n(1),
         n(2),
+        java_fixed6(avg),
         n(3)
     )
+}
+
+/// A statistics' average: 0 when empty.
+fn java_stats_average(items: &[Value]) -> f64 {
+    let count = items.first().map_or(0, Value::to_int);
+    if count == 0 {
+        return 0.0;
+    }
+    items.get(1).map_or(0.0, num_f64) / count as f64
+}
+
+/// `String.format("%f", x)` — six places, and `Infinity`/`NaN` spelled out.
+fn java_fixed6(x: f64) -> String {
+    if x.is_nan() {
+        "NaN".to_string()
+    } else if x.is_infinite() {
+        if x > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+    } else {
+        format!("{x:.6}")
+    }
 }
 
 /// The `IntSummaryStatistics` getters.
@@ -21721,17 +21821,13 @@ fn java_stats_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, String> {
-    let n = |i: usize| items.get(i).map_or(0, Value::to_int);
+    let item = |i: usize| items.get(i).cloned().unwrap_or(Value::Undef);
     match (name, args.len()) {
-        ("getCount", 0) => Ok(Value::int(n(0))),
-        ("getSum", 0) => Ok(Value::int(n(1))),
-        ("getMin", 0) => Ok(Value::int(n(2))),
-        ("getMax", 0) => Ok(Value::int(n(3))),
-        ("getAverage", 0) => Ok(Value::float(if n(0) == 0 {
-            0.0
-        } else {
-            n(1) as f64 / n(0) as f64
-        })),
+        ("getCount", 0) => Ok(item(0)),
+        ("getSum", 0) => Ok(item(1)),
+        ("getMin", 0) => Ok(item(2)),
+        ("getMax", 0) => Ok(item(3)),
+        ("getAverage", 0) => Ok(Value::float(java_stats_average(items))),
         _ => Err(no_such_method(recv, name)),
     }
 }
@@ -21761,7 +21857,7 @@ fn b_stream_factory(vm: &mut VM, argc: u8) -> Value {
         (a..=end).map(Value::int).collect::<Vec<_>>()
     };
     if class == "JList" {
-        return new_seq(SeqKind::JavaList, args);
+        return java_marked(new_seq(SeqKind::JavaList, args), false);
     }
     match (member, args.len(), elem) {
         ("range", 2, SElem::Int | SElem::Long) => new_stream(range(false), elem, None),
@@ -21771,6 +21867,18 @@ fn b_stream_factory(vm: &mut VM, argc: u8) -> Value {
             elem,
             None,
         ),
+        ("generate", 1, _) => new_stream(Vec::new(), elem, Some((args[0].clone(), Value::Undef))),
+        // `concat(a, b)` — both streams drained, in order, into one.
+        ("concat", 2, _) => {
+            let mut all = Vec::new();
+            for s in &args {
+                match stream_drain(vm, s) {
+                    Ok(xs) => all.extend(xs),
+                    Err(e) => return fault(vm, e),
+                }
+            }
+            new_stream(all, elem, None)
+        }
         ("iterate", 2, _) => new_stream(
             Vec::new(),
             elem,
@@ -21781,5 +21889,187 @@ fn b_stream_factory(vm: &mut VM, argc: u8) -> Value {
             vm,
             format!("scalars: value {member} is not a member of java.util.stream.{class}"),
         ),
+    }
+}
+
+/// Record `v`'s `java.util` mutability (see [`JAVA_MUT`]) and answer it.
+fn java_marked(v: Value, mutable: bool) -> Value {
+    if let Some(id) = as_obj_id(&v) {
+        JAVA_MUT.with(|t| t.borrow_mut().insert(id, mutable));
+    }
+    v
+}
+
+/// Whether a mutator may run on the `java.util` value `recv`: `Ok` when it is
+/// mutable, the JDK's `UnsupportedOperationException` when it is an
+/// unmodifiable one, not a member when its mutators are not modelled.
+fn java_mutable(recv: &Value, name: &str) -> Result<(), String> {
+    match as_obj_id(recv).and_then(|id| JAVA_MUT.with(|t| t.borrow().get(&id).copied())) {
+        Some(true) => Ok(()),
+        Some(false) => Err("scalars: java.lang.UnsupportedOperationException".to_string()),
+        None => Err(no_such_method(recv, name)),
+    }
+}
+
+/// The `java.util.ArrayList` mutators, on a mutable collected list: the new
+/// contents and the call's answer. `None` when `name` is not one.
+fn java_list_mutate(
+    vm: &mut VM,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<(Vec<Value>, Value), String>> {
+    let mut out = items.to_vec();
+    let index = |i: i64, len: usize| -> Result<usize, String> {
+        usize::try_from(i).ok().filter(|k| *k < len).ok_or_else(|| {
+            format!("scalars: java.lang.IndexOutOfBoundsException: Index {i} out of bounds for length {len}")
+        })
+    };
+    Some((|| {
+        let answer = match (name, args.len()) {
+            ("add", 1) => {
+                out.push(args[0].clone());
+                Value::bool(true)
+            }
+            ("add", 2) => {
+                let i = args[0].to_int();
+                if i < 0 || i as usize > out.len() {
+                    return Err(format!(
+                        "scalars: java.lang.IndexOutOfBoundsException: Index: {i}, Size: {}",
+                        out.len()
+                    ));
+                }
+                out.insert(i as usize, args[1].clone());
+                unit_value()
+            }
+            ("set", 2) => {
+                let i = index(args[0].to_int(), out.len())?;
+                std::mem::replace(&mut out[i], args[1].clone())
+            }
+            // `remove(int)` removes at an index; `remove(Object)` (see the
+            // compiler's `remove$object`) the first equal element.
+            ("remove", 1) => {
+                let i = index(args[0].to_int(), out.len())?;
+                out.remove(i)
+            }
+            ("remove$object", 1) => match out.iter().position(|x| value_eq(x, &args[0])) {
+                Some(i) => {
+                    out.remove(i);
+                    Value::bool(true)
+                }
+                None => Value::bool(false),
+            },
+            ("addAll", 1) => {
+                let more = as_seq_or_tuple(&args[0]).unwrap_or_default();
+                let changed = !more.is_empty();
+                out.extend(more);
+                Value::bool(changed)
+            }
+            ("clear", 0) => {
+                out.clear();
+                unit_value()
+            }
+            // `sort(comparator)` — stable, by a `Comparator` (an `Ordering`) or
+            // a two-argument function; `null` is the natural order.
+            ("sort", 1) => {
+                let cmp = args[0].clone();
+                let mut err = None;
+                let mut keyed: Vec<Value> = out.clone();
+                let idx = merge_sort_idx(vm, keyed.len(), &mut |vm, i, j| {
+                    if matches!(cmp, Value::Undef) {
+                        return Ok(value_cmp(&keyed[i], &keyed[j]));
+                    }
+                    if as_ordering(&cmp).is_some() {
+                        return ordering_cmp(vm, &cmp, &keyed[i], &keyed[j]);
+                    }
+                    invoke_closure(vm, &cmp, &[keyed[i].clone(), keyed[j].clone()])
+                        .map(|v| v.to_int().cmp(&0))
+                });
+                match idx {
+                    Ok(idx) => {
+                        let sorted: Vec<Value> =
+                            idx.into_iter().map(|i| keyed[i].clone()).collect();
+                        keyed = sorted;
+                    }
+                    Err(e) => err = Some(e),
+                }
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                out = keyed;
+                unit_value()
+            }
+            _ => return Err(String::new()),
+        };
+        Ok((out, answer))
+    })())
+    .filter(|r| !matches!(r, Err(e) if e.is_empty()))
+}
+
+/// A map mutator's outcome: the new entries and the call's answer.
+type MapMutation = (Vec<(Value, Value)>, Value);
+
+/// The `java.util.HashMap` mutators, on a mutable collected map: the new
+/// entries and the call's answer (`put`/`remove` answer the old value or
+/// `null`). `None` when `name` is not one.
+fn java_map_mutate(
+    vm: &mut VM,
+    pairs: &[(Value, Value)],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<MapMutation, String>> {
+    let mut out = pairs.to_vec();
+    let at = |out: &[(Value, Value)], k: &Value| out.iter().position(|(ek, _)| value_eq(ek, k));
+    let result = (|| -> Result<Value, String> {
+        Ok(match (name, args.len()) {
+            ("put", 2) => match at(&out, &args[0]) {
+                Some(i) => std::mem::replace(&mut out[i].1, args[1].clone()),
+                None => {
+                    out.push((args[0].clone(), args[1].clone()));
+                    Value::Undef
+                }
+            },
+            ("putIfAbsent", 2) => match at(&out, &args[0]) {
+                Some(i) => out[i].1.clone(),
+                None => {
+                    out.push((args[0].clone(), args[1].clone()));
+                    Value::Undef
+                }
+            },
+            ("remove", 1) => match at(&out, &args[0]) {
+                Some(i) => out.remove(i).1,
+                None => Value::Undef,
+            },
+            ("merge", 3) => match at(&out, &args[0]) {
+                Some(i) => {
+                    let merged =
+                        invoke_closure(vm, &args[2], &[out[i].1.clone(), args[1].clone()])?;
+                    out[i].1 = merged.clone();
+                    merged
+                }
+                None => {
+                    out.push((args[0].clone(), args[1].clone()));
+                    args[1].clone()
+                }
+            },
+            ("computeIfAbsent", 2) => match at(&out, &args[0]) {
+                Some(i) => out[i].1.clone(),
+                None => {
+                    let v = invoke_closure(vm, &args[1], std::slice::from_ref(&args[0]))?;
+                    out.push((args[0].clone(), v.clone()));
+                    v
+                }
+            },
+            ("clear", 0) => {
+                out.clear();
+                unit_value()
+            }
+            _ => return Err(String::new()),
+        })
+    })();
+    match result {
+        Err(e) if e.is_empty() => None,
+        Err(e) => Some(Err(e)),
+        Ok(v) => Some(Ok((out, v))),
     }
 }
