@@ -588,7 +588,8 @@ Implemented and checked against the reference `scala`:
 - **Method dispatch** — postfix `.` on core values: `String` (`length`,
   `toUpperCase`/`toLowerCase`, `trim`, `strip`, `stripMargin`, `reverse`,
   `substring`, `charAt`, `contains`/`startsWith`/`endsWith`,
-  `toInt`/`toLong`/`toDouble`, …), `Int`/`Double` (`abs`, `min`/`max`, `round`,
+  `toInt`/`toLong`/`toDouble`, `toSeq` as a `WrappedString`, `chars`/`codePoints`
+  as a lazy `IntStream`, …), `Int`/`Double` (`abs`, `min`/`max`, `round`,
   `signum`, `compareTo`, `toDouble`/`toInt`, …), and `toString` on any value;
   chains left-to-right (`s.trim.length`). `Math.round` is the JDK algorithm, so
   `(-2.5).round` is `-2`; `min`/`max` propagate a NaN operand; and the implicit

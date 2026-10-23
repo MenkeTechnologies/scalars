@@ -3192,6 +3192,23 @@ impl Compiler {
     /// static type must not be converted, because a wrong conversion is a wrong
     /// VALUE rather than an error.
     fn converted(&self, e: &Expr, to: Option<&str>) -> Option<Expr> {
+        // Predef's `wrapString`: a `String` where a `Seq[Char]` is expected is
+        // the `WrappedString` view, so `val s: Seq[Char] = "hi"; s.map(f)`
+        // builds a `Vector` rather than a `String`.
+        let seq_like = to.map(base_type).is_some_and(|t| {
+            matches!(
+                t.rsplit('.').next().unwrap_or(""),
+                "Seq" | "IndexedSeq" | "Iterable" | "IterableOnce"
+            )
+        });
+        if seq_like && self.static_type_name(e).as_deref() == Some("String") {
+            return Some(Expr::Method {
+                recv: Box::new(e.clone()),
+                name: "toSeq".to_string(),
+                args: Vec::new(),
+                line: 0,
+            });
+        }
         if self.conversions.is_empty() {
             return None;
         }
@@ -5074,6 +5091,41 @@ impl Compiler {
         // method of the name, which would own the repeated parameter.
         if let Some((bulk, spread)) = self.library_spread(name, args) {
             return self.method(recv, bulk, &spread, line);
+        }
+        // `s.toList(1)` / `xs.reverse(0)` — a PARAMETERLESS library member
+        // followed by an argument list is that member's result APPLIED to it.
+        // Only the members that take no implicit clause either, since there the
+        // argument would be the implicit (`xs.sorted(ord)`).
+        const NILADIC_THEN_APPLY: &[&str] = &[
+            "toList",
+            "toSeq",
+            "toIndexedSeq",
+            "toVector",
+            "toBuffer",
+            "reverse",
+            "distinct",
+            "tail",
+            "init",
+        ];
+        // A capitalized bare name is a module (`Integer.reverse(1)` is the
+        // static), not a value.
+        let module = boxed_module(recv).is_some()
+            || matches!(recv, Expr::Var(n) if n.starts_with(|c: char| c.is_ascii_uppercase())
+                && !self.vals.contains_key(n));
+        if args.len() == 1
+            && NILADIC_THEN_APPLY.contains(&name)
+            && !module
+            && !self.method_index.contains_key(name)
+            && !self.extensions.iter().any(|(_, m, _)| m == name)
+            && !self.objects.values().any(|o| o.methods.contains(name))
+        {
+            let member = Expr::Method {
+                recv: Box::new(recv.clone()),
+                name: name.to_string(),
+                args: Vec::new(),
+                line,
+            };
+            return self.method(&member, "apply", args, line);
         }
         // `sys.error(msg)` is `throw new RuntimeException(msg)`.
         if args.len() == 1 && name == "error" && matches!(recv, Expr::Var(s) if s == "sys") {

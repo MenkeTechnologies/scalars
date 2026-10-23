@@ -1590,6 +1590,19 @@ enum SeqKind {
     /// the same element vector) but its `toString` is the CONTENTS, with no
     /// `StringBuilder(…)` wrapper.
     StrBuf,
+    /// `scala.collection.immutable.WrappedString` — what `"abc".toSeq` and
+    /// `toIndexedSeq` answer: an `IndexedSeq[Char]` that prints as the text
+    /// itself. A selecting op (`filter`, `reverse`, `take`) keeps the kind; an
+    /// op that may change the element type (`map`) builds an `IndexedSeq`,
+    /// which is a `Vector`.
+    WrappedStr,
+    /// A `java.util.stream.IntStream` (`"abc".chars`): its elements are the
+    /// stream's SOURCE, and its lazy pipeline lives in `INT_STREAMS`.
+    IntStream,
+    /// A `java.util.OptionalInt` (`false`) or `OptionalDouble` (`true`) — what
+    /// an `IntStream`'s `max`/`min`/`average`/`findFirst` answer: zero or one
+    /// element, printed `OptionalInt[3]` / `OptionalInt.empty`.
+    JavaOptional(bool),
     /// An integer `Range` as a first-class value. Its elements are materialized
     /// like any other sequence; the bounds are kept because `Range.toString`
     /// prints them (`Range 1 to 10 by 3`) rather than the elements.
@@ -1661,6 +1674,10 @@ impl SeqKind {
             SeqKind::ArrayDeque => "ArrayDeque",
             SeqKind::PriorityQueue => "PriorityQueue",
             SeqKind::StrBuf => "StringBuilder",
+            SeqKind::WrappedStr => "WrappedString",
+            SeqKind::IntStream => "IntStream",
+            SeqKind::JavaOptional(false) => "OptionalInt",
+            SeqKind::JavaOptional(true) => "OptionalDouble",
             SeqKind::Range { .. } => "Range",
             SeqKind::CharRange { .. } => "NumericRange",
         }
@@ -1685,7 +1702,7 @@ impl SeqKind {
                 "scalars: java.lang.ArrayIndexOutOfBoundsException: Index {i} out of bounds for length {len}"
             ),
             // `StringBuilder` forwards to `String.charAt`'s check.
-            SeqKind::StrBuf => format!(
+            SeqKind::StrBuf | SeqKind::WrappedStr => format!(
                 "scalars: java.lang.StringIndexOutOfBoundsException: Index {i} out of bounds for length {len}"
             ),
             // Linear sequences pass the raw index through.
@@ -1750,9 +1767,12 @@ impl SeqKind {
                 EmptyOp::Init => None,
                 _ => Some(format!("{} on empty queue", op.word())),
             },
-            SeqKind::List | SeqKind::Iterable | SeqKind::Iterator => {
-                Some(format!("{} of empty list", op.word()))
-            }
+            // `IntStream` rides along for exhaustiveness only: it has no `head`.
+            SeqKind::List
+            | SeqKind::Iterable
+            | SeqKind::Iterator
+            | SeqKind::IntStream
+            | SeqKind::JavaOptional(_) => Some(format!("{} of empty list", op.word())),
             // `NumericRange` reports an empty access through `Nil`, and both its
             // `head` and its `last` (so `min`/`max` too) are `Nil.head`.
             SeqKind::CharRange { .. } => Some(match op {
@@ -1787,7 +1807,7 @@ impl SeqKind {
                 }
             }
             // A `StringBuilder` is a `Seq[Char]` whose ops report `IndexedSeq`.
-            SeqKind::StrBuf => match op {
+            SeqKind::StrBuf | SeqKind::WrappedStr => match op {
                 EmptyOp::Head | EmptyOp::Last => Some(format!("{} of empty IndexedSeq", op.word())),
                 _ => None,
             },
@@ -2316,6 +2336,8 @@ pub fn reset_heap() {
     MAP_DEFAULTS.with(|t| t.borrow_mut().clear());
     LIST_ITERS.with(|t| t.borrow_mut().clear());
     LAZY_ZIPS.with(|t| t.borrow_mut().clear());
+    INT_STREAMS.with(|t| t.borrow_mut().clear());
+    CHAR_ARRAYS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -2987,11 +3009,14 @@ fn char_of_code(code: i64) -> char {
     char::from_u32(code as u32 & 0xFFFF).unwrap_or('\u{FFFD}')
 }
 
-/// The text of a non-empty `Array[Char]` — what `String.valueOf(char[])` and
-/// `new String(char[])` answer — or `None` for any other value.
+/// The text of an `Array[Char]` — what `String.valueOf(char[])` and
+/// `new String(char[])` answer — or `None` for any other value. An EMPTY array
+/// is a `char[]` only when it was built with that element type
+/// ([`CHAR_ARRAYS`]); nothing else about it can tell.
 fn char_array_text(v: &Value) -> Option<String> {
+    let typed = as_obj_id(v).is_some_and(|id| CHAR_ARRAYS.with(|t| t.borrow().contains(&id)));
     with_seq(v, |k, xs| {
-        (k == SeqKind::Array && !xs.is_empty())
+        (k == SeqKind::Array && (typed || !xs.is_empty()))
             .then(|| xs.iter().map(as_char).collect::<Option<String>>())
             .flatten()
     })
@@ -5513,8 +5538,12 @@ fn obj_to_string(v: &Value) -> String {
                 },
                 items,
             )) => char_range_to_string(*start, *end, *inclusive, *step, items.is_empty()),
+            Some(HeapVal::Seq(kind @ SeqKind::JavaOptional(_), items)) => match items.first() {
+                Some(v) => format!("{}[{}]", kind.label(), scala_str(v)),
+                None => format!("{}.empty", kind.label()),
+            },
             // `StringBuilder.toString` is the contents, not a rendered sequence.
-            Some(HeapVal::Seq(SeqKind::StrBuf, items)) => {
+            Some(HeapVal::Seq(SeqKind::StrBuf | SeqKind::WrappedStr, items)) => {
                 items.iter().map(scala_str).collect::<String>()
             }
             // `Iterator.toString` is a FIXED string in the standard library, not
@@ -7241,7 +7270,8 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         // matching Scala — a `Vector` does not match `case List(…)`.
         "Seq" | "Iterable" | "collection.Seq" => matches!(seq_kind(v), Some(k) if !k.is_set()),
         "List" => matches!(seq_kind(v), Some(SeqKind::List)),
-        "Vector" | "IndexedSeq" => matches!(seq_kind(v), Some(SeqKind::Vector)),
+        "Vector" => matches!(seq_kind(v), Some(SeqKind::Vector)),
+        "IndexedSeq" => matches!(seq_kind(v), Some(SeqKind::Vector | SeqKind::WrappedStr)),
         "Array" => matches!(seq_kind(v), Some(SeqKind::Array)),
         "Set" => matches!(seq_kind(v), Some(k) if k.is_set()),
         "Map" => is_map(v),
@@ -10019,6 +10049,12 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     // representation already costs. Measured on `v = v :+ i` 10 000 times:
     // 40.3G instructions retired with the clone, 21.4G without it.
     let (kind, items) = seq_kind_items(recv).unwrap_or((SeqKind::List, Vec::new()));
+    if kind == SeqKind::IntStream {
+        return int_stream_method(vm, recv, &items, name, args);
+    }
+    if let SeqKind::JavaOptional(double) = kind {
+        return java_optional_method(recv, double, items.first(), name, args);
+    }
     if kind == SeqKind::Iterator {
         if let Some(r) = iterator_partial_method(vm, recv, &items, name, args) {
             return r;
@@ -10054,6 +10090,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // supply, so `pq.map(f)` is an `ArrayBuffer` where the selecting
         // `pq.filter(p)` is still a `PriorityQueue`.
         SeqKind::StrBuf | SeqKind::PriorityQueue => new_seq(SeqKind::ArrayBuffer, v),
+        SeqKind::WrappedStr => new_seq(SeqKind::Vector, v),
         _ => derive_seq(kind, v),
     };
     // In-place mutation (`+=`, `clear()`, …) — before the pure paths, because
@@ -10596,7 +10633,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         }
         ("zip", 1) => {
             let other = iterable_arg_forced(vm, &args[0], Some(items.len()))?;
-            Ok(same(
+            Ok(mapped(
                 items
                     .iter()
                     .zip(other)
@@ -10609,7 +10646,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         ("zipAll", 3) => {
             let other = iterable_arg_forced(vm, &args[0], None)?;
             let n = items.len().max(other.len());
-            Ok(same(
+            Ok(mapped(
                 (0..n)
                     .map(|i| {
                         new_pair(
@@ -10651,7 +10688,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             Ok(acc)
         }
         ("indices", 0) => Ok(indices_range(items.len())),
-        ("zipWithIndex", 0) => Ok(same(
+        ("zipWithIndex", 0) => Ok(mapped(
             items
                 .iter()
                 .enumerate()
@@ -10849,9 +10886,11 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         // builder is `List`'s: `ListBuffer(1,2).toSeq` is `List(1, 2)`, not a
         // `ListBuffer`. An `Array`'s is `ArraySeq`, as above.
         ("toSeq", 0) => match kind {
-            SeqKind::List | SeqKind::Vector | SeqKind::ArraySeq | SeqKind::Range { .. } => {
-                Ok(recv.clone())
-            }
+            SeqKind::List
+            | SeqKind::Vector
+            | SeqKind::ArraySeq
+            | SeqKind::Range { .. }
+            | SeqKind::WrappedStr => Ok(recv.clone()),
             SeqKind::Array => Ok(new_seq(SeqKind::ArraySeq, items)),
             _ => Ok(new_list(items)),
         },
@@ -12329,14 +12368,25 @@ fn b_ord_reg(vm: &mut VM, _argc: u8) -> Value {
     Value::Undef
 }
 
-/// The comparison a program-declared implicit `Ordering[C]` gives two instances
-/// of `C`. `None` when `a` is not a record of a class with one registered, or
-/// while that ordering is itself running.
+/// The comparison a program-declared implicit `Ordering[C]` gives two values of
+/// `C` — a user class, or a library type (`implicit val ord: Ordering[String]`
+/// orders every `String` comparison the implicit ordering decides, a tuple's
+/// `String` components included, as Scala's `Ordering.Tuple2` takes it).
+/// `None` when no ordering is registered for `a`'s type, or while that
+/// ordering is itself running.
 fn declared_ordering_cmp(vm: &mut VM, a: &Value, b: &Value) -> Option<Result<Ordering, String>> {
     if IN_ORDERING.with(|f| f.get()) || ORDERINGS.with(|t| t.borrow().is_empty()) {
         return None;
     }
-    let class = with_obj(a, |o| o.class.to_string())?;
+    let class = match a {
+        Value::Str(_) => "String".to_string(),
+        Value::Int(_) => "Int".to_string(),
+        Value::Float(_) => "Double".to_string(),
+        Value::Status(_) => "Float".to_string(),
+        Value::Bool(_) => "Boolean".to_string(),
+        _ if as_char(a).is_some() => "Char".to_string(),
+        _ => with_obj(a, |o| o.class.to_string())?,
+    };
     let ord = ORDERINGS.with(|t| t.borrow().get(&class).cloned())?;
     IN_ORDERING.with(|f| f.set(true));
     let r = if as_ordering(&ord).is_some() {
@@ -12762,12 +12812,20 @@ fn b_array_fill(vm: &mut VM, _argc: u8) -> Value {
         );
     }
     let zero = match ty.as_str() {
-        "Int" | "Long" | "Short" | "Byte" | "Char" => Value::int(0),
+        // `Char`'s zero is `'\u0000'`, a `Char` — not the `Int` 0.
+        "Char" => make_char('\0'),
+        "Int" | "Long" | "Short" | "Byte" => Value::int(0),
         "Double" | "Float" => Value::float(0.0),
         "Boolean" => Value::bool(false),
         _ => Value::Undef,
     };
-    new_seq(SeqKind::Array, vec![zero; n as usize])
+    let out = new_seq(SeqKind::Array, vec![zero; n as usize]);
+    if ty == "Char" {
+        if let Some(id) = as_obj_id(&out) {
+            CHAR_ARRAYS.with(|t| t.borrow_mut().insert(id));
+        }
+    }
+    out
 }
 
 /// `xs.indices` — `Range 0 until xs.length`, a real `Range` value (it prints
@@ -15058,7 +15116,10 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // answers every `Seq` operation through `StringOps`. The string is
         // exactly that view here.
         // `toIterable` is the same view under its `Iterable` name.
-        ("toSeq" | "toIterable", 0) => Ok(Value::str(s)),
+        ("toSeq" | "toIterable", 0) => Ok(new_seq(
+            SeqKind::WrappedStr,
+            s.chars().map(make_char).collect(),
+        )),
         ("reverse", 0) => Ok(Value::str(s.chars().rev().collect::<String>())),
         // `StringOps.toInt` IS `Integer.parseInt`, and the JDK's integer parses
         // do not trim: `" 42".toInt` throws where `" 42".trim.toInt` answers 42,
@@ -15396,7 +15457,17 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ))),
         // `StringOps.toIndexedSeq` is a `WrappedString`, which renders as the
         // string itself rather than as a sequence of `Char`s.
-        ("toIndexedSeq", 0) => Ok(Value::str(s)),
+        // `String.chars` is the UTF-16 code units, `codePoints` the code points.
+        ("chars", 0) => Ok(new_int_stream(
+            s.encode_utf16().map(|u| Value::int(i64::from(u))).collect(),
+        )),
+        ("codePoints", 0) => Ok(new_int_stream(
+            s.chars().map(|c| Value::int(i64::from(c as u32))).collect(),
+        )),
+        ("toIndexedSeq", 0) => Ok(new_seq(
+            SeqKind::WrappedStr,
+            s.chars().map(make_char).collect(),
+        )),
         ("toCharArray", 0) => Ok(new_seq(SeqKind::Array, s.chars().map(make_char).collect())),
         ("indices", 0) => Ok(indices_range(s.chars().count())),
         // `StringOps.zipWithIndex` answers an `IndexedSeq`, printed `Vector(…)`.
@@ -16977,7 +17048,11 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
             // A `Range` renders from its bounds and a `StringBuilder` from its
             // characters; neither can hold a record.
             Some(HeapVal::Seq(
-                SeqKind::Range { .. } | SeqKind::CharRange { .. } | SeqKind::StrBuf,
+                SeqKind::Range { .. }
+                | SeqKind::CharRange { .. }
+                | SeqKind::StrBuf
+                | SeqKind::WrappedStr
+                | SeqKind::JavaOptional(_),
                 _,
             )) => Renderable::Leaf,
             Some(HeapVal::Seq(kind, items)) => Renderable::Seq(kind.label(), items.clone()),
@@ -19461,5 +19536,269 @@ fn stream_evaluate_head(l: &mut LazyList) {
             None => l.done = true,
         },
         _ => {}
+    }
+}
+
+// ── `java.util.stream.IntStream` ─────────────────────────────────────────────
+//
+// What `String.chars` and `codePoints` answer. A stream is a SOURCE (the
+// `IntStream`-kind sequence's elements) and a PIPELINE of intermediate ops kept
+// beside it in [`INT_STREAMS`]; nothing runs until a terminal op, and then each
+// element travels the whole pipeline before the next is pulled — so a `map`
+// with a side effect interleaves with a later `filter`'s exactly as the JDK's
+// does, and `limit`/`anyMatch` stop pulling the source early.
+
+/// One intermediate op of an [`IntStream`](SeqKind::IntStream) pipeline.
+#[derive(Clone)]
+enum StreamOp {
+    Map(Value),
+    Filter(Value),
+    Distinct,
+    /// A stateful BARRIER: everything before it runs to completion first.
+    Sorted,
+    Limit(usize),
+    Skip(usize),
+}
+
+thread_local! {
+    /// The pipeline of each live `IntStream` value, by heap id.
+    static INT_STREAMS: RefCell<HashMap<usize, Vec<StreamOp>>> = RefCell::new(HashMap::new());
+    /// The heap ids of the arrays built as `Array[Char]` (`new Array[Char](n)`,
+    /// `Array[Char]()`, `Array.empty[Char]`), which is what tells an EMPTY one
+    /// from any other empty array.
+    static CHAR_ARRAYS: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// A new `IntStream` over `src` with no pipeline.
+fn new_int_stream(src: Vec<Value>) -> Value {
+    new_seq(SeqKind::IntStream, src)
+}
+
+/// `stream` with `op` appended to its pipeline, as a NEW stream value.
+fn int_stream_then(stream: &Value, src: &[Value], op: StreamOp) -> Value {
+    let mut ops = as_obj_id(stream)
+        .and_then(|id| INT_STREAMS.with(|t| t.borrow().get(&id).cloned()))
+        .unwrap_or_default();
+    ops.push(op);
+    let out = new_int_stream(src.to_vec());
+    if let Some(id) = as_obj_id(&out) {
+        INT_STREAMS.with(|t| t.borrow_mut().insert(id, ops));
+    }
+    out
+}
+
+/// Run the pipeline of `ops` over `src`, handing each surviving element to
+/// `sink`, which answers `false` to stop pulling (a short-circuiting terminal).
+fn int_stream_run(
+    vm: &mut VM,
+    src: &[Value],
+    ops: &[StreamOp],
+    sink: &mut dyn FnMut(&mut VM, Value) -> Result<bool, String>,
+) -> Result<(), String> {
+    // The ops after the LAST barrier stream element-wise into `sink`; the ones
+    // before it are run to completion first, which is what a barrier means.
+    if let Some(cut) = ops.iter().rposition(|o| matches!(o, StreamOp::Sorted)) {
+        let mut buffered = Vec::new();
+        int_stream_run(vm, src, &ops[..cut], &mut |_, v| {
+            buffered.push(v);
+            Ok(true)
+        })?;
+        buffered.sort_by_key(Value::to_int);
+        return int_stream_run(vm, &buffered, &ops[cut + 1..], sink);
+    }
+    let mut seen: Vec<std::collections::HashSet<i64>> =
+        vec![std::collections::HashSet::new(); ops.len()];
+    let mut counts: Vec<usize> = vec![0; ops.len()];
+    'pull: for x in src {
+        // A `limit` that has passed its quota CANCELS the pull: the next source
+        // element is never read, so an upstream `map` never sees it.
+        let quota_met = ops
+            .iter()
+            .zip(&counts)
+            .any(|(o, c)| matches!(o, StreamOp::Limit(n) if c >= n));
+        if quota_met {
+            break;
+        }
+        let mut v = x.clone();
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                StreamOp::Map(f) => {
+                    v = Value::int(i64::from(invoke_closure(vm, f, &[v])?.to_int() as i32))
+                }
+                StreamOp::Filter(p) => {
+                    if !truthy(&invoke_closure(vm, p, std::slice::from_ref(&v))?) {
+                        continue 'pull;
+                    }
+                }
+                StreamOp::Distinct => {
+                    if !seen[i].insert(v.to_int()) {
+                        continue 'pull;
+                    }
+                }
+                StreamOp::Limit(n) => {
+                    if counts[i] >= *n {
+                        break 'pull;
+                    }
+                    counts[i] += 1;
+                }
+                StreamOp::Skip(n) => {
+                    if counts[i] < *n {
+                        counts[i] += 1;
+                        continue 'pull;
+                    }
+                }
+                StreamOp::Sorted => unreachable!("barriers are split off above"),
+            }
+        }
+        if !sink(vm, v)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The `IntStream` members. Anything else is not a member — an `IntStream` is
+/// not a Scala collection, so none of `Seq`'s methods apply to it.
+fn int_stream_method(
+    vm: &mut VM,
+    recv: &Value,
+    src: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    let ops = as_obj_id(recv)
+        .and_then(|id| INT_STREAMS.with(|t| t.borrow().get(&id).cloned()))
+        .unwrap_or_default();
+    let then = |op| Ok(int_stream_then(recv, src, op));
+    let count_of = |a: &Value| usize::try_from(a.to_int()).unwrap_or(0);
+    let collect = |vm: &mut VM| -> Result<Vec<Value>, String> {
+        let mut out = Vec::new();
+        int_stream_run(vm, src, &ops, &mut |_, v| {
+            out.push(v);
+            Ok(true)
+        })?;
+        Ok(out)
+    };
+    match (name, args.len()) {
+        ("map", 1) => then(StreamOp::Map(args[0].clone())),
+        ("filter", 1) => then(StreamOp::Filter(args[0].clone())),
+        ("distinct", 0) => then(StreamOp::Distinct),
+        ("sorted", 0) => then(StreamOp::Sorted),
+        ("limit", 1) => then(StreamOp::Limit(count_of(&args[0]))),
+        ("skip", 1) => then(StreamOp::Skip(count_of(&args[0]))),
+        // `sum` is `int` addition, wrapping at 32 bits.
+        ("sum", 0) => Ok(Value::int(i64::from(
+            collect(vm)?
+                .iter()
+                .fold(0i32, |acc, v| acc.wrapping_add(v.to_int() as i32)),
+        ))),
+        // A pipeline that keeps the size KNOWN (`map`, `sorted`, and on JDK 21
+        // `skip`/`limit` too) is not run at all: the JDK answers `count` off the
+        // source's size, so a `map`'s side effect never happens.
+        ("count", 0)
+            if ops.iter().all(|o| {
+                matches!(
+                    o,
+                    StreamOp::Map(_) | StreamOp::Sorted | StreamOp::Skip(_) | StreamOp::Limit(_)
+                )
+            }) =>
+        {
+            let size = ops.iter().fold(src.len(), |n, o| match o {
+                StreamOp::Skip(k) => n.saturating_sub(*k),
+                StreamOp::Limit(k) => n.min(*k),
+                _ => n,
+            });
+            Ok(Value::int(size as i64))
+        }
+        ("count", 0) => Ok(Value::int(collect(vm)?.len() as i64)),
+        ("toArray", 0) => Ok(new_seq(SeqKind::Array, collect(vm)?)),
+        ("max" | "min" | "findFirst" | "findAny", 0) => {
+            let all = collect(vm)?;
+            let pick = match name {
+                "max" => all.iter().max_by_key(|v| v.to_int()),
+                "min" => all.iter().min_by_key(|v| v.to_int()),
+                _ => all.first(),
+            };
+            Ok(new_seq(
+                SeqKind::JavaOptional(false),
+                pick.cloned().into_iter().collect(),
+            ))
+        }
+        ("average", 0) => {
+            let all = collect(vm)?;
+            let avg = (!all.is_empty()).then(|| {
+                let sum: i64 = all.iter().map(Value::to_int).sum();
+                Value::float(sum as f64 / all.len() as f64)
+            });
+            Ok(new_seq(
+                SeqKind::JavaOptional(true),
+                avg.into_iter().collect(),
+            ))
+        }
+        ("forEach", 1) => {
+            let f = args[0].clone();
+            int_stream_run(vm, src, &ops, &mut |vm, v| {
+                invoke_closure(vm, &f, &[v]).map(|_| true)
+            })?;
+            Ok(unit_value())
+        }
+        ("anyMatch" | "allMatch" | "noneMatch", 1) => {
+            let p = args[0].clone();
+            // The answer when no element decides it: `anyMatch` of nothing is
+            // false, the other two true.
+            let mut answer = name != "anyMatch";
+            int_stream_run(vm, src, &ops, &mut |vm, v| {
+                let hit = truthy(&invoke_closure(vm, &p, &[v])?);
+                let decided = match name {
+                    "anyMatch" => hit,
+                    "allMatch" => !hit,
+                    _ => hit,
+                };
+                if decided {
+                    answer = name == "anyMatch";
+                }
+                Ok(!decided)
+            })?;
+            Ok(Value::bool(answer))
+        }
+        ("reduce", 2) => {
+            let f = args[1].clone();
+            let mut acc = args[0].clone();
+            int_stream_run(vm, src, &ops, &mut |vm, v| {
+                acc = Value::int(i64::from(
+                    invoke_closure(vm, &f, &[acc.clone(), v])?.to_int() as i32,
+                ));
+                Ok(true)
+            })?;
+            Ok(acc)
+        }
+        _ => Err(format!(
+            "scalars: value {name} is not a member of java.util.stream.IntStream"
+        )),
+    }
+}
+
+/// The `java.util.OptionalInt`/`OptionalDouble` members (see
+/// [`SeqKind::JavaOptional`]). An empty one's `getAsInt` is the JDK's
+/// `NoSuchElementException: No value present`.
+fn java_optional_method(
+    recv: &Value,
+    double: bool,
+    value: Option<&Value>,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    let get = if double { "getAsDouble" } else { "getAsInt" };
+    match (name, args.len(), value) {
+        (n, 0, Some(v)) if n == get || n == "orElseThrow" => Ok(v.clone()),
+        (n, 0, None) if n == get || n == "orElseThrow" => {
+            Err("scalars: java.util.NoSuchElementException: No value present".to_string())
+        }
+        ("isPresent", 0, _) => Ok(Value::bool(value.is_some())),
+        ("isEmpty", 0, _) => Ok(Value::bool(value.is_none())),
+        ("orElse", 1, Some(v)) => Ok(v.clone()),
+        ("orElse", 1, None) => Ok(args[0].clone()),
+        _ => Err(no_such_method(recv, name)),
     }
 }

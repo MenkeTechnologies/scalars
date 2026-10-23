@@ -3633,6 +3633,21 @@ impl Parser {
                 };
                 continue;
             }
+            // `Array.empty[T]` — `new Array[T](0)`, keeping the element type.
+            if matches!(&e, Expr::Var(v) if v == "Array")
+                && name == "empty"
+                && self.is(&Tok::LBracket)
+            {
+                self.advance();
+                let ty = self.type_ref()?;
+                self.eat(&Tok::RBracket)?;
+                e = Expr::Call {
+                    name: NEW_ARRAY.to_string(),
+                    args: vec![Expr::Int(0), Expr::Str(ty)],
+                    line,
+                };
+                continue;
+            }
             // `Array.ofDim[T](d1, d2, …)` — the element type decides the fill
             // value (`0`, `0.0`, `null`, …), so it is captured like
             // `new Array[T](n)`'s.
@@ -4199,6 +4214,25 @@ impl Parser {
                         args: vec![Expr::Str(ty)],
                         line,
                     });
+                }
+                // `Array[T]()` — an EMPTY array, whose element type is the only thing
+                // that says what it is (`String.valueOf(Array[Char]())` is `""`). It
+                // is `new Array[T](0)`, which keeps the type.
+                if name == "Array" && self.is(&Tok::LBracket) {
+                    let save = self.pos;
+                    self.advance();
+                    let ty = self.type_ref()?;
+                    self.eat(&Tok::RBracket)?;
+                    if self.is(&Tok::LParen) && matches!(self.peek_at(1), Tok::RParen) {
+                        self.advance();
+                        self.advance();
+                        return self.postfix_from(Expr::Call {
+                            name: NEW_ARRAY.to_string(),
+                            args: vec![Expr::Int(0), Expr::Str(ty)],
+                            line,
+                        });
+                    }
+                    self.pos = save;
                 }
                 // Optional generic type arguments (`List[Int](…)`, `foo[T](…)`).
                 if self.is(&Tok::LBracket) {

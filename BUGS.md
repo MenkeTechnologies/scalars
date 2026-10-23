@@ -57,7 +57,10 @@ reported as parse/compile errors, never silently mis-run.
   `implicit val o: Ordering[C] = Ordering.by(…)`, `given Ordering[C] = …` and
   `given Ordering[C] with { def compare … }` make `sorted`, `max`, `min`,
   `maxBy`/`minBy` over `C` itself and a `PriorityQueue[C]` order by it, as
-  Scala's implicit search would. The ordering is found by the RUNTIME class of
+  Scala's implicit search would. `C` may be a library type too: an
+  `implicit val ord: Ordering[String]` orders every `String` comparison an
+  implicit ordering decides, including the `String` components of a sorted
+  tuple (Scala's `Ordering.Tuple2` takes it). The ordering is found by the RUNTIME class of
   the elements being compared, not by static type, so two different `Ordering[C]`
   values in different scopes collapse to the last one registered. An ordering
   whose body compares two instances of `C` again (`Ordering.by(identity)`) falls
@@ -1242,8 +1245,8 @@ reported as parse/compile errors, never silently mis-run.
   namespace, and the many `String`/numeric methods beyond the wired subset
   above. Members a differential sweep reached and found missing (each an
   honest `not a member` error, never a wrong answer): `prefixLength` on a
-  sequence instance, `Ordering.Tuple2(o1, o2)`, and the JDK `String` members
-  `lines`/`chars`. `Map.foreachEntry`, `Map.applyOrElse`, `Map.updatedWith`
+  sequence instance, `Ordering.Tuple2(o1, o2)`, and the JDK `String` member
+  `lines`. `Map.foreachEntry`, `Map.applyOrElse`, `Map.updatedWith`
   (`updateWith` on the mutable one), `Map --`/`removedAll`, `sizeIs`/`lengthIs`,
   an instance's `empty` and `toBooleanOption` were found the same way and are
   now modelled.
@@ -1344,19 +1347,23 @@ reported as parse/compile errors, never silently mis-run.
   not a member of Null`), the composite `Ordering.Tuple2(o1, o2)` instance, and
   SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
   Double) => …` then `s.show(x)`).
-- **Found by the October 2026 differential round, still open:** `String.chars`
-  and `codePoints` (an `IntStream`). The implicit-class receivers that round
-  found (a tuple, a type parameter) and the deprecated `(xs, ys).zipped` are now
-  modelled.
 - **Found by the third October 2026 differential round, still open.** A boxed
   integral type is not kept at run time: `Int`, `Long`, `Short` and `Byte`
   values are one representation, so `(7L: Any) match { case i: Int => … }`
   takes the `Int` arm and `(Long.MaxValue: Any).isInstanceOf[Int]` is `true`,
-  where Scala tests the box (`java.lang.Long`). A tuple's component ordering
-  ignores a program-declared `implicit Ordering[String]` — `List((2, "b"), (2,
-  "a")).sorted` under a length ordering answers `(2,a), (2,b)` where Scala's
-  `Ordering.Tuple2(Ordering.Int, ord)` keeps `(2,b), (2,a)`. `"hey".toSeq.map(f)`
-  answers a `String` where the `WrappedString` result is a `Vector(H, E, Y)`.
+  where Scala tests the box (`java.lang.Long`). Telling them apart needs the
+  static type carried into the value wherever one is widened to `Any`, which
+  the `i64` value model does not have.
+- **`String.chars`/`codePoints` are a lazy `IntStream` of the members a
+  program reaches for** — `map`/`filter`/`distinct`/`sorted`/`skip`/`limit`,
+  and `sum`/`count`/`toArray`/`forEach`/`anyMatch`/`allMatch`/`noneMatch`/
+  `reduce(identity, op)`, with `max`/`min`/`findFirst`/`findAny`/`average` as
+  `OptionalInt`/`OptionalDouble`. Each element runs the whole pipeline before
+  the next is pulled, `limit` stops the pull, and a size-preserving pipeline
+  answers `count` without running, as on JDK 21. Not modelled: `boxed`,
+  `mapToObj`, `reduce(op)`, `collect`, `summaryStatistics`, and the
+  `IllegalStateException` of reusing a consumed stream; an `IntStream`'s
+  `toString` is the JVM identity form, which is not reproducible.
 - **Found by the second October 2026 differential round, still open.** These
   raise a catchable `java.lang.NullPointerException` where Scala runs, so a
   `catch` that matches it would hide the gap: `getClass` on a `case object`
@@ -1378,9 +1385,11 @@ reported as parse/compile errors, never silently mis-run.
   `java.lang.NullPointerException`, but `getMessage` answers `null` where the
   JDK's helpful message (`Cannot invoke "String.length()" because "<local1>" is
   null`) names bytecode slots and accessors this frontend does not have.
-- **`String.valueOf` of an EMPTY `Array[Char]`** renders `Array()`: with no
-  element there is nothing to tell it from any other empty array, so the
-  `char[]` overload (which answers `""`) is chosen only for a non-empty one.
+- **`String.valueOf` of an EMPTY `Array[Char]`** answers `""` when the array was
+  BUILT as one (`Array[Char]()`, `Array.empty[Char]`, `new Array[Char](0)`,
+  `Array.ofDim[Char](0)`). An empty array reached any other way (`Array('a')
+  .filter(_ => false)`) has no element to tell it from any other empty array and
+  still renders `Array()`.
 - **`math.sin` and `math.cos` round as the platform libm does, not as the
   JVM.** On JDK 21 aarch64 they are HotSpot intrinsics that disagree with
   `StrictMath` on about 7% of inputs (measured: 14,323 of 200,000), and on
@@ -1504,10 +1513,11 @@ reported as parse/compile errors, never silently mis-run.
   slot; under `extends App` the binding is a program global and always worked.
   A position the boxing scan still cannot see is refused with that message
   rather than losing the write.
-- **`"abc".toSeq` is the string itself.** Scala's is a `WrappedString` view,
-  which prints as `abc` and answers every `Seq` operation through `StringOps`;
-  the string stands in for it. Observably identical except for an equality
-  against a `String`, which Scala answers `false` and this answers `true`.
+- **`"abc".toSeq` is a `WrappedString`** (as are `toIndexedSeq` and a `String`
+  passed where a `Seq[Char]` is declared): it prints as `abc`, a selecting op
+  (`filter`, `reverse`, `take`) keeps it a `WrappedString`, and `map`/`zip`/
+  `zipWithIndex` build a `Vector`. Comparing one with `==` against a `String`
+  is a compile error in Scala 3.
 - **A subclass constructor parameter that renames a superclass field.** Our
   parser makes every constructor parameter a field, so in `class D(n: String)
   extends A(f(n))` the superclass argument is stored under `A`'s parameter name
