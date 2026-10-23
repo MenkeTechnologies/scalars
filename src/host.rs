@@ -10103,6 +10103,15 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             return r;
         }
     }
+    // The `…InPlace` transformers of a mutable collection: the result is the
+    // receiver itself, its contents replaced. `mapInPlace` is also an `Array`
+    // member; the rest are a buffer's (and `filterInPlace` a mutable `Set`'s).
+    if kind.is_mutable() {
+        if let Some(out) = in_place_contents(vm, kind, &items, name, args)? {
+            set_seq_items(recv, kind, out);
+            return Ok(recv.clone());
+        }
+    }
     if kind.is_mutable() {
         // What a `StringBuilder` addition contributes is the argument's
         // `String.valueOf`, so an appended instance renders through its
@@ -11461,6 +11470,21 @@ fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
         if let Some(r) = mut_map_method(recv, rep, &entries, name, args) {
             return r;
         }
+        // `filterInPlace((k, v) => …)` / `mapValuesInPlace((k, v) => …)`: the
+        // receiver itself, its entries replaced.
+        if args.len() == 1 && matches!(name, "filterInPlace" | "mapValuesInPlace") {
+            let mut kept = Vec::with_capacity(entries.len());
+            for (k, v) in &entries {
+                let r = invoke_closure(vm, &args[0], &[k.clone(), v.clone()])?;
+                match name {
+                    "filterInPlace" if truthy(&r) => kept.push((k.clone(), v.clone())),
+                    "filterInPlace" => {}
+                    _ => kept.push((k.clone(), r)),
+                }
+            }
+            set_map_entries(recv, rep, kept);
+            return Ok(recv.clone());
+        }
     }
     match (name, args.len()) {
         // `Iterable.toIterable` is `this`: a `Map` stays a `Map`.
@@ -11847,6 +11871,14 @@ fn map_read_method(
         )),
         ("values", 0) => Ok(new_seq(
             SeqKind::Iterable,
+            entries.iter().map(|(_, v)| v.clone()).collect(),
+        )),
+        ("keysIterator", 0) => Ok(new_seq(
+            SeqKind::Iterator,
+            entries.iter().map(|(k, _)| k.clone()).collect(),
+        )),
+        ("valuesIterator", 0) => Ok(new_seq(
+            SeqKind::Iterator,
             entries.iter().map(|(_, v)| v.clone()).collect(),
         )),
         _ => Err(no_such_method(recv, name)),
@@ -15121,6 +15153,24 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             s.chars().map(make_char).collect(),
         )),
         ("reverse", 0) => Ok(Value::str(s.chars().rev().collect::<String>())),
+        // `tails`/`inits` iterate the suffixes / prefixes, longest first and
+        // ending with `""`; `reverseIterator` the characters backwards.
+        ("tails" | "inits", 0) => {
+            let cs: Vec<char> = s.chars().collect();
+            let parts = (0..=cs.len()).map(|i| {
+                let piece: String = if name == "tails" {
+                    cs[i..].iter().collect()
+                } else {
+                    cs[..cs.len() - i].iter().collect()
+                };
+                Value::str(piece)
+            });
+            Ok(new_seq(SeqKind::Iterator, parts.collect()))
+        }
+        ("reverseIterator", 0) => Ok(new_seq(
+            SeqKind::Iterator,
+            s.chars().rev().map(make_char).collect(),
+        )),
         // `StringOps.toInt` IS `Integer.parseInt`, and the JDK's integer parses
         // do not trim: `" 42".toInt` throws where `" 42".trim.toInt` answers 42,
         // and `"2147483648".toInt` is out of an `Int`'s range even though every
@@ -16063,7 +16113,7 @@ fn string_fn_method(
     // (`"abc".collect { … => c.toInt }` is `Vector(97, 99)`). The rest keep the
     // sequence they build even though their elements ARE `Char`s — `toVector`,
     // `zip` and `scanLeft` are `Vector`s, not `String`s.
-    const ALWAYS_STRING: &[&str] = &["sortWith", "sortBy"];
+    const ALWAYS_STRING: &[&str] = &["sortWith", "sortBy", "distinctBy"];
     const REBUILDS_STRING: &[&str] = &["collect"];
     const PASSES_THROUGH: &[&str] = &[
         "foldLeft",
@@ -16087,6 +16137,10 @@ fn string_fn_method(
         "segmentLength",
         "corresponds",
         "aggregate",
+        "indexOfSlice",
+        "lastIndexOfSlice",
+        "containsSlice",
+        "sameElements",
     ];
     if ALWAYS_STRING.contains(&name)
         || REBUILDS_STRING.contains(&name)
@@ -16103,7 +16157,11 @@ fn string_fn_method(
         // call then matched no arity at all.
         let coerced;
         let args = match (name, args.first()) {
-            ("zip" | "corresponds", Some(Value::Str(t))) => {
+            (
+                "zip" | "corresponds" | "indexOfSlice" | "lastIndexOfSlice" | "containsSlice"
+                | "sameElements",
+                Some(Value::Str(t)),
+            ) => {
                 coerced =
                     std::iter::once(new_seq(SeqKind::Vector, t.chars().map(make_char).collect()))
                         .chain(args[1..].iter().cloned())
@@ -19801,4 +19859,50 @@ fn java_optional_method(
         ("orElse", 1, None) => Ok(args[0].clone()),
         _ => Err(no_such_method(recv, name)),
     }
+}
+
+/// The new contents an `…InPlace` transformer gives a mutable collection of
+/// `kind`, or `None` when `name` is not one it has. `mapInPlace` is defined on
+/// every mutable sequence (an `Array` included), `filterInPlace` on a buffer or
+/// a mutable `Set`, and the slicing ones on a buffer.
+fn in_place_contents(
+    vm: &mut VM,
+    kind: SeqKind,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Result<Option<Vec<Value>>, String> {
+    let n = |i: usize| {
+        usize::try_from(args[i].to_int())
+            .unwrap_or(0)
+            .min(items.len())
+    };
+    let buffer = kind.is_buffer() && kind != SeqKind::StrBuf;
+    Ok(Some(match (name, args.len()) {
+        ("mapInPlace", 1) if kind != SeqKind::StrBuf && !kind.is_set() => {
+            let mut out = Vec::with_capacity(items.len());
+            for x in items {
+                out.push(invoke_closure(vm, &args[0], std::slice::from_ref(x))?);
+            }
+            out
+        }
+        ("filterInPlace", 1) if buffer || kind.is_set() => {
+            let mut out = Vec::with_capacity(items.len());
+            for x in items {
+                if truthy(&invoke_closure(vm, &args[0], std::slice::from_ref(x))?) {
+                    out.push(x.clone());
+                }
+            }
+            out
+        }
+        ("dropInPlace", 1) if buffer => items[n(0)..].to_vec(),
+        ("dropRightInPlace", 1) if buffer => items[..items.len() - n(0)].to_vec(),
+        ("takeInPlace", 1) if buffer => items[..n(0)].to_vec(),
+        ("takeRightInPlace", 1) if buffer => items[items.len() - n(0)..].to_vec(),
+        ("sliceInPlace", 2) if buffer => {
+            let (a, b) = (n(0), n(1));
+            items[a..b.max(a)].to_vec()
+        }
+        _ => return Ok(None),
+    }))
 }
