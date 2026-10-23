@@ -1292,6 +1292,17 @@ reported as parse/compile errors, never silently mis-run.
   implicit that cannot be resolved stays an ordinary arity error, and an
   AMBIGUOUS one is an error, as in Scala.
 
+  A CONDITIONAL given — `given listShow[A](using s: Show[A]): Show[List[A]]
+  with { … }`, named or anonymous, with any number of `using` instances — is a
+  class whose constructor takes those instances. When no plain given matches,
+  its result type is unified with the one wanted (`Show[List[A]]` against
+  `Show[List[Int]]`, tuple types `(A, B)` included) and each `using` instance is
+  resolved in turn, recursively. A type argument is read off an argument whose
+  static type is nameable: a literal, a binding, a sequence literal of one
+  element type (`List(1, 2)` is `List[Int]`), a tuple literal, `Option(x)`. Not
+  from a method's result (`p(xs.headOption)` finds no `A`), which is the same
+  return-position limit as above.
+
   What follows from text-matching: no subtyping (a `given Animal` does not
   satisfy a `using Dog`, nor the reverse), no variance, no implicit priority
   ordering beyond "exactly one candidate or it is ambiguous", and no

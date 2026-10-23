@@ -148,6 +148,8 @@ struct Compiler {
     extensions: Vec<(String, String, String)>,
     /// See [`Program::implicit_classes`].
     implicit_classes: HashSet<String>,
+    /// See [`Program::cond_givens`].
+    cond_givens: Vec<CondGiven>,
     /// Each class whose primary constructor has several parameter lists, and the
     /// length of its first (see [`ClassDecl::first_list`]).
     first_lists: HashMap<String, usize>,
@@ -378,6 +380,10 @@ struct ClassMeta {
     /// [`declared_conv`]), own and inherited — what an assignment to
     /// `var w: Double` applies, as its declaration did.
     field_convs: HashMap<String, Conv>,
+    /// The declared type (base name) of each constructor field, which is what
+    /// gives a bare field reference inside the class its CLASS (`s.show` on a
+    /// field `s: Show[A]` is that trait's method).
+    field_types: HashMap<String, String>,
 }
 
 /// Compile-time singleton-object shape.
@@ -631,9 +637,13 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         // and for the bare field references inside the class's own methods.
         let mut field_convs = HashMap::new();
         let mut member_widths = HashMap::new();
+        let mut field_types: HashMap<String, String> = HashMap::new();
         for anc in mro.iter().rev().filter_map(|a| by_name.get(a.as_str())) {
             for (p, ty) in anc.params.iter().zip(&anc.param_tys) {
                 member_widths.insert(p.clone(), declared_width(ty.as_deref().unwrap_or("")));
+                if let Some(t) = ty {
+                    field_types.insert(p.clone(), base_type(t));
+                }
                 if let Some(c) = declared_conv(ty.as_deref()) {
                     field_convs.insert(p.clone(), c);
                 }
@@ -683,6 +693,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 responds,
                 member_widths,
                 field_convs,
+                field_types,
                 own_methods: cd
                     .methods
                     .iter()
@@ -877,6 +888,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         implicit_floor: 0,
         extensions: prog.extensions.clone(),
         implicit_classes: prog.implicit_classes.iter().cloned().collect(),
+        cond_givens: prog.cond_givens.clone(),
         first_lists: prog
             .classes
             .iter()
@@ -4741,6 +4753,11 @@ impl Compiler {
         } else {
             local
         };
+        if hits.is_empty() {
+            if let Some(e) = self.conditional_instance(&ty, line, 0) {
+                return Ok(e);
+            }
+        }
         match hits.as_slice() {
             [one] => Ok(Expr::Var(one.0.clone())),
             [] => Err(format!(
@@ -4754,6 +4771,38 @@ impl Compiler {
                     .join(" and ")
             )),
         }
+    }
+
+    /// An instance of `ty` built from a CONDITIONAL given (see
+    /// [`Program::cond_givens`]): the first whose result type unifies with
+    /// `ty`, constructed with each of its `using` instances resolved in turn
+    /// (`Show[List[Int]]` from `given [A](using Show[A]): Show[List[A]]` is
+    /// `new listShow(intShow)`). `depth` bounds the recursion.
+    fn conditional_instance(&self, ty: &str, line: u32, depth: usize) -> Option<Expr> {
+        if depth > 8 {
+            return None;
+        }
+        for cg in &self.cond_givens {
+            let mut subst: Vec<(String, String)> = Vec::new();
+            if !unify_type(&normalize_type(&cg.result), ty, &cg.tparams, &mut subst) {
+                continue;
+            }
+            let mut args = Vec::with_capacity(cg.needs.len());
+            for need in &cg.needs {
+                let want = normalize_type(&substitute_type(need, &subst));
+                let arg = self
+                    .resolve_implicit(&want, line)
+                    .ok()
+                    .or_else(|| self.conditional_instance(&want, line, depth + 1))?;
+                args.push(arg);
+            }
+            return Some(Expr::New {
+                name: cg.name.clone(),
+                args,
+                line,
+            });
+        }
+        None
     }
 
     /// What the callee's type parameters are bound to at this call site, as
@@ -4826,6 +4875,31 @@ impl Compiler {
     fn static_type_name(&self, e: &Expr) -> Option<String> {
         if let Some(cls) = self.class_of(e) {
             return Some(cls);
+        }
+        // A tuple literal of nameable components is `(A, B)`, and `Option(x)` an
+        // `Option[A]`: the shapes a `using` clause is resolved against.
+        if let Expr::Tuple(xs) = e {
+            if xs.len() >= 2 {
+                let parts: Option<Vec<String>> =
+                    xs.iter().map(|x| self.static_type_name(x)).collect();
+                return parts.map(|p| format!("({})", p.join(", ")));
+            }
+        }
+        if let Expr::Call { name, args, .. } = e {
+            if name == "Option" && args.len() == 1 && self.is_library_name(name) {
+                return Some(format!("Option[{}]", self.static_type_name(&args[0])?));
+            }
+        }
+        // A sequence literal of nameable elements: `List(1, 2)` is a `List[Int]`,
+        // which is what lets a `using Show[A]` resolve at `p(List(1, 2))`.
+        if let Expr::Collection { ctor, elems } = e {
+            if SEQ_CTORS.contains(&ctor.as_str()) && !elems.is_empty() {
+                let first = self.static_type_name(&elems[0])?;
+                let same = elems[1..]
+                    .iter()
+                    .all(|x| self.static_type_name(x).as_deref() == Some(first.as_str()));
+                return same.then(|| format!("{}[{first}]", simple_type_name_of(ctor)));
+            }
         }
         // A call to a user `def` — including the hoisted body of an
         // `extension` — is typed by its declared return type. This is what lets
@@ -7957,7 +8031,18 @@ impl Compiler {
             .iter()
             .filter_map(|f| {
                 let w = *meta.member_widths.get(f)?;
-                Some((f.clone(), Width::num(w)))
+                let cls = meta
+                    .field_types
+                    .get(f)
+                    .filter(|t| self.classes.contains_key(t.as_str()))
+                    .cloned();
+                Some((
+                    f.clone(),
+                    Width {
+                        cls,
+                        ..Width::num(w)
+                    },
+                ))
             })
             .collect()
     }
@@ -11114,4 +11199,50 @@ fn is_package_path(e: &Expr, path: &[&str]) -> bool {
     segs.push(root.as_str());
     segs.reverse();
     segs == path
+}
+
+/// Unify the type `pattern` (mentioning the type variables `vars`) with the
+/// concrete type `ty`, binding each variable once: `Show[List[A]]` against
+/// `Show[List[Int]]` binds `A = Int`. Both are compared as text, head and
+/// arguments, after [`normalize_type`].
+fn unify_type(pattern: &str, ty: &str, vars: &[String], subst: &mut Vec<(String, String)>) -> bool {
+    let (p, t) = (pattern.trim(), ty.trim());
+    if vars.iter().any(|v| v == p) {
+        return match subst.iter().find(|(v, _)| v == p) {
+            Some((_, bound)) => bound == t,
+            None => {
+                subst.push((p.to_string(), t.to_string()));
+                true
+            }
+        };
+    }
+    let split = |s: &str| -> (String, Vec<String>) {
+        // A tuple type `(A, B)` is `Tuple` of its components.
+        if let Some(inner) = s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+            return (
+                "(".to_string(),
+                split_type_args(inner)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            );
+        }
+        match s.split_once('[') {
+            Some((head, rest)) => (
+                head.trim().to_string(),
+                split_type_args(rest.strip_suffix(']').unwrap_or(rest))
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            None => (s.to_string(), Vec::new()),
+        }
+    };
+    let ((ph, pa), (th, ta)) = (split(p), split(t));
+    ph == th
+        && pa.len() == ta.len()
+        && pa
+            .iter()
+            .zip(&ta)
+            .all(|(a, b)| unify_type(a, b, vars, subst))
 }

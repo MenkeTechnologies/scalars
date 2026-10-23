@@ -72,6 +72,8 @@ struct Parser {
     extensions: Vec<(String, String, String)>,
     /// See [`Program::implicit_classes`].
     implicit_classes: Vec<String>,
+    /// See [`Program::cond_givens`].
+    cond_givens: Vec<CondGiven>,
     /// Implicit conversions — see [`Program::conversions`].
     conversions: Vec<Conversion>,
     /// The enclosing `object`/`class` names while a body is parsed.
@@ -111,6 +113,7 @@ impl Parser {
             implicits: Vec::new(),
             extensions: Vec::new(),
             implicit_classes: Vec::new(),
+            cond_givens: Vec::new(),
             conversions: Vec::new(),
             type_path: Vec::new(),
             jvm_prefixes: HashMap::new(),
@@ -439,6 +442,7 @@ impl Parser {
             implicits: std::mem::take(&mut self.implicits),
             extensions: std::mem::take(&mut self.extensions),
             implicit_classes: std::mem::take(&mut self.implicit_classes),
+            cond_givens: std::mem::take(&mut self.cond_givens),
             conversions: std::mem::take(&mut self.conversions),
             jvm_prefixes: std::mem::take(&mut self.jvm_prefixes),
         })
@@ -2222,8 +2226,11 @@ impl Parser {
     /// `using` clause by referencing one.
     fn given_decl(&mut self) -> Result<StmtKind, String> {
         self.advance(); // `given`
-                        // `given name: Ty` vs `given Ty` — only a `:` after the first
-                        // identifier makes it a name.
+        if let Some(kind) = self.conditional_given()? {
+            return Ok(kind);
+        }
+        // `given name: Ty` vs `given Ty` — only a `:` after the first
+        // identifier makes it a name.
         let named = matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Colon);
         let name = if named {
             let n = self.ident()?;
@@ -2347,6 +2354,98 @@ impl Parser {
     }
 
     /// The `{ … }` body of a `given … with`, read as an object's members.
+    /// `given name[A](using s: Show[A]): Show[List[A]] with { … }` — a
+    /// CONDITIONAL given (cursor just past `given`): an instance that exists for
+    /// every `A` with a `Show[A]` in scope. Declared as a class whose
+    /// constructor takes the `using` instances, and registered so implicit
+    /// resolution can build `new name(…)` for a concrete type. `None` (cursor
+    /// unmoved) for an ordinary given.
+    fn conditional_given(&mut self) -> Result<Option<StmtKind>, String> {
+        let start = self.pos;
+        let named = matches!(self.peek(), Tok::Ident(_))
+            && matches!(self.peek_at(1), Tok::LBracket | Tok::LParen);
+        if !named && !self.is(&Tok::LBracket) {
+            return Ok(None);
+        }
+        let name = if named {
+            self.ident()?
+        } else {
+            self.givens += 1;
+            format!("given${}", self.givens)
+        };
+        let (tparams, _) = self.type_param_clause()?;
+        let mut params = Vec::new();
+        let mut param_tys = Vec::new();
+        while self.is(&Tok::LParen) {
+            self.advance();
+            if !matches!(self.peek(), Tok::Ident(w) if w == "using") {
+                self.pos = start;
+                return Ok(None);
+            }
+            self.advance();
+            loop {
+                // `s: Show[A]`, or an anonymous `Show[A]`.
+                let pname = if matches!(self.peek(), Tok::Ident(_))
+                    && matches!(self.peek_at(1), Tok::Colon)
+                {
+                    let p = self.ident()?;
+                    self.advance();
+                    p
+                } else {
+                    format!("given$arg{}", params.len())
+                };
+                params.push(pname);
+                param_tys.push(Some(self.type_ref()?));
+                if !self.is(&Tok::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            self.eat(&Tok::RParen)?;
+        }
+        if !self.is(&Tok::Colon) {
+            self.pos = start;
+            return Ok(None);
+        }
+        self.advance();
+        let ty = self.type_ref_stop_with()?;
+        if !matches!(self.peek(), Tok::Ident(w) if w == "with") {
+            return Err(format!(
+                "scalars: a conditional given needs a `with {{ … }}` body (line {})",
+                self.line()
+            ));
+        }
+        self.advance();
+        let line = self.line();
+        let (body, methods) = self.given_body()?;
+        let n = params.len();
+        self.declare_class(
+            ClassDecl {
+                name: name.clone(),
+                is_case: false,
+                is_trait: false,
+                parents: vec![base_type_name(&ty)],
+                super_args: Vec::new(),
+                field_names: params.clone(),
+                params,
+                param_by_name: vec![false; n],
+                param_tys: param_tys.clone(),
+                param_defaults: vec![None; n],
+                first_list: None,
+                body,
+                methods,
+            },
+            line,
+        )?;
+        self.cond_givens.push(CondGiven {
+            name,
+            tparams,
+            result: ty,
+            needs: param_tys.into_iter().flatten().collect(),
+        });
+        Ok(Some(StmtKind::Expr(Expr::Tuple(Vec::new()))))
+    }
+
     fn given_body(&mut self) -> Result<(Vec<Stmt>, Vec<Func>), String> {
         let mut body = Vec::new();
         let mut methods = Vec::new();

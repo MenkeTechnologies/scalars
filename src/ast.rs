@@ -78,6 +78,10 @@ pub struct Program {
     /// as [`Self::extensions`]. Their own `responds` set is not a member a
     /// receiver can have: nothing is an instance of one but its own `new`.
     pub implicit_classes: Vec<String>,
+    /// The CONDITIONAL givens (`given name[A](using Show[A]): Show[List[A]]
+    /// with { … }`), each declared as the class `name` whose constructor takes
+    /// the `using` instances.
+    pub cond_givens: Vec<CondGiven>,
     /// Implicit CONVERSIONS, as `(from type, to type, how to apply it)`.
     ///
     /// Both spellings land here: `implicit def i2s(i: Int): String` records the
@@ -99,6 +103,19 @@ pub struct Program {
     /// whose type matches. An annotation is required, because the type is the
     /// only thing that selects one.
     pub implicits: Vec<(String, String)>,
+}
+
+/// One conditional given (see [`Program::cond_givens`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CondGiven {
+    /// The class that builds the instance.
+    pub name: String,
+    /// The given's type parameters, which `result` and `needs` mention.
+    pub tparams: Vec<String>,
+    /// The type it provides, in terms of `tparams` (`Show[List[A]]`).
+    pub result: String,
+    /// The instances its constructor takes, in order (`Show[A]`).
+    pub needs: Vec<String>,
 }
 
 /// A `class` / `case class` declaration. The instance is a host-heap record (an
