@@ -143,6 +143,9 @@ struct Compiler {
     extensions: Vec<(String, String, String)>,
     /// See [`Program::implicit_classes`].
     implicit_classes: HashSet<String>,
+    /// Each class whose primary constructor has several parameter lists, and the
+    /// length of its first (see [`ClassDecl::first_list`]).
+    first_lists: HashMap<String, usize>,
     /// Implicit conversions — see [`Program::conversions`].
     conversions: Vec<Conversion>,
     /// Each user `def`'s declared return TYPE NAME, where it has one. Distinct
@@ -868,6 +871,11 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         implicit_floor: 0,
         extensions: prog.extensions.clone(),
         implicit_classes: prog.implicit_classes.iter().cloned().collect(),
+        first_lists: prog
+            .classes
+            .iter()
+            .filter_map(|c| Some((c.name.clone(), c.first_list?)))
+            .collect(),
         conversions: prog.conversions.clone(),
         func_ret_ty: prog
             .functions
@@ -921,15 +929,18 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // both need shape the flat record cannot carry. Emitted only when the
     // program declares a supertype anywhere, so a hierarchy-free program keeps
     // the bytecode it had.
-    let needs_types = classes
-        .iter()
-        .any(|cd| !cd.parents.is_empty() || cd.is_trait || cd.params.len() != cd.field_names.len())
-        || objects.iter().any(|o| !o.parents.is_empty())
+    let needs_types = classes.iter().any(|cd| {
+        !cd.parents.is_empty()
+            || cd.is_trait
+            || cd.params.len() != cd.field_names.len()
+            || cd.first_list.is_some()
+    }) || objects.iter().any(|o| !o.parents.is_empty())
         || !prog.jvm_prefixes.is_empty();
     if needs_types {
         for cd in &classes {
             let meta = &c.classes[&cd.name];
-            let (supers, arity) = (meta.supers.join(","), meta.arity);
+            // A case class's product is its FIRST parameter list.
+            let (supers, arity) = (meta.supers.join(","), cd.first_list.unwrap_or(meta.arity));
             let prefix = prog.jvm_prefixes.get(&cd.name).map_or("", String::as_str);
             c.emit_type_reg(&cd.name, &supers, arity, prefix);
         }
@@ -1021,6 +1032,7 @@ fn builtin_case1(name: &str, field: &str) -> ClassDecl {
         param_by_name: vec![false],
         param_tys: vec![None],
         param_defaults: vec![None],
+        first_list: None,
         body: Vec::new(),
         field_names: vec![field.to_string()],
         methods: Vec::new(),
@@ -1942,6 +1954,7 @@ impl Compiler {
             "LinkedHashMap" => crate::host::MAKE_LINKEDMAP,
             "TreeSet" => crate::host::MAKE_SORTEDSET,
             "TreeMap" => crate::host::MAKE_SORTEDMAP,
+            "ListMap" => crate::host::MAKE_LISTMAP,
             _ => return Err(format!("scalars: unknown collection constructor `{ctor}`")),
         };
         self.b.emit(Op::CallBuiltin(id, elems.len() as u8), 0);
@@ -2600,7 +2613,11 @@ impl Compiler {
                 // Scala's derived `unapply` exposes the primary-constructor
                 // parameters only — the leading prefix of the record.
                 let fields = match self.classes.get(name) {
-                    Some(meta) => meta.field_names[..meta.arity].to_vec(),
+                    // (Of the FIRST parameter list, when there are several.)
+                    Some(meta) => {
+                        let n = self.first_lists.get(name).copied().unwrap_or(meta.arity);
+                        meta.field_names[..n].to_vec()
+                    }
                     // `case List(a, b) =>` / `Seq(…)` / `Vector(…)` / `Array(…)`
                     // are sequence patterns, matched on shape and length rather
                     // than against a record's fields.
@@ -5163,6 +5180,112 @@ impl Compiler {
         // method of the name, which would own the repeated parameter.
         if let Some((bulk, spread)) = self.library_spread(name, args) {
             return self.method(recv, bulk, &spread, line);
+        }
+        // `P(1)("t")` / `new P(1)("t")` — a construction of a class whose
+        // primary constructor has several parameter lists: the later list is
+        // not an `apply` on the instance but the rest of the constructor call.
+        if name == "apply" {
+            let joined = match recv {
+                Expr::Call {
+                    name: cls,
+                    args: first,
+                    line,
+                } if self.first_lists.get(cls).is_some_and(|n| *n == first.len()) => {
+                    let mut all = first.clone();
+                    all.extend_from_slice(args);
+                    Some(Expr::Call {
+                        name: cls.clone(),
+                        args: all,
+                        line: *line,
+                    })
+                }
+                Expr::New {
+                    name: cls,
+                    args: first,
+                    line,
+                } if self.first_lists.get(cls).is_some_and(|n| *n == first.len()) => {
+                    let mut all = first.clone();
+                    all.extend_from_slice(args);
+                    Some(Expr::New {
+                        name: cls.clone(),
+                        args: all,
+                        line: *line,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(e) = joined {
+                return self.expr(&e);
+            }
+        }
+        // `java.util.Comparator.naturalOrder()` / `reverseOrder()` — the natural
+        // `Ordering` and its reverse, which every comparator-taking member here
+        // accepts.
+        let comparator = match recv {
+            Expr::Var(n) => {
+                n == "Comparator"
+                    && self.is_library_name(n)
+                    && !self.vals.contains_key(n)
+                    && self
+                        .imports
+                        .get(n)
+                        .is_some_and(|p| p.join(".") == "java.util.Comparator")
+            }
+            Expr::Method {
+                recv: pkg,
+                name: n,
+                args: a,
+                ..
+            } => n == "Comparator" && a.is_empty() && is_package_path(pkg, &["java", "util"]),
+            _ => false,
+        };
+        if comparator && args.is_empty() && matches!(name, "naturalOrder" | "reverseOrder") {
+            let natural = Expr::Method {
+                recv: Box::new(Expr::Var("Ordering".to_string())),
+                name: "Int".to_string(),
+                args: Vec::new(),
+                line,
+            };
+            let ord = if name == "reverseOrder" {
+                Expr::Method {
+                    recv: Box::new(natural),
+                    name: "reverse".to_string(),
+                    args: Vec::new(),
+                    line,
+                }
+            } else {
+                natural
+            };
+            return self.expr(&ord);
+        }
+        // `java.util.stream.Stream.of(a, b, …)` — an object stream over the
+        // arguments. Only the Java class: a bare `Stream` is Scala's.
+        let java_stream = match recv {
+            Expr::Var(n) => {
+                n == "Stream"
+                    && !self.vals.contains_key(n)
+                    && self
+                        .imports
+                        .get(n)
+                        .is_some_and(|p| p.join(".") == "java.util.stream.Stream")
+            }
+            Expr::Method {
+                recv: pkg,
+                name: n,
+                args: a,
+                ..
+            } => n == "Stream" && a.is_empty() && is_package_path(pkg, &["java", "util", "stream"]),
+            _ => false,
+        };
+        if java_stream && name == "of" {
+            for a in args {
+                self.expr(a)?;
+            }
+            let argc = u8::try_from(args.len())
+                .map_err(|_| format!("scalars: too many arguments on line {line}"))?;
+            self.b
+                .emit(Op::CallBuiltin(crate::host::STREAM_OF, argc), line);
+            return Ok(());
         }
         // `Collectors.toList()` / `java.util.stream.Collectors.joining(", ")` —
         // the JDK collector factories a stream's `collect` takes.

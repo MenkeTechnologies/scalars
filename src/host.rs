@@ -525,6 +525,10 @@ pub const COLLECTOR: u16 = 819;
 /// Builtin id boxing every integer element of a sequence (see `b_box_elems`);
 /// pops the box code and the sequence.
 pub const BOX_ELEMS: u16 = 820;
+/// Builtin id for an immutable `ListMap(k -> v, …)`: pops `argc` pairs.
+pub const MAKE_LISTMAP: u16 = 821;
+/// Builtin id for `java.util.stream.Stream.of(…)`: pops `argc` elements.
+pub const STREAM_OF: u16 = 822;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -789,6 +793,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(UNBOX, b_unbox);
     vm.register_builtin(COLLECTOR, b_collector);
     vm.register_builtin(BOX_ELEMS, b_box_elems);
+    vm.register_builtin(MAKE_LISTMAP, b_make_listmap);
+    vm.register_builtin(STREAM_OF, b_stream_of);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -1535,6 +1541,10 @@ enum HashRep {
     /// same one (`compare == 0`, not `equals`). The stored `Vec` is kept in
     /// that order. It prints `TreeSet(…)`/`TreeMap(…)` at every size.
     Sorted,
+    /// A `scala.collection.immutable.ListMap` — immutable, iterated in
+    /// INSERTION order (an update keeps the key's position, a removal drops
+    /// it). The stored `Vec` is that order. It prints `ListMap(…)`.
+    ListMap,
 }
 
 /// The rendered prefix of a [`HeapVal::Seq`].
@@ -1625,6 +1635,12 @@ enum SeqKind {
     JavaOptional(JOpt),
     /// A `java.util.List` a stream collected into, printed `[a, b]`.
     JavaList,
+    /// A `java.util.HashMap` a stream collected into (`groupingBy`, `toMap`):
+    /// its elements are `(key, value)` pairs in the table's iteration order,
+    /// printed `{k=v, …}`.
+    JavaMap,
+    /// An `IntSummaryStatistics`: its elements are `count, sum, min, max`.
+    JavaStats,
     /// A `java.util.stream.Collectors` collector; its elements are the
     /// factory's arguments (`joining`'s delimiter, prefix and suffix).
     JCollector(Coll),
@@ -1684,6 +1700,8 @@ impl SeqKind {
             SeqKind::Set(HashRep::Hashed | HashRep::Mutable(_)) => "HashSet",
             SeqKind::Set(HashRep::Linked) => "LinkedHashSet",
             SeqKind::Set(HashRep::Sorted) => "TreeSet",
+            // There is no `ListSet` here: only a map takes this representation.
+            SeqKind::Set(HashRep::ListMap) => "ListSet",
             SeqKind::Iterable => "Iterable",
             SeqKind::Iterator => "Iterator",
             SeqKind::View(false) => "SeqView",
@@ -1703,6 +1721,8 @@ impl SeqKind {
             SeqKind::JStream => "Stream",
             SeqKind::JavaOptional(k) => k.label(),
             SeqKind::JavaList => "List",
+            SeqKind::JavaMap => "Map",
+            SeqKind::JavaStats => "IntSummaryStatistics",
             SeqKind::JCollector(_) => "Collector",
             SeqKind::Range { .. } => "Range",
             SeqKind::CharRange { .. } => "NumericRange",
@@ -1800,6 +1820,8 @@ impl SeqKind {
             | SeqKind::JStream
             | SeqKind::JavaOptional(_)
             | SeqKind::JavaList
+            | SeqKind::JavaMap
+            | SeqKind::JavaStats
             | SeqKind::JCollector(_) => Some(format!("{} of empty list", op.word())),
             // `NumericRange` reports an empty access through `Nil`, and both its
             // `head` and its `last` (so `min`/`max` too) are `Nil.head`.
@@ -2365,6 +2387,8 @@ pub fn reset_heap() {
     LIST_ITERS.with(|t| t.borrow_mut().clear());
     LAZY_ZIPS.with(|t| t.borrow_mut().clear());
     JSTREAMS.with(|t| t.borrow_mut().clear());
+    MATCH_DATA.with(|t| t.borrow_mut().clear());
+    JAVA_DECS.with(|t| t.borrow_mut().clear());
     CHAR_ARRAYS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
@@ -3704,7 +3728,15 @@ fn b_obj_copy(vm: &mut VM, argc: u8) -> Value {
         spec.split(',').collect()
     };
     let mut fields = base.fields.clone();
+    let first = ctor_arity(&base.class, fields.len());
     for (s, val) in specs.into_iter().zip(vals) {
+        // `^j`: the j-th parameter of a SECOND constructor list.
+        if let Some(j) = s.strip_prefix('^').and_then(|j| j.parse::<usize>().ok()) {
+            if let Some(f) = fields.get_mut(first + j) {
+                f.1 = val;
+            }
+            continue;
+        }
         if let Some(idx) = s.strip_prefix('#') {
             if let Ok(i) = idx.parse::<usize>() {
                 if let Some(f) = fields.get_mut(i) {
@@ -4319,6 +4351,19 @@ fn sorted_insert_all<T>(items: Vec<T>, key: impl Fn(&T) -> &Value, overwrite: bo
         }
     }
     out
+}
+
+/// `MAKE_LISTMAP` builtin — an immutable `ListMap` of the popped pairs.
+fn b_make_listmap(vm: &mut VM, argc: u8) -> Value {
+    let pairs = pop_n(vm, argc);
+    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
+    for p in &pairs {
+        match as_seq_or_tuple(p) {
+            Some(t) if t.len() == 2 => entries.push((t[0].clone(), t[1].clone())),
+            _ => return fault(vm, "scalars: ListMap(...) expects `key -> value` pairs"),
+        }
+    }
+    new_map(HashRep::ListMap, entries)
 }
 
 fn b_make_linkedmap(vm: &mut VM, argc: u8) -> Value {
@@ -5335,6 +5380,11 @@ fn class_of(recv: &Value) -> Result<Value, String> {
         Value::Obj(_) if as_big(recv).is_some() => {
             ("scala.math.BigInt".to_string(), "BigInt".to_string(), false)
         }
+        Value::Obj(_) if is_java_dec(recv) => (
+            "java.math.BigDecimal".to_string(),
+            "BigDecimal".to_string(),
+            false,
+        ),
         Value::Obj(_) if as_dec(recv).is_some() => (
             "scala.math.BigDecimal".to_string(),
             "BigDecimal".to_string(),
@@ -5577,6 +5627,18 @@ fn obj_to_string(v: &Value) -> String {
                     items.iter().map(scala_str).collect::<Vec<_>>().join(", ")
                 )
             }
+            Some(HeapVal::Seq(SeqKind::JavaMap, items)) => {
+                let entry = |p: &Value| {
+                    let kv = as_seq_or_tuple(p).unwrap_or_default();
+                    let s = |i: usize| kv.get(i).map(scala_str).unwrap_or_default();
+                    format!("{}={}", s(0), s(1))
+                };
+                format!(
+                    "{{{}}}",
+                    items.iter().map(entry).collect::<Vec<_>>().join(", ")
+                )
+            }
+            Some(HeapVal::Seq(SeqKind::JavaStats, items)) => java_stats_string(items),
             Some(HeapVal::Seq(kind @ SeqKind::JavaOptional(_), items)) => match items.first() {
                 Some(v) => format!("{}[{}]", kind.label(), scala_str(v)),
                 None => format!("{}.empty", kind.label()),
@@ -8750,7 +8812,7 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
         return big_method(&b, name, args);
     }
     if let Some(d) = as_dec(recv) {
-        return dec_method(&d, name, args);
+        return java_dec_method(recv, &d, name, args).unwrap_or_else(|| dec_method(&d, name, args));
     }
     if name == "getClass" && args.is_empty() {
         return class_of(recv);
@@ -8801,6 +8863,14 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
                     .collect();
                 return Ok(new_set(HashRep::Small, pairs));
             }
+        }
+    }
+    // `r.findAllIn(s).matchData` — the `Match` values of a `MatchIterator`.
+    if name == "matchData" && args.is_empty() {
+        if let Some(data) =
+            as_obj_id(recv).and_then(|id| MATCH_DATA.with(|t| t.borrow().get(&id).cloned()))
+        {
+            return Ok(new_seq(SeqKind::Iterator, data));
         }
     }
     // `(xs, ys).zipped` / `(xs, ys, zs).zipped` — the deprecated
@@ -8860,6 +8930,7 @@ fn map_label(id: usize, rep: HashRep) -> &'static str {
         HashRep::Linked => "LinkedHashMap",
         HashRep::Sorted => "TreeMap",
         HashRep::Small => "Map",
+        HashRep::ListMap => "ListMap",
     }
 }
 
@@ -10135,6 +10206,12 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     }
     if kind == SeqKind::JavaList {
         return java_list_method(vm, recv, &items, name, args);
+    }
+    if kind == SeqKind::JavaMap {
+        return java_map_method(recv, &items, name, args);
+    }
+    if kind == SeqKind::JavaStats {
+        return java_stats_method(recv, &items, name, args);
     }
     if let SeqKind::JCollector(_) = kind {
         return Err(no_such_method(recv, name));
@@ -14037,9 +14114,10 @@ fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
         return mut_map_from(mut_table_size_for(MUT_INITIAL_CAPACITY), entries);
     }
     let mut entries = entries;
-    // A `LinkedHashMap` keeps its insertion list: a repeated key holds its
-    // original position and takes the later value, exactly as `put` does.
-    if rep == HashRep::Linked {
+    // A `LinkedHashMap` (and a `ListMap`) keeps its insertion list: a repeated
+    // key holds its original position and takes the later value, exactly as
+    // `put` does.
+    if matches!(rep, HashRep::Linked | HashRep::ListMap) {
         let mut uniq: Vec<(Value, Value)> = Vec::with_capacity(entries.len());
         for (k, v) in entries {
             match uniq.iter_mut().find(|(ek, _)| value_eq(ek, &k)) {
@@ -14047,7 +14125,7 @@ fn new_map(rep: HashRep, entries: Vec<(Value, Value)>) -> Value {
                 None => uniq.push((k, v)),
             }
         }
-        return heap_push(HeapVal::Map(HashRep::Linked, uniq));
+        return heap_push(HeapVal::Map(rep, uniq));
     }
     let rep = hash_rep(rep, entries.len());
     if rep == HashRep::Hashed {
@@ -14578,7 +14656,7 @@ fn dispatch_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
         return big_method(&b, name, args);
     }
     if let Some(d) = as_dec(recv) {
-        return dec_method(&d, name, args);
+        return java_dec_method(recv, &d, name, args).unwrap_or_else(|| dec_method(&d, name, args));
     }
     // An `Ordering` handle is likewise not a record; `.reverse` on one must not
     // reach the sequence dispatcher, which would try to reverse a collection.
@@ -16110,13 +16188,18 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
         // the un-consumed result differs.
         ("findAllIn", 1) => {
             let s = target();
-            Ok(new_seq(
+            let spans = regex_matches(&re, &s);
+            let out = new_seq(
                 SeqKind::Iterable,
-                regex_matches(&re, &s)
-                    .into_iter()
-                    .map(|(a, b)| Value::str(&s[a..b]))
-                    .collect(),
-            ))
+                spans.iter().map(|&(a, b)| Value::str(&s[a..b])).collect(),
+            );
+            // The `MatchIterator`'s `matchData` — the same matches as `Match`
+            // values — is kept beside the strings it iterates.
+            if let Some(id) = as_obj_id(&out) {
+                let data = spans.iter().map(|&(a, _)| make_match(&re, &s, a)).collect();
+                MATCH_DATA.with(|t| t.borrow_mut().insert(id, data));
+            }
+            Ok(out)
         }
         ("findAllMatchIn", 1) => {
             let s = target();
@@ -17236,7 +17319,9 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
                 | SeqKind::StrBuf
                 | SeqKind::WrappedStr
                 | SeqKind::JavaOptional(_)
-                | SeqKind::JavaList,
+                | SeqKind::JavaList
+                | SeqKind::JavaMap
+                | SeqKind::JavaStats,
                 _,
             )) => Renderable::Leaf,
             Some(HeapVal::Seq(kind, items)) => Renderable::Seq(kind.label(), items.clone()),
@@ -19756,6 +19841,8 @@ enum StreamOp {
     MapInt(Value),
     /// `Stream.map` / `IntStream.mapToObj`: any value.
     MapObj(Value),
+    /// `Stream.flatMap`: the function answers a stream whose elements continue.
+    FlatMap(Value),
     Filter(Value),
     Distinct,
     /// A stateful BARRIER: everything before it runs to completion first.
@@ -19800,11 +19887,22 @@ enum Coll {
     ToSet,
     Joining,
     Counting,
+    /// `groupingBy(classifier[, downstream])`.
+    GroupingBy,
+    /// `toMap(keyMapper, valueMapper)`.
+    ToMap,
 }
 
 thread_local! {
     /// The state of each live stream value, by heap id.
     static JSTREAMS: RefCell<HashMap<usize, StreamState>> = RefCell::new(HashMap::new());
+    /// The `Match` values behind each `findAllIn` result, by heap id: what its
+    /// `matchData` iterates.
+    static MATCH_DATA: RefCell<HashMap<usize, Vec<Value>>> = RefCell::new(HashMap::new());
+    /// The heap ids of the `java.math.BigDecimal`s `BigDecimal.underlying`
+    /// answered — the same number, under the Java class and its own members.
+    static JAVA_DECS: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
     /// The heap ids of the arrays known to be `Array[Char]` (built as one, or
     /// derived from one), which is what tells an EMPTY one from any other.
     static CHAR_ARRAYS: RefCell<std::collections::HashSet<usize>> =
@@ -19864,56 +19962,107 @@ fn stream_run(
         buffered.sort_by(value_cmp);
         return stream_run(vm, &buffered, &ops[cut + 1..], sink);
     }
-    let mut seen: Vec<Vec<Value>> = vec![Vec::new(); ops.len()];
-    let mut counts: Vec<usize> = vec![0; ops.len()];
-    'pull: for x in src {
+    let mut state = PipeState {
+        seen: vec![Vec::new(); ops.len()],
+        counts: vec![0; ops.len()],
+    };
+    for x in src {
         // A `limit` that has passed its quota CANCELS the pull: the next source
         // element is never read, so an upstream `map` never sees it.
-        let quota_met = ops
-            .iter()
-            .zip(&counts)
-            .any(|(o, c)| matches!(o, StreamOp::Limit(n) if c >= n));
-        if quota_met {
+        if state.quota_met(ops) {
             break;
         }
-        let mut v = x.clone();
-        for (i, op) in ops.iter().enumerate() {
-            match op {
-                StreamOp::MapInt(f) => {
-                    v = Value::int(i64::from(invoke_closure(vm, f, &[v])?.to_int() as i32))
-                }
-                StreamOp::MapObj(f) => v = invoke_closure(vm, f, &[v])?,
-                StreamOp::Filter(p) => {
-                    if !truthy(&invoke_closure(vm, p, std::slice::from_ref(&v))?) {
-                        continue 'pull;
-                    }
-                }
-                StreamOp::Distinct => {
-                    if seen[i].iter().any(|s| value_eq(s, &v)) {
-                        continue 'pull;
-                    }
-                    seen[i].push(v.clone());
-                }
-                StreamOp::Limit(n) => {
-                    if counts[i] >= *n {
-                        break 'pull;
-                    }
-                    counts[i] += 1;
-                }
-                StreamOp::Skip(n) => {
-                    if counts[i] < *n {
-                        counts[i] += 1;
-                        continue 'pull;
-                    }
-                }
-                StreamOp::Sorted => unreachable!("barriers are split off above"),
-            }
-        }
-        if !sink(vm, v)? {
+        if !stream_push(vm, x.clone(), 0, ops, &mut state, sink)? {
             break;
         }
     }
     Ok(())
+}
+
+/// The per-op state of one pipeline run: the values a `distinct` has seen and
+/// the elements a `limit`/`skip` has counted.
+struct PipeState {
+    seen: Vec<Vec<Value>>,
+    counts: Vec<usize>,
+}
+
+impl PipeState {
+    fn quota_met(&self, ops: &[StreamOp]) -> bool {
+        ops.iter()
+            .zip(&self.counts)
+            .any(|(o, c)| matches!(o, StreamOp::Limit(n) if c >= n))
+    }
+}
+
+/// Push one element through `ops[i..]` into `sink`. Answers `false` when the
+/// pull must stop (the sink short-circuited or a `limit` is exhausted).
+fn stream_push(
+    vm: &mut VM,
+    mut v: Value,
+    from: usize,
+    ops: &[StreamOp],
+    state: &mut PipeState,
+    sink: &mut dyn FnMut(&mut VM, Value) -> Result<bool, String>,
+) -> Result<bool, String> {
+    for (i, op) in ops.iter().enumerate().skip(from) {
+        match op {
+            StreamOp::MapInt(f) => {
+                v = Value::int(i64::from(invoke_closure(vm, f, &[v])?.to_int() as i32))
+            }
+            StreamOp::MapObj(f) => v = invoke_closure(vm, f, &[v])?,
+            // `flatMap` — each element of the stream `f` answers continues
+            // down the rest of the pipeline before the next source element.
+            StreamOp::FlatMap(f) => {
+                let inner = invoke_closure(vm, f, &[v])?;
+                for e in stream_drain(vm, &inner)? {
+                    if state.quota_met(ops) || !stream_push(vm, e, i + 1, ops, state, sink)? {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            StreamOp::Filter(p) => {
+                if !truthy(&invoke_closure(vm, p, std::slice::from_ref(&v))?) {
+                    return Ok(true);
+                }
+            }
+            StreamOp::Distinct => {
+                if state.seen[i].iter().any(|s| value_eq(s, &v)) {
+                    return Ok(true);
+                }
+                state.seen[i].push(v.clone());
+            }
+            StreamOp::Limit(n) => {
+                if state.counts[i] >= *n {
+                    return Ok(false);
+                }
+                state.counts[i] += 1;
+            }
+            StreamOp::Skip(n) => {
+                if state.counts[i] < *n {
+                    state.counts[i] += 1;
+                    return Ok(true);
+                }
+            }
+            StreamOp::Sorted => unreachable!("barriers are split off above"),
+        }
+    }
+    sink(vm, v)
+}
+
+/// Every element a stream value yields, consuming it.
+fn stream_drain(vm: &mut VM, stream: &Value) -> Result<Vec<Value>, String> {
+    let Some((SeqKind::JStream, src)) = seq_kind_items(stream) else {
+        return Err("scalars: flatMap expects a function answering a stream".to_string());
+    };
+    let state = stream_state(stream);
+    stream_mark_used(stream);
+    let mut out = Vec::new();
+    stream_run(vm, &src, &state.ops, &mut |_, v| {
+        out.push(v);
+        Ok(true)
+    })?;
+    Ok(out)
 }
 
 /// The `IntStream`/`Stream` members. Anything else is not a member — a stream
@@ -19954,6 +20103,7 @@ fn int_stream_method(
         ("map", 1) => then(Some(StreamOp::MapInt(args[0].clone())), false),
         ("mapToObj", 1) if !objects => then(Some(StreamOp::MapObj(args[0].clone())), true),
         ("boxed", 0) if !objects => then(None, true),
+        ("flatMap", 1) if objects => then(Some(StreamOp::FlatMap(args[0].clone())), true),
         ("filter", 1) => then(Some(StreamOp::Filter(args[0].clone())), objects),
         ("distinct", 0) => then(Some(StreamOp::Distinct), objects),
         ("sorted", 0) => then(Some(StreamOp::Sorted), objects),
@@ -20001,6 +20151,24 @@ fn int_stream_method(
                 Coll::ToList => new_seq(SeqKind::JavaList, all),
                 Coll::ToSet => new_seq(SeqKind::JavaList, java_hash_set_order(all)),
                 Coll::Counting => Value::int(all.len() as i64),
+                Coll::GroupingBy => java_grouping_by(vm, &params, all)?,
+                Coll::ToMap => {
+                    let mut entries: Vec<(Value, Value)> = Vec::new();
+                    for x in all {
+                        let k = invoke_closure(vm, &params[0], std::slice::from_ref(&x))?;
+                        let v = invoke_closure(vm, &params[1], std::slice::from_ref(&x))?;
+                        if let Some((_, old)) = entries.iter().find(|(ek, _)| value_eq(ek, &k)) {
+                            return Err(format!(
+                                "scalars: java.lang.IllegalStateException: Duplicate key {} (attempted merging values {} and {})",
+                                scala_str(&k),
+                                scala_str(old),
+                                scala_str(&v)
+                            ));
+                        }
+                        entries.push((k, v));
+                    }
+                    java_map_value(entries)
+                }
                 Coll::Joining => {
                     let text = |i: usize| params.get(i).map(scala_str).unwrap_or_default();
                     let body: Vec<String> = all.iter().map(|v| scala_str_vm(vm, v)).collect();
@@ -20015,6 +20183,49 @@ fn int_stream_method(
                 _ => all.iter().min_by_key(|v| v.to_int()),
             };
             Ok(optional(JOpt::Int, pick.cloned()))
+        }
+        // `max(comparator)`/`min(comparator)` — a `Comparator` (an `Ordering`
+        // here) or a two-argument function answering its sign.
+        ("max" | "min", 1) => {
+            let all = collect(vm)?;
+            let cmp = args[0].clone();
+            let mut best: Option<Value> = None;
+            for v in all {
+                let replace = match &best {
+                    None => true,
+                    Some(b) => {
+                        let o = if as_ordering(&cmp).is_some() {
+                            ordering_cmp(vm, &cmp, &v, b)?
+                        } else {
+                            invoke_closure(vm, &cmp, &[v.clone(), b.clone()])?
+                                .to_int()
+                                .cmp(&0)
+                        };
+                        if name == "max" {
+                            o == Ordering::Greater
+                        } else {
+                            o == Ordering::Less
+                        }
+                    }
+                };
+                if replace {
+                    best = Some(v);
+                }
+            }
+            Ok(optional(JOpt::Obj, best))
+        }
+        ("summaryStatistics", 0) if !objects => {
+            let all = collect(vm)?;
+            let xs: Vec<i64> = all.iter().map(Value::to_int).collect();
+            Ok(new_seq(
+                SeqKind::JavaStats,
+                vec![
+                    Value::int(xs.len() as i64),
+                    Value::int(xs.iter().sum()),
+                    Value::int(xs.iter().copied().min().unwrap_or(i64::from(i32::MAX))),
+                    Value::int(xs.iter().copied().max().unwrap_or(i64::from(i32::MIN))),
+                ],
+            ))
         }
         ("findFirst" | "findAny", 0) => {
             let mut first = None;
@@ -20186,6 +20397,8 @@ fn b_collector(vm: &mut VM, argc: u8) -> Value {
         ("toSet" | "toUnmodifiableSet", 0) => Coll::ToSet,
         ("joining", 0..=3) if args.len() != 2 => Coll::Joining,
         ("counting", 0) => Coll::Counting,
+        ("groupingBy", 1 | 2) => Coll::GroupingBy,
+        ("toMap", 2) => Coll::ToMap,
         _ => {
             return fault(
                 vm,
@@ -20213,7 +20426,7 @@ fn java_hash_set_order(items: Vec<Value>) -> Vec<Value> {
         cap *= 2;
     }
     let bucket = |v: &Value| {
-        let h = scala_hash(v).unwrap_or(0) as u32;
+        let h = java_hash_code(v) as u32;
         ((h ^ (h >> 16)) as usize) & (cap - 1)
     };
     let mut keyed: Vec<(usize, usize, Value)> = uniq
@@ -21029,4 +21242,213 @@ fn b_box_elems(vm: &mut VM, _argc: u8) -> Value {
         })
         .collect();
     derive_seq(kind, boxed)
+}
+
+/// Whether `v` is a `java.math.BigDecimal` (see [`JAVA_DECS`]).
+fn is_java_dec(v: &Value) -> bool {
+    as_obj_id(v).is_some_and(|id| JAVA_DECS.with(|t| t.borrow().contains(&id)))
+}
+
+/// The members where a `java.math.BigDecimal` and a Scala `BigDecimal` part:
+/// `underlying` (Scala's, answering the Java one) and `toPlainString` (Java's);
+/// `getClass` is [`class_of`]'s. `None` leaves the shared members to [`dec_method`].
+fn java_dec_method(
+    recv: &Value,
+    d: &BigDec,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let java = is_java_dec(recv);
+    Some(match (name, args.len()) {
+        ("underlying", 0) if !java => {
+            let u = make_dec(d.clone());
+            if let Some(id) = as_obj_id(&u) {
+                JAVA_DECS.with(|t| t.borrow_mut().insert(id));
+            }
+            Ok(u)
+        }
+        ("toPlainString", 0) if java => Ok(Value::str(dec_plain_string(d))),
+        _ => return None,
+    })
+}
+
+/// `java.math.BigDecimal.toPlainString`: the digits with the decimal point
+/// placed by the scale, never an exponent.
+fn dec_plain_string(d: &BigDec) -> String {
+    let neg = d.unscaled < BigInt::from(0);
+    let digits = if neg {
+        (-d.unscaled.clone()).to_string()
+    } else {
+        d.unscaled.to_string()
+    };
+    let body = if d.scale <= 0 {
+        format!("{digits}{}", "0".repeat((-d.scale) as usize))
+    } else {
+        let s = d.scale as usize;
+        let padded = if digits.len() <= s {
+            format!("{}{digits}", "0".repeat(s + 1 - digits.len()))
+        } else {
+            digits
+        };
+        let (int, frac) = padded.split_at(padded.len() - s);
+        format!("{int}.{frac}")
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// `Object.hashCode` as the JDK computes it for the values a Java collection
+/// here holds: `Integer`/`Character`/`String` as `##` does, a `Long` outside
+/// `Int` range (or boxed as one) as `(int)(v ^ (v >>> 32))`, a `Double` as the
+/// same fold of its bits — which is what orders a `java.util.HashSet`/`HashMap`.
+fn java_hash_code(v: &Value) -> i32 {
+    let long = |n: i64| (n ^ ((n as u64) >> 32) as i64) as i32;
+    match (as_boxed(v), v) {
+        (Some((IntBox::Long, n)), _) => long(n),
+        (Some((_, n)), _) => n as i32,
+        (None, Value::Int(n)) if i32::try_from(*n).is_err() => long(*n),
+        (None, Value::Float(f)) => {
+            let bits = if f.is_nan() {
+                0x7ff8_0000_0000_0000
+            } else {
+                f.to_bits() as i64
+            };
+            long(bits)
+        }
+        _ => scala_hash(v).unwrap_or(0),
+    }
+}
+
+/// A `java.util.HashMap` holding `entries` (first key wins its slot; a later
+/// value for it replaces the earlier), iterated as the JDK table orders it.
+fn java_map_value(entries: Vec<(Value, Value)>) -> Value {
+    let keys = java_hash_set_order(entries.iter().map(|(k, _)| k.clone()).collect());
+    let pairs = keys
+        .into_iter()
+        .map(|k| {
+            let v = entries
+                .iter()
+                .rev()
+                .find(|(ek, _)| value_eq(ek, &k))
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Undef);
+            new_pair(k, v)
+        })
+        .collect();
+    new_seq(SeqKind::JavaMap, pairs)
+}
+
+/// `Collectors.groupingBy(classifier[, downstream])`: a `HashMap` from each key
+/// to the `List` of its elements (encounter order), or to the downstream
+/// collector's result over them.
+fn java_grouping_by(vm: &mut VM, params: &[Value], all: Vec<Value>) -> Result<Value, String> {
+    let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+    for x in all {
+        let k = invoke_closure(vm, &params[0], std::slice::from_ref(&x))?;
+        match groups.iter_mut().find(|(gk, _)| value_eq(gk, &k)) {
+            Some((_, g)) => g.push(x),
+            None => groups.push((k, vec![x])),
+        }
+    }
+    let down = params.get(1).and_then(as_collector);
+    let mut entries = Vec::with_capacity(groups.len());
+    for (k, g) in groups {
+        let v = match &down {
+            None => new_seq(SeqKind::JavaList, g),
+            Some((Coll::Counting, _)) => Value::int(g.len() as i64),
+            Some((Coll::ToList, _)) => new_seq(SeqKind::JavaList, g),
+            Some((Coll::ToSet, _)) => new_seq(SeqKind::JavaList, java_hash_set_order(g)),
+            Some((Coll::Joining, p)) => {
+                let text = |i: usize| p.get(i).map(scala_str).unwrap_or_default();
+                let body: Vec<String> = g.iter().map(|v| scala_str_vm(vm, v)).collect();
+                Value::str(format!("{}{}{}", text(1), body.join(&text(0)), text(2)))
+            }
+            Some(_) => {
+                return Err("scalars: this groupingBy downstream collector is not modelled".into())
+            }
+        };
+        entries.push((k, v));
+    }
+    Ok(java_map_value(entries))
+}
+
+/// The `java.util.Map` members a collected map answers.
+fn java_map_method(
+    recv: &Value,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    let pairs: Vec<(Value, Value)> = items
+        .iter()
+        .filter_map(|p| {
+            let kv = as_seq_or_tuple(p)?;
+            Some((kv.first()?.clone(), kv.get(1)?.clone()))
+        })
+        .collect();
+    let find = |k: &Value| {
+        pairs
+            .iter()
+            .find(|(ek, _)| value_eq(ek, k))
+            .map(|(_, v)| v.clone())
+    };
+    match (name, args.len()) {
+        ("size", 0) => Ok(Value::int(pairs.len() as i64)),
+        ("isEmpty", 0) => Ok(Value::bool(pairs.is_empty())),
+        // `get` of an absent key is Java's `null`.
+        ("get", 1) => Ok(find(&args[0]).unwrap_or(Value::Undef)),
+        ("getOrDefault", 2) => Ok(find(&args[0]).unwrap_or_else(|| args[1].clone())),
+        ("containsKey", 1) => Ok(Value::bool(find(&args[0]).is_some())),
+        _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// `IntSummaryStatistics.toString`: `count`, `sum`, `min`, `average` to six
+/// places, `max` — with `Integer.MAX_VALUE`/`MIN_VALUE` as an empty one's
+/// min/max.
+fn java_stats_string(items: &[Value]) -> String {
+    let n = |i: usize| items.get(i).map_or(0, Value::to_int);
+    let avg = if n(0) == 0 {
+        0.0
+    } else {
+        n(1) as f64 / n(0) as f64
+    };
+    format!(
+        "IntSummaryStatistics{{count={}, sum={}, min={}, average={avg:.6}, max={}}}",
+        n(0),
+        n(1),
+        n(2),
+        n(3)
+    )
+}
+
+/// The `IntSummaryStatistics` getters.
+fn java_stats_method(
+    recv: &Value,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    let n = |i: usize| items.get(i).map_or(0, Value::to_int);
+    match (name, args.len()) {
+        ("getCount", 0) => Ok(Value::int(n(0))),
+        ("getSum", 0) => Ok(Value::int(n(1))),
+        ("getMin", 0) => Ok(Value::int(n(2))),
+        ("getMax", 0) => Ok(Value::int(n(3))),
+        ("getAverage", 0) => Ok(Value::float(if n(0) == 0 {
+            0.0
+        } else {
+            n(1) as f64 / n(0) as f64
+        })),
+        _ => Err(no_such_method(recv, name)),
+    }
+}
+
+/// `STREAM_OF` builtin: an object `Stream` over the popped elements.
+fn b_stream_of(vm: &mut VM, argc: u8) -> Value {
+    let items = pop_n(vm, argc);
+    stream_then(&Value::Undef, &items, None, true)
 }

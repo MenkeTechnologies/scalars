@@ -190,6 +190,9 @@ struct CtorParams {
     param_tys: Vec<Option<String>>,
     param_by_name: Vec<bool>,
     param_defaults: Vec<Option<Expr>>,
+    /// The first list's length when there are several (see
+    /// [`ClassDecl::first_list`]).
+    first_list: Option<usize>,
 }
 
 /// The outcome of parsing a top-level `object`: the program entry point, or a
@@ -740,6 +743,7 @@ impl Parser {
             param_tys,
             param_by_name,
             param_defaults,
+            first_list,
         } = self.ctor_params()?;
         // `extends Parent[(args)] [with T]*`.
         let (parents, super_args) = self.parents_clause()?;
@@ -758,6 +762,7 @@ impl Parser {
             param_by_name,
             param_tys,
             param_defaults,
+            first_list,
             body,
             field_names,
             methods,
@@ -983,9 +988,21 @@ impl Parser {
     /// otherwise. Shared by `class` and by an `enum`'s parameterized `case`.
     fn ctor_params(&mut self) -> Result<CtorParams, String> {
         let mut out = CtorParams::default();
-        if !self.is(&Tok::LParen) {
-            return Ok(out);
+        // Every parameter list joins the one field list; the length of the
+        // first is kept when there are more (see [`ClassDecl::first_list`]).
+        let mut lists = 0;
+        while self.is(&Tok::LParen) {
+            if lists == 1 {
+                out.first_list = Some(out.params.len());
+            }
+            self.ctor_param_list(&mut out)?;
+            lists += 1;
         }
+        Ok(out)
+    }
+
+    /// One parenthesized primary-constructor parameter list, appended to `out`.
+    fn ctor_param_list(&mut self, out: &mut CtorParams) -> Result<(), String> {
         self.advance();
         self.skip_seps();
         while !self.is(&Tok::RParen) && !self.is(&Tok::Eof) {
@@ -1030,7 +1047,7 @@ impl Parser {
             }
         }
         self.eat(&Tok::RParen)?;
-        Ok(out)
+        Ok(())
     }
 
     /// A Scala 3 `enum` (cursor on the `enum` word), lowered to the declarations
@@ -1099,6 +1116,7 @@ impl Parser {
                         param_tys,
                         param_by_name,
                         param_defaults,
+                        ..
                     } = self.ctor_params()?;
                     let (mut case_parents, super_args) = self.parents_clause()?;
                     if !case_parents.contains(&name) {
@@ -1117,6 +1135,7 @@ impl Parser {
                             param_by_name,
                             param_tys,
                             param_defaults,
+                            first_list: None,
                             body: Vec::new(),
                             field_names,
                             methods: Vec::new(),
@@ -1159,11 +1178,13 @@ impl Parser {
             param_tys,
             param_by_name,
             param_defaults,
+            ..
         } = ctor.unwrap_or(CtorParams {
             params: Vec::new(),
             param_tys: Vec::new(),
             param_by_name: Vec::new(),
             param_defaults: Vec::new(),
+            first_list: None,
         });
         self.declare_class(
             ClassDecl {
@@ -1186,6 +1207,7 @@ impl Parser {
                 param_by_name,
                 param_tys,
                 param_defaults,
+                first_list: None,
                 body: fields,
                 methods,
             },
@@ -3610,7 +3632,14 @@ impl Parser {
             // updates. Named args (`field =`) are not general-purpose method args
             // in this frontend, so `copy` is parsed specially.
             if name == "copy" && self.is(&Tok::LParen) {
-                let updates = self.copy_updates()?;
+                let mut updates = self.copy_updates()?;
+                // A case class with a SECOND parameter list takes it on `copy`
+                // too, positionally after the first list (`^j`).
+                if self.is(&Tok::LParen) {
+                    for (j, a) in self.arg_list()?.into_iter().enumerate() {
+                        updates.push((Some(format!("^{j}")), a));
+                    }
+                }
                 e = Expr::Copy {
                     recv: Box::new(e),
                     updates,
@@ -4459,6 +4488,7 @@ impl Parser {
             param_by_name: vec![false; params.len()],
             param_tys: vec![None; params.len()],
             param_defaults: vec![None; params.len()],
+            first_list: None,
             params,
             body,
             field_names,
@@ -5794,12 +5824,14 @@ fn mutable_factory_name(name: &str) -> bool {
     mutable_buffer_ctor(name).is_some() || matches!(name, "Set" | "HashSet" | "Map" | "HashMap")
 }
 
-/// The ordered collection a `TreeSet`/`TreeMap`/`SortedSet`/`SortedMap` factory
-/// builds (`scala.collection.immutable`), else `None`.
+/// The ordered collection a `TreeSet`/`TreeMap`/`SortedSet`/`SortedMap` (or
+/// insertion-ordered `ListMap`) factory builds (`scala.collection.immutable`),
+/// else `None`.
 pub fn sorted_ctor(name: &str) -> Option<&'static str> {
     match name {
         "TreeSet" | "SortedSet" => Some("TreeSet"),
         "TreeMap" | "SortedMap" => Some("TreeMap"),
+        "ListMap" => Some("ListMap"),
         _ => None,
     }
 }

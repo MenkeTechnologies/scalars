@@ -1386,24 +1386,27 @@ reported as parse/compile errors, never silently mis-run.
   `skip`, `toList`, `findFirst` as an `Optional`, `reduce` in both forms, and
   `collect` with `Collectors.toList`/`toSet`/`joining`/`counting`, a
   collected list printing `[a, b]`), and a stream is single-use: an op on one
-  already linked or consumed is the JDK's `IllegalStateException`. Not
-  modelled: `summaryStatistics`, `Stream.max`/`min` with a `Comparator`,
-  `flatMap`, `Collectors.groupingBy`/`toMap`, and the `java.util.List` beyond
-  `size`/`get`/`contains`/`indexOf`/`isEmpty`/`forEach`/`stream`; a
-  `toSet` orders by `##`, which differs from `hashCode` for a `Long` outside
-  `Int` range or a `Double`. A stream's `toString` is the JVM identity form,
+  already linked or consumed is the JDK's `IllegalStateException`. Also
+  `flatMap` (with `java.util.stream.Stream.of`), `max`/`min` with a
+  `Comparator` (`Comparator.naturalOrder`/`reverseOrder` or a two-argument
+  function), `IntStream.summaryStatistics`, and `Collectors.groupingBy(f[,
+  downstream])`/`toMap(kf, vf)` into a `HashMap` printed `{k=v, …}` (with
+  `get`/`getOrDefault`/`containsKey`/`size`/`isEmpty`). A Java set or map
+  iterates in its table order of the JDK `hashCode` (`Long` and `Double` fold
+  their bits). Not modelled: the `java.util.List`/`Map` beyond the members
+  listed, `Collectors.partitioningBy`/`mapping`/`reducing`, a `toMap` merge
+  function, and `LongStream`/`DoubleStream`. A stream's `toString` is the JVM identity form,
   which is not reproducible.
 - **Found by the second October 2026 differential round, still open.** These
   raise a catchable `java.lang.NullPointerException` where Scala runs, so a
   `catch` that matches it would hide the gap: `getClass` on a `case object`
   (Scala answers `Unit1$`), `Function.tupled(f)`, `mutable.TreeMap(…)` and
   `mutable.BitSet(…)`. These are compile/parse errors: `import
-  scala.util.boundary.break` then a bare `break(v)` inside `boundary { … }`,
-  `collection.immutable.ListMap`, and a `case class` with a SECOND parameter
-  list (`case class P(x: Int)(val tag: String)`); `BigDecimal.underlying` and
-  `MatchIterator.matchData` (on a `findAllIn` result) are not members.
-  (`Regex.unapplySeq` and `super.m` inside a singleton `object` are now
-  modelled, as are the buffer/`Map` `…InPlace` transformers, `keysIterator`/`valuesIterator`, and the `String` members
+  scala.util.boundary.break` then a bare `break(v)` inside `boundary { … }`.
+  (`Regex.unapplySeq`, `super.m` inside a singleton `object`, the immutable
+  `ListMap`, a `case class` with a SECOND parameter list — whose product is the
+  first list only —, `BigDecimal.underlying` (a `java.math.BigDecimal` with
+  `toPlainString`) and `MatchIterator.matchData` are now modelled, as are the buffer/`Map` `…InPlace` transformers, `keysIterator`/`valuesIterator`, and the `String` members
   `indexOfSlice`/`lastIndexOfSlice`/`containsSlice`/`inits`/`tails`/
   `reverseIterator`/`sameElements`/`distinctBy`/`union`/`regionMatches`/
   `indent`/`getBytes(charset)` this round listed;

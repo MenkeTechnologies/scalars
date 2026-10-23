@@ -130,6 +130,12 @@ pub struct ClassDecl {
     /// construction is what reproduces that exactly, and it is the same thing
     /// `Compiler::adapt_args` does for a `def`.
     pub param_defaults: Vec<Option<Expr>>,
+    /// How many of [`Self::params`] the FIRST parameter list holds, when the
+    /// primary constructor has more than one (`case class P(x: Int)(val tag:
+    /// String)`). Only the first list is a case class's product — its
+    /// `equals`, `hashCode`, `toString`, `unapply` and `copy` — and later lists
+    /// are ordinary fields. `None` for a single list.
+    pub first_list: Option<usize>,
     /// Whether each [`Self::params`] entry is BY-NAME (`x: => Int`), same order
     /// and length.
     ///
