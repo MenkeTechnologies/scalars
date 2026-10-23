@@ -143,6 +143,11 @@ reported as parse/compile errors, never silently mis-run.
   a statement that is nothing but `_` (`xs.map { _ }`) is refused, since there is
   no containing expression to expand at ("Unbound placeholder parameter" in
   Scala). Covered by the parity fuzzer's `braces` mode.
+
+  A call whose argument is a bare `_` (`f(_)`) is expanded at the call only when
+  nothing larger contains it; as an OPERAND it belongs to the enclosing
+  expression, so `xs.sortWith(_.compareTo(_) < 0)` is `(a, b) => a.compareTo(b)
+  < 0` and `xs.map(f(_) + 1)` is `x => f(x) + 1`.
 - **User-defined methods (`def`), lexically scoped.** Helper `def`s alongside
   `main` (or inside an `extends App` body) are compiled to fusevm's native
   `Op::Call` frame ABI: parameters bind to per-call frame slots, recursion and
@@ -439,6 +444,11 @@ reported as parse/compile errors, never silently mis-run.
     captured by the closure the pattern sits in;
   - the second clause of a curried by-name call (`rep(i < 3) { t += i }`)
     shares the cells of the `var`s it assigns.
+- **`%a`/`%A`, the hexadecimal float conversion**, and `Double.toHexString`.
+  `java.util.Formatter.hexDouble` is ported: a precision rounds the significand
+  half-even to that many hex digits (`%.0a` is one), a subnormal is normalized
+  first, a zero pad goes between `0x` and the digits, and `-0.0` is negative.
+  `%(a` and `%,a` raise `FormatFlagsConversionMismatchException`.
 - **`%c` of a `Char`, `%h`/`%H`, and `startsWith(prefix, offset)`.**
 - **The standard `Ordering[T]` for an implicit parameter.** `def maxOf[T](xs:
   List[T])(implicit ord: Ordering[T])`, its `using` spelling and a `[T:
@@ -519,12 +529,14 @@ reported as parse/compile errors, never silently mis-run.
   sequence operations (`length`, `map`, `filter`, `sum`, `mkString`, `toList`,
   `reverse`, `contains`, `foreach`, …).
 - **Collections: `List`/`Seq`/`Vector`/`Set`/`Map`.** Literals for all five
-  (`Seq` is `List` and `IndexedSeq` is `Vector`, as in Scala 3), `Nil`, `::`,
+  (`Seq` and `Iterable` are `List` and `IndexedSeq` is `Vector`, as in Scala
+  3), `Nil`, `::`,
   and the combinator set: `map`/`flatMap`/`filter`/`filterNot`/`foreach`;
   `foldLeft`/`foldRight`/`fold`/`reduce`/`reduceLeft`/`reduceRight`;
   `sum`/`product`/`min`/`max`/`minBy`/`maxBy`/`count`/`length`/`size`;
   `exists`/`forall`/`find`/`indexOf`/`lastIndexOf`/`indexWhere`/`contains`
-  (`indexWhere(p, from)` and `lastIndexWhere(p, end)` too);
+  (`indexWhere(p, from)`, `lastIndexWhere(p, end)` and `segmentLength(p,
+  from)` too);
   `sorted`/`sortBy`/`sortWith`/`reverse`/`distinct`;
   `take`/`drop`/`takeRight`/`dropRight`/`takeWhile`/`dropWhile`/`slice`/
   `splitAt`/`span`/`partition`/`init`/`tail`/`head`/`last`/`headOption`/
@@ -767,6 +779,11 @@ reported as parse/compile errors, never silently mis-run.
   **pattern definitions**: `val (a, b) = pair`, `val Some(x) = opt`,
   `val h :: t = xs`, `val Pt(x, y) = p` and nested forms all bind into the
   enclosing scope and raise `scala.MatchError` on a non-matching value.
+  The `scala.collection` extractors `h +: t` and `init :+ last` match any
+  non-empty sequence (a `Range` and an `ArrayBuffer` too) and keep its kind in
+  the remainder; `+:` binds tighter than `::`/`:+` and is right-associative,
+  `:+` is left-associative (`case rest :+ y :+ z`), and both work in a `val`
+  pattern definition.
 - **`scala.Option`'s method surface.** `get`, `getOrElse`, `orNull`, `isEmpty`,
   `isDefined`, `nonEmpty`, `size`, `contains`, `map`, `flatMap`, `filter`,
   `filterNot`, `exists`, `forall`, `count`, `foreach`, `fold(ifEmpty)(f)`,
@@ -790,8 +807,8 @@ reported as parse/compile errors, never silently mis-run.
   like `Left`/`Right`, which is what makes `case Success(v) =>` and
   `Failure(e).exception` work. The surface is `isSuccess`/`isFailure`, `get`
   (which rethrows), `getOrElse`, `orElse`, `map`, `flatMap`, `foreach`,
-  `filter`, `recover`/`recoverWith`, `failed`, `toOption`, `toEither` and
-  `toSeq`/`toList`. Two deviations: Scala catches only `NonFatal` throwables and
+  `filter`, `recover`/`recoverWith`, `transform`, `failed`, `toOption`,
+  `toEither` and `toSeq`/`toList`. Two deviations: Scala catches only `NonFatal` throwables and
   lets a fatal one (`StackOverflowError`, `OutOfMemoryError`) propagate, where
   this catches every `Throwable`; and a program defining its own `Try` cannot
   shadow the factory, the same way it cannot shadow `List(…)`.
@@ -932,6 +949,19 @@ reported as parse/compile errors, never silently mis-run.
   (`Math.signum(5)` is `1.0`, `math.signum(5)` is `1`). A method named without
   arguments is eta-expanded into a function value, as Scala does:
   `xs.map(math.sqrt)`, `xs.reduce(math.max)`, `math.hypot.tupled`.
+
+  The transcendental functions are bit-exact with the JVM. `src/fdlibm.rs` is a
+  port of fdlibm 5.3 as the JDK transliterates it in `java.lang.FdLibm`, which is
+  `StrictMath`; measured on JDK 21 (aarch64), `Math.X` equals `StrictMath.X` on
+  every one of 200,000 random inputs for `tan`, `asin`, `acos`, `atan`, `atan2`,
+  `exp`, `log`, `log10`, `log1p`, `expm1`, `sinh`, `cosh`, `tanh`, `cbrt`,
+  `pow` and `hypot`, while the platform libm was a ulp off on 2-40% of them
+  (`math.exp(1)` is `2.7182818284590455`, not `2.718281828459045`). `sin` and
+  `cos` are the exception — see *Modeled with a documented simplification*.
+  `Math.absExact` raises `Overflow to represent absolute value of
+  Integer.MIN_VALUE` (`Long.MIN_VALUE` for a `Long`), and `abs`, `floorDiv`,
+  `floorMod` and unary `-` at `Long.MinValue` wrap as the JVM does rather than
+  faulting; `Math.floorDiv(Int.MinValue, -1)` wraps at 32 bits.
 
 - **`scala.collection.mutable.PriorityQueue`.** `enqueue`/`+=`/`++=`, `dequeue`,
   `dequeueAll`, `head`/`max`, `clone`, `clear`, and the shared read-only
@@ -1285,11 +1315,32 @@ reported as parse/compile errors, never silently mis-run.
   not a member of Null`), the composite `Ordering.Tuple2(o1, o2)` instance, and
   SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
   Double) => …` then `s.show(x)`).
+- **Found by the October 2026 differential round, still open:** an `implicit
+  class` whose receiver is a tuple or a type parameter (`implicit class
+  Ops[A, B, C](t: (A, B, C))`) — extension selection goes by the receiver's
+  static type NAME and a tuple has none (`value swap2 is not a member of
+  value`); the deprecated `(xs, ys).zipped`; `String.chars` (an `IntStream`).
 - **`do/while` is not a gap.** Scala 3 removed it from the language and the
   reference compiler rejects it, so scalars does not implement it either.
 
 ## Modeled with a documented simplification
 
+- **`math.sin` and `math.cos` round as the platform libm does, not as the
+  JVM.** On JDK 21 aarch64 they are HotSpot intrinsics that disagree with
+  `StrictMath` on about 7% of inputs (measured: 14,323 of 200,000), and on
+  x86-64 they are a different intrinsic again, so there is no portable answer
+  to port; a ulp-level difference remains on roughly 8% of arguments.
+  `src/fdlibm.rs` carries the `StrictMath` versions (`strict_sin`,
+  `strict_cos`), unused.
+- **`Char` classification follows a newer Unicode than JDK 21.** `isLetter`,
+  `isDigit`, `isSpaceChar`, `isWhitespace`, `isControl`, `isTitleCase`,
+  `asDigit`, `Character.digit` and the simple case mappings `toUpper`/`toLower`
+  are Java's general-category rules (a sweep of the whole BMP agrees with the
+  reference on all but 18 chars). Those 18 are characters Unicode 16 added or
+  re-cased (`U+A7CB`..`U+A7DC`, `U+1C89`, `U+1C8A`, `U+019B`, `U+0264`,
+  `U+0295`); JDK 21 implements Unicode 15. `Character.getNumericValue` of a
+  numeric char that is not a decimal digit (`Ⅻ` is 12, `½` is -2 in Java)
+  answers -1, and `toTitleCase` is not provided.
 - **`sizeIs`/`lengthIs` answer the size itself.** Scala's `xs.sizeIs > n`
   builds a `SizeCompareOps` wrapper whose six comparison operators each call
   `sizeCompare(n)` — a short-circuit that lets a `LazyList` or a `List` stop

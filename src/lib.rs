@@ -13,6 +13,7 @@ pub mod cli;
 pub mod compiler;
 pub mod corpus;
 pub mod dap;
+pub mod fdlibm;
 pub mod host;
 pub mod jrandom;
 pub mod lexer;

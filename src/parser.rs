@@ -2448,7 +2448,7 @@ impl Parser {
     /// Whether the token after `val`/`var` starts a PATTERN definition rather
     /// than a plain binder. `(` opens a tuple pattern; a capitalized identifier
     /// followed by more pattern is a constructor (`Some(x)`) pattern; any
-    /// identifier followed by `::` is a cons pattern. A bare identifier before
+    /// identifier followed by `::`, `+:` or `:+` is an infix pattern. A bare identifier before
     /// `=` or `:` is the ordinary `val x = …` — capitalized or not, since Scala
     /// reads a lone identifier in a `val` as a binder (`val Pat = "…".r`).
     fn starts_pattern_decl(&self) -> bool {
@@ -2458,6 +2458,7 @@ impl Parser {
                 let binder = matches!(self.peek_at(1), Tok::Assign | Tok::Colon | Tok::Comma);
                 (n.chars().next().is_some_and(char::is_uppercase) && !binder)
                     || matches!(self.peek_at(1), Tok::ColonColon | Tok::At)
+                    || matches!(self.peek_at(1), Tok::Op(o) if o == "+:" || o == ":+")
             }
             _ => false,
         }
@@ -3720,7 +3721,15 @@ impl Parser {
         // mutable one stays immutable, as in Scala.
         if matches!(
             name.as_str(),
-            "List" | "Map" | "Array" | "Seq" | "Vector" | "Set" | "IndexedSeq" | "Iterator"
+            "List"
+                | "Map"
+                | "Array"
+                | "Seq"
+                | "Iterable"
+                | "Vector"
+                | "Set"
+                | "IndexedSeq"
+                | "Iterator"
         ) {
             let elems = self.arg_list()?;
             return Ok(eta_bare_args(Expr::Collection { ctor: name, elems }));
@@ -4748,15 +4757,44 @@ impl Parser {
         matches!(self.peek(), Tok::Op(o) if o == "|")
     }
 
-    /// Scala's `Pattern3` — the infix `::` pattern, right-associative so
-    /// `a :: b :: rest` nests as `a :: (b :: rest)`.
+    /// Scala's `Pattern3` — the infix patterns. `::` is right-associative, so
+    /// `a :: b :: rest` nests as `a :: (b :: rest)`; `:+` (the
+    /// `scala.collection.:+` extractor) shares its precedence but is
+    /// left-associative, so `xs :+ a :+ b` nests as `(xs :+ a) :+ b`; and `+:`
+    /// binds tighter than both (precedence goes by the first character) and is
+    /// right-associative. The two collection extractors become constructor
+    /// patterns named by their operator.
     fn pattern_cons(&mut self) -> Result<Pattern, String> {
-        let head = self.pattern_primary()?;
+        let mut head = self.pattern_prepend()?;
+        while matches!(self.peek(), Tok::Op(o) if o == ":+") {
+            self.advance();
+            self.skip_seps();
+            let last = self.pattern_prepend()?;
+            head = Pattern::Constructor {
+                name: ":+".to_string(),
+                elems: vec![head, last],
+            };
+        }
         if self.is(&Tok::ColonColon) {
             self.advance();
             self.skip_seps();
             let tail = self.pattern_cons()?;
             return Ok(Pattern::Cons(Box::new(head), Box::new(tail)));
+        }
+        Ok(head)
+    }
+
+    /// The right-associative `h +: t` pattern — see [`Self::pattern_cons`].
+    fn pattern_prepend(&mut self) -> Result<Pattern, String> {
+        let head = self.pattern_primary()?;
+        if matches!(self.peek(), Tok::Op(o) if o == "+:") {
+            self.advance();
+            self.skip_seps();
+            let tail = self.pattern_prepend()?;
+            return Ok(Pattern::Constructor {
+                name: "+:".to_string(),
+                elems: vec![head, tail],
+            });
         }
         Ok(head)
     }
@@ -5159,6 +5197,12 @@ fn of_dim(dims: &[Expr], ty: String, line: u32) -> Expr {
 /// where [`expand_statement_placeholders`] would lift the WHOLE statement into a
 /// function: `println(xs.map(_))` would build `$ph0 => println(xs.map($ph0))`,
 /// evaluate it, discard it, and print nothing at all.
+///
+/// The call is only PROVISIONALLY the boundary. When it turns out to be an
+/// operand of a larger expression — `_.compareTo(_) < 0`, `f(_) + 1` — that
+/// expression is the one Scala expands at, so the lambda built here names its
+/// parameters with [`ETA_PARAM`] for the enclosing boundary to recognize and
+/// absorb (see [`absorb_eta`]).
 fn eta_bare_args(e: Expr) -> Expr {
     let bare = match &e {
         Expr::Method { args, .. }
@@ -5170,7 +5214,7 @@ fn eta_bare_args(e: Expr) -> Expr {
         _ => false,
     };
     if bare {
-        wrap_placeholders(e)
+        wrap_placeholders_as(e, ETA_PARAM)
     } else {
         e
     }
@@ -5211,13 +5255,20 @@ fn expand_statement_placeholders(kind: &mut StmtKind) {
 }
 
 fn wrap_placeholders(e: Expr) -> Expr {
+    wrap_placeholders_as(e, "$ph")
+}
+
+/// The parameter prefix of a provisional lambda [`eta_bare_args`] built.
+const ETA_PARAM: &str = "$eta";
+
+fn wrap_placeholders_as(e: Expr, prefix: &str) -> Expr {
     let mut n = 0usize;
     let mut body = e;
-    replace_placeholders(&mut body, &mut n);
+    replace_placeholders(&mut body, &mut n, prefix);
     if n == 0 {
         return body;
     }
-    let params = (0..n).map(|i| format!("$ph{i}")).collect();
+    let params = (0..n).map(|i| format!("{prefix}{i}")).collect();
     Expr::Lambda {
         params,
         body: Box::new(body),
@@ -5225,57 +5276,96 @@ fn wrap_placeholders(e: Expr) -> Expr {
     }
 }
 
-/// Replace each [`Expr::Placeholder`] with `Var($ph{n})`, bumping `n`. Does not
+/// An OPERAND that is a provisional [`eta_bare_args`] lambda belongs to the
+/// expression being expanded: `_.compareTo(_) < 0` is `(a, b) =>
+/// a.compareTo(b) < 0`, not a function compared with zero. The lambda is
+/// applied to this expansion's next parameters, which is that expression with
+/// its parameters substituted. Answers whether it absorbed one; the node it
+/// built is complete and must not be walked again. A provisional lambda in ARGUMENT position is
+/// left alone — an argument is a real boundary, and the lambda is already its
+/// expansion.
+fn absorb_eta(e: &mut Expr, n: &mut usize, prefix: &str) -> bool {
+    let Expr::Lambda { params, .. } = &*e else {
+        return false;
+    };
+    if !params.first().is_some_and(|p| p.starts_with(ETA_PARAM)) {
+        return false;
+    }
+    let args = (0..params.len())
+        .map(|i| Expr::Var(format!("{prefix}{}", *n + i)))
+        .collect();
+    *n += params.len();
+    let lambda = std::mem::replace(e, Expr::Tuple(Vec::new()));
+    *e = Expr::Method {
+        recv: Box::new(lambda),
+        name: "apply".to_string(),
+        args,
+        line: 0,
+    };
+    true
+}
+
+/// Replace each [`Expr::Placeholder`] with `Var({prefix}{n})`, bumping `n`. Does not
 /// recurse into a nested `Lambda` (its placeholders already belong to it).
-fn replace_placeholders(e: &mut Expr, n: &mut usize) {
+fn replace_placeholders(e: &mut Expr, n: &mut usize, prefix: &str) {
     match e {
         Expr::Placeholder => {
-            *e = Expr::Var(format!("$ph{n}"));
+            *e = Expr::Var(format!("{prefix}{n}"));
             *n += 1;
         }
         Expr::Lambda { .. } => {}
-        Expr::Unary { rhs, .. } => replace_placeholders(rhs, n),
+        Expr::Unary { rhs, .. } => {
+            if !absorb_eta(rhs, n, prefix) {
+                replace_placeholders(rhs, n, prefix);
+            }
+        }
         Expr::Binary { lhs, rhs, .. } => {
-            replace_placeholders(lhs, n);
-            replace_placeholders(rhs, n);
+            if !absorb_eta(lhs, n, prefix) {
+                replace_placeholders(lhs, n, prefix);
+            }
+            if !absorb_eta(rhs, n, prefix) {
+                replace_placeholders(rhs, n, prefix);
+            }
         }
         Expr::Method { recv, args, .. } => {
-            replace_placeholders(recv, n);
+            if !absorb_eta(recv, n, prefix) {
+                replace_placeholders(recv, n, prefix);
+            }
             for a in args {
-                replace_placeholders(a, n);
+                replace_placeholders(a, n, prefix);
             }
         }
         Expr::Call { args, .. } => {
             for a in args {
-                replace_placeholders(a, n);
+                replace_placeholders(a, n, prefix);
             }
         }
         Expr::New { args, .. } | Expr::Tuple(args) | Expr::Collection { elems: args, .. } => {
             for a in args {
-                replace_placeholders(a, n);
+                replace_placeholders(a, n, prefix);
             }
         }
-        Expr::Println { arg: Some(a), .. } => replace_placeholders(a, n),
-        Expr::Format { value, .. } => replace_placeholders(value, n),
+        Expr::Println { arg: Some(a), .. } => replace_placeholders(a, n, prefix),
+        Expr::Format { value, .. } => replace_placeholders(value, n, prefix),
         // `_.copy(sal = 0)` — the receiver of a `copy` is an operand like any
         // method receiver.
         Expr::Copy { recv, updates, .. } => {
-            replace_placeholders(recv, n);
+            replace_placeholders(recv, n, prefix);
             for (_, v) in updates {
-                replace_placeholders(v, n);
+                replace_placeholders(v, n, prefix);
             }
         }
         Expr::If { cond, then, els } => {
-            replace_placeholders(cond, n);
-            replace_placeholders(then, n);
+            replace_placeholders(cond, n, prefix);
+            replace_placeholders(then, n, prefix);
             if let Some(e) = els {
-                replace_placeholders(e, n);
+                replace_placeholders(e, n, prefix);
             }
         }
         // `_ match { case … }` is `x => x match { case … }`: the scrutinee is an
         // operand of the match expression. The arms are separate expressions,
         // so a placeholder inside one belongs to that arm, not to this lambda.
-        Expr::Match { scrut, .. } => replace_placeholders(scrut, n),
+        Expr::Match { scrut, .. } => replace_placeholders(scrut, n, prefix),
         // Placeholders do not reach across a block/comprehension boundary
         // (Scala's placeholder scope is the enclosing expression), and the other
         // arms carry no sub-expressions.

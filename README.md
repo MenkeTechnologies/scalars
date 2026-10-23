@@ -568,10 +568,13 @@ Implemented and checked against the reference `scala`:
   `toRadians`/`toDegrees`, `Pi`, `E`, under the `math`, `scala.math`, `Math` and
   `java.lang.Math` spellings. Integral overloads stay integral, and the two
   namespaces are kept apart where the JDK lacks an overload (`Math.signum(5)` is
-  `1.0`, `math.signum(5)` is `1`).
+  `1.0`, `math.signum(5)` is `1`). Every transcendental except `sin`/`cos` is a
+  port of the JDK's fdlibm (`StrictMath`), so it is bit-exact with the JVM on
+  every platform rather than inheriting the host libm's last-ulp rounding.
 - **`BigInt`** — arbitrary precision (`BigInt(n)`, `BigInt("…"[, radix])`),
   mixed with `Int`/`Long` operands on either side, `pow`/`gcd`/`mod`/`modPow`/
-  `/%`/`isProbablePrime`/bitwise ops, `sum`/`product`/`sorted` over a
+  `/%`/`isProbablePrime`/bitwise ops, the narrowing `toByte`/`toShort`/`toChar`
+  and `isValidByte`/`isValidShort`/`isValidChar`, `sum`/`product`/`sorted` over a
   collection of them, and `val b: BigInt = 7` widening as Scala's `int2bigInt`
   does.
 - **`BigDecimal`** — `java.math.BigDecimal`'s unscaled-value-and-scale model under

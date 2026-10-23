@@ -1902,8 +1902,8 @@ impl Compiler {
             self.expr(el)?;
         }
         let id = match ctor {
-            // Scala 3 `Seq` is `List`; `IndexedSeq` is `Vector`.
-            "List" | "Seq" => crate::host::MAKE_LIST,
+            // Scala 3 `Seq` and `Iterable` are `List`; `IndexedSeq` is `Vector`.
+            "List" | "Seq" | "Iterable" => crate::host::MAKE_LIST,
             "Vector" | "IndexedSeq" => crate::host::MAKE_VECTOR,
             "Iterator" => crate::host::MAKE_ITERATOR,
             // Only produced by the varargs collection in `adapt_args`.
@@ -2539,6 +2539,30 @@ impl Compiler {
                     self.emit_store(ep);
                     self.match_pattern(elem, ep, fail_jumps)?;
                 }
+            }
+            // `case h +: t =>` / `case init :+ last =>` — the
+            // `scala.collection` extractors over any non-empty sequence, which
+            // split off the first or the last element. The parts keep the
+            // receiver's kind (`init` of a `Vector` is a `Vector`), because
+            // they come from its own `tail`/`init`.
+            Pattern::Constructor { name, elems }
+                if matches!(name.as_str(), "+:" | ":+")
+                    && elems.len() == 2
+                    && !self.classes.contains_key(name) =>
+            {
+                self.emit_type_test(vplace, "Seq", fail_jumps);
+                let ne = self.bind_accessor(vplace, "nonEmpty", "ne");
+                self.emit_load(ne);
+                fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
+                let (first, second) = if name == "+:" {
+                    ("head", "tail")
+                } else {
+                    ("init", "last")
+                };
+                let a = self.bind_accessor(vplace, first, "sx");
+                self.match_pattern(&elems[0], a, fail_jumps)?;
+                let b = self.bind_accessor(vplace, second, "sx");
+                self.match_pattern(&elems[1], b, fail_jumps)?;
             }
             Pattern::Constructor { name, elems } => {
                 // Scala's derived `unapply` exposes the primary-constructor
@@ -7156,7 +7180,9 @@ impl Compiler {
         if math_module(recv).is_some() {
             return match (name, args.len()) {
                 ("abs" | "signum", 1) => self.num_ty(&args[0]),
-                ("max" | "min", 2) => self.num_ty(&args[0]).combine(self.num_ty(&args[1])),
+                ("max" | "min", 2) | ("floorDiv" | "floorMod", 2) => {
+                    self.num_ty(&args[0]).combine(self.num_ty(&args[1]))
+                }
                 _ => NumTy::Unknown,
             };
         }
@@ -8011,8 +8037,8 @@ const ORDERING_MEMBERS: &[&str] = &[
 /// (`Map`, whose factory members take key/value pairs instead).
 fn factory_conversion(owner: &str) -> Option<&'static str> {
     Some(match owner {
-        // Scala 3 `Seq` is `List`; `IndexedSeq` is `Vector`.
-        "List" | "Seq" => "toList",
+        // Scala 3 `Seq` and `Iterable` are `List`; `IndexedSeq` is `Vector`.
+        "List" | "Seq" | "Iterable" => "toList",
         "Vector" | "IndexedSeq" => "toVector",
         "Set" | "HashSet" => "toSet",
         "Array" => "toArray",
@@ -8416,6 +8442,7 @@ const MATH_MEMBERS: &[&str] = &[
     "incrementExact",
     "decrementExact",
     "negateExact",
+    "absExact",
     "toIntExact",
 ];
 
@@ -8738,10 +8765,13 @@ const WIDTH_COMBINING_METHODS: &[&str] = &["+", "-", "*", "/", "%", "max", "min"
 /// cannot leave the range, and wrapping it would cost four ops on every call for
 /// no change in answer. These are the ones that genuinely overflow — the
 /// arithmetic operators in method spelling, `abs` (at `Int.MinValue`), `toInt`,
-/// which is Scala's explicit narrowing conversion, and the two folds over a
-/// collection that accumulate — `sum` and `product` overflow on a long enough
-/// `List[Int]` however small its elements are.
-const NARROW_AFTER_METHODS: &[&str] = &["toInt", "abs", "+", "-", "*", "/", "%", "sum", "product"];
+/// which is Scala's explicit narrowing conversion, `Math.floorDiv` (at
+/// `Int.MinValue / -1`), and the two folds over a collection that accumulate —
+/// `sum` and `product` overflow on a long enough `List[Int]` however small its
+/// elements are.
+const NARROW_AFTER_METHODS: &[&str] = &[
+    "toInt", "abs", "floorDiv", "+", "-", "*", "/", "%", "sum", "product",
+];
 
 /// The parameter count of a `scala.math`/`java.lang.Math` METHOD, `None` for a
 /// constant (`Pi`, `E`) or a name that is not one — what decides whether an
@@ -8751,7 +8781,9 @@ fn math_method_arity(name: &str) -> Option<usize> {
         "abs" | "signum" | "sqrt" | "cbrt" | "exp" | "expm1" | "log" | "log10" | "log1p"
         | "floor" | "ceil" | "rint" | "round" | "sin" | "cos" | "tan" | "asin" | "acos"
         | "atan" | "sinh" | "cosh" | "tanh" | "toRadians" | "toDegrees" | "ulp"
-        | "incrementExact" | "decrementExact" | "negateExact" | "toIntExact" => Some(1),
+        | "incrementExact" | "decrementExact" | "negateExact" | "absExact" | "toIntExact" => {
+            Some(1)
+        }
         "max" | "min" | "pow" | "hypot" | "atan2" | "floorDiv" | "floorMod" | "IEEEremainder"
         | "addExact" | "subtractExact" | "multiplyExact" => Some(2),
         _ => None,

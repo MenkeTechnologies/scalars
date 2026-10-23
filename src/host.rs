@@ -22,6 +22,7 @@
 //!    answers with Scala's own rules (`Long` wraps; a mixed pair promotes).
 
 use crate::bigdec::{BigDec, Round};
+use crate::fdlibm;
 use fusevm::{Frame, NumOp, VMResult, Value, VM};
 use num_bigint::BigInt;
 use num_integer::Integer;
@@ -2568,8 +2569,20 @@ fn big_method(b: &BigInt, name: &str, args: &[Value]) -> Result<Value, String> {
         ("toLong", 0) => Ok(Value::int(
             (b & BigInt::from(u64::MAX)).to_u64().unwrap_or(0) as i64,
         )),
+        // `toByte`/`toShort`/`toChar` narrow those same low-order bits further.
+        ("toByte" | "toShort" | "toChar", 0) => {
+            let low = i64::from((b & BigInt::from(u16::MAX)).to_u16().unwrap_or(0));
+            Ok(match name {
+                "toByte" => Value::int(to_byte(low)),
+                "toShort" => Value::int(to_short(low)),
+                _ => make_char(char_of_code(low)),
+            })
+        }
         ("toDouble", 0) => Ok(Value::float(b.to_f64().unwrap_or(f64::NAN))),
         ("isValidInt", 0) => Ok(Value::bool(b.to_i32().is_some())),
+        ("isValidByte", 0) => Ok(Value::bool(b.to_i8().is_some())),
+        ("isValidShort", 0) => Ok(Value::bool(b.to_i16().is_some())),
+        ("isValidChar", 0) => Ok(Value::bool(b.to_u16().is_some())),
         ("isValidLong", 0) => Ok(Value::bool(b.to_i64().is_some())),
         ("abs", 0) => Ok(make_big(b.abs())),
         ("unary_-", 0) => Ok(make_big(-b)),
@@ -2935,6 +2948,95 @@ fn random_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Valu
 /// not a Rust `char`, so it stands in as U+FFFD rather than aborting.
 fn char_of_code(code: i64) -> char {
     char::from_u32(code as u32 & 0xFFFF).unwrap_or('\u{FFFD}')
+}
+
+/// `Character.isSpaceChar`: the Unicode space separators `Zs`, `Zl` and `Zp` —
+/// [`java_is_whitespace`] without the ASCII controls (`'\t'` is not a space
+/// char) and with the three no-break spaces.
+fn java_is_space_char(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
+/// Whether `c` is in the Unicode general category `class` (`L`, `Nd`, `Lt`),
+/// answered through the regex engine's category tables — Rust's `char` exposes
+/// only the derived properties (`Alphabetic`, `Numeric`), which are wider than
+/// the categories `java.lang.Character` tests.
+fn in_general_category(c: char, class: &str) -> bool {
+    let mut buf = [0u8; 4];
+    regex_compile(&format!(r"\A\p{{{class}}}\z"))
+        .is_ok_and(|re| re.is_match(c.encode_utf8(&mut buf)).unwrap_or(false))
+}
+
+/// `Character.isLetter`: the categories `Lu`/`Ll`/`Lt`/`Lm`/`Lo`. Not
+/// `char::is_alphabetic`, which adds the letter numbers and the combining
+/// marks of `Other_Alphabetic` (`'ͅ'`, `'Ⅻ'`).
+fn java_is_letter(c: char) -> bool {
+    c.is_ascii_alphabetic() || (!c.is_ascii() && in_general_category(c, "L"))
+}
+
+/// `Character.isDigit`: the category `Nd`, every script's decimal digits
+/// (`'٣'`, `'５'`) — not `char::is_numeric`, which adds `½` and `Ⅻ`.
+fn java_is_digit(c: char) -> bool {
+    c.is_ascii_digit() || (!c.is_ascii() && in_general_category(c, "Nd"))
+}
+
+/// `Character.digit(c, 36)`, which `RichChar.asDigit` is: a decimal digit's
+/// value in any script, `10..35` for the Latin letters in their ASCII and
+/// fullwidth forms, `-1` otherwise. Every `Nd` run is a whole `0..9` block, so
+/// a digit's value is its distance from the start of its run, modulo ten.
+fn java_digit36(c: char) -> i64 {
+    if let Some(d) = c.to_digit(36) {
+        return i64::from(d);
+    }
+    match c {
+        '\u{ff21}'..='\u{ff3a}' => return c as i64 - 0xff21 + 10,
+        '\u{ff41}'..='\u{ff5a}' => return c as i64 - 0xff41 + 10,
+        _ if !java_is_digit(c) => return -1,
+        _ => {}
+    }
+    let mut start = c as u32;
+    while char::from_u32(start - 1).is_some_and(java_is_digit) {
+        start -= 1;
+    }
+    i64::from((c as u32 - start) % 10)
+}
+
+/// `Character.toUpperCase(char)`: the SIMPLE case mapping, one char to one
+/// char. Where the full mapping expands (`'ß'` to `SS`) the char has no simple
+/// one and maps to itself — except the Greek vowels with ypogegrammeni, whose
+/// full mapping expands (`'ᾳ'` to `ΑΙ`) but whose simple one is the
+/// prosgegrammeni form (`'ᾼ'`).
+fn java_to_upper(c: char) -> char {
+    match c {
+        '\u{1f80}'..='\u{1f87}' | '\u{1f90}'..='\u{1f97}' | '\u{1fa0}'..='\u{1fa7}' => {
+            return char::from_u32(c as u32 + 8).unwrap_or(c)
+        }
+        '\u{1fb3}' | '\u{1fc3}' | '\u{1ff3}' => return char::from_u32(c as u32 + 9).unwrap_or(c),
+        _ => {}
+    }
+    let mut up = c.to_uppercase();
+    match (up.next(), up.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
+}
+
+/// `Character.toLowerCase(char)` — [`java_to_upper`]'s counterpart. `'İ'` is
+/// the one char whose full lowercase expands (to `i` and a combining dot)
+/// while its simple mapping is plain `i`.
+fn java_to_lower(c: char) -> char {
+    if c == '\u{130}' {
+        return 'i';
+    }
+    let mut low = c.to_lowercase();
+    match (low.next(), low.next()) {
+        (Some(l), None) => l,
+        _ => c,
+    }
 }
 
 /// `scala.StringContext.glob` (2.13 library, which Scala 3 runs on): match
@@ -7118,6 +7220,13 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             "scalars: java.util.FormatFlagsConversionMismatchException: Conversion = {conv}, Flags = ,"
         ));
     }
+    // `%a` refuses `(` as well (`checkFloat`), having no negative-in-parentheses
+    // form.
+    if paren && matches!(conv, 'a' | 'A') {
+        return Err(format!(
+            "scalars: java.util.FormatFlagsConversionMismatchException: Conversion = {conv}, Flags = ("
+        ));
+    }
     // A signed numeric body, padded. Under the `(` flag a NEGATIVE value is
     // wrapped in parentheses instead of signed; a zero pad goes inside them
     // (`%(08d` of -42 is `(000042)`), a space pad outside.
@@ -7146,7 +7255,7 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
     // A `null` argument prints `null` under every conversion.
     if matches!(
         conv,
-        'd' | 'o' | 'x' | 'X' | 'e' | 'E' | 'f' | 'g' | 'G' | 'c' | 'C'
+        'd' | 'o' | 'x' | 'X' | 'e' | 'E' | 'f' | 'g' | 'G' | 'a' | 'A' | 'c' | 'C'
     ) && matches!(v, Value::Undef)
     {
         let null = if conv.is_ascii_uppercase() {
@@ -7313,6 +7422,62 @@ fn format_one(spec: &str, v: &Value, vm: Option<&mut VM>) -> Result<String, Stri
             };
             Ok(num(body, x.is_sign_negative()))
         }
+        // `%a` — hexadecimal floating point, `Formatter.print(double)` with the
+        // `HEXADECIMAL_FLOAT` body. The sign is `Double.compare(v, 0.0) < 0`, so
+        // `-0.0` is negative; a zero pad goes between `0x` and the digits; a
+        // precision rounds the significand to that many hex digits (`%.0a` is
+        // one), and a shorter significand is zero-filled out to it.
+        'a' | 'A' => {
+            let x = num_f64(v);
+            let upper = conv == 'A';
+            if x.is_nan() {
+                return Ok(pad_str(
+                    if upper { "NAN" } else { "NaN" }.to_string(),
+                    left,
+                    width,
+                ));
+            }
+            let neg = x.is_sign_negative();
+            let mut sb = String::from(match (neg, plus, space) {
+                (true, ..) => "-",
+                (false, true, _) => "+",
+                (false, false, true) => " ",
+                _ => "",
+            });
+            if x.is_infinite() {
+                sb.push_str(if upper { "INFINITY" } else { "Infinity" });
+                return Ok(pad_str(sb, left, width));
+            }
+            let p = match prec {
+                None => 0,
+                Some(0) => 1,
+                Some(p) => p,
+            };
+            let s = formatter_hex_double(x.abs(), p);
+            sb.push_str(if upper { "0X" } else { "0x" });
+            if zero {
+                let lead = if sb.len() > 2 { 3 } else { 2 };
+                let n = width as i64 - s.len() as i64 - lead;
+                sb.push_str(&"0".repeat(n.max(0) as usize));
+            }
+            let (mant, exp) = s.split_once('p').unwrap_or((&s, "0"));
+            let mut mant = if upper {
+                mant.to_uppercase()
+            } else {
+                mant.to_string()
+            };
+            if p != 0 {
+                let have = mant.split_once('.').map_or(0, |(_, f)| f.len());
+                if !mant.contains('.') {
+                    mant.push('.');
+                }
+                mant.push_str(&"0".repeat(p.saturating_sub(have)));
+            }
+            sb.push_str(&mant);
+            sb.push(if upper { 'P' } else { 'p' });
+            sb.push_str(exp);
+            Ok(pad_str(sb, left, width))
+        }
         // `%h` — `Integer.toHexString(arg.hashCode())`, `null` for `null`. That
         // is the JAVA `hashCode`, not `##`: they differ for a fractional
         // `Double` (`3.5` is `400c0000` by `Double.hashCode`, `40600000` by
@@ -7390,7 +7555,9 @@ fn format_arg_check(conv: char, v: &Value) -> Result<(), String> {
     let integral = matches!(v, Value::Int(_));
     let accepts = match conv {
         'd' | 'o' | 'x' | 'X' => integral,
-        'e' | 'E' | 'f' | 'g' | 'G' => matches!(v, Value::Float(_)) || f32_of(v).is_some(),
+        'e' | 'E' | 'f' | 'g' | 'G' | 'a' | 'A' => {
+            matches!(v, Value::Float(_)) || f32_of(v).is_some()
+        }
         'c' | 'C' => integral || as_char(v).is_some(),
         _ => true,
     };
@@ -7467,6 +7634,70 @@ fn sci_body(mantissa: &str, exp: i32, upper: bool) -> String {
         if exp < 0 { "-" } else { "+" },
         exp.abs()
     )
+}
+
+/// `java.lang.Double.toHexString` — `0x1.8p1` for 3.0, `-0x0.0p0` for -0.0, a
+/// subnormal as `0x0.…p-1022`; a non-finite value is its decimal rendering.
+fn double_to_hex_string(d: f64) -> String {
+    if !d.is_finite() {
+        return format_double(d);
+    }
+    let sign = if d.is_sign_negative() { "-" } else { "" };
+    let a = d.abs();
+    if a == 0.0 {
+        return format!("{sign}0x0.0p0");
+    }
+    let subnormal = a < f64::MIN_POSITIVE;
+    let signif = format!("{:013x}", a.to_bits() & 0x000f_ffff_ffff_ffff);
+    let signif = match signif.trim_end_matches('0') {
+        "" => "0",
+        s => s,
+    };
+    let exp = if subnormal {
+        -1022
+    } else {
+        java_get_exponent(a)
+    };
+    format!("{sign}0x{}.{signif}p{exp}", if subnormal { 0 } else { 1 })
+}
+
+/// `Math.getExponent(double)` — the unbiased exponent field, so a subnormal
+/// (and zero) answers `-1023`.
+fn java_get_exponent(d: f64) -> i32 {
+    ((d.to_bits() >> 52) & 0x7ff) as i32 - 1023
+}
+
+/// `java.util.Formatter.hexDouble` — the `%a` body of a non-negative finite
+/// `d` with `prec` hex digits after the point (0 meaning "all of them"),
+/// without the `0x` prefix. The significand is rounded half-even at that
+/// precision, and a subnormal is normalized first.
+fn formatter_hex_double(d: f64, prec: usize) -> String {
+    if d == 0.0 || prec == 0 || prec >= 13 {
+        return double_to_hex_string(d)[2..].to_string();
+    }
+    let subnormal = java_get_exponent(d) == -1023;
+    // `SCALEUP` is 2^54, which lifts every subnormal into the normal range.
+    let d = if subnormal { d * 2f64.powi(54) } else { d };
+    let shift = 52 - 4 * prec as u32;
+    let bits = d.to_bits();
+    let mut signif = bits >> shift;
+    let dropped = bits & !(!0u64 << shift);
+    let least_zero = signif & 1 == 0;
+    let round = dropped & (1 << (shift - 1)) != 0;
+    let sticky = shift > 1 && dropped & !(1 << (shift - 1)) != 0;
+    if (least_zero && round && sticky) || (!least_zero && round) {
+        signif += 1;
+    }
+    let result = f64::from_bits(signif << shift);
+    if result.is_infinite() {
+        return "1.0p1024".to_string();
+    }
+    let res = double_to_hex_string(result)[2..].to_string();
+    if !subnormal {
+        return res;
+    }
+    let (mant, exp) = res.split_once('p').unwrap_or((&res, "0"));
+    format!("{mant}p{}", exp.parse::<i32>().unwrap_or(0) - 54)
 }
 
 /// Java's rendering of a non-finite double under a float conversion, or `None`
@@ -10301,10 +10532,15 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             }
             Ok(Value::int(-1))
         }
-        // The length of the longest PREFIX all of whose elements hold — it stops
+        // The length of the longest segment all of whose elements hold, starting
+        // at `from` (a negative one is 0, as `iterator.drop` makes it) — it stops
         // at the first failure rather than counting every match.
-        ("segmentLength", 1) => {
-            let mut n = 0usize;
+        ("segmentLength", 1 | 2) => {
+            let start = args
+                .get(1)
+                .map_or(0, |v| v.to_int().max(0) as usize)
+                .min(items.len());
+            let mut n = start;
             while n < items.len()
                 && truthy(&invoke_closure(
                     vm,
@@ -10314,7 +10550,7 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
             {
                 n += 1;
             }
-            Ok(Value::int(n as i64))
+            Ok(Value::int((n - start) as i64))
         }
         ("takeWhile" | "dropWhile", 1) => {
             let mut n = 0usize;
@@ -11392,7 +11628,8 @@ fn java_trim(s: &str) -> String {
 fn java_is_whitespace(c: char) -> bool {
     matches!(c,
         // Zs, minus the three non-breaking ones.
-        '\u{20}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{205F}' | '\u{3000}'
+        '\u{20}' | '\u{1680}' | '\u{2000}'..='\u{2006}' | '\u{2008}'..='\u{200A}' | '\u{205F}'
+        | '\u{3000}'
         // Zl and Zp.
         | '\u{2028}' | '\u{2029}'
         // The ASCII control whitespace, and the four information separators.
@@ -12651,6 +12888,9 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
         ("java.Integer", "toUnsignedLong", 1) => Ok(Value::int(i64::from(i(0) as i32 as u32))),
         // `Double.toString(d)` is the same shortest-round-trip rendering the
         // implicit `"" + d` uses, so `-0.0` keeps its sign.
+        ("java.Double", "toHexString", 1) => {
+            Ok(Value::str(double_to_hex_string(num_f64(&args[0]))))
+        }
         ("java.Double" | "java.Float", "toString", 1) => {
             Ok(Value::str(format_double(num_f64(&args[0]))))
         }
@@ -12784,25 +13024,37 @@ fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, Strin
             }))
         }
         // ── `java.lang.Character` ────────────────────────────────────────────
+        // `Character.digit(c, radix)`: the value of `c` as a digit of `radix`, or
+        // -1 when it is not one (or the radix is outside `2..=36`).
+        ("java.Character", "digit", 2) => {
+            let c = as_char(&args[0]).or_else(|| char::from_u32(args[0].to_int() as u32));
+            let radix = args[1].to_int();
+            let d = c.map_or(-1, java_digit36);
+            Ok(Value::int(if (2..=36).contains(&radix) && d < radix {
+                d
+            } else {
+                -1
+            }))
+        }
         ("java.Character", _, 1) => {
             let c = as_char(&args[0])
                 .or_else(|| char::from_u32(args[0].to_int() as u32))
                 .ok_or_else(|| format!("scalars: {name} expects a Char"))?;
             match name {
-                "isDigit" => Ok(Value::bool(c.is_numeric())),
-                "isLetter" => Ok(Value::bool(c.is_alphabetic())),
-                "isLetterOrDigit" => Ok(Value::bool(c.is_alphanumeric())),
-                "isWhitespace" | "isSpaceChar" => Ok(Value::bool(c.is_whitespace())),
+                "isDigit" => Ok(Value::bool(java_is_digit(c))),
+                "isLetter" => Ok(Value::bool(java_is_letter(c))),
+                "isLetterOrDigit" => Ok(Value::bool(java_is_letter(c) || java_is_digit(c))),
+                "isWhitespace" => Ok(Value::bool(java_is_whitespace(c))),
+                "isSpaceChar" => Ok(Value::bool(java_is_space_char(c))),
                 "isUpperCase" => Ok(Value::bool(c.is_uppercase())),
                 "isLowerCase" => Ok(Value::bool(c.is_lowercase())),
-                "toUpperCase" => Ok(make_char(c.to_ascii_uppercase())),
-                "toLowerCase" => Ok(make_char(c.to_ascii_lowercase())),
-                // `getNumericValue` answers -1 for a non-alphanumeric character
-                // and 10..35 for `a`..`z`, as the JDK does.
-                "getNumericValue" => Ok(Value::int(match c.to_digit(36) {
-                    Some(d) => d as i64,
-                    None => -1,
-                })),
+                "toUpperCase" => Ok(make_char(java_to_upper(c))),
+                "toLowerCase" => Ok(make_char(java_to_lower(c))),
+                // `getNumericValue` answers a decimal digit's value in any script
+                // and 10..35 for `a`..`z`, as the JDK does. The JDK also gives the
+                // other numeric chars a value (`'Ⅻ'` is 12, a fraction -2); those
+                // are not modelled and answer -1.
+                "getNumericValue" => Ok(Value::int(java_digit36(c))),
                 _ => unknown(),
             }
         }
@@ -12829,7 +13081,7 @@ fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
     match (name, args.len()) {
         ("Pi" | "PI", 0) => Ok(Value::float(std::f64::consts::PI)),
         ("E", 0) => Ok(Value::float(std::f64::consts::E)),
-        ("abs", 1) if ints => Ok(Value::int(args[0].to_int().abs())),
+        ("abs", 1) if ints => Ok(Value::int(args[0].to_int().wrapping_abs())),
         ("abs", 1) => Ok(Value::float(f(0).abs())),
         ("signum", 1) if ints => Ok(Value::int(args[0].to_int().signum())),
         ("signum", 1) => Ok(Value::float(if f(0) == 0.0 { f(0) } else { f(0).signum() })),
@@ -12844,19 +13096,21 @@ fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
         ("ceil", 1) => Ok(Value::float(f(0).ceil())),
         ("rint", 1) => Ok(Value::float(round_half_even(f(0)))),
         ("sqrt", 1) => Ok(Value::float(f(0).sqrt())),
-        ("cbrt", 1) => Ok(Value::float(f(0).cbrt())),
-        ("exp", 1) => Ok(Value::float(f(0).exp())),
-        ("log", 1) => Ok(Value::float(f(0).ln())),
-        ("log10", 1) => Ok(Value::float(f(0).log10())),
-        ("pow", 2) => Ok(Value::float(f(0).powf(f(1)))),
-        ("hypot", 2) => Ok(Value::float(f(0).hypot(f(1)))),
+        ("cbrt", 1) => Ok(Value::float(fdlibm::cbrt(f(0)))),
+        ("exp", 1) => Ok(Value::float(fdlibm::exp(f(0)))),
+        ("log", 1) => Ok(Value::float(fdlibm::log(f(0)))),
+        ("log10", 1) => Ok(Value::float(fdlibm::log10(f(0)))),
+        ("pow", 2) => Ok(Value::float(fdlibm::pow(f(0), f(1)))),
+        ("hypot", 2) => Ok(Value::float(fdlibm::hypot(f(0), f(1)))),
+        // `Math.sin`/`Math.cos` are HotSpot intrinsics, not `StrictMath` — see
+        // `fdlibm`; they stay on the platform libm.
         ("sin", 1) => Ok(Value::float(f(0).sin())),
         ("cos", 1) => Ok(Value::float(f(0).cos())),
-        ("tan", 1) => Ok(Value::float(f(0).tan())),
-        ("asin", 1) => Ok(Value::float(f(0).asin())),
-        ("acos", 1) => Ok(Value::float(f(0).acos())),
-        ("atan", 1) => Ok(Value::float(f(0).atan())),
-        ("atan2", 2) => Ok(Value::float(f(0).atan2(f(1)))),
+        ("tan", 1) => Ok(Value::float(fdlibm::tan(f(0)))),
+        ("asin", 1) => Ok(Value::float(fdlibm::asin(f(0)))),
+        ("acos", 1) => Ok(Value::float(fdlibm::acos(f(0)))),
+        ("atan", 1) => Ok(Value::float(fdlibm::atan(f(0)))),
+        ("atan2", 2) => Ok(Value::float(fdlibm::atan2(f(0), f(1)))),
         // `floorDiv`/`floorMod` round the quotient toward negative infinity, so
         // the remainder takes the DIVISOR's sign: `floorMod(-5, 3)` is `1`.
         ("floorDiv" | "floorMod", 2) if ints => {
@@ -12867,8 +13121,12 @@ fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
             // The Euclidean quotient keeps the remainder non-negative, which
             // is the floor for a positive divisor and one too high for a
             // negative one that leaves a remainder.
-            let q = a.div_euclid(b) - i64::from(b < 0 && a.rem_euclid(b) != 0);
-            Ok(Value::int(if name == "floorDiv" { q } else { a - q * b }))
+            let q = a.wrapping_div_euclid(b) - i64::from(b < 0 && a.wrapping_rem_euclid(b) != 0);
+            Ok(Value::int(if name == "floorDiv" {
+                q
+            } else {
+                a.wrapping_sub(q.wrapping_mul(b))
+            }))
         }
         // The `*Exact` family: the result, or `ArithmeticException` when it
         // does not fit the overload's width.
@@ -12892,14 +13150,26 @@ fn math_member(name: &str, args: &[Value]) -> Result<Value, String> {
                 )),
             }
         }
+        // `absExact` names the bound it cannot negate, at the overload's width.
+        ("absExact", 1) if ints => {
+            let a = args[0].to_int();
+            let min = if long { i64::MIN } else { i64::from(i32::MIN) };
+            if a == min {
+                return Err(format!(
+                    "scalars: java.lang.ArithmeticException: Overflow to represent absolute value of {}.MIN_VALUE",
+                    if long { "Long" } else { "Integer" }
+                ));
+            }
+            Ok(Value::int(a.abs()))
+        }
         ("toIntExact", 1) if ints => i32::try_from(args[0].to_int())
             .map(|r| Value::int(i64::from(r)))
             .map_err(|_| "scalars: java.lang.ArithmeticException: integer overflow".to_string()),
-        ("sinh", 1) => Ok(Value::float(f(0).sinh())),
-        ("cosh", 1) => Ok(Value::float(f(0).cosh())),
-        ("tanh", 1) => Ok(Value::float(f(0).tanh())),
-        ("log1p", 1) => Ok(Value::float(f(0).ln_1p())),
-        ("expm1", 1) => Ok(Value::float(f(0).exp_m1())),
+        ("sinh", 1) => Ok(Value::float(fdlibm::sinh(f(0)))),
+        ("cosh", 1) => Ok(Value::float(fdlibm::cosh(f(0)))),
+        ("tanh", 1) => Ok(Value::float(fdlibm::tanh(f(0)))),
+        ("log1p", 1) => Ok(Value::float(fdlibm::log1p(f(0)))),
+        ("expm1", 1) => Ok(Value::float(fdlibm::expm1(f(0)))),
         ("toRadians", 1) => Ok(Value::float(f(0).to_radians())),
         ("toDegrees", 1) => Ok(Value::float(f(0).to_degrees())),
         _ => Err(format!(
@@ -13384,6 +13654,9 @@ fn try_method(
         // which was every `fold`.
         ("fold", 2, Ok(v)) => invoke_closure(vm, &args[1], std::slice::from_ref(v)),
         ("fold", 2, Err(e)) => invoke_closure(vm, &args[0], std::slice::from_ref(e)),
+        // `transform(s, f)` is `fold` whose two functions each answer a `Try`.
+        ("transform", 2, Ok(v)) => invoke_closure(vm, &args[0], std::slice::from_ref(v)),
+        ("transform", 2, Err(e)) => invoke_closure(vm, &args[1], std::slice::from_ref(e)),
         // `failed` INVERTS the two cases: a `Failure`'s exception becomes a
         // `Success`, and a `Success` becomes a `Failure` saying so.
         ("failed", 0, Err(e)) => Ok(make_try_success(e.clone())),
@@ -13613,15 +13886,18 @@ fn char_method(c: char, name: &str, args: &[Value]) -> Result<Value, String> {
         ("equals", 1) => Ok(Value::bool(as_char(&args[0]) == Some(c))),
         // `asDigit` is the *numeric value* of a digit character, so '5' is 5;
         // it also accepts the hex letters, as `Character.digit(c, 36)` does.
-        ("asDigit", 0) => Ok(Value::int(c.to_digit(36).map(|d| d as i64).unwrap_or(-1))),
-        ("toUpper", 0) => Ok(make_char(c.to_ascii_uppercase())),
-        ("toLower", 0) => Ok(make_char(c.to_ascii_lowercase())),
-        ("isDigit", 0) => cls(c.is_ascii_digit()),
-        ("isLetter", 0) => cls(c.is_alphabetic()),
-        ("isLetterOrDigit", 0) => cls(c.is_alphanumeric()),
+        ("asDigit", 0) => Ok(Value::int(java_digit36(c))),
+        ("toUpper", 0) => Ok(make_char(java_to_upper(c))),
+        ("toLower", 0) => Ok(make_char(java_to_lower(c))),
+        ("isDigit", 0) => cls(java_is_digit(c)),
+        ("isLetter", 0) => cls(java_is_letter(c)),
+        ("isLetterOrDigit", 0) => cls(java_is_letter(c) || java_is_digit(c)),
+        ("isControl", 0) => cls(c.is_control()),
+        ("isTitleCase", 0) => cls(!c.is_ascii() && in_general_category(c, "Lt")),
         ("isUpper", 0) => cls(c.is_uppercase()),
         ("isLower", 0) => cls(c.is_lowercase()),
-        ("isWhitespace" | "isSpaceChar", 0) => cls(c.is_whitespace()),
+        ("isWhitespace", 0) => cls(java_is_whitespace(c)),
+        ("isSpaceChar", 0) => cls(java_is_space_char(c)),
         // Ordering is by code point. Scala's `Char.compare` answers the
         // difference, exactly as `Character.compare` does.
         ("compare" | "compareTo", 1) => match char_code(&args[0]) {
@@ -14374,20 +14650,23 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("stripSuffix", 1) => Ok(Value::str(
             s.strip_suffix(&*args[0].as_str_cow()).unwrap_or(s),
         )),
+        // `StringOps.capitalize` upper-cases a LOWERCASE first char through the
+        // simple mapping and leaves anything else alone — a titlecase `'ǅ'`
+        // stays, `'ß'` has no one-char upper form and stays too.
         ("capitalize", 0) => Ok(Value::str(match s.chars().next() {
-            Some(c) => c.to_uppercase().collect::<String>() + &s[c.len_utf8()..],
-            None => String::new(),
+            Some(c) if c.is_lowercase() && (c as u32) < 0x10000 => {
+                format!("{}{}", java_to_upper(c), &s[c.len_utf8()..])
+            }
+            _ => s.to_string(),
         })),
         // `String.compareTo` answers the char difference at the first differing
         // position, or the length difference — `java.lang.String`'s exact rule,
         // not a normalized -1/0/1.
         ("compareTo" | "compare", 1) => Ok(Value::int(str_compare(s, &args[0].as_str_cow()))),
-        ("compareToIgnoreCase", 1) => Ok(Value::int(str_compare(
-            &s.to_lowercase(),
-            &args[0].as_str_cow().to_lowercase(),
-        ))),
+        ("compareToIgnoreCase", 1) => Ok(Value::int(str_compare_ci(s, &args[0].as_str_cow()))),
+        // `equalsIgnoreCase` is `regionMatches(true, …)`: the same per-char rule.
         ("equalsIgnoreCase", 1) => Ok(Value::bool(
-            s.to_lowercase() == args[0].as_str_cow().to_lowercase(),
+            !matches!(args[0], Value::Undef) && str_compare_ci(s, &args[0].as_str_cow()) == 0,
         )),
         ("*", 1) => Ok(Value::str(s.repeat(args[0].to_int().max(0) as usize))),
         // `java.lang.String.repeat` — unlike `*`, a negative count throws.
@@ -14541,12 +14820,14 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // the same kind as the unchecked types, never a different answer.
         ("toUpper", 0) => Ok(Value::str(s.to_uppercase())),
         ("toLower", 0) => Ok(Value::str(s.to_lowercase())),
-        ("isLetter", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_alphabetic))),
-        ("isDigit", 0) => Ok(Value::bool(one_char(s).is_some_and(|c| c.is_ascii_digit()))),
-        ("isLetterOrDigit", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_alphanumeric))),
+        ("isLetter", 0) => Ok(Value::bool(one_char(s).is_some_and(java_is_letter))),
+        ("isDigit", 0) => Ok(Value::bool(one_char(s).is_some_and(java_is_digit))),
+        ("isLetterOrDigit", 0) => Ok(Value::bool(
+            one_char(s).is_some_and(|c| java_is_letter(c) || java_is_digit(c)),
+        )),
         ("isUpper", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_uppercase))),
         ("isLower", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_lowercase))),
-        ("isWhitespace", 0) => Ok(Value::bool(one_char(s).is_some_and(char::is_whitespace))),
+        ("isWhitespace", 0) => Ok(Value::bool(one_char(s).is_some_and(java_is_whitespace))),
         // A recognized name with the wrong arity is an arity error; an
         // unrecognized name is "no such method".
         (
@@ -15374,6 +15655,25 @@ fn str_compare(a: &str, b: &str) -> i64 {
     for (x, y) in a.chars().zip(b.chars()) {
         if x != y {
             return x as i64 - y as i64;
+        }
+    }
+    a.chars().count() as i64 - b.chars().count() as i64
+}
+
+/// `String.compareToIgnoreCase`: char by char, two chars that differ are
+/// compared again through `Character.toUpperCase` and then through
+/// `toLowerCase` of those, and the first pair still unequal decides. The
+/// SIMPLE mappings, one char each — so `"ß"` does not fold to `"ss"`.
+fn str_compare_ci(a: &str, b: &str) -> i64 {
+    for (x, y) in a.chars().zip(b.chars()) {
+        if x != y {
+            let (ux, uy) = (java_to_upper(x), java_to_upper(y));
+            if ux != uy {
+                let (lx, ly) = (java_to_lower(ux), java_to_lower(uy));
+                if lx != ly {
+                    return lx as i64 - ly as i64;
+                }
+            }
         }
     }
     a.chars().count() as i64 - b.chars().count() as i64
@@ -17996,6 +18296,11 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             NumOp::Ne => Value::bool(x != y),
             NumOp::Neg => Value::float(-x),
         });
+    }
+    // `-Long.MinValue` is the one integer negation that leaves `i64`, and the VM
+    // delegates it here for the same reason; it wraps back onto itself.
+    if let (NumOp::Neg, Value::Int(x)) = (op, a) {
+        return Ok(Value::int(x.wrapping_neg()));
     }
     // Two integers reaching this hook means the exact result left `i64` — the VM
     // delegates an overflow here so a host with bignums can widen. Scala has no
