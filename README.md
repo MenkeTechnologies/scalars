@@ -292,7 +292,22 @@ Implemented and checked against the reference `scala`:
 - **Singleton objects with fields** — an `object`'s `val`s (its own, a
   supertype's, and the constructor parameters it passes on in
   `object O extends C(5)` / `case object A extends S(5)`) are read through
-  its name and through any value of it (`List(A, B).map(_.w)`).
+  its name and through any value of it (`List(A, B).map(_.w)`). An object is
+  initialized on FIRST ACCESS, as Scala initializes one: its body's statements
+  (`println("init")` included) run in declaration order then, a forward or
+  cyclic reference reads a field's type default, and an initializer that throws
+  raises `ExceptionInInitializerError` once and `NoClassDefFoundError` on every
+  later access.
+- **`java.util` collections** — `new java.util.ArrayList`/`LinkedList`/
+  `HashMap`/`HashSet`/`ArrayDeque`/`TreeMap`/`TreeSet` (or the imported names)
+  build the JDK classes, printing `[a, b]` / `{k=v}`: a `HashSet`/`HashMap`
+  iterates in its table order, the tree forms in key order, a `Deque` answers
+  `push`/`pop`/`poll`/`peek`/`offer` and their `First`/`Last` forms, and the
+  navigable ones `floor`/`ceiling`/`higher`/`lower`, `headMap`/`tailMap`/
+  `subMap` and the `first`/`last` entries. `java.util.Arrays` (`asList`,
+  `sort`, `fill`, `binarySearch`, `toString`, `equals`) and `Collections`
+  (`sort`, `reverse`, `shuffle` with a seeded `Random`, `swap`, `max`/`min`,
+  `frequency`, `nCopies`) work on them and on Scala arrays.
 - **Bindings** — `val` / `var` with optional type ascription
   (`val x: Int = …`, `var s = …`), type inferred as storage; plain and compound
   assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`). Reassigning a `val`

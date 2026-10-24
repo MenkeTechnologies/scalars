@@ -247,6 +247,11 @@ struct Compiler {
     /// per-statement unwind checks emitted, so an exception-free program keeps
     /// byte-identical bytecode (and its speed).
     has_try: bool,
+    /// The singleton `object`s initialized LAZILY, on first access, as Scala
+    /// initializes every `object`: those whose body runs anything but literal
+    /// `val`s. Each has an `Obj$clinit` subroutine and an `Obj$init` flag, and
+    /// every access from outside the object runs [`Compiler::emit_object_guard`].
+    lazy_objects: HashSet<String>,
     /// Whether the body currently being emitted is a LAMBDA body. A `return`
     /// there is non-local (it belongs to the enclosing `def`), so it lowers to
     /// `NLR_RAISE` + the unwind walk rather than a frame-local `ReturnValue`.
@@ -370,6 +375,9 @@ struct ClassMeta {
     is_trait: bool,
     /// The linearization *excluding* this type: supertypes nearest first.
     supers: Vec<String>,
+    /// The DIRECT parents, in `extends P with T` order — the only types a
+    /// static `super[T]` may name.
+    parents: Vec<String>,
     /// Every method name an instance of this type responds to, own and
     /// inherited (abstract declarations included — they are dispatched, not
     /// called directly).
@@ -405,6 +413,8 @@ struct ObjMeta {
     is_case: bool,
     /// The linearization excluding the object itself.
     supers: Vec<String>,
+    /// The direct parents (see [`ClassMeta::parents`]).
+    parents: Vec<String>,
     /// The declared numeric width of each member — a `def`'s return type, a
     /// `val`'s annotation or its literal initializer. The object counterpart of
     /// `ClassMeta::member_widths`, and the reason `O.f(1)` is typed by `def
@@ -698,6 +708,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 is_case: cd.is_case,
                 is_trait: cd.is_trait,
                 supers: mro[1..].to_vec(),
+                parents: cd.parents.clone(),
                 responds,
                 member_widths,
                 field_convs,
@@ -750,6 +761,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 methods,
                 is_case: od.is_case,
                 supers: lin[&od.name][1..].to_vec(),
+                parents: od.parents.clone(),
                 member_widths,
             },
         );
@@ -943,6 +955,11 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         // with either needs the per-statement checks even without a `try`.
         has_try: program_any(prog, &classes, &objects, body_has_try)
             || program_any(prog, &classes, &objects, body_has_lambda_return),
+        lazy_objects: objects
+            .iter()
+            .filter(|o| !o.body.iter().all(is_literal_val))
+            .map(|o| o.name.clone())
+            .collect(),
         in_lambda: false,
         // Likewise for `+=`: only a program that builds a mutable collection
         // can need the run-time growable test (see `compound_tail`).
@@ -978,12 +995,15 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         }
     }
 
-    // Singleton-object `val`s initialize once before `main` (into `Name.val`
-    // globals). Scala inits objects lazily; eager pre-init is a documented
-    // simplification that is observably identical for pure val bodies.
+    // Singleton-object `val`s initialize into `Name.val` globals. Scala runs an
+    // object's initializer on FIRST ACCESS; an object whose body holds only
+    // literal `val`s cannot tell, so it is filled here before `main`, and every
+    // other one runs from its `Obj$clinit` subroutine (see `lazy_objects`).
     for od in &objects {
-        c.object_inits(od)?;
-        c.adopt_object_record(od);
+        if !c.lazy_objects.contains(&od.name) {
+            c.object_inits(od)?;
+            c.adopt_object_record(od);
+        }
     }
 
     // An `extends App` body's `val`s are FIELDS of the entry object, and a JVM
@@ -1010,6 +1030,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let has_subs = !prog.functions.is_empty()
         || !classes.is_empty()
         || objects.iter().any(|o| !o.methods.is_empty())
+        || !c.lazy_objects.is_empty()
         || !c.pending_closures.is_empty();
     if has_subs {
         let skip = c.b.emit(Op::Jump(0), 0);
@@ -1032,6 +1053,9 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             }
         }
         for od in &objects {
+            if c.lazy_objects.contains(&od.name) {
+                c.object_clinit(od)?;
+            }
             for m in &od.methods {
                 c.object_method(od, m)?;
             }
@@ -1116,6 +1140,49 @@ fn method_sub_name(owner: &str, method: &str) -> String {
 /// The global-variable name backing an `object`'s `val` member.
 fn object_field_global(obj: &str, field: &str) -> String {
     format!("{obj}.{field}")
+}
+
+/// Whether an `object` body statement is a `val`/`var` with a LITERAL
+/// initializer — the one statement whose evaluation order nothing can observe.
+fn is_literal_val(s: &Stmt) -> bool {
+    matches!(
+        &s.kind,
+        StmtKind::Local {
+            init: Some(
+                Expr::Int(_)
+                    | Expr::Long(_)
+                    | Expr::Float(_)
+                    | Expr::Bool(_)
+                    | Expr::Char(_)
+                    | Expr::Str(_)
+            ),
+            is_lazy: false,
+            ..
+        }
+    )
+}
+
+/// The default a JVM field of the declared type `ty` (or, undeclared, of the
+/// literal type of `init`) holds before its initializer runs, as the op that
+/// loads it and whether it is a `Char`. `None` for a reference type, whose
+/// default `null` is what an unassigned global already reads as.
+fn field_default(ty: Option<&str>, init: Option<&Expr>) -> Option<(Op, bool)> {
+    let declared = ty.map(str::to_string).or_else(|| match init? {
+        Expr::Int(_) => Some("Int".to_string()),
+        Expr::Long(_) => Some("Long".to_string()),
+        Expr::Float(_) => Some("Double".to_string()),
+        Expr::Bool(_) => Some("Boolean".to_string()),
+        Expr::Char(_) => Some("Char".to_string()),
+        _ => None,
+    })?;
+    match declared.as_str() {
+        "Int" | "Long" | "Short" | "Byte" => Some((Op::LoadInt(0), false)),
+        "Double" | "Float" => Some((Op::LoadFloat(0.0), false)),
+        "Boolean" => Some((Op::LoadFalse, false)),
+        // `'\u0000'`, which Scala prints as the NUL character itself.
+        "Char" => Some((Op::LoadInt(0), true)),
+        _ => None,
+    }
 }
 
 impl Compiler {
@@ -3059,6 +3126,7 @@ impl Compiler {
             Some(meta) => meta.is_case,
             None => return Err(format!("scalars: not found: value {name}")),
         };
+        self.emit_object_guard(name);
         self.emit_singleton(name, is_case);
         Ok(())
     }
@@ -3754,17 +3822,50 @@ impl Compiler {
     /// Lower `super.m(args)` inside a class/trait method: resolve `m` in the
     /// enclosing type's linearization *after* the type itself and call that
     /// implementation directly with the current `this`.
-    fn super_call(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+    /// `qual` is the `T` of a static `super[T].m`: the search starts at `T` and
+    /// runs down `T`'s own linearization, and the call is static even in a
+    /// trait.
+    fn super_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        line: u32,
+        qual: Option<&str>,
+    ) -> Result<(), String> {
+        let qualified = match qual {
+            None => None,
+            Some(q) => {
+                let (owner, parents) = match (&self.current_class, &self.current_object) {
+                    (Some((c, _)), _) => (c.clone(), self.classes.get(c).map(|m| &m.parents)),
+                    (None, Some(o)) => (o.clone(), self.objects.get(o).map(|m| &m.parents)),
+                    (None, None) => (String::new(), None),
+                };
+                if !parents.is_some_and(|ps| ps.iter().any(|p| p == q)) {
+                    return Err(format!(
+                        "scalars: {q} does not name a parent of {owner} (line {line})"
+                    ));
+                }
+                let mut lin = vec![q.to_string()];
+                lin.extend(
+                    self.classes
+                        .get(q)
+                        .map(|m| m.supers.clone())
+                        .unwrap_or_default(),
+                );
+                Some(lin)
+            }
+        };
         let Some((cname, _)) = self.current_class.clone() else {
             // `super.m` in a singleton `object`'s method: the first supertype in
             // its linearization that implements `m`, called with the singleton
             // as `this` (an object method has no receiver slot of its own).
             if let Some(obj) = self.current_object.clone() {
-                let supers = self
-                    .objects
-                    .get(&obj)
-                    .map(|m| m.supers.clone())
-                    .unwrap_or_default();
+                let supers = qualified.clone().unwrap_or_else(|| {
+                    self.objects
+                        .get(&obj)
+                        .map(|m| m.supers.clone())
+                        .unwrap_or_default()
+                });
                 let owner = supers
                     .iter()
                     .find(|s| self.type_declares_method(s, name))
@@ -3786,7 +3887,7 @@ impl Compiler {
         // Inside a TRAIT, `super` is the next implementation in the
         // linearization of whatever class the trait is mixed into, which only
         // the runtime receiver knows.
-        if self.classes.get(&cname).is_some_and(|m| m.is_trait) {
+        if qualified.is_none() && self.classes.get(&cname).is_some_and(|m| m.is_trait) {
             let this = self.resolve_place("this");
             self.emit_load(this);
             for a in args {
@@ -3802,9 +3903,10 @@ impl Compiler {
             );
             return Ok(());
         }
-        let supers = match self.classes.get(&cname) {
-            Some(m) => m.supers.clone(),
-            None => Vec::new(),
+        let supers = match (qualified, self.classes.get(&cname)) {
+            (Some(lin), _) => lin,
+            (None, Some(m)) => m.supers.clone(),
+            (None, None) => Vec::new(),
         };
         // The first supertype that owns an implementation of `m`.
         let owner = supers
@@ -4447,6 +4549,7 @@ impl Compiler {
         op: AssignOp,
         value: &Expr,
     ) -> Result<(), String> {
+        self.emit_object_guard(obj);
         let g = self.b.add_name(&object_field_global(obj, name));
         if op == AssignOp::Assign {
             self.expr(value)?;
@@ -4963,6 +5066,13 @@ impl Compiler {
     /// can name one for. `None` where it cannot — which stops inference rather
     /// than guessing.
     fn static_type_name(&self, e: &Expr) -> Option<String> {
+        if let Expr::Call { name, args, .. } = e {
+            if name == crate::parser::TYPED {
+                if let [_, Expr::Str(ty)] = args.as_slice() {
+                    return Some(ty.clone());
+                }
+            }
+        }
         if let Some(cls) = self.class_of(e) {
             return Some(cls);
         }
@@ -5652,6 +5762,39 @@ impl Compiler {
             self.b.emit(Op::LoadConst(k), line);
             return Ok(());
         }
+        // `java.util.Arrays.sort(a)` / `Collections.reverse(l)` — the static
+        // members of the two `java.util` utility classes, named in full or
+        // imported.
+        let java_util_class = ["Arrays", "Collections"].into_iter().find(|c| match recv {
+            Expr::Var(n) => {
+                n == c
+                    && self.is_library_name(n)
+                    && !self.vals.contains_key(n)
+                    && self
+                        .imports
+                        .get(n)
+                        .is_some_and(|p| p.join(".") == format!("java.util.{c}"))
+            }
+            Expr::Method {
+                recv: pkg,
+                name: n,
+                args: a,
+                ..
+            } => n == c && a.is_empty() && is_package_path(pkg, &["java", "util"]),
+            _ => false,
+        });
+        if let Some(class) = java_util_class {
+            for a in args {
+                self.expr(a)?;
+            }
+            let k = self.b.add_constant(Value::str(format!("{class}.{name}")));
+            self.b.emit(Op::LoadConst(k), line);
+            let argc = u8::try_from(args.len() + 1)
+                .map_err(|_| format!("scalars: too many arguments on line {line}"))?;
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JAVA_STATIC, argc), line);
+            return Ok(());
+        }
         if collectors {
             for a in args {
                 self.expr(a)?;
@@ -6138,8 +6281,13 @@ impl Compiler {
         // `super.m(args)` — skip this class in the linearization and call the
         // nearest supertype that defines `m` (a static call, as the JVM's
         // `invokespecial` is).
-        if matches!(recv, Expr::Var(v) if v == "super") {
-            return self.super_call(name, args, line);
+        if let Expr::Var(v) = recv {
+            if v == "super" {
+                return self.super_call(name, args, line, None);
+            }
+            if let Some(q) = v.strip_prefix("super[").and_then(|q| q.strip_suffix(']')) {
+                return self.super_call(name, args, line, Some(q));
+            }
         }
         // `x.isInstanceOf[T]` is the runtime type test the parser captured the
         // type name for; `x.asInstanceOf[T]` is a static assertion with no
@@ -6177,6 +6325,7 @@ impl Compiler {
                         };
                         return self.method(&call, "apply", args, line);
                     }
+                    self.emit_object_guard(obj);
                     for a in args {
                         self.expr(a)?;
                     }
@@ -6186,6 +6335,7 @@ impl Compiler {
                     return Ok(());
                 }
                 if is_val && args.is_empty() {
+                    self.emit_object_guard(obj);
                     let g = self.b.add_name(&object_field_global(obj, name));
                     self.b.emit(Op::GetVar(g), line);
                     return Ok(());
@@ -6472,8 +6622,16 @@ impl Compiler {
                 line,
             );
             self.b.emit(Op::LoadInt(1), line);
-            self.b
-                .emit(Op::CallBuiltin(crate::host::MAKE_RANGE, 4), line);
+            // A `Long` receiver builds a `NumericRange[Long]`, which prints as
+            // one; the values alone cannot say so.
+            if self.num_ty(recv) == NumTy::Long {
+                self.b.emit(Op::LoadTrue, line);
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::MAKE_RANGE, 5), line);
+            } else {
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::MAKE_RANGE, 4), line);
+            }
             return Ok(());
         }
         self.emit_smethod(recv, name, args, line)
@@ -7283,6 +7441,10 @@ impl Compiler {
                 );
             }
         }
+        // `(e, "T")` — `e`, its type known only to the type naming.
+        if name == crate::parser::TYPED {
+            return self.expr(&args[0]);
+        }
         if name == crate::parser::ANY_WIDEN {
             if let [e] = args {
                 self.expr(e)?;
@@ -7368,6 +7530,17 @@ impl Compiler {
             self.expr(&args[0])?;
             self.b
                 .emit(Op::CallBuiltin(crate::host::MAKE_OPTION, 1), line);
+            return Ok(());
+        }
+        // `new java.util.ArrayList[T](…)` — the class name, then the arguments.
+        if name == crate::parser::JAVA_NEW {
+            for a in args {
+                self.expr(a)?;
+            }
+            let argc = u8::try_from(args.len())
+                .map_err(|_| format!("scalars: too many arguments on line {line}"))?;
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JAVA_NEW, argc), line);
             return Ok(());
         }
         // `new Array[T](n)` — the length and the element-type name.
@@ -7682,30 +7855,9 @@ impl Compiler {
             let StmtKind::Local { name, ty, init, .. } = &s.kind else {
                 continue;
             };
-            let declared = ty
-                .as_deref()
-                .map(str::to_string)
-                .or_else(|| match init.as_ref()? {
-                    Expr::Int(_) => Some("Int".to_string()),
-                    Expr::Long(_) => Some("Long".to_string()),
-                    Expr::Float(_) => Some("Double".to_string()),
-                    Expr::Bool(_) => Some("Boolean".to_string()),
-                    Expr::Char(_) => Some("Char".to_string()),
-                    _ => None,
-                });
-            let op = match declared.as_deref() {
-                Some("Int" | "Long" | "Short" | "Byte") => Op::LoadInt(0),
-                Some("Double" | "Float") => Op::LoadFloat(0.0),
-                Some("Boolean") => Op::LoadFalse,
-                // `' '`, which Scala prints as the NUL character itself.
-                Some("Char") => Op::LoadInt(0),
-                // Every reference type — and anything unrecognised — is `null`,
-                // which a global already reads as. Emitting nothing keeps the
-                // bytecode of a program with no annotated forward reference
-                // byte-identical.
-                _ => continue,
+            let Some((op, is_char)) = field_default(ty.as_deref(), init.as_ref()) else {
+                continue;
             };
-            let is_char = declared.as_deref() == Some("Char");
             let place = self.declare_place(name);
             self.b.emit(op, s.line);
             if is_char {
@@ -7714,6 +7866,101 @@ impl Compiler {
             }
             self.emit_store(place);
         }
+    }
+
+    /// Run the singleton `obj`'s initializer if it has not run yet — the
+    /// first-access check the JVM makes before touching an `object`. Nothing is
+    /// emitted for an object initialized eagerly, nor inside the object itself,
+    /// which is already initialized (or initializing) by the time its own code
+    /// runs.
+    fn emit_object_guard(&mut self, obj: &str) {
+        if !self.lazy_objects.contains(obj) || self.current_object.as_deref() == Some(obj) {
+            return;
+        }
+        let flag = self.b.add_name(&format!("{obj}$init"));
+        self.b.emit(Op::GetVar(flag), 0);
+        let j = self.b.emit(Op::JumpIfTrue(0), 0);
+        let sub = self.b.add_name(&format!("{obj}$clinit"));
+        self.b.emit(Op::Call(sub, 0), 0);
+        self.b.emit(Op::Pop, 0);
+        let done = self.b.current_pos();
+        self.b.patch_jump(j, done);
+    }
+
+    /// Emit the `Obj$clinit` subroutine of a lazily initialized object (see
+    /// [`Compiler::lazy_objects`]). The `Obj$init` flag is set FIRST, so a
+    /// cyclic access from inside the initializer reads the fields as they stand
+    /// — their type's default until assigned — as a JVM class initializer
+    /// re-entered on its own thread does. An initializer that raises leaves the
+    /// object FAILED: the exception leaves wrapped in an
+    /// `ExceptionInInitializerError` (an `Error` leaves as it is), and every
+    /// later access raises `NoClassDefFoundError`.
+    fn object_clinit(&mut self, od: &ObjectDecl) -> Result<(), String> {
+        let nidx = self.b.add_name(&format!("{}$clinit", od.name));
+        let ip = self.b.current_pos();
+        self.b.add_sub_entry(nidx, ip);
+        let name = self.b.add_constant(Value::str(od.name.clone()));
+        let failed = self.b.add_name(&format!("{}$failed", od.name));
+        self.b.emit(Op::GetVar(failed), 0);
+        let j_fresh = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.b.emit(Op::LoadConst(name), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::OBJ_NCDFE, 1), 0);
+        self.b.emit(Op::Pop, 0);
+        self.emit_return_unit(0);
+        let fresh = self.b.current_pos();
+        self.b.patch_jump(j_fresh, fresh);
+        let flag = self.b.add_name(&format!("{}$init", od.name));
+        self.b.emit(Op::LoadTrue, 0);
+        self.b.emit(Op::SetVar(flag), 0);
+        for s in &od.body {
+            let StmtKind::Local { name, ty, init, .. } = &s.kind else {
+                continue;
+            };
+            let Some((op, is_char)) = field_default(ty.as_deref(), init.as_ref()) else {
+                continue;
+            };
+            self.b.emit(op, s.line);
+            if is_char {
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::CHAR_NEW, 1), s.line);
+            }
+            let g = self.b.add_name(&object_field_global(&od.name, name));
+            self.b.emit(Op::SetVar(g), 0);
+        }
+        // Without a `try` anywhere in the program nothing can catch the
+        // failure, so it aborts the run where it is raised.
+        if !self.has_try {
+            self.object_inits(od)?;
+            self.adopt_object_record(od);
+            self.emit_return_unit(0);
+            return Ok(());
+        }
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_ENTER, 0), 0);
+        self.b.emit(Op::Pop, 0);
+        let saved_unwind = std::mem::take(&mut self.unwind);
+        self.push_unwind(UnwindKind::Try);
+        self.object_inits(od)?;
+        self.unwind_check();
+        self.adopt_object_record(od);
+        self.unwind_check();
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_EXIT, 0), 0);
+        self.b.emit(Op::Pop, 0);
+        self.emit_return_unit(0);
+        let dispatch = self.b.current_pos();
+        self.pop_unwind_to(dispatch);
+        self.unwind = saved_unwind;
+        self.b.emit(Op::CallBuiltin(crate::host::EXC_EXIT, 0), 0);
+        self.b.emit(Op::Pop, 0);
+        self.b.emit(Op::LoadTrue, 0);
+        self.b.emit(Op::SetVar(failed), 0);
+        self.b.emit(Op::LoadFalse, 0);
+        self.b.emit(Op::SetVar(flag), 0);
+        self.b.emit(Op::LoadConst(name), 0);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::OBJ_INIT_FAIL, 1), 0);
+        self.b.emit(Op::Pop, 0);
+        self.emit_return_unit(0);
+        Ok(())
     }
 
     fn emit_store(&mut self, p: Place) {

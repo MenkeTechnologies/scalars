@@ -17,6 +17,19 @@ use std::collections::{HashMap, HashSet};
 /// The synthetic call `new Array[T](n)` desugars to; lowered by
 /// [`crate::compiler`] to the zero-filling array builtin.
 pub const NEW_ARRAY: &str = "$new_array";
+/// The desugar target of `new java.util.ArrayList[T](…)` and the other
+/// [`JAVA_UTIL_CLASSES`]: the class's simple name, then the arguments.
+pub const JAVA_NEW: &str = "$java_new";
+/// The `java.util` collection classes `new` builds as the JDK's own.
+pub const JAVA_UTIL_CLASSES: &[&str] = &[
+    "ArrayList",
+    "LinkedList",
+    "HashMap",
+    "HashSet",
+    "ArrayDeque",
+    "TreeMap",
+    "TreeSet",
+];
 
 /// The function an auxiliary constructor `def this(…)` of `class` with `arity`
 /// parameters lowers to (see `Parser::auxiliary_ctor`).
@@ -627,7 +640,18 @@ impl Parser {
                 }
                 body.push(stmt);
             } else {
-                self.skip_member()?;
+                // Any other statement is part of the object's initializer and
+                // runs with it, in declaration order (`println("init")`). A
+                // member this parser has no statement form for is skipped, as
+                // every non-`val` member used to be.
+                let save = self.pos;
+                match self.statement() {
+                    Ok(stmt) => body.push(stmt),
+                    Err(_) => {
+                        self.pos = save;
+                        self.skip_member()?;
+                    }
+                }
             }
             self.skip_seps();
         }
@@ -3981,6 +4005,38 @@ impl Parser {
                 e = of_dim(&dims, ty, line);
                 continue;
             }
+            // `List.empty[Int]` / `Option.empty[String]` — the one shape whose
+            // type argument is the WHOLE of what types it, kept as a
+            // [`TYPED`] wrapper so a `using` clause can be resolved against
+            // `List[Int]` (`show(List.empty[Int].headOption)`).
+            if name == "empty"
+                && self.is(&Tok::LBracket)
+                && matches!(&e, Expr::Var(v) if TYPED_EMPTY_OWNERS.contains(&v.as_str()))
+            {
+                let owner = match &e {
+                    Expr::Var(v) => v.clone(),
+                    _ => unreachable!("matched a Var above"),
+                };
+                self.advance();
+                let mut targs = vec![self.type_ref()?];
+                while self.is(&Tok::Comma) {
+                    self.advance();
+                    targs.push(self.type_ref()?);
+                }
+                self.eat(&Tok::RBracket)?;
+                let call = Expr::Method {
+                    recv: Box::new(e),
+                    name,
+                    args: Vec::new(),
+                    line,
+                };
+                e = Expr::Call {
+                    name: TYPED.to_string(),
+                    args: vec![call, Expr::Str(format!("{owner}[{}]", targs.join(", ")))],
+                    line,
+                };
+                continue;
+            }
             // Optional `[T]` type arguments on a method (`xs.map[Int](f)`).
             if self.is(&Tok::LBracket) {
                 self.skip_bracket_group();
@@ -4568,6 +4624,36 @@ impl Parser {
                     }
                     self.pos = save;
                 }
+                // `super[T]` — a STATIC super reference naming the parent `T`
+                // whose member is called, kept as the receiver `super[T]`.
+                if name == "super" && self.is(&Tok::LBracket) {
+                    self.advance();
+                    let ty = self.type_ref()?;
+                    self.eat(&Tok::RBracket)?;
+                    return self.postfix_from(Expr::Var(format!("super[{ty}]")));
+                }
+                // `List[Int]()` — an EMPTY literal, typed only by its type
+                // argument, which is kept (see [`TYPED`]).
+                if TYPED_EMPTY_OWNERS.contains(&name.as_str()) && self.is(&Tok::LBracket) {
+                    let save = self.pos;
+                    self.advance();
+                    let mut targs = vec![self.type_ref()?];
+                    while self.is(&Tok::Comma) {
+                        self.advance();
+                        targs.push(self.type_ref()?);
+                    }
+                    self.eat(&Tok::RBracket)?;
+                    if self.is(&Tok::LParen) && matches!(self.peek_at(1), Tok::RParen) {
+                        let ty = format!("{name}[{}]", targs.join(", "));
+                        let e = self.bare_application(name, line)?;
+                        return self.postfix_from(Expr::Call {
+                            name: TYPED.to_string(),
+                            args: vec![e, Expr::Str(ty)],
+                            line,
+                        });
+                    }
+                    self.pos = save;
+                }
                 // Optional generic type arguments (`List[Int](…)`, `foo[T](…)`).
                 if self.is(&Tok::LBracket) {
                     self.skip_bracket_group();
@@ -4694,10 +4780,19 @@ impl Parser {
         }
         // `new java.util.Random(…)` / `new scala.util.Random(…)`: the JDK and
         // `scala.util` package prefixes name where the type lives, nothing more.
+        let mut package = Vec::new();
         while self.is(&Tok::Dot) && matches!(name.as_str(), "java" | "util") {
             self.advance();
-            name = self.ident()?;
+            package.push(std::mem::replace(&mut name, self.ident()?));
         }
+        // A `java.util` collection class — named in full, or imported — is the
+        // JDK's, never the Scala collection of the same simple name.
+        let java_util = package == ["java", "util"]
+            || (package.is_empty()
+                && self
+                    .imports
+                    .get(&name)
+                    .is_some_and(|p| p.len() == 3 && p[0] == "java" && p[1] == "util"));
         // `new Outer.Inner(…)` — a type declared inside an `object`/`class`
         // lives in the one flat type namespace, so the qualifier names where it
         // was written and nothing else.
@@ -4729,6 +4824,14 @@ impl Parser {
             args.push(Expr::Str(ty));
             return Ok(Expr::Call {
                 name: NEW_ARRAY.to_string(),
+                args,
+                line,
+            });
+        }
+        if java_util && JAVA_UTIL_CLASSES.contains(&name.as_str()) {
+            args.insert(0, Expr::Str(name));
+            return Ok(Expr::Call {
+                name: JAVA_NEW.to_string(),
                 args,
                 line,
             });
@@ -5968,6 +6071,20 @@ pub const SUMMON: &str = "summon$";
 /// The synthetic call an expression WIDENED to `Any` is wrapped in, so the
 /// compiler can keep the box of an integer whose static type it knows.
 pub const ANY_WIDEN: &str = "any$widen";
+/// The synthetic call `(e, "T")` an expression of a statically known type `T`
+/// is wrapped in where nothing else could name it (`List.empty[Int]`). It
+/// evaluates to `e`; only the compiler's type naming reads `T`.
+pub const TYPED: &str = "typed$";
+/// The companions whose `empty[T]` a [`TYPED`] wrapper records.
+const TYPED_EMPTY_OWNERS: &[&str] = &[
+    "List",
+    "Vector",
+    "Seq",
+    "IndexedSeq",
+    "Set",
+    "Map",
+    "Option",
+];
 /// The synthetic call a NON-literal sequence of proven integral element type
 /// is wrapped in where it reaches `C[Any]`: `(seq, box code)`.
 pub const ANY_WIDEN_ELEMS: &str = "any$widen_elems";

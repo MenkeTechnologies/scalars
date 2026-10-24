@@ -539,7 +539,9 @@ reported as parse/compile errors, never silently mis-run.
   `C, T2, T1, B`. `super.m` inside a TRAIT is the next implementation in the
   linearization of the class the trait is mixed into, so stackable traits
   (`abstract override def put(x: Int) = super.put(2 * x)`) compose in mixin
-  order.
+  order. A STATIC `super[T].m` calls `T`'s implementation (found down `T`'s
+  own linearization) even inside a trait, and `T` must be a direct parent
+  (`A does not name a parent of D` otherwise, as scalac reports).
 - **`Array`.** `Array(a, b, c)`, `new Array[T](n)` (filled with `T`'s zero
   value), `a(i)` reads, `a(i) = v` writes (Scala's `update` sugar), and the
   sequence operations (`length`, `map`, `filter`, `sum`, `mkString`, `toList`,
@@ -954,6 +956,18 @@ reported as parse/compile errors, never silently mis-run.
   `inits` is `dropRight(i)` for every `i` up to the length, and `grouped(0)`
   reports Range's own `size=0, but size must be positive`. Used as a `for`
   generator it still compiles to the counted loop (no materialization).
+  `sorted` under the natural ordering is the range itself when it ascends and
+  its `reverse` when it descends, still a `Range`.
+- **A `Long` or `BigInt` range — `1L to 9L`, `BigInt(1) until BigInt(9) by 2`.**
+  A `NumericRange`: laid out as the `Range` of its values (a `BigInt` one's
+  elements are `BigInt`s; a bound beyond the `Long` range is refused), printing
+  `NumericRange 1 to 9` with no `inexact` marker, and its `reverse`/`take`/
+  `drop`/`by` stay `NumericRange`s while `sorted` is a `Vector`. A `BigInt`
+  range used to treat its bounds as `0` (`List(0)`), and a `Long` one printed
+  `Range`. Still open: a `BigDecimal` range (refused), `Range.Long(a, b, s)`
+  (a catchable `NullPointerException` where Scala runs), and a range of more
+  than eight million elements, which is materialized and raises
+  `OutOfMemoryError: Range too large` where Scala answers `(0 until Int.MaxValue by 2).length` without building one.
 - **A `Char` range — `'a' to 'e'`, `'a' until 'z' by 2`.** Scala's
   `NumericRange[Char]`, a class of its own rather than a `Range`: it prints
   `NumericRange a to e` (`empty NumericRange e to a`, and `by` renders its step
@@ -1017,7 +1031,9 @@ reported as parse/compile errors, never silently mis-run.
 - **Unbounded iterators.** `Iterator.from(n[, step])`, `continually(x)`,
   `iterate(x)(f)` and `unfold(s)(f)` are the `LazyList` machinery marked as an
   iterator: they print `<iterator>`, answer `hasNext`/`next()` and derive
-  lazily (`map`/`filter`/`take`/`takeWhile`/`zip`/`drop`). `Iterator.single`,
+  lazily (`map`/`filter`/`take`/`takeWhile`/`zip`/`drop`). After `next()` every other
+  member reads from the cursor on: `it.next(); it.take(2)` used to restart at
+  the first element. `Iterator.single`,
   `fill` and `tabulate` work. `LazyList` also has `take`, `slice`, `flatMap`,
   `zipWithIndex`, `scanLeft`, `collect`, `dropWhile`, `++`/`#:::`/`:+`/`+:`,
   `range`, `tabulate`, `fill` and `unfold` lazily; every other member forces
@@ -1061,8 +1077,8 @@ reported as parse/compile errors, never silently mis-run.
   enums with a case of the same name are a redeclaration.
 - **What the optional-braces pass does not cover.** An indentation region
   inside `( )` is not a region, so a fewer-braces argument written inside an
-  argument list (`println(wrap("b"):` with the block below) does not parse. A singleton object's `lazy val` initializes with the object, which
-  is eager here (see *Singleton `object` `val`s initialize eagerly* below).
+  argument list (`println(wrap("b"):` with the block below) does not parse. (A singleton object's `lazy val` is a memoizing method, initialized on
+  its first read.)
 - **Widening gaps.** A `Char` widens to `Double`/`Float` but not to a declared
   `Int`/`Long` (`val i: Int = 'c'` is `c`, not `99`), and a function type's
   result does not widen (`val f: Int => Double = x => x * 2` answers `6` for
@@ -1307,8 +1323,12 @@ reported as parse/compile errors, never silently mis-run.
   element type (`List(1, 2)` is `List[Int]`), a tuple literal, `Option(x)`, and
   a library method whose result follows from its receiver's type (`xs.head`,
   `xs.headOption`/`lastOption`/`find`, `filter`/`take`/`sorted`/…, an
-  `Option`'s `get`/`getOrElse`) on a receiver of known type. Not a type
-  argument the parser drops (`List.empty[Int].headOption` finds no `A`).
+  `Option`'s `get`/`getOrElse`) on a receiver of known type. A
+  type argument that is the whole of an expression's type is read too —
+  `List.empty[Int]`, `Option.empty[String]`, `List[Int]()` and the
+  `Vector`/`Seq`/`IndexedSeq`/`Set`/`Map` forms — so `show(List.empty[Int].headOption)`
+  resolves. Not a lambda's result type (`List.empty[Int].map(_ + 1)` finds no
+  `A`).
   An `extension [A](xs: List[A])(using s: Show[A])` clause is a `using`
   parameter of every method the extension declares, resolved at the call from
   the receiver's type. An `opaque type`/`type` alias declared in an `object`
@@ -1430,11 +1450,26 @@ reported as parse/compile errors, never silently mis-run.
   `remove(Integer.valueOf(x))`/`addAll`/`sort`/`clear`; `put`/`remove`/
   `merge`/`computeIfAbsent`/`putIfAbsent`/`clear`, re-laid-out in table
   order), and an unmodifiable one (`List.of`, `Stream.toList`) answers those with
-  `UnsupportedOperationException`; a collected `HashSet`'s mutators are not
-  modelled. `Long`/`DoubleSummaryStatistics` and `Stream`/`IntStream`
-  `.generate`/`.concat` are modelled (`concat` drains both streams when it is
-  called, where the JDK defers that to the terminal op). Not modelled: the rest of
-  the `java.util` collection API. A stream's `toString` is the JVM identity form,
+  `UnsupportedOperationException`; a collected `HashSet` (`Collectors.toSet`)
+  is mutable too (`add`/`remove`/`addAll`/`removeAll`/`retainAll`/`clear`), its
+  table only ever growing, as the JDK's does. `Long`/`DoubleSummaryStatistics`,
+  `peek`, and `Stream`/`IntStream` `.generate`/`.concat` are modelled; `concat`
+  and `flatMap` pull their inner streams element by element at the terminal
+  op, so a short-circuiting terminal stops them, and `count` over a pipeline
+  of known size (`concat` of sized streams, `peek` included) runs nothing, as
+  on JDK 21. `new java.util.ArrayList`/`LinkedList`/`HashMap`/`HashSet`/
+  `ArrayDeque`/`TreeMap`/`TreeSet` (named in full or imported) build the JDK
+  classes, with the `Deque` operations, the `NavigableSet`/`NavigableMap`
+  queries, `iterator()`, and `java.util.Arrays` (`asList` — fixed size, `set`
+  and `sort` allowed —, `sort`, `fill`, `binarySearch`, `toString`, `equals`)
+  and `java.util.Collections` (`sort`, `reverse`, `shuffle(l, rnd)`, `swap`,
+  `max`/`min`, `frequency`, `nCopies`, `emptyList`, `singletonList`). A
+  `catch` arm may name a built-in throwable by its qualified name (`case e:
+  java.util.NoSuchElementException`), which used to match nothing. Leniency:
+  with no types, an `Arrays.sort`/`Arrays.toString` call scalac rejects as an
+  ambiguous overload (an `Array[String]` argument) runs here. Not modelled: a
+  `Comparator` constructor argument, `unmodifiableList` views, the remaining
+  `java.util` classes, and `toUnmodifiableSet`'s salted iteration order. A stream's `toString` is the JVM identity form,
   which is not reproducible.
 - **Found by the second October 2026 differential round.** Each raised a
   catchable `java.lang.NullPointerException` where Scala runs, and is now
@@ -1809,8 +1844,17 @@ reported as parse/compile errors, never silently mis-run.
   spelling of the same both exit with ``nested entry object `U```, where Scala
   compiles them (and never runs `U`'s body unless something touches `U`). A
   refusal, not a wrong answer.
-- **Singleton `object` `val`s initialize eagerly**, before `main`, rather than
-  lazily on first access. Observably identical for pure initializers.
+- **A singleton `object` whose body holds only literal `val`s initializes
+  before `main`**; every other one initializes on first access, as in Scala
+  (`Obj$clinit`, guarded by an `Obj$init` flag at each access from outside the
+  object). The two are indistinguishable: a literal initializer has no effect
+  and reads nothing. Its body's non-`val` statements — which the parser used to
+  skip, so `object O { println("init") }` printed nothing — run with it; a
+  forward or cyclic reference reads the field's type default (`0`, `0.0`,
+  `false`, NUL, `null`); a throwing initializer raises
+  `ExceptionInInitializerError` (an `Error` passes through unwrapped) and every
+  later access `NoClassDefFoundError: Could not initialize class O$`. A
+  statement the parser has no statement form for is still skipped.
 - **A METHOD VALUE needs a receiver whose class can be named, and a method that
   declares one arity.** `xs.map(o.f)` eta-expands to `($eta0) => o.f($eta0)`,
   with the receiver evaluated once where the value is written. Three receivers

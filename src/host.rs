@@ -543,6 +543,21 @@ pub const MAKE_MUTSORTEDSET: u16 = 825;
 pub const MAKE_MUTSORTEDMAP: u16 = 826;
 /// Builtin id for a `mutable.BitSet(...)` literal: `HashRep::BitSet`.
 pub const MAKE_BITSET: u16 = 827;
+/// Builtin id run when a lazily initialized singleton `object`'s initializer
+/// raised: pops the object's name, records the failure, and — as the JVM's
+/// class initialization does — wraps an in-flight exception that is not an
+/// `Error` in an `ExceptionInInitializerError`.
+pub const OBJ_INIT_FAIL: u16 = 828;
+/// Builtin id for touching an `object` whose initializer already failed: pops
+/// its name and raises the JVM's `NoClassDefFoundError: Could not initialize
+/// class X$`.
+pub const OBJ_NCDFE: u16 = 829;
+/// Builtin id for `new java.util.ArrayList[T](…)` and the other
+/// `crate::parser::JAVA_UTIL_CLASSES`: pops the class name and its arguments.
+pub const JAVA_NEW: u16 = 830;
+/// Builtin id for a `java.util.Arrays`/`java.util.Collections` static member:
+/// pops `"Class.member"` and the arguments.
+pub const JAVA_STATIC: u16 = 831;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -811,6 +826,10 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(STREAM_OF, b_stream_of);
     vm.register_builtin(STREAM_FACTORY, b_stream_factory);
     vm.register_builtin(MATH_CTX, b_math_ctx);
+    vm.register_builtin(OBJ_INIT_FAIL, b_obj_init_fail);
+    vm.register_builtin(OBJ_NCDFE, b_obj_ncdfe);
+    vm.register_builtin(JAVA_NEW, b_java_new);
+    vm.register_builtin(JAVA_STATIC, b_java_static);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -1100,6 +1119,12 @@ pub const BUILTIN_THROWABLES: &[(&str, &str)] = &[
     ("FileNotFoundException", "java.io.FileNotFoundException"),
     ("EOFException", "java.io.EOFException"),
     ("TimeoutException", "java.util.concurrent.TimeoutException"),
+    ("LinkageError", "java.lang.LinkageError"),
+    (
+        "ExceptionInInitializerError",
+        "java.lang.ExceptionInInitializerError",
+    ),
+    ("NoClassDefFoundError", "java.lang.NoClassDefFoundError"),
     ("ControlThrowable", "scala.util.control.ControlThrowable"),
     ("BreakControl", "scala.util.control.BreakControl"),
     // `scala.util.boundary`'s `break(v)` (see the desugar in [`crate::parser`]).
@@ -1157,6 +1182,9 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ("TimeoutException", "Exception"),
     ("OutOfMemoryError", "VirtualMachineError"),
     ("AssertionError", "Error"),
+    ("LinkageError", "Error"),
+    ("ExceptionInInitializerError", "LinkageError"),
+    ("NoClassDefFoundError", "LinkageError"),
     ("NotImplementedError", "Error"),
     // Deliberately hangs off `Throwable`, not `Exception`: Scala's
     // `ControlThrowable` is a direct `Throwable` so control-flow signals are not
@@ -1300,7 +1328,12 @@ fn b_exc_pending(_vm: &mut VM, _argc: u8) -> Value {
 
 /// `EXC_MATCH` builtin — see [`EXC_MATCH`].
 fn b_exc_match(vm: &mut VM, _argc: u8) -> Value {
-    let want = vm.pop().as_str_cow().into_owned();
+    let mut want = vm.pop().as_str_cow().into_owned();
+    // `case e: java.util.NoSuchElementException` names the class by its
+    // fully-qualified name, which is the same class as the simple one.
+    if let Some((simple, _)) = BUILTIN_THROWABLES.iter().find(|(_, fqn)| *fqn == want) {
+        want = simple.to_string();
+    }
     let thrown = PENDING.with(|p| p.borrow().as_ref().and_then(thrown_class));
     Value::Bool(match thrown {
         // `case e: Throwable` (and a bare `case e`, which the compiler lowers to
@@ -1439,6 +1472,67 @@ fn b_exc_abort(vm: &mut VM, _argc: u8) -> Value {
     }
     vm.request_halt();
     Value::Undef
+}
+
+thread_local! {
+    /// The `toString` of the throwable that aborted each failed singleton
+    /// `object`'s initializer, by object name — what the
+    /// `ExceptionInInitializerError` behind a later `NoClassDefFoundError` says.
+    static FAILED_INITS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// The JVM class of the singleton `object` named `name` (`Q$`, `T$In$`).
+fn object_jvm_class(name: &str) -> String {
+    let q = jvm_qualified(name);
+    if q.ends_with('$') {
+        q
+    } else {
+        format!("{q}$")
+    }
+}
+
+/// `OBJ_INIT_FAIL` builtin — see [`OBJ_INIT_FAIL`].
+fn b_obj_init_fail(vm: &mut VM, _argc: u8) -> Value {
+    let name = vm.pop().as_str_cow().into_owned();
+    let Some(exc) = PENDING.with(|p| p.borrow_mut().take()) else {
+        return Value::Undef;
+    };
+    FAILED_INITS.with(|f| f.borrow_mut().insert(name, scala_str(&exc)));
+    let is_error = thrown_class(&exc).is_some_and(|c| throwable_conforms(&c, "Error"));
+    let raised = if is_error {
+        exc
+    } else {
+        let wrapper = new_throwable("java.lang.ExceptionInInitializerError", None);
+        set_exc_cause(&wrapper, exc);
+        wrapper
+    };
+    PENDING.with(|p| *p.borrow_mut() = Some(raised));
+    Value::Undef
+}
+
+/// `OBJ_NCDFE` builtin — see [`OBJ_NCDFE`].
+fn b_obj_ncdfe(vm: &mut VM, _argc: u8) -> Value {
+    let name = vm.pop().as_str_cow().into_owned();
+    let first = FAILED_INITS.with(|f| f.borrow().get(&name).cloned().unwrap_or_default());
+    let msg = format!("Could not initialize class {}", object_jvm_class(&name));
+    let exc = new_throwable("java.lang.NoClassDefFoundError", Some(&msg));
+    let cause = new_throwable(
+        "java.lang.ExceptionInInitializerError",
+        Some(&format!("Exception {first} [in thread \"main\"]")),
+    );
+    set_exc_cause(&exc, cause);
+    raise(vm, exc)
+}
+
+/// Record `cause` as what the built-in throwable `exc` answers to `getCause`.
+fn set_exc_cause(exc: &Value, cause: Value) {
+    if let Value::Obj(id) = exc {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Exc(e)) = h.borrow_mut().get_mut(*id as usize) {
+                e.cause = Some(cause);
+            }
+        });
+    }
 }
 
 // ── Host-side object heap ───────────────────────────────────────────────────
@@ -2460,6 +2554,9 @@ pub fn reset_heap() {
     JAVA_MUT.with(|t| t.borrow_mut().clear());
     JAVA_DECS.with(|t| t.borrow_mut().clear());
     CHAR_ARRAYS.with(|t| t.borrow_mut().clear());
+    FAILED_INITS.with(|t| t.borrow_mut().clear());
+    JAVA_FLAVOR.with(|t| t.borrow_mut().clear());
+    NUMERIC_RANGES.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -5716,7 +5813,13 @@ fn obj_to_string(v: &Value) -> String {
                     step,
                 },
                 items,
-            )) => range_to_string(*start, *end, *inclusive, *step, items.is_empty()),
+            )) => {
+                if NUMERIC_RANGES.with(|t| t.borrow().contains_key(&(id as usize))) {
+                    numeric_range_to_string(*start, *end, *inclusive, *step, items.is_empty())
+                } else {
+                    range_to_string(*start, *end, *inclusive, *step, items.is_empty())
+                }
+            }
             Some(HeapVal::Seq(
                 SeqKind::CharRange {
                     start,
@@ -10284,7 +10387,40 @@ fn multiset_filter(
 
 /// `Seq` (`List`/`Set`/`Iterable`) methods — a faithful subset. Closure-taking
 /// ops run their function argument through [`invoke_closure`].
+/// A collection member. A `NumericRange` receiver (see [`NUMERIC_RANGES`]) is
+/// answered as the `Range` it is laid out as, and a `Range` it derives —
+/// `reverse`, `take`, `by` — is a `NumericRange` of the same element type.
 fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let Some(kind) = numeric_range_kind(recv) else {
+        return seq_method_inner(vm, recv, name, args);
+    };
+    // `NumericRange.sorted` is the generic `IndexedSeq` one: a `Vector`.
+    if name == "sorted" && args.is_empty() {
+        let mut items = seq_kind_items(recv).map(|(_, xs)| xs).unwrap_or_default();
+        items.sort_by(value_cmp);
+        return Ok(new_seq(SeqKind::Vector, items));
+    }
+    // A `BigInt` range's `by` step is a `BigInt`.
+    let args: Vec<Value> = args
+        .iter()
+        .map(|a| match (kind, as_big(a)) {
+            (NumRange::BigInt, Some(b)) => i64::try_from(&b).map_or(a.clone(), Value::int),
+            _ => a.clone(),
+        })
+        .collect();
+    let out = seq_method_inner(vm, recv, name, &args)?;
+    if matches!(seq_kind(&out), Some(SeqKind::Range { .. })) {
+        mark_numeric_range(&out, kind);
+    }
+    Ok(out)
+}
+
+fn seq_method_inner(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     // Appending is answered BEFORE the receiver's elements are read, because
     // reading them is what made appending quadratic — see [`append_in_place`].
     if let Some(r) = append_in_place(recv, name, args) {
@@ -10513,14 +10649,17 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
     match (name, args.len()) {
         // `Range.reverse` is another `Range`, walked the other way.
         ("reverse", 0) if matches!(kind, SeqKind::Range { .. }) => {
-            let SeqKind::Range { step, .. } = kind else {
+            let SeqKind::Range { start, step, .. } = kind else {
                 unreachable!("just matched a range")
             };
+            // The bounds come from the range, not its elements, which are
+            // `BigInt`s in a `NumericRange[BigInt]`.
+            let last = start + step * (items.len() as i64 - 1);
             match (items.first(), items.last()) {
-                (Some(a), Some(b)) => Ok(new_seq(
+                (Some(_), Some(_)) => Ok(new_seq(
                     SeqKind::Range {
-                        start: b.to_int(),
-                        end: a.to_int(),
+                        start: last,
+                        end: start,
                         inclusive: true,
                         step: -step,
                     },
@@ -13017,6 +13156,21 @@ fn range_slice_method(
     let arg = |i: usize| args[i].to_int();
     Some(match (name, args.len()) {
         ("take", 1) => take(arg(0)),
+        // `Range.sorted` under the natural `Ordering.Int` is the range itself
+        // when it ascends and its `reverse` when it descends — still a
+        // `Range` (an empty one is itself either way).
+        ("sorted", 0) if step > 0 || len == 0 => make(start, end, inclusive),
+        ("sorted", 0) => range_items(at(len - 1), start, true, -step).map(|items| {
+            new_seq(
+                SeqKind::Range {
+                    start: at(len - 1),
+                    end: start,
+                    inclusive: true,
+                    step: -step,
+                },
+                items,
+            )
+        }),
         ("drop", 1) => drop(arg(0)),
         // `takeRight` and `dropRight` test emptiness FIRST, so an empty receiver
         // answers `newEmptyRange(start)` and itself respectively whatever the
@@ -13181,7 +13335,9 @@ fn indices_range(n: usize) -> Value {
 
 /// `MAKE_RANGE` builtin — pop the step, `inclusive`, end and start; return the
 /// materialized range.
-fn b_make_range(vm: &mut VM, _argc: u8) -> Value {
+fn b_make_range(vm: &mut VM, argc: u8) -> Value {
+    // A fifth operand marks the bounds statically `Long`: a `NumericRange`.
+    let long = argc == 5 && truthy(&vm.pop());
     let step_v = vm.pop();
     let inclusive = matches!(vm.pop(), Value::Bool(true));
     let end_v = vm.pop();
@@ -13189,19 +13345,41 @@ fn b_make_range(vm: &mut VM, _argc: u8) -> Value {
     if let Some(r) = char_range_of(&start_v, &end_v, inclusive, &step_v) {
         return r.unwrap_or_else(|e| fault(vm, e));
     }
+    if as_dec(&start_v).is_some() || as_dec(&end_v).is_some() {
+        return fault(vm, "scalars: a BigDecimal range is not modelled");
+    }
+    // A `BigInt` range is laid out over its values as `Long`s, which every
+    // one this frontend can materialize fits.
+    let big = as_big(&start_v).is_some() || as_big(&end_v).is_some();
+    let bound = |v: &Value| match as_big(v) {
+        Some(b) => i64::try_from(&b).map_err(|_| {
+            "scalars: a BigInt range beyond the Long range is not modelled".to_string()
+        }),
+        None => Ok(v.to_int()),
+    };
+    let (start, end) = match (bound(&start_v), bound(&end_v)) {
+        (Ok(s), Ok(e)) => (s, e),
+        (Err(e), _) | (_, Err(e)) => return fault(vm, e),
+    };
     let step = step_v.to_int();
-    let end = end_v.to_int();
-    let start = start_v.to_int();
     match range_items(start, end, inclusive, step) {
-        Ok(items) => new_seq(
-            SeqKind::Range {
-                start,
-                end,
-                inclusive,
-                step,
-            },
-            items,
-        ),
+        Ok(items) => {
+            let out = new_seq(
+                SeqKind::Range {
+                    start,
+                    end,
+                    inclusive,
+                    step,
+                },
+                items,
+            );
+            if big {
+                mark_numeric_range(&out, NumRange::BigInt);
+            } else if long {
+                mark_numeric_range(&out, NumRange::Long);
+            }
+            out
+        }
         Err(e) => fault(vm, e),
     }
 }
@@ -17871,6 +18049,21 @@ fn lazy_method(
             _ => {}
         }
     }
+    // An iterator `next` has advanced is the REST of its elements: every other
+    // member reads from the cursor on, not from the source's first element.
+    let rest;
+    let recv = if source.iter && source.cursor > 0 {
+        rest = new_lazy(
+            Vec::new(),
+            LazySrc::Drop {
+                src: recv.clone(),
+                n: source.cursor,
+            },
+        );
+        &rest
+    } else {
+        recv
+    };
     let result = lazy_method_inner(vm, recv, name, args);
     // A lazily derived collection of an iterator is an iterator.
     if source.iter {
@@ -20017,6 +20210,11 @@ enum StreamOp {
     MapObj(Value),
     /// `Stream.flatMap`: the function answers a stream whose elements continue.
     FlatMap(Value),
+    /// `Stream.concat`'s source: each source element IS a stream, whose
+    /// elements continue in its place.
+    Flatten,
+    /// `peek(action)`: `action` sees each element as it passes.
+    Peek(Value),
     Filter(Value),
     Distinct,
     /// A stateful BARRIER: everything before it runs to completion first.
@@ -20287,15 +20485,39 @@ fn stream_push(
             }
             StreamOp::MapObj(f) => v = invoke_closure(vm, f, &[v])?,
             // `flatMap` — each element of the stream `f` answers continues
-            // down the rest of the pipeline before the next source element.
-            StreamOp::FlatMap(f) => {
-                let inner = invoke_closure(vm, f, &[v])?;
-                for e in stream_drain(vm, &inner)? {
-                    if state.quota_met(ops) || !stream_push(vm, e, i + 1, ops, state, sink)? {
-                        return Ok(false);
-                    }
-                }
-                return Ok(true);
+            // down the rest of the pipeline before the inner stream is asked
+            // for the next, so a short-circuiting terminal stops the inner pull
+            // too (JDK 10 and later).
+            StreamOp::FlatMap(_) | StreamOp::Flatten => {
+                let inner = match op {
+                    StreamOp::FlatMap(f) => invoke_closure(vm, f, &[v])?,
+                    _ => v,
+                };
+                let Some((SeqKind::JStream, src)) = seq_kind_items(&inner) else {
+                    return Err(
+                        "scalars: flatMap expects a function answering a stream".to_string()
+                    );
+                };
+                let inner_state = stream_state(&inner);
+                stream_mark_used(&inner);
+                let mut more = true;
+                stream_run(
+                    vm,
+                    &src,
+                    inner_state.iterate.as_ref(),
+                    &inner_state.ops,
+                    &mut |vm, e| {
+                        // A `limit` downstream that has just been met CANCELS the
+                        // inner pull, as it cancels the outer one.
+                        more =
+                            stream_push(vm, e, i + 1, ops, state, sink)? && !state.quota_met(ops);
+                        Ok(more)
+                    },
+                )?;
+                return Ok(more);
+            }
+            StreamOp::Peek(f) => {
+                invoke_closure(vm, f, std::slice::from_ref(&v))?;
             }
             StreamOp::Filter(p) => {
                 if !truthy(&invoke_closure(vm, p, std::slice::from_ref(&v))?) {
@@ -20324,21 +20546,6 @@ fn stream_push(
         }
     }
     sink(vm, v)
-}
-
-/// Every element a stream value yields, consuming it.
-fn stream_drain(vm: &mut VM, stream: &Value) -> Result<Vec<Value>, String> {
-    let Some((SeqKind::JStream, src)) = seq_kind_items(stream) else {
-        return Err("scalars: flatMap expects a function answering a stream".to_string());
-    };
-    let state = stream_state(stream);
-    stream_mark_used(stream);
-    let mut out = Vec::new();
-    stream_run(vm, &src, state.iterate.as_ref(), &state.ops, &mut |_, v| {
-        out.push(v);
-        Ok(true)
-    })?;
-    Ok(out)
 }
 
 /// `DoubleStream.sum`'s compensated (Kahan) summation, as the JDK's
@@ -20421,6 +20628,7 @@ fn int_stream_method(
         }
         ("boxed", 0) if !objects => then(None, SElem::Obj),
         ("flatMap", 1) if objects => then(Some(StreamOp::FlatMap(args[0].clone())), SElem::Obj),
+        ("peek", 1) => then(Some(StreamOp::Peek(args[0].clone())), elem),
         ("filter", 1) => then(Some(StreamOp::Filter(args[0].clone())), elem),
         ("distinct", 0) => then(Some(StreamOp::Distinct), elem),
         ("sorted", 0) => then(Some(StreamOp::Sorted), elem),
@@ -20446,25 +20654,9 @@ fn int_stream_method(
         // A pipeline that keeps the size KNOWN (`map`, `sorted`, and on JDK 21
         // `skip`/`limit` too) is not run at all: the JDK answers `count` off the
         // source's size, so a `map`'s side effect never happens.
-        ("count", 0)
-            if iterate.is_none()
-                && ops.iter().all(|o| {
-                    matches!(
-                        o,
-                        StreamOp::MapPrim(..)
-                            | StreamOp::MapObj(_)
-                            | StreamOp::Sorted
-                            | StreamOp::Skip(_)
-                            | StreamOp::Limit(_)
-                    )
-                }) =>
-        {
+        ("count", 0) if stream_known_size(src, iterate.is_some(), &ops).is_some() => {
             stream_mark_used(recv);
-            let size = ops.iter().fold(src.len(), |n, o| match o {
-                StreamOp::Skip(k) => n.saturating_sub(*k),
-                StreamOp::Limit(k) => n.min(*k),
-                _ => n,
-            });
+            let size = stream_known_size(src, false, &ops).unwrap_or(0);
             Ok(Value::int(size as i64))
         }
         ("count", 0) => Ok(Value::int(collect(vm)?.len() as i64)),
@@ -20644,6 +20836,17 @@ fn apply_collector(
     // An `ArrayList`/`HashMap` result is mutable.
     Ok(match coll {
         Coll::ToList | Coll::ToMap | Coll::GroupingBy => java_marked(out, true),
+        // `Collectors.toSet` builds a `HashSet` (default table, grown as the
+        // elements went in), so its mutators keep that table order.
+        Coll::ToSet => {
+            let len = with_seq(&out, |_, xs| xs.len()).unwrap_or(0);
+            let mut cap = 16;
+            while len as f64 > cap as f64 * 0.75 {
+                cap *= 2;
+            }
+            set_java_flavor(&out, JFlavor::HashSet { cap });
+            java_marked(out, true)
+        }
         _ => out,
     })
 }
@@ -20804,6 +21007,60 @@ fn java_list_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, String> {
+    let flavor = java_flavor(recv);
+    match flavor {
+        // An `Arrays.asList` list writes through `set` and `sort`; everything
+        // that would change its size is the JDK's `UnsupportedOperationException`.
+        Some(JFlavor::FixedSize) if matches!(name, "set" | "sort") => {
+            if let Some(r) = java_list_mutate(vm, items, name, args) {
+                let (out, answer) = r?;
+                set_seq_items(recv, SeqKind::JavaList, out);
+                return Ok(answer);
+            }
+        }
+        Some(f @ (JFlavor::HashSet { .. } | JFlavor::TreeSet)) => {
+            if let Some(r) = java_set_mutate(items, f, name, args) {
+                java_mutable(recv, name)?;
+                let (out, answer, f) = r?;
+                set_seq_items(recv, SeqKind::JavaList, out);
+                set_java_flavor(recv, f);
+                return Ok(answer);
+            }
+            if f == JFlavor::TreeSet {
+                if let Some(r) = java_tree_set_query(items, name, args) {
+                    return r;
+                }
+            }
+            // A `Set` has no index: `get`, `indexOf` and the `List` mutators
+            // are not its members.
+            if matches!(
+                name,
+                "get" | "set" | "indexOf" | "lastIndexOf" | "subList" | "sort"
+            ) {
+                return Err(no_such_method(recv, name));
+            }
+        }
+        Some(f @ (JFlavor::ArrayDeque | JFlavor::LinkedList)) => {
+            if let Some(r) = java_deque_op(items, f, name, args) {
+                java_mutable(recv, name)?;
+                let (out, answer) = r?;
+                set_seq_items(recv, SeqKind::JavaList, out);
+                return Ok(answer);
+            }
+            if f == JFlavor::ArrayDeque
+                && matches!(
+                    name,
+                    "get" | "set" | "indexOf" | "lastIndexOf" | "subList" | "sort"
+                )
+            {
+                return Err(no_such_method(recv, name));
+            }
+        }
+        _ => {}
+    }
+    if name == "iterator" && args.is_empty() {
+        return Ok(new_seq(SeqKind::Iterator, items.to_vec()));
+    }
     if let Some(r) = java_list_mutate(vm, items, name, args) {
         java_mutable(recv, name)?;
         let (out, answer) = r?;
@@ -21867,11 +22124,29 @@ fn java_map_method(
             Some((kv.first()?.clone(), kv.get(1)?.clone()))
         })
         .collect();
+    let tree = java_flavor(recv) == Some(JFlavor::TreeMap);
+    if tree {
+        if let Some(r) = java_tree_map_op(&pairs, name, args) {
+            let (rest, answer) = r?;
+            if let Some(rest) = rest {
+                java_mutable(recv, name)?;
+                let fresh = tree_map_value(rest);
+                let items = seq_kind_items(&fresh).map(|(_, xs)| xs).unwrap_or_default();
+                set_seq_items(recv, SeqKind::JavaMap, items);
+            }
+            return Ok(answer);
+        }
+    }
     if let Some(r) = java_map_mutate(vm, &pairs, name, args) {
         java_mutable(recv, name)?;
         let (out, answer) = r?;
-        // Re-laid-out in the table order the JDK would iterate.
-        let fresh = java_map_value(out);
+        // Re-laid-out in the order the JDK would iterate: a `TreeMap`'s key
+        // order, a `HashMap`'s table order.
+        let fresh = if tree {
+            tree_map_value(out)
+        } else {
+            java_map_value(out)
+        };
         let items = seq_kind_items(&fresh).map(|(_, xs)| xs).unwrap_or_default();
         set_seq_items(recv, SeqKind::JavaMap, items);
         return Ok(answer);
@@ -22025,16 +22300,21 @@ fn b_stream_factory(vm: &mut VM, argc: u8) -> Value {
             None,
         ),
         ("generate", 1, _) => new_stream(Vec::new(), elem, Some((args[0].clone(), Value::Undef))),
-        // `concat(a, b)` — both streams drained, in order, into one.
+        // `concat(a, b)` — a stream whose source is the two streams, each
+        // pulled element by element only when the terminal op runs.
         ("concat", 2, _) => {
-            let mut all = Vec::new();
             for s in &args {
-                match stream_drain(vm, s) {
-                    Ok(xs) => all.extend(xs),
-                    Err(e) => return fault(vm, e),
-                }
+                stream_mark_used(s);
             }
-            new_stream(all, elem, None)
+            let out = new_stream(args, elem, None);
+            if let Some(id) = as_obj_id(&out) {
+                JSTREAMS.with(|t| {
+                    if let Some(st) = t.borrow_mut().get_mut(&id) {
+                        st.ops.push(StreamOp::Flatten);
+                    }
+                });
+            }
+            out
         }
         ("iterate", 2, _) => new_stream(
             Vec::new(),
@@ -22047,6 +22327,731 @@ fn b_stream_factory(vm: &mut VM, argc: u8) -> Value {
             format!("scalars: value {member} is not a member of java.util.stream.{class}"),
         ),
     }
+}
+
+/// Which `java.util` class a [`SeqKind::JavaList`]/[`SeqKind::JavaMap`] value
+/// is, when it is not the default `ArrayList`/`HashMap`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum JFlavor {
+    /// A `HashSet`, with its table length: iterated in table order, and the
+    /// table only ever grows, as the JDK's does.
+    HashSet { cap: usize },
+    /// A `TreeSet` — natural order.
+    TreeSet,
+    /// An `ArrayDeque` — a `Deque` with no index access.
+    ArrayDeque,
+    /// A `LinkedList` — a `List` and a `Deque` at once.
+    LinkedList,
+    /// A `TreeMap` — entries in natural key order.
+    TreeMap,
+    /// An `Arrays.asList` list: its elements can be replaced, its size
+    /// cannot change.
+    FixedSize,
+}
+
+thread_local! {
+    /// The [`JFlavor`] of each `java.util` value that has one, by heap id.
+    static JAVA_FLAVOR: RefCell<HashMap<usize, JFlavor>> = RefCell::new(HashMap::new());
+}
+
+fn java_flavor(v: &Value) -> Option<JFlavor> {
+    as_obj_id(v).and_then(|id| JAVA_FLAVOR.with(|t| t.borrow().get(&id).copied()))
+}
+
+fn set_java_flavor(v: &Value, f: JFlavor) {
+    if let Some(id) = as_obj_id(v) {
+        JAVA_FLAVOR.with(|t| t.borrow_mut().insert(id, f));
+    }
+}
+
+/// `HashMap.tableSizeFor`: the power of two at or above `c` (and at least 1).
+fn java_table_size_for(c: usize) -> usize {
+    c.max(1).next_power_of_two()
+}
+
+/// `items` (already distinct) in the iteration order of a JDK hash table that
+/// started at length `cap` and received them in this order, and the length it
+/// has grown to: it doubles whenever the size passes three quarters of it.
+fn java_table_order(items: Vec<Value>, mut cap: usize) -> (Vec<Value>, usize) {
+    while items.len() as f64 > cap as f64 * 0.75 {
+        cap *= 2;
+    }
+    let bucket = |v: &Value| {
+        let h = java_hash_code(v) as u32;
+        ((h ^ (h >> 16)) as usize) & (cap - 1)
+    };
+    let mut keyed: Vec<(usize, usize, Value)> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (bucket(&v), i, v))
+        .collect();
+    keyed.sort_by_key(|(b, i, _)| (*b, *i));
+    (keyed.into_iter().map(|(_, _, v)| v).collect(), cap)
+}
+
+/// `items` without repeats, first occurrence kept.
+fn distinct_values(items: Vec<Value>) -> Vec<Value> {
+    let mut uniq: Vec<Value> = Vec::new();
+    for x in items {
+        if !uniq.iter().any(|u| value_eq(u, &x)) {
+            uniq.push(x);
+        }
+    }
+    uniq
+}
+
+/// The elements a `java.util` collection constructor (or `addAll`) copies from
+/// `v` — which must itself be a `java.util` collection: a Scala one is not a
+/// `java.util.Collection`, and scalac rejects passing it.
+fn java_source_items(v: &Value) -> Option<Vec<Value>> {
+    with_seq(v, |k, xs| (k == SeqKind::JavaList).then(|| xs.to_vec())).flatten()
+}
+
+/// The entries a `java.util` map constructor copies from `v`, itself a
+/// `java.util.Map`.
+fn java_source_pairs(v: &Value) -> Option<Vec<(Value, Value)>> {
+    let items = with_seq(v, |k, xs| (k == SeqKind::JavaMap).then(|| xs.to_vec())).flatten()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|p| {
+                let kv = as_seq_or_tuple(p)?;
+                Some((kv.first()?.clone(), kv.get(1)?.clone()))
+            })
+            .collect(),
+    )
+}
+
+/// A `TreeMap`'s entries: one per key, the last value written winning, in
+/// natural key order.
+fn tree_map_value(entries: Vec<(Value, Value)>) -> Value {
+    let mut kept: Vec<(Value, Value)> = Vec::new();
+    for (k, v) in entries {
+        map_put(&mut kept, k, v);
+    }
+    kept.sort_by(|a, b| value_cmp(&a.0, &b.0));
+    new_seq(
+        SeqKind::JavaMap,
+        kept.into_iter().map(|(k, v)| new_pair(k, v)).collect(),
+    )
+}
+
+/// `JAVA_NEW` builtin — see [`JAVA_NEW`].
+fn b_java_new(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_n(vm, argc);
+    let class = if args.is_empty() {
+        String::new()
+    } else {
+        args.remove(0).as_str_cow().into_owned()
+    };
+    // The one argument is a source collection or an initial capacity; a
+    // capacity changes nothing observable except a `HashSet`'s table.
+    let (source, capacity) = match args.first() {
+        None => (None, None),
+        Some(v @ Value::Int(_)) => {
+            if v.to_int() < 0 {
+                return fault(
+                    vm,
+                    format!(
+                        "scalars: java.lang.IllegalArgumentException: Illegal initial capacity: {}",
+                        v.to_int()
+                    ),
+                );
+            }
+            (None, Some(v.to_int() as usize))
+        }
+        Some(v) => (Some(v.clone()), None),
+    };
+    if args.len() > 1 {
+        return fault(
+            vm,
+            format!("scalars: new java.util.{class} takes at most one argument"),
+        );
+    }
+    let items = match &source {
+        None => Vec::new(),
+        Some(v) if class.ends_with("Map") => {
+            let Some(pairs) = java_source_pairs(v) else {
+                return fault(vm, format!("scalars: new java.util.{class}: not a map"));
+            };
+            let out = if class == "TreeMap" {
+                let m = tree_map_value(pairs);
+                set_java_flavor(&m, JFlavor::TreeMap);
+                m
+            } else {
+                java_map_value(pairs)
+            };
+            return java_marked(out, true);
+        }
+        Some(v) => match java_source_items(v) {
+            Some(xs) => xs,
+            None => {
+                return fault(
+                    vm,
+                    format!("scalars: new java.util.{class}: not a collection"),
+                )
+            }
+        },
+    };
+    let out = match class.as_str() {
+        "ArrayList" => new_seq(SeqKind::JavaList, items),
+        "LinkedList" | "ArrayDeque" => {
+            let v = new_seq(SeqKind::JavaList, items);
+            let f = if class == "LinkedList" {
+                JFlavor::LinkedList
+            } else {
+                JFlavor::ArrayDeque
+            };
+            set_java_flavor(&v, f);
+            v
+        }
+        "HashSet" => {
+            // `HashSet(Collection)` sizes its table for the source.
+            let start = match (&source, capacity) {
+                (Some(_), _) => {
+                    java_table_size_for(((items.len() as f64 / 0.75) as usize + 1).max(16))
+                }
+                (None, Some(c)) => java_table_size_for(c),
+                (None, None) => 16,
+            };
+            let (ordered, cap) = java_table_order(distinct_values(items), start);
+            let v = new_seq(SeqKind::JavaList, ordered);
+            set_java_flavor(&v, JFlavor::HashSet { cap });
+            v
+        }
+        "TreeSet" => {
+            let mut xs = distinct_values(items);
+            xs.sort_by(value_cmp);
+            let v = new_seq(SeqKind::JavaList, xs);
+            set_java_flavor(&v, JFlavor::TreeSet);
+            v
+        }
+        "HashMap" => java_map_value(Vec::new()),
+        "TreeMap" => {
+            let m = tree_map_value(Vec::new());
+            set_java_flavor(&m, JFlavor::TreeMap);
+            m
+        }
+        _ => return fault(vm, format!("scalars: not found: type {class}")),
+    };
+    java_marked(out, true)
+}
+
+/// A set mutator's outcome: the new contents, the call's answer, and the
+/// flavor carrying the table length after.
+type SetMutation = (Vec<Value>, Value, JFlavor);
+
+/// The `java.util.Set` mutators on a `HashSet`/`TreeSet`: the new contents,
+/// the call's answer, and the table length after. `None` when `name` is not
+/// one.
+fn java_set_mutate(
+    items: &[Value],
+    flavor: JFlavor,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<SetMutation, String>> {
+    let mut out = items.to_vec();
+    let has = |out: &[Value], x: &Value| out.iter().any(|e| value_eq(e, x));
+    let answer = match (name, args.len()) {
+        ("add", 1) => {
+            let fresh = !has(&out, &args[0]);
+            if fresh {
+                out.push(args[0].clone());
+            }
+            Value::bool(fresh)
+        }
+        ("remove" | "remove$object", 1) => {
+            let before = out.len();
+            out.retain(|e| !value_eq(e, &args[0]));
+            Value::bool(out.len() != before)
+        }
+        ("addAll", 1) => {
+            let before = out.len();
+            for x in java_source_items(&args[0]).unwrap_or_default() {
+                if !has(&out, &x) {
+                    out.push(x);
+                }
+            }
+            Value::bool(out.len() != before)
+        }
+        ("removeAll" | "retainAll", 1) => {
+            let other = java_source_items(&args[0]).unwrap_or_default();
+            let keep_found = name == "retainAll";
+            let before = out.len();
+            out.retain(|e| other.iter().any(|o| value_eq(o, e)) == keep_found);
+            Value::bool(out.len() != before)
+        }
+        ("clear", 0) => {
+            out.clear();
+            unit_value()
+        }
+        _ => return None,
+    };
+    let flavor = match flavor {
+        JFlavor::HashSet { cap } => {
+            let (ordered, cap) = java_table_order(out, cap);
+            out = ordered;
+            JFlavor::HashSet { cap }
+        }
+        other => {
+            out.sort_by(value_cmp);
+            other
+        }
+    };
+    Some(Ok((out, answer, flavor)))
+}
+
+/// The JDK's `NoSuchElementException` with no message, as an empty `Deque`'s
+/// `pop`/`remove`/`element`/`getFirst` and an empty `TreeSet`'s `first` raise.
+fn java_no_such_element() -> String {
+    "scalars: java.util.NoSuchElementException".to_string()
+}
+
+/// The `java.util.Deque` operations of an `ArrayDeque`/`LinkedList`: the new
+/// contents and the call's answer. `None` when `name` is not one. An empty
+/// deque answers `null` to the `poll`/`peek` forms and raises from the others.
+fn java_deque_op(
+    items: &[Value],
+    flavor: JFlavor,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<(Vec<Value>, Value), String>> {
+    let mut out = items.to_vec();
+    let first = items.first().cloned();
+    let last = items.last().cloned();
+    let answer = match (name, args.len()) {
+        ("addFirst" | "push", 1) => {
+            out.insert(0, args[0].clone());
+            unit_value()
+        }
+        ("offerFirst", 1) => {
+            out.insert(0, args[0].clone());
+            Value::bool(true)
+        }
+        ("addLast", 1) => {
+            out.push(args[0].clone());
+            unit_value()
+        }
+        ("offerLast" | "offer", 1) => {
+            out.push(args[0].clone());
+            Value::bool(true)
+        }
+        // `ArrayDeque.add` is `addLast`; a `LinkedList`'s `add` is the
+        // `List` one, answered by the list path.
+        ("add", 1) if flavor == JFlavor::ArrayDeque => {
+            out.push(args[0].clone());
+            Value::bool(true)
+        }
+        ("poll" | "pollFirst", 0) => match first {
+            Some(v) => {
+                out.remove(0);
+                v
+            }
+            None => Value::Undef,
+        },
+        ("pollLast", 0) => match last {
+            Some(v) => {
+                out.pop();
+                v
+            }
+            None => Value::Undef,
+        },
+        ("pop" | "removeFirst" | "remove", 0) => match first {
+            Some(v) => {
+                out.remove(0);
+                v
+            }
+            None => return Some(Err(java_no_such_element())),
+        },
+        ("removeLast", 0) => match last {
+            Some(v) => {
+                out.pop();
+                v
+            }
+            None => return Some(Err(java_no_such_element())),
+        },
+        ("peek" | "peekFirst", 0) => first.unwrap_or(Value::Undef),
+        ("peekLast", 0) => last.unwrap_or(Value::Undef),
+        ("element" | "getFirst", 0) => match first {
+            Some(v) => v,
+            None => return Some(Err(java_no_such_element())),
+        },
+        ("getLast", 0) => match last {
+            Some(v) => v,
+            None => return Some(Err(java_no_such_element())),
+        },
+        // An `ArrayDeque` has no index, so its `remove(x)` is by element.
+        ("remove", 1) | ("remove$object", 1) if flavor == JFlavor::ArrayDeque => {
+            match out.iter().position(|e| value_eq(e, &args[0])) {
+                Some(i) => {
+                    out.remove(i);
+                    Value::bool(true)
+                }
+                None => Value::bool(false),
+            }
+        }
+        ("descendingIterator", 0) => {
+            return Some(Ok((
+                out,
+                new_seq(SeqKind::Iterator, items.iter().rev().cloned().collect()),
+            )))
+        }
+        _ => return None,
+    };
+    Some(Ok((out, answer)))
+}
+
+/// The `java.util.NavigableSet` queries of a `TreeSet`. `None` when `name` is
+/// not one.
+fn java_tree_set_query(
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let pick = |f: &dyn Fn(Ordering) -> bool, from_end: bool| -> Value {
+        let found = if from_end {
+            items.iter().rev().find(|x| f(value_cmp(x, &args[0])))
+        } else {
+            items.iter().find(|x| f(value_cmp(x, &args[0])))
+        };
+        found.cloned().unwrap_or(Value::Undef)
+    };
+    let tree = |xs: Vec<Value>| {
+        let v = new_seq(SeqKind::JavaList, xs);
+        set_java_flavor(&v, JFlavor::TreeSet);
+        v
+    };
+    Some(Ok(match (name, args.len()) {
+        ("first", 0) => match items.first() {
+            Some(v) => v.clone(),
+            None => return Some(Err(java_no_such_element())),
+        },
+        ("last", 0) => match items.last() {
+            Some(v) => v.clone(),
+            None => return Some(Err(java_no_such_element())),
+        },
+        ("floor", 1) => pick(&|o| o != Ordering::Greater, true),
+        ("lower", 1) => pick(&|o| o == Ordering::Less, true),
+        ("ceiling", 1) => pick(&|o| o != Ordering::Less, false),
+        ("higher", 1) => pick(&|o| o == Ordering::Greater, false),
+        ("headSet", 1) => tree(
+            items
+                .iter()
+                .filter(|x| value_cmp(x, &args[0]) == Ordering::Less)
+                .cloned()
+                .collect(),
+        ),
+        ("tailSet", 1) => tree(
+            items
+                .iter()
+                .filter(|x| value_cmp(x, &args[0]) != Ordering::Less)
+                .cloned()
+                .collect(),
+        ),
+        ("descendingSet", 0) => new_seq(SeqKind::JavaList, items.iter().rev().cloned().collect()),
+        _ => return None,
+    }))
+}
+
+/// A `TreeMap` op's outcome: the entries left when it removed one, and its
+/// answer.
+type TreeMapOp = (Option<Vec<(Value, Value)>>, Value);
+
+/// The `java.util.NavigableMap` queries and polls of a `TreeMap`: the new
+/// entries (when the call removes one) and the answer. `None` when `name` is
+/// not one.
+fn java_tree_map_op(
+    pairs: &[(Value, Value)],
+    name: &str,
+    args: &[Value],
+) -> Option<Result<TreeMapOp, String>> {
+    let key_where = |f: &dyn Fn(Ordering) -> bool, from_end: bool| -> Option<(Value, Value)> {
+        let mut it: Box<dyn Iterator<Item = &(Value, Value)>> = if from_end {
+            Box::new(pairs.iter().rev())
+        } else {
+            Box::new(pairs.iter())
+        };
+        it.find(|(k, _)| f(value_cmp(k, &args[0]))).cloned()
+    };
+    let entry = |kv: Option<(Value, Value)>| match kv {
+        Some((k, v)) => new_seq(SeqKind::JavaEntry, vec![k, v]),
+        None => Value::Undef,
+    };
+    let key = |kv: Option<(Value, Value)>| kv.map_or(Value::Undef, |(k, _)| k);
+    let sub = |keep: &dyn Fn(&Value) -> bool| {
+        let m = tree_map_value(pairs.iter().filter(|(k, _)| keep(k)).cloned().collect());
+        set_java_flavor(&m, JFlavor::TreeMap);
+        m
+    };
+    let floor = |o: Ordering| o != Ordering::Greater;
+    let lower = |o: Ordering| o == Ordering::Less;
+    let ceiling = |o: Ordering| o != Ordering::Less;
+    let higher = |o: Ordering| o == Ordering::Greater;
+    Some(Ok(match (name, args.len()) {
+        ("firstKey", 0) | ("lastKey", 0) => {
+            let kv = if name == "firstKey" {
+                pairs.first()
+            } else {
+                pairs.last()
+            };
+            match kv {
+                Some((k, _)) => (None, k.clone()),
+                None => return Some(Err(java_no_such_element())),
+            }
+        }
+        ("firstEntry", 0) => (None, entry(pairs.first().cloned())),
+        ("lastEntry", 0) => (None, entry(pairs.last().cloned())),
+        ("pollFirstEntry", 0) => {
+            let rest = pairs.iter().skip(1).cloned().collect();
+            (Some(rest), entry(pairs.first().cloned()))
+        }
+        ("pollLastEntry", 0) => {
+            let rest = pairs[..pairs.len().saturating_sub(1)].to_vec();
+            (Some(rest), entry(pairs.last().cloned()))
+        }
+        ("floorKey", 1) => (None, key(key_where(&floor, true))),
+        ("lowerKey", 1) => (None, key(key_where(&lower, true))),
+        ("ceilingKey", 1) => (None, key(key_where(&ceiling, false))),
+        ("higherKey", 1) => (None, key(key_where(&higher, false))),
+        ("floorEntry", 1) => (None, entry(key_where(&floor, true))),
+        ("lowerEntry", 1) => (None, entry(key_where(&lower, true))),
+        ("ceilingEntry", 1) => (None, entry(key_where(&ceiling, false))),
+        ("higherEntry", 1) => (None, entry(key_where(&higher, false))),
+        ("headMap", 1) => (None, sub(&|k| value_cmp(k, &args[0]) == Ordering::Less)),
+        ("tailMap", 1) => (None, sub(&|k| value_cmp(k, &args[0]) != Ordering::Less)),
+        ("subMap", 2) => (
+            None,
+            sub(&|k| {
+                value_cmp(k, &args[0]) != Ordering::Less && value_cmp(k, &args[1]) == Ordering::Less
+            }),
+        ),
+        ("descendingMap", 0) => (
+            None,
+            new_seq(
+                SeqKind::JavaMap,
+                pairs
+                    .iter()
+                    .rev()
+                    .map(|(k, v)| new_pair(k.clone(), v.clone()))
+                    .collect(),
+            ),
+        ),
+        _ => return None,
+    }))
+}
+
+/// `JAVA_STATIC` builtin — see [`JAVA_STATIC`].
+fn b_java_static(vm: &mut VM, argc: u8) -> Value {
+    let which = vm.pop().as_str_cow().into_owned();
+    let args = pop_n(vm, argc.saturating_sub(1));
+    match java_static(vm, &which, &args) {
+        Ok(v) => v,
+        Err(e) => fault(vm, e),
+    }
+}
+
+/// The elements of a Scala `Array` argument, or `None` for anything else.
+fn array_items(v: &Value) -> Option<Vec<Value>> {
+    with_seq(v, |k, xs| (k == SeqKind::Array).then(|| xs.to_vec())).flatten()
+}
+
+/// The `[from, to)` bounds of an `Arrays` range operation, checked as
+/// `Arrays.rangeCheck` checks them.
+fn java_range(len: usize, from: i64, to: i64) -> Result<(usize, usize), String> {
+    if from > to {
+        return Err(format!(
+            "scalars: java.lang.IllegalArgumentException: fromIndex({from}) > toIndex({to})"
+        ));
+    }
+    if from < 0 {
+        return Err(format!(
+            "scalars: java.lang.ArrayIndexOutOfBoundsException: Array index out of range: {from}"
+        ));
+    }
+    if to as usize > len {
+        return Err(format!(
+            "scalars: java.lang.ArrayIndexOutOfBoundsException: Array index out of range: {to}"
+        ));
+    }
+    Ok((from as usize, to as usize))
+}
+
+/// `java.util.Arrays`/`java.util.Collections` static members, `which` being
+/// `"Class.member"`.
+fn java_static(vm: &mut VM, which: &str, args: &[Value]) -> Result<Value, String> {
+    let not_member = || {
+        let (class, member) = which.split_once('.').unwrap_or((which, ""));
+        Err(format!(
+            "scalars: value {member} is not a member of object java.util.{class}"
+        ))
+    };
+    let array = |i: usize| {
+        args.get(i)
+            .and_then(array_items)
+            .ok_or_else(|| format!("scalars: {which}: argument {i} is not an Array"))
+    };
+    let list = |i: usize| {
+        args.get(i)
+            .and_then(java_source_items)
+            .ok_or_else(|| format!("scalars: {which}: argument {i} is not a java.util collection"))
+    };
+    match (which, args.len()) {
+        ("Arrays.asList", _) => {
+            let v = java_marked(new_seq(SeqKind::JavaList, args.to_vec()), false);
+            set_java_flavor(&v, JFlavor::FixedSize);
+            Ok(v)
+        }
+        ("Arrays.toString", 1) => Ok(match &args[0] {
+            Value::Undef => Value::str("null".to_string()),
+            v => {
+                let xs = array_items(v).ok_or_else(|| format!("scalars: {which}: not an Array"))?;
+                let body: Vec<String> = xs.iter().map(|x| scala_str_vm(vm, x)).collect();
+                Value::str(format!("[{}]", body.join(", ")))
+            }
+        }),
+        ("Arrays.sort", 1 | 3) => {
+            let mut xs =
+                array_items(&args[0]).ok_or_else(|| format!("scalars: {which}: not an Array"))?;
+            let (a, b) = if args.len() == 3 {
+                java_range(xs.len(), args[1].to_int(), args[2].to_int())?
+            } else {
+                (0, xs.len())
+            };
+            xs[a..b].sort_by(value_cmp);
+            set_seq_items(&args[0], SeqKind::Array, xs);
+            Ok(unit_value())
+        }
+        ("Arrays.fill", 2 | 4) => {
+            let mut xs =
+                array_items(&args[0]).ok_or_else(|| format!("scalars: {which}: not an Array"))?;
+            let (a, b, v) = if args.len() == 4 {
+                let (a, b) = java_range(xs.len(), args[1].to_int(), args[2].to_int())?;
+                (a, b, args[3].clone())
+            } else {
+                (0, xs.len(), args[1].clone())
+            };
+            for x in &mut xs[a..b] {
+                *x = v.clone();
+            }
+            set_seq_items(&args[0], SeqKind::Array, xs);
+            Ok(unit_value())
+        }
+        // `Arrays.binarySearch0`: the index of `key`, or `-(insertion point) - 1`.
+        ("Arrays.binarySearch", 2) => {
+            let xs = array(0)?;
+            let (mut low, mut high) = (0i64, xs.len() as i64 - 1);
+            while low <= high {
+                let mid = (low + high) >> 1;
+                match value_cmp(&xs[mid as usize], &args[1]) {
+                    Ordering::Less => low = mid + 1,
+                    Ordering::Greater => high = mid - 1,
+                    Ordering::Equal => return Ok(Value::int(mid)),
+                }
+            }
+            Ok(Value::int(-(low + 1)))
+        }
+        ("Arrays.equals", 2) => Ok(Value::bool(
+            match (array_items(&args[0]), array_items(&args[1])) {
+                (Some(a), Some(b)) => {
+                    a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| value_eq(x, y))
+                }
+                (None, None) => matches!((&args[0], &args[1]), (Value::Undef, Value::Undef)),
+                _ => false,
+            },
+        )),
+        ("Collections.sort", 1 | 2)
+        | ("Collections.reverse", 1)
+        | ("Collections.shuffle", 2)
+        | ("Collections.swap", 3) => {
+            let mut xs = list(0)?;
+            let member = which.trim_start_matches("Collections.");
+            java_list_writable(&args[0], member)?;
+            match member {
+                "sort" => {
+                    let cmp = args.get(1).cloned().unwrap_or(Value::Undef);
+                    if let Some(r) = java_list_mutate(vm, &xs, "sort", &[cmp]) {
+                        xs = r?.0;
+                    }
+                }
+                "reverse" => xs.reverse(),
+                "swap" => {
+                    let len = xs.len();
+                    let at = |i: i64| {
+                        usize::try_from(i).ok().filter(|k| *k < len).ok_or_else(|| {
+                            format!("scalars: java.lang.IndexOutOfBoundsException: Index {i} out of bounds for length {len}")
+                        })
+                    };
+                    let (i, j) = (at(args[1].to_int())?, at(args[2].to_int())?);
+                    xs.swap(i, j);
+                }
+                _ => {
+                    let Value::Obj(id) = &args[1] else {
+                        return Err(format!("scalars: {which}: not a java.util.Random"));
+                    };
+                    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+                        Some(HeapVal::Random(r)) => {
+                            r.shuffle(&mut xs);
+                            Ok(())
+                        }
+                        _ => Err(format!("scalars: {which}: not a java.util.Random")),
+                    })?;
+                }
+            }
+            set_seq_items(&args[0], SeqKind::JavaList, xs);
+            Ok(unit_value())
+        }
+        // The FIRST greatest (least) element wins, as the JDK's scan keeps its
+        // candidate unless a later one compares strictly beyond it.
+        ("Collections.max" | "Collections.min", 1) => {
+            let xs = list(0)?;
+            let want = if which.ends_with("max") {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+            let mut it = xs.into_iter();
+            let mut best = it.next().ok_or_else(java_no_such_element)?;
+            for x in it {
+                if value_cmp(&x, &best) == want {
+                    best = x;
+                }
+            }
+            Ok(best)
+        }
+        ("Collections.frequency", 2) => Ok(Value::int(
+            list(0)?.iter().filter(|x| value_eq(x, &args[1])).count() as i64,
+        )),
+        ("Collections.nCopies", 2) => {
+            let n = args[0].to_int();
+            if n < 0 {
+                return Err(format!(
+                    "scalars: java.lang.IllegalArgumentException: List length = {n}"
+                ));
+            }
+            Ok(java_marked(
+                new_seq(SeqKind::JavaList, vec![args[1].clone(); n as usize]),
+                false,
+            ))
+        }
+        ("Collections.emptyList", 0) => {
+            Ok(java_marked(new_seq(SeqKind::JavaList, Vec::new()), false))
+        }
+        ("Collections.singletonList", 1) => Ok(java_marked(
+            new_seq(SeqKind::JavaList, vec![args[0].clone()]),
+            false,
+        )),
+        _ => not_member(),
+    }
+}
+
+/// Whether the `java.util` list `recv` may be written in place by `member`:
+/// a mutable one always, a fixed-size `Arrays.asList` one too (its elements
+/// are writable, only its size is not), an unmodifiable one never.
+fn java_list_writable(recv: &Value, member: &str) -> Result<(), String> {
+    if java_flavor(recv) == Some(JFlavor::FixedSize) {
+        return Ok(());
+    }
+    java_mutable(recv, member)
 }
 
 /// Record `v`'s `java.util` mutability (see [`JAVA_MUT`]) and answer it.
@@ -22304,4 +23309,92 @@ fn dec_strip_zeros(d: &BigDec) -> BigDec {
         out = BigDec::new(&out.unscaled / &ten, out.scale - 1).with_ctx(d.ctx);
     }
     out
+}
+
+/// The element count of a stream whose pipeline keeps its size KNOWN — `map`,
+/// `peek`, `sorted`, and on JDK 21 `skip`/`limit` too, over a sized source or
+/// the `concat` of sized streams — or `None` when only running it can tell.
+/// The JDK answers `count` off that size without running the pipeline, so a
+/// `map`'s or a `peek`'s side effect never happens.
+fn stream_known_size(src: &[Value], unbounded: bool, ops: &[StreamOp]) -> Option<usize> {
+    if unbounded {
+        return None;
+    }
+    let (start, rest) = match ops.first() {
+        Some(StreamOp::Flatten) => {
+            let mut total = 0usize;
+            for part in src {
+                let (_, items) = seq_kind_items(part)?;
+                let st = stream_state(part);
+                total += stream_known_size(&items, st.iterate.is_some(), &st.ops)?;
+            }
+            (total, &ops[1..])
+        }
+        _ => (src.len(), ops),
+    };
+    rest.iter().try_fold(start, |n, o| match o {
+        StreamOp::MapPrim(..) | StreamOp::MapObj(_) | StreamOp::Sorted | StreamOp::Peek(_) => {
+            Some(n)
+        }
+        StreamOp::Skip(k) => Some(n.saturating_sub(*k)),
+        StreamOp::Limit(k) => Some(n.min(*k)),
+        _ => None,
+    })
+}
+
+/// The element type of a `NumericRange` — a range of `Long`s or `BigInt`s,
+/// laid out as the `Range` of its values (see [`NUMERIC_RANGES`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NumRange {
+    Long,
+    BigInt,
+}
+
+thread_local! {
+    /// The heap ids of the `Range` values that are `NumericRange`s, with their
+    /// element type: what prints them as `NumericRange …` and makes a
+    /// `BigInt` one's elements `BigInt`s.
+    static NUMERIC_RANGES: RefCell<HashMap<usize, NumRange>> = RefCell::new(HashMap::new());
+}
+
+fn numeric_range_kind(v: &Value) -> Option<NumRange> {
+    as_obj_id(v).and_then(|id| NUMERIC_RANGES.with(|t| t.borrow().get(&id).copied()))
+}
+
+/// Make the `Range` value `v` a `NumericRange` of `kind`: a `BigInt` one holds
+/// `BigInt` elements.
+fn mark_numeric_range(v: &Value, kind: NumRange) {
+    let Some(id) = as_obj_id(v) else { return };
+    NUMERIC_RANGES.with(|t| t.borrow_mut().insert(id, kind));
+    if kind == NumRange::BigInt {
+        if let Some((k, items)) = seq_kind_items(v) {
+            let big = items
+                .iter()
+                .map(|x| match x {
+                    Value::Int(n) => make_big(BigInt::from(*n)),
+                    other => other.clone(),
+                })
+                .collect();
+            set_seq_items(v, k, big);
+        }
+    }
+}
+
+/// `NumericRange.toString`: `Range`'s, under its own name and with no
+/// `inexact` marker.
+fn numeric_range_to_string(
+    start: i64,
+    end: i64,
+    inclusive: bool,
+    step: i64,
+    is_empty: bool,
+) -> String {
+    let preposition = if inclusive { "to" } else { "until" };
+    let stepped = if step == 1 {
+        String::new()
+    } else {
+        format!(" by {step}")
+    };
+    let empty = if is_empty { "empty " } else { "" };
+    format!("{empty}NumericRange {start} {preposition} {end}{stepped}")
 }
