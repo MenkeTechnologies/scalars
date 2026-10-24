@@ -581,6 +581,13 @@ pub const MAKE_STRING_CONTEXT: u16 = 836;
 /// Builtin id for the standard library's `Numeric`/`Integral`/`Fractional`
 /// instance: pops the type-class name and the numeric type's.
 pub const MAKE_NUMERIC: u16 = 838;
+/// Builtin id for a string concatenation chain (`"a" + x + y`, and every
+/// `s`/`f`/`raw` interpolation, which desugars to one): pops `argc / 3`
+/// (value, format spec, integral box) triples, every operand already
+/// evaluated, and renders and joins them in order. Scala compiles such a chain
+/// to one `StringConcatFactory` call (an `s"…"` to one `StringContext.s`), so
+/// no operand is turned into text until every operand has been computed.
+pub const STR_CONCAT: u16 = 839;
 /// Builtin id for a `@main` method's REPEATED parameter (`rest: Int*`): pops
 /// the type name and the first index, and answers every argument from there on
 /// read as that type, in a `List` — Scala's
@@ -896,6 +903,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(USING_RELEASE, b_using_release);
     vm.register_builtin(MAKE_STRING_CONTEXT, b_make_string_context);
     vm.register_builtin(MAKE_NUMERIC, b_make_numeric);
+    vm.register_builtin(STR_CONCAT, b_str_concat);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -8117,6 +8125,31 @@ fn b_format(vm: &mut VM, argc: u8) -> Value {
         Ok(s) => Value::str(localize_number(s, spec.chars().last().unwrap_or('s'))),
         Err(e) => fault(vm, e),
     }
+}
+
+/// `STR_CONCAT` builtin — see [`STR_CONCAT`]. A triple whose spec is
+/// `Undef` renders the value as `String.valueOf` does (a user `toString`
+/// runs); one with a spec is an `f` interpolator splice, formatted by it.
+fn b_str_concat(vm: &mut VM, argc: u8) -> Value {
+    let ops = pop_n(vm, argc);
+    let mut out = String::new();
+    for t in ops.chunks(3) {
+        let [v, spec, bx] = t else { break };
+        if matches!(spec, Value::Undef) {
+            out.push_str(&scala_str_vm(vm, v));
+            continue;
+        }
+        let spec = spec.as_str_cow().into_owned();
+        let bx = match bx {
+            Value::Undef => None,
+            code => IntBox::from_code(code.as_str_cow().chars().next()),
+        };
+        match format_one(&spec, v, bx, Some(vm)) {
+            Ok(s) => out.push_str(&localize_number(s, spec.chars().last().unwrap_or('s'))),
+            Err(e) => return fault(vm, e),
+        }
+    }
+    Value::str(out)
 }
 
 /// `FORMAT_TYPED` builtin: `fmt.format(args…)` with the arguments' static

@@ -1150,6 +1150,20 @@ reported as parse/compile errors, never silently mis-run.
   exception from a class body (`require` failing), a supertype argument, or a
   constructor argument returns to the `new` site; it used to stop the run as
   uncaught, because the constructor had no unwind frame of its own.
+- **A string concatenation computes every operand before rendering any.**
+  Scala compiles `"a" + x + y` to one `StringConcatFactory` call and an
+  `s`/`f`/`raw` interpolation to one `StringContext` call, so `s"$buf ${buf
+  += 2}"` shows the buffer already grown, and a `toString` override that
+  prints runs after every operand has been computed. A chain one of whose
+  later operands may have an effect (anything but a literal, a name, or
+  arithmetic on those) is compiled that way; any other keeps the native `+`.
+- **Value discarding and trailing compound assignments.** An expression
+  whose expected type is `Unit` is evaluated and answers `()`: `def f():
+  Unit = { 5 }` and `val u: Unit = 5` are `()`. A block, method body or
+  lambda body ending in a compound assignment answers its value, as the
+  assignment does anywhere else: `{ buf += 1 }` is the buffer (the `+=`
+  member), `{ n += 1 }` is `()`. A lambda whose function type alone says
+  `Unit` (`val f: () => Unit = () => 42`) still answers its body's value.
 - **Custom string interpolators.** `id"a${x}b"` for any `id` other than
   `s`/`f`/`raw` is `StringContext("a", "b").id(x)`, the parts kept raw
   (escapes undecoded, `$$` a `$`), so an `extension (sc: StringContext) def

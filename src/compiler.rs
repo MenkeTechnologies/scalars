@@ -2352,6 +2352,9 @@ impl Compiler {
         for s in init {
             self.stmt(s)?;
         }
+        if let Some(e) = compound_as_value(last) {
+            return self.expr(&e);
+        }
         match &last.kind {
             // A trailing expression (including `println`, which leaves `Unit`) is
             // the block's value.
@@ -8498,7 +8501,15 @@ impl Compiler {
     }
 
     fn tail_stmt(&mut self, s: &Stmt) -> Result<(), String> {
-        match &s.kind {
+        let owned;
+        let kind = match compound_as_value(s) {
+            Some(e) => {
+                owned = StmtKind::Expr(e);
+                &owned
+            }
+            None => &s.kind,
+        };
+        match kind {
             // The value of a tail expression is the function's result — unless
             // it left something in flight (a raise, or a non-local return out of
             // a `try`/lambda inside it), in which case the check drops the
@@ -9224,6 +9235,10 @@ impl Compiler {
                 self.b
                     .emit(Op::CallBuiltin(crate::host::SCONV_SHAPE, 2), line);
             }
+            Conv::Unit => {
+                self.b.emit(Op::Pop, line);
+                self.emit_unit(line);
+            }
         }
     }
 
@@ -9347,6 +9362,37 @@ impl Compiler {
         }
     }
 
+    /// One operand of a [`crate::host::STR_CONCAT`] chain, as the
+    /// (value, spec, box) triple it takes: an `f` splice keeps its format spec
+    /// and static integral type for the final rendering; any other operand has
+    /// neither. A `Float` is rendered here, where its static width is known —
+    /// a number's text cannot depend on the operands after it.
+    fn concat_operand(&mut self, leaf: &Expr) -> Result<(), String> {
+        if let Expr::Format { value, spec, line } = leaf {
+            self.expr(value)?;
+            if spec.ends_with('s') {
+                self.emit_f32_str(self.num_ty(value), *line);
+            }
+            let c = self.b.add_constant(Value::str(spec.clone()));
+            self.b.emit(Op::LoadConst(c), *line);
+            match self.int_box(value) {
+                Some(bx) => {
+                    let k = self.b.add_constant(Value::str(bx.code().to_string()));
+                    self.b.emit(Op::LoadConst(k), *line);
+                }
+                None => {
+                    self.b.emit(Op::LoadUndef, *line);
+                }
+            }
+            return Ok(());
+        }
+        self.expr(leaf)?;
+        self.emit_f32_str(self.num_ty(leaf), 0);
+        self.b.emit(Op::LoadUndef, 0);
+        self.b.emit(Op::LoadUndef, 0);
+        Ok(())
+    }
+
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
         // A literal `null` has type `Null`, which has no `+`: Scala 3 rejects
         // `null + "a"` at compile time. (A `String` VALUE holding null does
@@ -9360,6 +9406,20 @@ impl Compiler {
             return Err(format!(
                 "scalars: `+` is not defined between `null` and `{shown}`"
             ));
+        }
+        // A concatenation chain one of whose later operands may have an effect
+        // computes every operand before rendering any (see
+        // [`crate::host::STR_CONCAT`]).
+        if op == BinOp::Add {
+            if let Some(leaves) = deferred_concat(lhs, rhs) {
+                for leaf in &leaves {
+                    self.concat_operand(leaf)?;
+                }
+                let argc = u8::try_from(leaves.len() * 3).expect("bounded by deferred_concat");
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::STR_CONCAT, argc), 0);
+                return Ok(());
+            }
         }
         // `&&` / `||` short-circuit: keep the deciding operand as the result.
         match op {
@@ -11085,10 +11145,18 @@ enum Conv {
     /// tuple's slots and nested collections each convert to their own type
     /// argument.
     Shape(String),
+    /// `Unit`: Scala's value discarding (SLS 6.26.1). An expression whose
+    /// expected type is `Unit` is evaluated and its value dropped for `()`, so
+    /// `def f(): Unit = { 5 }` answers `()` and `val u: Unit = buf += 1` holds
+    /// `()`.
+    Unit,
 }
 
 fn declared_conv(ty: Option<&str>) -> Option<Conv> {
     let ty = ty.map(|t| t.trim_start_matches("=>").trim())?;
+    if matches!(ty, "Unit" | "scala.Unit") {
+        return Some(Conv::Unit);
+    }
     // One collection layer counts: the ELEMENTS of a `List[Double]` are what
     // carry the width, and the conversion applies to them (see
     // `host::conv_elementwise`).
@@ -11733,6 +11801,77 @@ fn yields_chars(body: &Expr) -> bool {
 /// `String.flatMap` has the same empty-receiver problem as [`yields_chars`], but
 /// splits on `Char => String` (concatenate) vs `Char => IterableOnce[B]` (build
 /// a `Vector`), so it needs the `String` side rather than the `Char` side.
+/// A trailing compound assignment read as the value of its block or body:
+/// `{ buf += 1 }` is `buf`, as `buf += 1` in any other value position is (the
+/// `+=` member's result, SLS 6.12.4), and `{ n += 1 }` is `()`. `None` for any
+/// other statement.
+fn compound_as_value(s: &Stmt) -> Option<Expr> {
+    let (target, op, value) = match &s.kind {
+        StmtKind::Assign { name, op, value } => (Expr::Var(name.clone()), *op, value),
+        StmtKind::PlaceAssign { place, op, value } => (place.clone(), *op, value),
+        _ => return None,
+    };
+    (op != AssignOp::Assign).then(|| Expr::CompoundAssign {
+        target: Box::new(target),
+        op,
+        value: Box::new(value.clone()),
+        line: s.line,
+    })
+}
+
+/// The operands of the string concatenation `lhs + rhs`, flattened through
+/// every left operand that is itself a concatenation (`(("a" + x) + y) + z` is
+/// `"a"`, `x`, `y`, `z`), when the chain must compute them all before
+/// rendering any: Scala compiles it to one `StringConcatFactory` call, so an
+/// operand's text reflects whatever the operands AFTER it did (`s"$buf
+/// ${buf += 1}"` shows the buffer grown, a `toString` that prints runs after
+/// them). `None` when no operand after the first could have an effect — then
+/// rendering as it goes is indistinguishable and the native `+` stays — or
+/// when `lhs` is not statically a `String`.
+fn deferred_concat<'e>(lhs: &'e Expr, rhs: &'e Expr) -> Option<Vec<&'e Expr>> {
+    fn flatten<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match e {
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            } if yields_strings(lhs) => {
+                flatten(lhs, out);
+                out.push(rhs);
+            }
+            other => out.push(other),
+        }
+    }
+    fn effect_free(e: &Expr) -> bool {
+        match e {
+            Expr::Str(_)
+            | Expr::Int(_)
+            | Expr::Long(_)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Char(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::Var(_) => true,
+            Expr::Format { value, .. } => effect_free(value),
+            // Arithmetic and comparisons of such operands (`s"$i ${i * 2}"`).
+            Expr::Binary { op, lhs, rhs } => {
+                !matches!(op, BinOp::Cons | BinOp::LazyCons) && effect_free(lhs) && effect_free(rhs)
+            }
+            Expr::Unary { rhs, .. } => effect_free(rhs),
+            _ => false,
+        }
+    }
+    if !yields_strings(lhs) {
+        return None;
+    }
+    let mut leaves = Vec::new();
+    flatten(lhs, &mut leaves);
+    leaves.push(rhs);
+    let effects = leaves.iter().skip(1).any(|e| !effect_free(e));
+    (effects && leaves.len() * 3 <= usize::from(u8::MAX)).then_some(leaves)
+}
+
 fn yields_strings(body: &Expr) -> bool {
     match body {
         Expr::Str(_) => true,
