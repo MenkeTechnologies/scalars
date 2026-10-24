@@ -964,10 +964,25 @@ reported as parse/compile errors, never silently mis-run.
   `NumericRange 1 to 9` with no `inexact` marker, and its `reverse`/`take`/
   `drop`/`by` stay `NumericRange`s while `sorted` is a `Vector`. A `BigInt`
   range used to treat its bounds as `0` (`List(0)`), and a `Long` one printed
-  `Range`. Still open: a `BigDecimal` range (refused), `Range.Long(a, b, s)`
-  (a catchable `NullPointerException` where Scala runs), and a range of more
-  than eight million elements, which is materialized and raises
-  `OutOfMemoryError: Range too large` where Scala answers `(0 until Int.MaxValue by 2).length` without building one.
+  `Range`. `Range.Long(a, b, s)`/`Range.Long.inclusive` and the `BigInt` forms are
+  the same ranges (they were a catchable `NullPointerException`). `getClass`
+  names `Range$Inclusive`/`Exclusive` or `NumericRange$Inclusive`/`Exclusive`.
+- **A range longer than eight million elements** holds no elements: its
+  `length`, `apply`, `contains`, `head`/`last`, `min`/`max`, closed-form `sum`
+  (wrapping as `Int`/`Long` arithmetic does), `take`/`drop`/`slice`, `reverse`
+  and `by` are answered from its bounds, so `(0 until Int.MaxValue by 2).length`
+  is `1073741824`. A member that visits every element (`filter`, `map`,
+  `foreach`, `toList`) raises `OutOfMemoryError: Range too large` where Scala
+  runs it. Past `Int.MaxValue` elements `length` raises Scala's
+  `IllegalArgumentException` (`… seqs cannot contain more than Int.MaxValue
+  elements.` for a `Range`, `More than Int.MaxValue elements.` for a
+  `NumericRange`, which raises it from `last`/`contains`/`apply`/`sum` too).
+- **A `BigDecimal` range** (`BigDecimal(1) to BigDecimal(2) by BigDecimal("0.5")`)
+  holds its elements as `start + step * n`, as `NumericRange.locationAfterN`
+  computes them, and prints `NumericRange 1 to 2 by 0.5`. Without `by` it is
+  `Range.Partial` (`Range requires step`, nothing but `by`). It is held as a
+  `Vector`, so its own `take`/`drop`/`reverse` answer `Vector`s where Scala
+  keeps a `NumericRange`.
 - **A `Char` range — `'a' to 'e'`, `'a' until 'z' by 2`.** Scala's
   `NumericRange[Char]`, a class of its own rather than a `Range`: it prints
   `NumericRange a to e` (`empty NumericRange e to a`, and `by` renders its step
@@ -1079,7 +1094,9 @@ reported as parse/compile errors, never silently mis-run.
   inside `( )` is not a region, so a fewer-braces argument written inside an
   argument list (`println(wrap("b"):` with the block below) does not parse. (A singleton object's `lazy val` is a memoizing method, initialized on
   its first read.)
-- **Widening gaps.** A `Char` widens to `Double`/`Float` but not to a declared
+- **Widening gaps.** An `Int` constant in range narrows to a declared `Char`
+  (`val c: Char = 66` is `B`; it printed `66`), and a `Char` argument to an
+  `Integer`/`Long` static (`Integer.toBinaryString('a')`) is its code. A `Char` widens to `Double`/`Float` but not to a declared
   `Int`/`Long` (`val i: Int = 'c'` is `c`, not `99`), and a function type's
   result does not widen (`val f: Int => Double = x => x * 2` answers `6` for
   `f(3)`, not `6.0`).
@@ -1327,8 +1344,12 @@ reported as parse/compile errors, never silently mis-run.
   type argument that is the whole of an expression's type is read too —
   `List.empty[Int]`, `Option.empty[String]`, `List[Int]()` and the
   `Vector`/`Seq`/`IndexedSeq`/`Set`/`Map` forms — so `show(List.empty[Int].headOption)`
-  resolves. Not a lambda's result type (`List.empty[Int].map(_ + 1)` finds no
-  `A`).
+  resolves. A `map` whose function is a one-parameter lambda is typed by the
+  lambda's body, read with the parameter standing as a value of the element
+  type (`List.empty[Int].map(_ + 1)` is `List[Int]`, `.map(_.toString + "!")`
+  `List[String]`): operators with numeric promotion and `String` `+`, and the
+  fixed-result members `toString`/`toInt`/`toLong`/`toDouble`/`length` of the
+  value types. A lambda body of any other shape still names no type.
   An `extension [A](xs: List[A])(using s: Show[A])` clause is a `using`
   parameter of every method the extension declares, resolved at the call from
   the receiver's type. An `opaque type`/`type` alias declared in an `object`
@@ -1389,7 +1410,13 @@ reported as parse/compile errors, never silently mis-run.
   Only the block rule is unchecked. Found by running the `appmember` mode under
   `--entry mainsig`, which no `app` run could have reached.
 - **Found missing by a differential sweep, each an honest error rather than a
-  wrong answer:** the composite `Ordering.Tuple2(o1, o2)` instance, and
+  wrong answer:** the composite `Ordering.Tuple2(o1, o2)` instance (the
+  argument-less `Ordering.Tuple2[A, B]` … `Tuple5` are the natural tuple
+  orderings now, as are `orElse`/`orElseBy` chains, `Ordering[T].on(f)` and the
+  `None`-first `Option` ordering — the last of which compared every `Option`
+  equal, so `List(Some(3), None).sorted` kept its input order), an explicit
+  ordering for a sorted collection or `PriorityQueue` (`TreeSet(3, 1)(using
+  ord)`, refused: it parsed as `apply` and answered `contains`, `false`), and
   SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
   Double) => …` then `s.show(x)`).
 - **An integer's box is kept only where it is WIDENED to `Any` with a static
@@ -1467,9 +1494,26 @@ reported as parse/compile errors, never silently mis-run.
   `catch` arm may name a built-in throwable by its qualified name (`case e:
   java.util.NoSuchElementException`), which used to match nothing. Leniency:
   with no types, an `Arrays.sort`/`Arrays.toString` call scalac rejects as an
-  ambiguous overload (an `Array[String]` argument) runs here. Not modelled: a
-  `Comparator` constructor argument, `unmodifiableList` views, the remaining
-  `java.util` classes, and `toUnmodifiableSet`'s salted iteration order. A stream's `toString` is the JVM identity form,
+  ambiguous overload (an `Array[String]` argument) runs here. So does
+  `Ordering.on(f)` written on the companion, which has no such member: an
+  `Ordering[T]` reaches the compiler as the companion, its type argument
+  erased, and `Ordering[Int].on(f)` is legal. Not modelled: a
+  `PriorityQueue` is the JDK binary heap (printed and iterated in its array
+  order, `siftUp`/`siftDown`/`heapify` ported), with a `Comparator` argument
+  as for `TreeSet`/`TreeMap`, whose comparator decides membership
+  (`compare == 0` is the same element); under a comparator those two answer
+  `add`/`put`/`get`/`contains`/`containsKey`/`remove`/`first`/`last`/
+  `firstKey`/`lastKey` and the read-only views, and refuse the navigation
+  queries. `Collections.unmodifiableList`/`Set`/`Map`/`Collection` are VIEWS: a
+  write to the backing collection shows through, and their own mutators raise
+  `UnsupportedOperationException`. `new java.lang.StringBuilder` is Scala's
+  builder except that `reverse()` reverses in place. Not modelled: the
+  remaining `java.util` classes. `toUnmodifiableSet` and `Set.of` iterate in
+  an order salted per JVM run (`ImmutableCollections.SALT32L`; three reference
+  runs printed three orders), which no frozen record can pin. The
+  `Arrays.sort`/`toString` leniency stays: rejecting it needs the array's
+  ELEMENT type, and the parser drops an explicit `Array[AnyRef](…)` type
+  argument, so a rule could not tell that legal call from the rejected one. A stream's `toString` is the JVM identity form,
   which is not reproducible.
 - **Found by the second October 2026 differential round.** Each raised a
   catchable `java.lang.NullPointerException` where Scala runs, and is now

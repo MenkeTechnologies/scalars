@@ -29,6 +29,7 @@ pub const JAVA_UTIL_CLASSES: &[&str] = &[
     "ArrayDeque",
     "TreeMap",
     "TreeSet",
+    "PriorityQueue",
 ];
 
 /// The function an auxiliary constructor `def this(…)` of `class` with `arity`
@@ -3860,6 +3861,17 @@ impl Parser {
                 // `getFn()(arg)`, `"abc"(1)`) — Scala's `apply`.
                 if self.is(&Tok::LParen) {
                     let line = self.line();
+                    // `TreeSet(3, 1)(using Ordering[Int].reverse)` supplies the
+                    // collection's ORDERING, which the sorted collections here
+                    // do not carry; read as `apply` it would answer
+                    // `contains`, so it is refused instead.
+                    if matches!(self.peek_at(1), Tok::Ident(w) if w == "using")
+                        && ordered_literal(&e)
+                    {
+                        return Err(format!(
+                            "scalars: an explicit Ordering for a sorted collection or PriorityQueue is not modelled (line {line})"
+                        ));
+                    }
                     let args = self.arg_list()?;
                     e = eta_bare_args(Expr::Method {
                         recv: Box::new(e),
@@ -4781,7 +4793,7 @@ impl Parser {
         // `new java.util.Random(…)` / `new scala.util.Random(…)`: the JDK and
         // `scala.util` package prefixes name where the type lives, nothing more.
         let mut package = Vec::new();
-        while self.is(&Tok::Dot) && matches!(name.as_str(), "java" | "util") {
+        while self.is(&Tok::Dot) && matches!(name.as_str(), "java" | "util" | "lang") {
             self.advance();
             package.push(std::mem::replace(&mut name, self.ident()?));
         }
@@ -4824,6 +4836,16 @@ impl Parser {
             args.push(Expr::Str(ty));
             return Ok(Expr::Call {
                 name: NEW_ARRAY.to_string(),
+                args,
+                line,
+            });
+        }
+        // `new java.lang.StringBuilder(…)` — the JDK builder, whose `reverse`
+        // reverses IN PLACE where Scala's answers a new one.
+        if package == ["java", "lang"] && name == "StringBuilder" {
+            args.insert(0, Expr::Str("java.lang.StringBuilder".to_string()));
+            return Ok(Expr::Call {
+                name: JAVA_NEW.to_string(),
                 args,
                 line,
             });
@@ -6631,4 +6653,30 @@ pub(crate) fn enumeration_members(owner: &str, body: Vec<Stmt>) -> (Vec<Stmt>, V
         member("apply", &["i$"], "apply", Expr::Var("i$".to_string())),
     ];
     (out, methods)
+}
+
+/// Whether `e` builds a collection whose ORDERING is a `using` parameter of
+/// its factory: a `TreeSet`/`TreeMap`/`SortedSet`/`SortedMap` literal or
+/// `empty`, and the `PriorityQueue` and mutable sorted ones.
+fn ordered_literal(e: &Expr) -> bool {
+    const ORDERED: &[&str] = &[
+        "TreeSet",
+        "TreeMap",
+        "SortedSet",
+        "SortedMap",
+        "PriorityQueue",
+    ];
+    let named = |n: &str| ORDERED.contains(&n);
+    match e {
+        Expr::Collection { ctor, .. } => named(ctor.rsplit('.').next().unwrap_or(ctor)),
+        Expr::Method { recv, name, .. } => match recv.as_ref() {
+            Expr::Var(owner) if name == "empty" => named(owner),
+            Expr::Var(pkg) if matches!(pkg.as_str(), "mutable" | "immutable" | "collection") => {
+                named(name)
+            }
+            Expr::Method { name: owner, .. } if name == "empty" => named(owner),
+            _ => false,
+        },
+        _ => false,
+    }
 }

@@ -299,15 +299,20 @@ Implemented and checked against the reference `scala`:
   raises `ExceptionInInitializerError` once and `NoClassDefFoundError` on every
   later access.
 - **`java.util` collections** — `new java.util.ArrayList`/`LinkedList`/
-  `HashMap`/`HashSet`/`ArrayDeque`/`TreeMap`/`TreeSet` (or the imported names)
-  build the JDK classes, printing `[a, b]` / `{k=v}`: a `HashSet`/`HashMap`
+  `HashMap`/`HashSet`/`ArrayDeque`/`TreeMap`/`TreeSet`/`PriorityQueue` (or the
+  imported names, with an optional `Comparator`) build the JDK classes, printing `[a, b]` / `{k=v}`: a `HashSet`/`HashMap`
   iterates in its table order, the tree forms in key order, a `Deque` answers
   `push`/`pop`/`poll`/`peek`/`offer` and their `First`/`Last` forms, and the
   navigable ones `floor`/`ceiling`/`higher`/`lower`, `headMap`/`tailMap`/
   `subMap` and the `first`/`last` entries. `java.util.Arrays` (`asList`,
   `sort`, `fill`, `binarySearch`, `toString`, `equals`) and `Collections`
   (`sort`, `reverse`, `shuffle` with a seeded `Random`, `swap`, `max`/`min`,
-  `frequency`, `nCopies`) work on them and on Scala arrays.
+  `frequency`, `nCopies`, the `unmodifiable…` views) work on them and on Scala
+  arrays.
+- **Ranges of every element type** — `Int` ranges, `Long`/`BigInt`/
+  `BigDecimal` `NumericRange`s (`Range.Long(…)` included) and `Char` ranges,
+  each printing as Scala does; a range too long to hold is answered from its
+  bounds (`(0 until Int.MaxValue by 2).length`).
 - **Bindings** — `val` / `var` with optional type ascription
   (`val x: Int = …`, `var s = …`), type inferred as storage; plain and compound
   assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`). Reassigning a `val`

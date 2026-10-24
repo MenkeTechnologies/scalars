@@ -1579,6 +1579,9 @@ enum HeapVal {
         key: Value,
         lt: Value,
         reversed: bool,
+        /// `first.orElse(second)`: the second breaks the first's ties. A
+        /// chained ordering has no `key`/`lt` of its own.
+        chain: Option<(Value, Value)>,
     },
     /// A `scala.util.matching.Regex` (`"…".r`). The *source* pattern is stored,
     /// which is what `toString`/`regex` answer; the compiled automaton lives in
@@ -2557,6 +2560,10 @@ pub fn reset_heap() {
     FAILED_INITS.with(|t| t.borrow_mut().clear());
     JAVA_FLAVOR.with(|t| t.borrow_mut().clear());
     NUMERIC_RANGES.with(|t| t.borrow_mut().clear());
+    BIG_RANGES.with(|t| t.borrow_mut().clear());
+    DEC_RANGES.with(|t| t.borrow_mut().clear());
+    JAVA_CMP.with(|t| t.borrow_mut().clear());
+    JAVA_VIEWS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -2969,7 +2976,12 @@ fn unit_value() -> Value {
 
 /// Build an `Ordering` value. `key`/`lt` are `Value::Undef` for the natural one.
 fn make_ordering(key: Value, lt: Value, reversed: bool) -> Value {
-    heap_push(HeapVal::Ordering { key, lt, reversed })
+    heap_push(HeapVal::Ordering {
+        key,
+        lt,
+        reversed,
+        chain: None,
+    })
 }
 
 /// [`MAKE_ORDERING`] — build an `Ordering` from a companion member. A member
@@ -2989,6 +3001,9 @@ fn b_make_ordering(vm: &mut VM, argc: u8) -> Value {
     args.reverse();
     match (name.as_str(), args.len()) {
         ("by", 1) => make_ordering(args[0].clone(), Value::Undef, false),
+        // `Ordering[T].on(f)` — the natural ordering keyed by `f`. (`Ordering[T]`
+        // reaches here as the companion, its type argument erased.)
+        ("on", 1) => make_ordering(args[0].clone(), Value::Undef, false),
         ("fromLessThan", 1) => make_ordering(Value::Undef, args[0].clone(), false),
         // Every other companion member names the natural ordering, for the
         // reason `MAKE_ORDERING` gives: the member picks the element TYPE, which
@@ -3017,7 +3032,23 @@ fn ordering_method(
     let (key, lt, reversed) = as_ordering(recv)?;
     let cmp = |vm: &mut VM| ordering_cmp(vm, recv, &args[0], &args[1]);
     Some(match (name, args.len()) {
-        ("reverse", 0) => Ok(make_ordering(key, lt, !reversed)),
+        ("reverse", 0) => Ok(match ordering_chain(recv) {
+            Some((first, second)) => chained_ordering(first, second, !reversed),
+            None => make_ordering(key, lt, !reversed),
+        }),
+        // `orElse(other)` breaks ties with `other`; `orElseBy(f)` with the
+        // natural ordering of `f`'s result.
+        ("orElse", 1) if as_ordering(&args[0]).is_some() => {
+            Ok(chained_ordering(recv.clone(), args[0].clone(), false))
+        }
+        ("orElseBy", 1) => Ok(chained_ordering(
+            recv.clone(),
+            make_ordering(args[0].clone(), Value::Undef, false),
+            false,
+        )),
+        ("on", 1) if ordering_chain(recv).is_some() => {
+            Err("scalars: Ordering.on over an orElse chain is not modeled".into())
+        }
         // `ord.on(f)` sorts by `f`'s result under `ord`. Composing two key
         // functions is not modeled, so an `on` over an already-keyed ordering is
         // rejected rather than silently dropping one of them.
@@ -3065,9 +3096,9 @@ fn ordering_method(
 fn as_ordering(v: &Value) -> Option<(Value, Value, bool)> {
     if let Value::Obj(id) = v {
         HEAP.with(|h| match h.borrow().get(*id as usize) {
-            Some(HeapVal::Ordering { key, lt, reversed }) => {
-                Some((key.clone(), lt.clone(), *reversed))
-            }
+            Some(HeapVal::Ordering {
+                key, lt, reversed, ..
+            }) => Some((key.clone(), lt.clone(), *reversed)),
             _ => None,
         })
     } else {
@@ -3082,6 +3113,13 @@ fn ordering_cmp(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Orderi
     let Some((key, lt, reversed)) = as_ordering(ord) else {
         return Err("scalars: expected an Ordering".into());
     };
+    if let Some((first, second)) = ordering_chain(ord) {
+        let mut o = ordering_cmp(vm, &first, a, b)?;
+        if o == Ordering::Equal {
+            o = ordering_cmp(vm, &second, a, b)?;
+        }
+        return Ok(if reversed { o.reverse() } else { o });
+    }
     let (a, b) = match key {
         Value::Undef => (a.clone(), b.clone()),
         f => (
@@ -5096,6 +5134,9 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
                 // Set(1,2,3); s(2)` is `true`. It has to be answered here as
                 // well as in `seq_method`, because a BOUND set reaches this
                 // universal dispatch rather than the named-method path.
+                if is_big_range(recv) {
+                    return seq_method(vm, recv, "apply", args);
+                }
                 if matches!(seq_kind(recv), Some(SeqKind::Set(_))) {
                     let items = as_seq_or_tuple(recv).unwrap_or_default();
                     let key = args.first().cloned().unwrap_or(Value::Undef);
@@ -5496,6 +5537,14 @@ fn sort_by_ordering(vm: &mut VM, ord: &Value, items: &[Value]) -> Result<Vec<Val
 /// components are `Int`/`Double`/`Boolean`/`Char`.
 fn jvm_collection_class(v: &Value) -> Option<String> {
     let Value::Obj(id) = v else { return None };
+    if let Some((_, _, step, inclusive)) = dec_range_bounds(v) {
+        let form = match (step, inclusive) {
+            (None, _) => "Range$Partial",
+            (Some(_), true) => "NumericRange$Inclusive",
+            (Some(_), false) => "NumericRange$Exclusive",
+        };
+        return Some(format!("scala.collection.immutable.{form}"));
+    }
     enum Shape {
         Name(String),
         Pair(Value, Value),
@@ -5521,6 +5570,15 @@ fn jvm_collection_class(v: &Value) -> Option<String> {
                 SeqKind::Set(HashRep::Hashed) => format!("{imm}.HashSet"),
                 SeqKind::ListBuffer => "scala.collection.mutable.ListBuffer".to_string(),
                 SeqKind::ArrayBuffer => "scala.collection.mutable.ArrayBuffer".to_string(),
+                // `Range.Inclusive`/`Exclusive`, and the `NumericRange` forms of a
+                // `Long`, `BigInt` or `Char` range.
+                SeqKind::Range { inclusive, .. } | SeqKind::CharRange { inclusive, .. } => {
+                    let numeric = matches!(kind, SeqKind::CharRange { .. })
+                        || NUMERIC_RANGES.with(|t| t.borrow().contains_key(&(*id as usize)));
+                    let form = if *inclusive { "Inclusive" } else { "Exclusive" };
+                    let class = if numeric { "NumericRange" } else { "Range" };
+                    format!("{imm}.{class}${form}")
+                }
                 _ => return None,
             }),
             HeapVal::Map(HashRep::Small, entries) => Shape::Name(match entries.len() {
@@ -5747,6 +5805,10 @@ fn obj_to_string(v: &Value) -> String {
     if let Some(sources) = lazy_zip_sources(v) {
         return lazy_zip_string(&sources, scala_str);
     }
+    // An unmodifiable view prints its backing collection as it is now.
+    if let Some(b) = java_view_backing(v) {
+        return scala_str(&b);
+    }
     let id = if let Value::Obj(i) = v { *i } else { 0 };
     HEAP.with(|h| {
         let h = h.borrow();
@@ -5805,6 +5867,12 @@ fn obj_to_string(v: &Value) -> String {
                     format!("{}@{:x}", o.class, id)
                 }
             }
+            Some(HeapVal::Seq(SeqKind::Vector, items))
+                if DEC_RANGES.with(|t| t.borrow().contains_key(&(id as usize))) =>
+            {
+                let b = DEC_RANGES.with(|t| t.borrow().get(&(id as usize)).cloned());
+                b.map_or_else(String::new, |b| dec_range_to_string(&b, items.is_empty()))
+            }
             Some(HeapVal::Seq(
                 SeqKind::Range {
                     start,
@@ -5814,10 +5882,12 @@ fn obj_to_string(v: &Value) -> String {
                 },
                 items,
             )) => {
+                let empty =
+                    items.is_empty() && !BIG_RANGES.with(|t| t.borrow().contains(&(id as usize)));
                 if NUMERIC_RANGES.with(|t| t.borrow().contains_key(&(id as usize))) {
-                    numeric_range_to_string(*start, *end, *inclusive, *step, items.is_empty())
+                    numeric_range_to_string(*start, *end, *inclusive, *step, empty)
                 } else {
-                    range_to_string(*start, *end, *inclusive, *step, items.is_empty())
+                    range_to_string(*start, *end, *inclusive, *step, empty)
                 }
             }
             Some(HeapVal::Seq(
@@ -10288,6 +10358,11 @@ fn seq_read_fast(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Valu
     ) {
         return None;
     }
+    // A range too long to hold its elements, and an unmodifiable view, keep
+    // theirs elsewhere.
+    if is_big_range(recv) || java_view_backing(recv).is_some() {
+        return None;
+    }
     let Value::Obj(id) = recv else { return None };
     HEAP.with(|h| {
         let heap = h.borrow();
@@ -10391,6 +10466,35 @@ fn multiset_filter(
 /// answered as the `Range` it is laid out as, and a `Range` it derives —
 /// `reverse`, `take`, `by` — is a `NumericRange` of the same element type.
 fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if name == "reverse" && args.is_empty() && java_flavor(recv) == Some(JFlavor::JavaStringBuilder)
+    {
+        if let Some((k, mut items)) = seq_kind_items(recv) {
+            items.reverse();
+            set_seq_items(recv, k, items);
+        }
+        return Ok(recv.clone());
+    }
+    if let Some((start, end, _, inclusive)) = dec_range_bounds(recv) {
+        if name == "by" && args.len() == 1 {
+            let step = dec_operand(&args[0]).ok_or_else(|| no_such_method(recv, name))?;
+            return dec_range_value(start, end, step, inclusive);
+        }
+        // A `Range.Partial` has no other member.
+        if dec_range_bounds(recv).is_some_and(|b| b.2.is_none()) && name != "toString" {
+            return Err(format!(
+                "scalars: value {name} is not a member of scala.collection.immutable.Range.Partial"
+            ));
+        }
+    }
+    if is_big_range(recv) {
+        let out = big_range_method(recv, name, args)?;
+        if let (Some(kind), Some(SeqKind::Range { .. })) =
+            (numeric_range_kind(recv), seq_kind(&out))
+        {
+            mark_numeric_range(&out, kind);
+        }
+        return Ok(out);
+    }
     let Some(kind) = numeric_range_kind(recv) else {
         return seq_method_inner(vm, recv, name, args);
     };
@@ -10635,7 +10739,7 @@ fn seq_method_inner(
     // A `Range` sliced by position is another `Range` (`(1 to 5).take(2)` is
     // `Range 1 to 2`), not the `Vector` a generic `IndexedSeq` slice builds.
     if let SeqKind::Range { .. } = kind {
-        if let Some(out) = range_slice_method(kind, &items, name, args) {
+        if let Some(out) = range_slice_method(kind, name, args) {
             return out;
         }
     }
@@ -10654,19 +10758,15 @@ fn seq_method_inner(
             };
             // The bounds come from the range, not its elements, which are
             // `BigInt`s in a `NumericRange[BigInt]`.
-            let last = start + step * (items.len() as i64 - 1);
-            match (items.first(), items.last()) {
-                (Some(_), Some(_)) => Ok(new_seq(
-                    SeqKind::Range {
-                        start: last,
-                        end: start,
-                        inclusive: true,
-                        step: -step,
-                    },
-                    items.iter().rev().cloned().collect(),
-                )),
-                _ => Ok(new_seq(kind, Vec::new())),
+            let SeqKind::Range { end, inclusive, .. } = kind else {
+                unreachable!("just matched a range")
+            };
+            let n = range_count(start, end, inclusive, step);
+            if n == 0 {
+                return Ok(new_seq(kind, Vec::new()));
             }
+            let last = start + step * (n as i64 - 1);
+            range_value(last, start, true, -step)
         }
         // `(a to b) by s` — rebuild the range with a new step.
         ("by", 1) => {
@@ -10680,16 +10780,7 @@ fn seq_method_inner(
                 return Err(no_such_method(recv, name));
             };
             let step = args[0].to_int();
-            let items = range_items(start, end, inclusive, step)?;
-            Ok(new_seq(
-                SeqKind::Range {
-                    start,
-                    end,
-                    inclusive,
-                    step,
-                },
-                items,
-            ))
+            range_value(start, end, inclusive, step)
         }
         // In-place element assignment (`a(i) = v`), the desugar target of
         // `Array.update`. Only a `mutable.Seq` answers it — an `Array` or one of
@@ -12506,6 +12597,15 @@ fn value_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Obj(_), Value::Obj(_)) if enum_id(a).is_some() && enum_id(b).is_some() => {
             enum_id(a).cmp(&enum_id(b))
         }
+        // `Ordering.Option`: `None` first, then the contents in order.
+        (Value::Obj(_), Value::Obj(_)) if as_option(a).is_some() && as_option(b).is_some() => {
+            match (as_option(a).flatten(), as_option(b).flatten()) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some(x), Some(y)) => value_cmp(&x, &y),
+            }
+        }
         (Value::Obj(_), Value::Obj(_)) => match (as_seq_or_tuple(a), as_seq_or_tuple(b)) {
             (Some(xs), Some(ys)) => xs
                 .iter()
@@ -13068,12 +13168,7 @@ fn keys_of(vm: &mut VM, f: &Value, items: &[Value]) -> Result<Vec<Value>, String
 /// end and form, and an empty result is `Exclusive(v, v, step)` at the boundary
 /// value. `None` for any other member; an empty receiver's `tail`/`init` fault
 /// is left to the generic arm, whose wording is already per-kind.
-fn range_slice_method(
-    kind: SeqKind,
-    items: &[Value],
-    name: &str,
-    args: &[Value],
-) -> Option<Result<Value, String>> {
+fn range_slice_method(kind: SeqKind, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     let SeqKind::Range {
         start,
         end,
@@ -13083,20 +13178,8 @@ fn range_slice_method(
     else {
         return None;
     };
-    let len = items.len() as i64;
-    let make = |start: i64, end: i64, inclusive: bool| {
-        range_items(start, end, inclusive, step).map(|items| {
-            new_seq(
-                SeqKind::Range {
-                    start,
-                    end,
-                    inclusive,
-                    step,
-                },
-                items,
-            )
-        })
-    };
+    let len = i64::try_from(range_count(start, end, inclusive, step)).unwrap_or(i64::MAX);
+    let make = |start: i64, end: i64, inclusive: bool| range_value(start, end, inclusive, step);
     // `locationAfterN(n)` — the value `n` steps past `start`.
     let at = |n: i64| start + step * n;
     let take = |n: i64| {
@@ -13160,17 +13243,7 @@ fn range_slice_method(
         // when it ascends and its `reverse` when it descends — still a
         // `Range` (an empty one is itself either way).
         ("sorted", 0) if step > 0 || len == 0 => make(start, end, inclusive),
-        ("sorted", 0) => range_items(at(len - 1), start, true, -step).map(|items| {
-            new_seq(
-                SeqKind::Range {
-                    start: at(len - 1),
-                    end: start,
-                    inclusive: true,
-                    step: -step,
-                },
-                items,
-            )
-        }),
+        ("sorted", 0) => range_value(at(len - 1), start, true, -step),
         ("drop", 1) => drop(arg(0)),
         // `takeRight` and `dropRight` test emptiness FIRST, so an empty receiver
         // answers `newEmptyRange(start)` and itself respectively whatever the
@@ -13346,7 +13419,10 @@ fn b_make_range(vm: &mut VM, argc: u8) -> Value {
         return r.unwrap_or_else(|e| fault(vm, e));
     }
     if as_dec(&start_v).is_some() || as_dec(&end_v).is_some() {
-        return fault(vm, "scalars: a BigDecimal range is not modelled");
+        let (Some(s), Some(e)) = (dec_operand(&start_v), dec_operand(&end_v)) else {
+            return fault(vm, "scalars: a BigDecimal range needs numeric bounds");
+        };
+        return dec_range_partial(s, e, inclusive);
     }
     // A `BigInt` range is laid out over its values as `Long`s, which every
     // one this frontend can materialize fits.
@@ -13362,17 +13438,8 @@ fn b_make_range(vm: &mut VM, argc: u8) -> Value {
         (Err(e), _) | (_, Err(e)) => return fault(vm, e),
     };
     let step = step_v.to_int();
-    match range_items(start, end, inclusive, step) {
-        Ok(items) => {
-            let out = new_seq(
-                SeqKind::Range {
-                    start,
-                    end,
-                    inclusive,
-                    step,
-                },
-                items,
-            );
+    match range_value(start, end, inclusive, step) {
+        Ok(out) => {
             if big {
                 mark_numeric_range(&out, NumRange::BigInt);
             } else if long {
@@ -13843,7 +13910,8 @@ fn java_parse_unsigned_int(s: &str, radix: i64) -> Result<i64, String> {
 /// rather than a quietly accepted superset.
 fn boxed_member(module: &str, name: &str, args: &[Value]) -> Result<Value, String> {
     let unknown = || Err(format!("scalars: value {name} is not a member of {module}"));
-    let i = |k: usize| args[k].to_int();
+    // A `Char` argument widens to its code, as Scala's `Char`-to-`Int` does.
+    let i = |k: usize| char_code(&args[k]).unwrap_or_else(|| args[k].to_int());
     // The JDK's fixed-width renderings show the two's-complement bit pattern at
     // the box's own width, so `Integer.toHexString(-1)` is 8 digits and
     // `Long.toHexString(-1)` is 16.
@@ -21007,7 +21075,26 @@ fn java_list_method(
     name: &str,
     args: &[Value],
 ) -> Result<Value, String> {
+    if let Some(b) = java_view_backing(recv) {
+        return java_view_method(vm, &b, name, args);
+    }
     let flavor = java_flavor(recv);
+    let cmp = java_comparator(recv);
+    if flavor == Some(JFlavor::PriorityQueue) {
+        if let Some(r) = java_pq_op(vm, items, cmp.as_ref(), name, args) {
+            java_mutable(recv, name)?;
+            let (out, answer) = r?;
+            set_seq_items(recv, SeqKind::JavaList, out);
+            return Ok(answer);
+        }
+    }
+    if let (Some(JFlavor::TreeSet), Some(c)) = (flavor, &cmp) {
+        if let Some(r) = java_cmp_tree_set(vm, items, c, name, args) {
+            let (out, answer) = r?;
+            set_seq_items(recv, SeqKind::JavaList, out);
+            return Ok(answer);
+        }
+    }
     match flavor {
         // An `Arrays.asList` list writes through `set` and `sort`; everything
         // that would change its size is the JDK's `UnsupportedOperationException`.
@@ -22124,7 +22211,18 @@ fn java_map_method(
             Some((kv.first()?.clone(), kv.get(1)?.clone()))
         })
         .collect();
+    if let Some(b) = java_view_backing(recv) {
+        return java_view_method(vm, &b, name, args);
+    }
     let tree = java_flavor(recv) == Some(JFlavor::TreeMap);
+    if let (true, Some(c)) = (tree, java_comparator(recv)) {
+        if let Some(r) = java_cmp_tree_map(vm, &pairs, &c, name, args) {
+            let (out, answer) = r?;
+            let items = out.into_iter().map(new_pair_of).collect();
+            set_seq_items(recv, SeqKind::JavaMap, items);
+            return Ok(answer);
+        }
+    }
     if tree {
         if let Some(r) = java_tree_map_op(&pairs, name, args) {
             let (rest, answer) = r?;
@@ -22347,6 +22445,12 @@ enum JFlavor {
     /// An `Arrays.asList` list: its elements can be replaced, its size
     /// cannot change.
     FixedSize,
+    /// A `PriorityQueue` — a binary heap, printed and iterated in its array
+    /// order.
+    PriorityQueue,
+    /// A `java.lang.StringBuilder`: Scala's builder, except that `reverse`
+    /// reverses in place.
+    JavaStringBuilder,
 }
 
 thread_local! {
@@ -22444,6 +22548,61 @@ fn b_java_new(vm: &mut VM, argc: u8) -> Value {
     } else {
         args.remove(0).as_str_cow().into_owned()
     };
+    // A `Comparator` argument (an `Ordering` such as `Comparator.reverseOrder()`
+    // or a two-argument function) orders a `PriorityQueue`, `TreeSet` or
+    // `TreeMap`; it is the last argument (`PriorityQueue(cap, cmp)`).
+    let mut cmp = None;
+    if matches!(class.as_str(), "PriorityQueue" | "TreeSet" | "TreeMap")
+        && args
+            .last()
+            .is_some_and(|c| is_function(c) || as_ordering(c).is_some())
+    {
+        cmp = args.pop();
+        if class != "PriorityQueue" && !args.is_empty() {
+            return fault(
+                vm,
+                format!("scalars: new java.util.{class}: too many arguments"),
+            );
+        }
+    }
+    if class == "java.lang.StringBuilder" {
+        let v = new_seq(SeqKind::StrBuf, args.iter().flat_map(str_chars).collect());
+        set_java_flavor(&v, JFlavor::JavaStringBuilder);
+        return v;
+    }
+    if class == "PriorityQueue" {
+        let items = match args.first() {
+            Some(Value::Int(n)) if *n < 1 => {
+                return fault(vm, "scalars: java.lang.IllegalArgumentException")
+            }
+            None | Some(Value::Int(_)) => Vec::new(),
+            Some(v) => match java_source_items(v) {
+                Some(xs) => xs,
+                None => return fault(vm, "scalars: new java.util.PriorityQueue: not a collection"),
+            },
+        };
+        let mut q = items;
+        if let Err(e) = pq_heapify(vm, cmp.as_ref(), &mut q) {
+            return fault(vm, e);
+        }
+        let v = java_marked(new_seq(SeqKind::JavaList, q), true);
+        set_java_flavor(&v, JFlavor::PriorityQueue);
+        set_java_cmp(&v, cmp);
+        return v;
+    }
+    if let Some(c) = cmp {
+        let v = if class == "TreeSet" {
+            let s = new_seq(SeqKind::JavaList, Vec::new());
+            set_java_flavor(&s, JFlavor::TreeSet);
+            s
+        } else {
+            let m = tree_map_value(Vec::new());
+            set_java_flavor(&m, JFlavor::TreeMap);
+            m
+        };
+        set_java_cmp(&v, Some(c));
+        return java_marked(v, true);
+    }
     // The one argument is a source collection or an initial capacity; a
     // capacity changes nothing observable except a `HashSet`'s table.
     let (source, capacity) = match args.first() {
@@ -23033,6 +23192,23 @@ fn java_static(vm: &mut VM, which: &str, args: &[Value]) -> Result<Value, String
                 false,
             ))
         }
+        (
+            "Collections.unmodifiableList"
+            | "Collections.unmodifiableSet"
+            | "Collections.unmodifiableCollection"
+            | "Collections.unmodifiableMap",
+            1,
+        ) => {
+            let ok = match seq_kind(&args[0]) {
+                Some(SeqKind::JavaMap) => which.ends_with("Map"),
+                Some(SeqKind::JavaList) => !which.ends_with("Map"),
+                _ => false,
+            };
+            if !ok {
+                return Err(format!("scalars: {which}: not a java.util collection"));
+            }
+            Ok(java_view(&args[0]))
+        }
         ("Collections.emptyList", 0) => {
             Ok(java_marked(new_seq(SeqKind::JavaList, Vec::new()), false))
         }
@@ -23397,4 +23573,646 @@ fn numeric_range_to_string(
     };
     let empty = if is_empty { "empty " } else { "" };
     format!("{empty}NumericRange {start} {preposition} {end}{stepped}")
+}
+
+thread_local! {
+    /// The heap ids of the `Range` values too long to materialize: their
+    /// element vector is EMPTY, and [`big_range_method`] answers the members
+    /// a `Range` computes from its bounds alone.
+    static BIG_RANGES: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// The element count of `start until|to end by step` (`step != 0`).
+fn range_count(start: i64, end: i64, inclusive: bool, step: i64) -> u64 {
+    if step == 0 {
+        return 0;
+    }
+    let (s, e, st) = (i128::from(start), i128::from(end), i128::from(step));
+    let span = e - s;
+    if (st > 0 && span < 0) || (st < 0 && span > 0) || (span == 0 && !inclusive) {
+        return 0;
+    }
+    let whole = span / st;
+    let exact = span % st == 0;
+    let n = if exact && !inclusive {
+        whole
+    } else {
+        whole + 1
+    };
+    n.max(0) as u64
+}
+
+/// The largest range [`range_items`] materializes; a longer one is a
+/// [`BIG_RANGES`] value.
+const RANGE_MATERIALIZE_CAP: u64 = 8_000_000;
+
+/// A `Range` value over `start until|to end by step`: its elements
+/// materialized, or — past [`RANGE_MATERIALIZE_CAP`] — none, answered from the
+/// bounds (see [`BIG_RANGES`]).
+fn range_value(start: i64, end: i64, inclusive: bool, step: i64) -> Result<Value, String> {
+    if step == 0 {
+        return Err("scalars: java.lang.IllegalArgumentException: step cannot be 0.".into());
+    }
+    let kind = SeqKind::Range {
+        start,
+        end,
+        inclusive,
+        step,
+    };
+    if range_count(start, end, inclusive, step) <= RANGE_MATERIALIZE_CAP {
+        return Ok(new_seq(kind, range_items(start, end, inclusive, step)?));
+    }
+    let v = new_seq(kind, Vec::new());
+    if let Some(id) = as_obj_id(&v) {
+        BIG_RANGES.with(|t| t.borrow_mut().insert(id));
+    }
+    Ok(v)
+}
+
+fn is_big_range(v: &Value) -> bool {
+    as_obj_id(v).is_some_and(|id| BIG_RANGES.with(|t| t.borrow().contains(&id)))
+}
+
+/// The members of a range too long to materialize that its bounds answer:
+/// `length`, `apply`, `contains`, `head`/`last`, `min`/`max`, the closed-form
+/// `sum`, and the slices and `reverse`/`by`, which are ranges again. Anything
+/// that has to visit every element is refused as the out-of-memory it would be.
+fn big_range_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let Some(
+        kind @ SeqKind::Range {
+            start,
+            end,
+            inclusive,
+            step,
+        },
+    ) = seq_kind(recv)
+    else {
+        return Err(no_such_method(recv, name));
+    };
+    let numeric = numeric_range_kind(recv);
+    let n = range_count(start, end, inclusive, step);
+    let last = start + step * (n as i64 - 1);
+    let too_many = || {
+        if numeric.is_some() {
+            "scalars: java.lang.IllegalArgumentException: More than Int.MaxValue elements."
+                .to_string()
+        } else {
+            let prep = if inclusive { "to" } else { "until" };
+            format!(
+                "scalars: java.lang.IllegalArgumentException: {start} {prep} {end} by {step}: seqs cannot contain more than Int.MaxValue elements."
+            )
+        }
+    };
+    let elem = |x: i64| match numeric {
+        Some(NumRange::BigInt) => make_big(BigInt::from(x)),
+        _ => Value::int(x),
+    };
+    // A `NumericRange` counts its elements for nearly every member (`last`,
+    // `contains`, `sum` all go through `length`), so past `Int.MaxValue` only
+    // the ones that do not are answered.
+    if numeric.is_some()
+        && n > i32::MAX as u64
+        && !matches!(
+            name,
+            "isEmpty" | "nonEmpty" | "head" | "by" | "getClass" | "toString"
+        )
+    {
+        return Err(too_many());
+    }
+    match (name, args.len()) {
+        ("length" | "size" | "knownSize", 0) => {
+            if n > i32::MAX as u64 {
+                return Err(too_many());
+            }
+            Ok(Value::int(n as i64))
+        }
+        ("toString", 0) => Ok(Value::str(scala_str(recv))),
+        ("reverse", 0) => range_value(last, start, true, -step),
+        ("by", 1) => {
+            let s = match (numeric, as_big(&args[0])) {
+                (Some(NumRange::BigInt), Some(b)) => i64::try_from(&b).unwrap_or(0),
+                _ => args[0].to_int(),
+            };
+            range_value(start, end, inclusive, s)
+        }
+        // A `NumericRange` sorts into a `Vector`, which would hold every element.
+        ("sorted", 0) if numeric.is_some() => {
+            Err("scalars: java.lang.OutOfMemoryError: Range too large".to_string())
+        }
+        ("isEmpty", 0) => Ok(Value::bool(false)),
+        ("nonEmpty", 0) => Ok(Value::bool(true)),
+        ("head", 0) => Ok(elem(start)),
+        ("last", 0) => Ok(elem(last)),
+        ("min", 0) => Ok(elem(if step > 0 { start } else { last })),
+        ("max", 0) => Ok(elem(if step > 0 { last } else { start })),
+        ("apply", 1) => {
+            if n > i32::MAX as u64 {
+                return Err(too_many());
+            }
+            let i = args[0].to_int();
+            if i < 0 || i as u64 >= n {
+                return Err(format!(
+                    "scalars: java.lang.IndexOutOfBoundsException: {i} is out of bounds (min 0, max {})",
+                    n - 1
+                ));
+            }
+            Ok(elem(start + step * i))
+        }
+        ("contains", 1) => {
+            let Value::Int(x) = &args[0] else {
+                return Ok(Value::bool(false));
+            };
+            let (lo, hi) = if step > 0 {
+                (start, last)
+            } else {
+                (last, start)
+            };
+            let on_step = (i128::from(*x) - i128::from(start)) % i128::from(step) == 0;
+            Ok(Value::bool(*x >= lo && *x <= hi && on_step))
+        }
+        // `Range.sum` is the closed form, wrapping as `Int` (`Long` for a
+        // `NumericRange[Long]`) arithmetic does.
+        ("sum", 0) if numeric != Some(NumRange::BigInt) => {
+            let total = (i128::from(start) + i128::from(last)) * i128::from(n) / 2;
+            Ok(Value::int(if numeric == Some(NumRange::Long) {
+                total as i64
+            } else {
+                i64::from(total as i32)
+            }))
+        }
+        _ => match range_slice_method(kind, name, args) {
+            Some(out) => out,
+            None => Err("scalars: java.lang.OutOfMemoryError: Range too large".to_string()),
+        },
+    }
+}
+
+/// A `NumericRange[BigDecimal]`'s bounds: `(start, end, step, inclusive)`.
+type DecBounds = (BigDec, BigDec, Option<BigDec>, bool);
+
+thread_local! {
+    /// The `BigDecimal` ranges, by heap id: a `Vector` of their elements whose
+    /// bounds print it as `NumericRange …` and rebuild it under `by`.
+    static DEC_RANGES: RefCell<HashMap<usize, DecBounds>> = RefCell::new(HashMap::new());
+}
+
+fn dec_range_bounds(v: &Value) -> Option<DecBounds> {
+    as_obj_id(v).and_then(|id| DEC_RANGES.with(|t| t.borrow().get(&id).cloned()))
+}
+
+/// `start until|to end by step` over `BigDecimal`s: element `n` is
+/// `start + step * n`, as `NumericRange.locationAfterN` computes it.
+fn dec_range_value(
+    start: BigDec,
+    end: BigDec,
+    step: BigDec,
+    inclusive: bool,
+) -> Result<Value, String> {
+    if step.signum() == 0 {
+        return Err("scalars: java.lang.IllegalArgumentException: step cannot be 0.".into());
+    }
+    let up = step.signum() > 0;
+    let mut items = Vec::new();
+    let mut x = start.clone();
+    loop {
+        let past = match (x.compare(&end), up, inclusive) {
+            (Ordering::Equal, _, inc) => !inc,
+            (Ordering::Greater, true, _) | (Ordering::Less, false, _) => true,
+            _ => false,
+        };
+        if past {
+            break;
+        }
+        items.push(make_dec(x.clone()));
+        if items.len() as u64 > RANGE_MATERIALIZE_CAP {
+            return Err("scalars: java.lang.OutOfMemoryError: Range too large".into());
+        }
+        x = start.add(&step.mul(&BigDec::from_int(items.len() as i64)));
+    }
+    let v = new_seq(SeqKind::Vector, items);
+    if let Some(id) = as_obj_id(&v) {
+        DEC_RANGES.with(|t| {
+            t.borrow_mut()
+                .insert(id, (start, end, Some(step), inclusive))
+        });
+    }
+    Ok(v)
+}
+
+/// `NumericRange.toString` for a `BigDecimal` range.
+fn dec_range_to_string((start, end, step, inclusive): &DecBounds, is_empty: bool) -> String {
+    // `Range.Partial`: a fractional `to`/`until` with no `by` yet.
+    let Some(step) = step else {
+        return "Range requires step".to_string();
+    };
+    let empty = if is_empty { "empty " } else { "" };
+    let prep = if *inclusive { "to" } else { "until" };
+    let stepped = if step.compare(&BigDec::from_int(1)) == Ordering::Equal {
+        String::new()
+    } else {
+        format!(" by {}", step.render())
+    };
+    format!(
+        "{empty}NumericRange {} {prep} {}{stepped}",
+        start.render(),
+        end.render()
+    )
+}
+
+/// `a to b` / `a until b` over `BigDecimal`s with no step: Scala's
+/// `Range.Partial`, which has nothing but `by` (and prints `Range requires
+/// step`).
+fn dec_range_partial(start: BigDec, end: BigDec, inclusive: bool) -> Value {
+    let v = new_seq(SeqKind::Vector, Vec::new());
+    if let Some(id) = as_obj_id(&v) {
+        DEC_RANGES.with(|t| t.borrow_mut().insert(id, (start, end, None, inclusive)));
+    }
+    v
+}
+
+thread_local! {
+    /// The `Comparator` a `java.util` `PriorityQueue`/`TreeSet`/`TreeMap` was
+    /// constructed with, by heap id. Absent is the natural order.
+    static JAVA_CMP: RefCell<HashMap<usize, Value>> = RefCell::new(HashMap::new());
+}
+
+fn java_comparator(v: &Value) -> Option<Value> {
+    as_obj_id(v).and_then(|id| JAVA_CMP.with(|t| t.borrow().get(&id).cloned()))
+}
+
+/// `cmp.compare(a, b)`: an `Ordering` (`Comparator.reverseOrder()`), a
+/// two-argument function answering an `Int`, or — `None` — the natural order.
+fn java_compare(
+    vm: &mut VM,
+    cmp: Option<&Value>,
+    a: &Value,
+    b: &Value,
+) -> Result<Ordering, String> {
+    match cmp {
+        None => Ok(value_cmp(a, b)),
+        Some(c) if as_ordering(c).is_some() => ordering_cmp(vm, c, a, b),
+        Some(c) => invoke_closure(vm, c, &[a.clone(), b.clone()]).map(|v| v.to_int().cmp(&0)),
+    }
+}
+
+/// `PriorityQueue.siftUp`: `x` placed at `k` and moved toward the root past
+/// every parent it orders before.
+fn pq_sift_up(
+    vm: &mut VM,
+    cmp: Option<&Value>,
+    q: &mut [Value],
+    mut k: usize,
+    x: Value,
+) -> Result<(), String> {
+    while k > 0 {
+        let parent = (k - 1) >> 1;
+        if java_compare(vm, cmp, &x, &q[parent])? != Ordering::Less {
+            break;
+        }
+        q[k] = q[parent].clone();
+        k = parent;
+    }
+    q[k] = x;
+    Ok(())
+}
+
+/// `PriorityQueue.siftDown` over the first `n` slots; answers where `x` landed.
+fn pq_sift_down(
+    vm: &mut VM,
+    cmp: Option<&Value>,
+    q: &mut [Value],
+    mut k: usize,
+    x: Value,
+    n: usize,
+) -> Result<usize, String> {
+    let half = n >> 1;
+    while k < half {
+        let mut child = 2 * k + 1;
+        let right = child + 1;
+        if right < n && java_compare(vm, cmp, &q[child], &q[right])? == Ordering::Greater {
+            child = right;
+        }
+        if java_compare(vm, cmp, &x, &q[child])? != Ordering::Greater {
+            break;
+        }
+        q[k] = q[child].clone();
+        k = child;
+    }
+    q[k] = x;
+    Ok(k)
+}
+
+/// `PriorityQueue.heapify`: the array a collection constructor copied in,
+/// made a heap from the last parent down.
+fn pq_heapify(vm: &mut VM, cmp: Option<&Value>, q: &mut [Value]) -> Result<(), String> {
+    let n = q.len();
+    for i in (0..n / 2).rev() {
+        let x = q[i].clone();
+        pq_sift_down(vm, cmp, q, i, x, n)?;
+    }
+    Ok(())
+}
+
+/// The `java.util.PriorityQueue` operations over its heap array (which is
+/// also what it prints and iterates): the new array and the answer. `None`
+/// when `name` is not one.
+fn java_pq_op(
+    vm: &mut VM,
+    items: &[Value],
+    cmp: Option<&Value>,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<(Vec<Value>, Value), String>> {
+    let mut q = items.to_vec();
+    let res = (|| -> Result<Value, String> {
+        Ok(match (name, args.len()) {
+            ("add" | "offer", 1) => {
+                if matches!(args[0], Value::Undef) {
+                    return Err("scalars: java.lang.NullPointerException".to_string());
+                }
+                q.push(args[0].clone());
+                let k = q.len() - 1;
+                pq_sift_up(vm, cmp, &mut q, k, args[0].clone())?;
+                Value::bool(true)
+            }
+            ("poll" | "remove", 0) => {
+                if q.is_empty() {
+                    if name == "remove" {
+                        return Err(java_no_such_element());
+                    }
+                    return Ok(Value::Undef);
+                }
+                let top = q[0].clone();
+                let x = q.pop().expect("non-empty");
+                let n = q.len();
+                if n > 0 {
+                    pq_sift_down(vm, cmp, &mut q, 0, x, n)?;
+                }
+                top
+            }
+            ("peek", 0) => q.first().cloned().unwrap_or(Value::Undef),
+            ("element", 0) => q.first().cloned().ok_or_else(java_no_such_element)?,
+            ("remove" | "remove$object", 1) => {
+                let Some(i) = q.iter().position(|e| value_eq(e, &args[0])) else {
+                    return Ok(Value::bool(false));
+                };
+                let moved = q.pop().expect("non-empty");
+                if i < q.len() {
+                    let n = q.len();
+                    // `removeAt`: a `moved` that did not sift down may belong
+                    // above `i` instead.
+                    if pq_sift_down(vm, cmp, &mut q, i, moved.clone(), n)? == i {
+                        pq_sift_up(vm, cmp, &mut q, i, moved)?;
+                    }
+                }
+                Value::bool(true)
+            }
+            ("clear", 0) => {
+                q.clear();
+                unit_value()
+            }
+            _ => return Err(String::new()),
+        })
+    })();
+    match res {
+        Err(e) if e.is_empty() => None,
+        Err(e) => Some(Err(e)),
+        Ok(v) => Some(Ok((q, v))),
+    }
+}
+
+fn set_java_cmp(v: &Value, cmp: Option<Value>) {
+    if let (Some(id), Some(c)) = (as_obj_id(v), cmp) {
+        JAVA_CMP.with(|t| t.borrow_mut().insert(id, c));
+    }
+}
+
+/// The members of a `TreeSet` built with a `Comparator`: membership and order
+/// are the comparator's (`compare == 0` is the same element), so they are
+/// answered here rather than by the natural-order set. `None` for a member
+/// not modelled under a comparator.
+fn java_cmp_tree_set(
+    vm: &mut VM,
+    items: &[Value],
+    cmp: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<(Vec<Value>, Value), String>> {
+    let mut out = items.to_vec();
+    let res = (|| -> Result<Value, String> {
+        let find =
+            |vm: &mut VM, out: &[Value], x: &Value| -> Result<Result<usize, usize>, String> {
+                // Binary search under the comparator: `Ok` found, `Err` insertion point.
+                let (mut lo, mut hi) = (0usize, out.len());
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    match java_compare(vm, Some(cmp), &out[mid], x)? {
+                        Ordering::Less => lo = mid + 1,
+                        Ordering::Greater => hi = mid,
+                        Ordering::Equal => return Ok(Ok(mid)),
+                    }
+                }
+                Ok(Err(lo))
+            };
+        Ok(match (name, args.len()) {
+            ("add", 1) => match find(vm, &out, &args[0])? {
+                Ok(_) => Value::bool(false),
+                Err(i) => {
+                    out.insert(i, args[0].clone());
+                    Value::bool(true)
+                }
+            },
+            ("remove" | "remove$object", 1) => match find(vm, &out, &args[0])? {
+                Ok(i) => {
+                    out.remove(i);
+                    Value::bool(true)
+                }
+                Err(_) => Value::bool(false),
+            },
+            ("contains", 1) => Value::bool(find(vm, &out, &args[0])?.is_ok()),
+            ("first", 0) => out.first().cloned().ok_or_else(java_no_such_element)?,
+            ("last", 0) => out.last().cloned().ok_or_else(java_no_such_element)?,
+            ("clear", 0) => {
+                out.clear();
+                unit_value()
+            }
+            ("size" | "isEmpty" | "iterator" | "toString" | "forEach" | "stream", _) => {
+                return Err(String::new())
+            }
+            _ => {
+                return Err(format!(
+                    "scalars: TreeSet.{name} under a Comparator is not modelled"
+                ))
+            }
+        })
+    })();
+    match res {
+        Err(e) if e.is_empty() => None,
+        Err(e) => Some(Err(e)),
+        Ok(v) => Some(Ok((out, v))),
+    }
+}
+
+/// The members of a `TreeMap` built with a `Comparator` (see
+/// [`java_cmp_tree_set`]): the new entries and the answer.
+fn java_cmp_tree_map(
+    vm: &mut VM,
+    pairs: &[(Value, Value)],
+    cmp: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<MapMutation, String>> {
+    let mut out = pairs.to_vec();
+    let res = (|| -> Result<Value, String> {
+        let find = |vm: &mut VM,
+                    out: &[(Value, Value)],
+                    k: &Value|
+         -> Result<Result<usize, usize>, String> {
+            let (mut lo, mut hi) = (0usize, out.len());
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                match java_compare(vm, Some(cmp), &out[mid].0, k)? {
+                    Ordering::Less => lo = mid + 1,
+                    Ordering::Greater => hi = mid,
+                    Ordering::Equal => return Ok(Ok(mid)),
+                }
+            }
+            Ok(Err(lo))
+        };
+        Ok(match (name, args.len()) {
+            // A key the comparator calls equal keeps the ORIGINAL key and
+            // takes the new value, as `TreeMap.put` does.
+            ("put", 2) => match find(vm, &out, &args[0])? {
+                Ok(i) => std::mem::replace(&mut out[i].1, args[1].clone()),
+                Err(i) => {
+                    out.insert(i, (args[0].clone(), args[1].clone()));
+                    Value::Undef
+                }
+            },
+            ("get", 1) => match find(vm, &out, &args[0])? {
+                Ok(i) => out[i].1.clone(),
+                Err(_) => Value::Undef,
+            },
+            ("containsKey", 1) => Value::bool(find(vm, &out, &args[0])?.is_ok()),
+            ("remove", 1) => match find(vm, &out, &args[0])? {
+                Ok(i) => out.remove(i).1,
+                Err(_) => Value::Undef,
+            },
+            ("firstKey", 0) => out
+                .first()
+                .map(|p| p.0.clone())
+                .ok_or_else(java_no_such_element)?,
+            ("lastKey", 0) => out
+                .last()
+                .map(|p| p.0.clone())
+                .ok_or_else(java_no_such_element)?,
+            ("size" | "isEmpty" | "keySet" | "values" | "entrySet" | "forEach" | "toString", _) => {
+                return Err(String::new())
+            }
+            _ => {
+                return Err(format!(
+                    "scalars: TreeMap.{name} under a Comparator is not modelled"
+                ))
+            }
+        })
+    })();
+    match res {
+        Err(e) if e.is_empty() => None,
+        Err(e) => Some(Err(e)),
+        Ok(v) => Some(Ok((out, v))),
+    }
+}
+
+thread_local! {
+    /// `Collections.unmodifiableList`/`Set`/`Map`/`Collection` VIEWS, by heap
+    /// id, mapped to the collection they read through: a write to the backing
+    /// one shows in the view, and the view's own mutators all raise.
+    static JAVA_VIEWS: RefCell<HashMap<usize, Value>> = RefCell::new(HashMap::new());
+}
+
+fn java_view_backing(v: &Value) -> Option<Value> {
+    as_obj_id(v).and_then(|id| JAVA_VIEWS.with(|t| t.borrow().get(&id).cloned()))
+}
+
+/// An unmodifiable view of `backing` (see [`JAVA_VIEWS`]).
+fn java_view(backing: &Value) -> Value {
+    let kind = seq_kind(backing).unwrap_or(SeqKind::JavaList);
+    let v = java_marked(new_seq(kind, Vec::new()), false);
+    if let Some(id) = as_obj_id(&v) {
+        JAVA_VIEWS.with(|t| t.borrow_mut().insert(id, backing.clone()));
+    }
+    v
+}
+
+/// Whether `name` is a `java.util` collection mutator, which an unmodifiable
+/// view refuses.
+fn java_mutator_name(name: &str) -> bool {
+    matches!(
+        name,
+        "add"
+            | "addAll"
+            | "remove"
+            | "remove$object"
+            | "removeAll"
+            | "retainAll"
+            | "removeIf"
+            | "clear"
+            | "set"
+            | "sort"
+            | "replaceAll"
+            | "put"
+            | "putAll"
+            | "putIfAbsent"
+            | "merge"
+            | "compute"
+            | "computeIfAbsent"
+            | "computeIfPresent"
+            | "replace"
+            | "addFirst"
+            | "addLast"
+            | "push"
+            | "pop"
+            | "poll"
+            | "offer"
+    )
+}
+
+/// A member of an unmodifiable view: a mutator raises, anything else is
+/// answered by the backing collection as it stands now.
+fn java_view_method(
+    vm: &mut VM,
+    backing: &Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    if java_mutator_name(name) {
+        return Err("scalars: java.lang.UnsupportedOperationException".to_string());
+    }
+    let items = seq_kind_items(backing)
+        .map(|(_, xs)| xs)
+        .unwrap_or_default();
+    match seq_kind(backing) {
+        Some(SeqKind::JavaMap) => java_map_method(vm, backing, &items, name, args),
+        _ => java_list_method(vm, backing, &items, name, args),
+    }
+}
+
+/// The `(first, second)` of an `orElse`-chained `Ordering`.
+fn ordering_chain(v: &Value) -> Option<(Value, Value)> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::Ordering { chain, .. }) => chain.clone(),
+        _ => None,
+    })
+}
+
+/// `first.orElse(second)`, reversed when `reversed`.
+fn chained_ordering(first: Value, second: Value, reversed: bool) -> Value {
+    heap_push(HeapVal::Ordering {
+        key: Value::Undef,
+        lt: Value::Undef,
+        reversed,
+        chain: Some((first, second)),
+    })
 }

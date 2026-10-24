@@ -3369,6 +3369,18 @@ impl Compiler {
     /// static type must not be converted, because a wrong conversion is a wrong
     /// VALUE rather than an error.
     fn converted(&self, e: &Expr, to: Option<&str>) -> Option<Expr> {
+        // An `Int` CONSTANT in range narrows to a declared `Char` (`val c: Char =
+        // 66` is `B`), as Scala's constant typing does; a non-constant does not
+        // compile there.
+        if let (Some("Char"), Expr::Int(n)) = (to.map(str::trim), e) {
+            if let Some(c) = u32::try_from(*n)
+                .ok()
+                .filter(|c| *c <= 0xFFFF)
+                .and_then(char::from_u32)
+            {
+                return Some(Expr::Char(c));
+            }
+        }
         if let Some(w) = to.and_then(|t| self.widened(e, t)) {
             return Some(w);
         }
@@ -5084,6 +5096,9 @@ impl Compiler {
         if let Some(t) = self.method_result_type(e) {
             return Some(t);
         }
+        if let Some(t) = self.value_member_type(e) {
+            return Some(t);
+        }
         // A tuple literal of nameable components is `(A, B)`, and `Option(x)` an
         // `Option[A]`: the shapes a `using` clause is resolved against.
         if let Expr::Tuple(xs) = e {
@@ -5141,6 +5156,61 @@ impl Compiler {
         )
     }
 
+    /// The static type of a member of a value type (`String`, the numeric
+    /// types, `Char`, `Boolean`) whose result type is fixed — `toString`,
+    /// `length`, `toDouble`, … — and of a `+` with a `String` on either side.
+    fn value_member_type(&self, e: &Expr) -> Option<String> {
+        const VALUE_TYPES: &[&str] = &[
+            "String", "Int", "Long", "Double", "Float", "Char", "Boolean",
+        ];
+        if let Expr::Binary { op, lhs, rhs } = e {
+            let (l, r) = (self.static_type_name(lhs), self.static_type_name(rhs));
+            let either = |t: &str| l.as_deref() == Some(t) || r.as_deref() == Some(t);
+            if *op == BinOp::Add && either("String") {
+                return Some("String".to_string());
+            }
+            // Numeric promotion: the wider operand's type.
+            let numeric = |t: &Option<String>| {
+                matches!(t.as_deref(), Some("Int" | "Long" | "Float" | "Double"))
+            };
+            if matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+            ) && numeric(&l)
+                && numeric(&r)
+            {
+                let t = ["Double", "Float", "Long"]
+                    .into_iter()
+                    .find(|t| either(t))
+                    .unwrap_or("Int");
+                return Some(t.to_string());
+            }
+            return None;
+        }
+        let Expr::Method {
+            recv, name, args, ..
+        } = e
+        else {
+            return None;
+        };
+        let rt = self.static_type_name(recv)?;
+        if !VALUE_TYPES.contains(&rt.as_str()) || !args.is_empty() {
+            return None;
+        }
+        Some(
+            match (rt.as_str(), name.as_str()) {
+                (_, "toString") => "String",
+                (_, "toInt") => "Int",
+                (_, "toLong") => "Long",
+                (_, "toDouble") => "Double",
+                ("String", "length" | "size") => "Int",
+                ("String", "trim" | "toUpperCase" | "toLowerCase" | "reverse") => "String",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    }
+
     /// The static type of a library method call whose result type follows
     /// from its receiver's: the element (`head`, `last`, `apply`, `max`,
     /// `get`), an `Option` of it (`headOption`, `lastOption`, `find`), or the
@@ -5173,6 +5243,24 @@ impl Compiler {
                 1,
             ) if seq => rt.clone(),
             ("tail" | "init" | "reverse" | "sorted" | "distinct", 0) if seq => rt.clone(),
+            // `xs.map(f)` is a collection of `f`'s result type, read off its body
+            // with the parameter standing as a value of the element type.
+            ("map", 1) if seq || option => {
+                let Expr::Lambda {
+                    params,
+                    body,
+                    partial: false,
+                } = &args[0]
+                else {
+                    return None;
+                };
+                let [p] = params.as_slice() else {
+                    return None;
+                };
+                let witness = type_witness(elem)?;
+                let t = self.static_type_name(&subst_param(body, p, &witness))?;
+                format!("{head}[{t}]")
+            }
             ("get", 0) if option => elem.to_string(),
             ("getOrElse", 1) if option => elem.to_string(),
             _ => return None,
@@ -6247,6 +6335,12 @@ impl Compiler {
             if let Some(desugared) = companion_factory(owner, name, args, line) {
                 return self.expr(&desugared);
             }
+        }
+        // `Range.Long(a, b, s)` / `Range.BigInt.inclusive(a, b, s)` — the
+        // `NumericRange` factories, which are `a until b by s` (or `to`) over
+        // the element type.
+        if let Some(e) = numeric_range_factory(recv, name, args, line) {
+            return self.expr(&e);
         }
         // A `case class` companion's `unapply`, called explicitly. Scala 3
         // derives it as a name-based extractor that answers the instance
@@ -9556,6 +9650,12 @@ const ORDERING_MEMBERS: &[&str] = &[
     "Unit",
     "BigInt",
     "BigDecimal",
+    // The derived tuple orderings, element-wise under each component's
+    // natural order (which is what `value_cmp` compares tuples by).
+    "Tuple2",
+    "Tuple3",
+    "Tuple4",
+    "Tuple5",
 ];
 
 /// The conversion that rebuilds a generic sequence as the collection named by
@@ -11856,4 +11956,97 @@ fn unify_type(pattern: &str, ty: &str, vars: &[String], subst: &mut Vec<(String,
             .iter()
             .zip(&ta)
             .all(|(a, b)| unify_type(a, b, vars, subst))
+}
+
+/// `Range.Long(a, b, s)` / `Range.Long.inclusive(a, b, s)` and the `BigInt`
+/// forms, as the `until`/`to` … `by` expression over that element type: a
+/// `Long` operand is converted with `toLong`, so `Range.Long(1, 10, 3)` is
+/// `NumericRange 1 until 10 by 3` as Scala's widening makes it.
+fn numeric_range_factory(recv: &Expr, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+    let (elem, inclusive) = match (recv, name) {
+        (Expr::Var(r), "Long" | "BigInt") if r == "Range" => (name, false),
+        (
+            Expr::Method {
+                recv: r,
+                name: elem,
+                args: none,
+                ..
+            },
+            "apply" | "inclusive",
+        ) if none.is_empty() && matches!(r.as_ref(), Expr::Var(v) if v == "Range") => {
+            if elem != "Long" && elem != "BigInt" {
+                return None;
+            }
+            (elem.as_str(), name == "inclusive")
+        }
+        _ => return None,
+    };
+    let [a, b, s] = args else { return None };
+    let conv = |e: &Expr| {
+        if elem == "Long" {
+            Expr::Method {
+                recv: Box::new(e.clone()),
+                name: "toLong".to_string(),
+                args: Vec::new(),
+                line,
+            }
+        } else {
+            e.clone()
+        }
+    };
+    let m = |recv: Expr, name: &str, arg: Expr| Expr::Method {
+        recv: Box::new(recv),
+        name: name.to_string(),
+        args: vec![arg],
+        line,
+    };
+    let prep = if inclusive { "to" } else { "until" };
+    Some(m(m(conv(a), prep, conv(b)), "by", conv(s)))
+}
+
+/// `e` with every read of the parameter `p` replaced by `lit`, through the
+/// expression shapes a lambda body's type is read from (operators, method
+/// calls, tuples, conditionals). A read inside any other shape is left as it
+/// is, and the unbound name then stops the type naming rather than guessing.
+fn subst_param(e: &Expr, p: &str, lit: &Expr) -> Expr {
+    let s = |x: &Expr| Box::new(subst_param(x, p, lit));
+    match e {
+        Expr::Var(v) if v == p => lit.clone(),
+        Expr::Unary { op, rhs } => Expr::Unary {
+            op: *op,
+            rhs: s(rhs),
+        },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: s(lhs),
+            rhs: s(rhs),
+        },
+        Expr::Method {
+            recv,
+            name,
+            args,
+            line,
+        } => Expr::Method {
+            recv: s(recv),
+            name: name.clone(),
+            args: args.iter().map(|a| subst_param(a, p, lit)).collect(),
+            line: *line,
+        },
+        Expr::Tuple(xs) => Expr::Tuple(xs.iter().map(|a| subst_param(a, p, lit)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// A literal of the simple value type `ty`, standing for a parameter of that
+/// type while a lambda body is typed (see [`subst_param`]).
+fn type_witness(ty: &str) -> Option<Expr> {
+    Some(match ty {
+        "Int" => Expr::Int(0),
+        "Long" => Expr::Long(0),
+        "Double" => Expr::Float(0.0),
+        "String" => Expr::Str(String::new()),
+        "Boolean" => Expr::Bool(false),
+        "Char" => Expr::Char('a'),
+        _ => return None,
+    })
 }
