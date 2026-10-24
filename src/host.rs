@@ -1943,6 +1943,11 @@ enum HeapVal {
         /// `Ordering.Tuple2(o1, o2)` …: tuples compared component by component,
         /// component `i` under ordering `i`.
         tuple: Option<Vec<Value>>,
+        /// Whether a `reversed` keyed ordering applies its key BEFORE the swap:
+        /// `Ordering.Int.reverse.on(f)` is `outer.compare(f(x), f(y))` with
+        /// the reversal inside, so `f` sees `x` first, where
+        /// `Ordering.by(f).reverse` swaps first and `f` sees `y` first.
+        keyed_first: bool,
     },
     /// A `scala.util.matching.Regex` (`"…".r`). The *source* pattern is stored,
     /// which is what `toString`/`regex` answer; the compiled automaton lives in
@@ -3367,6 +3372,7 @@ fn make_ordering(key: Value, lt: Value, reversed: bool) -> Value {
         reversed,
         chain: None,
         tuple: None,
+        keyed_first: false,
     })
 }
 
@@ -3431,6 +3437,7 @@ fn ordering_method(
                 reversed: !reversed,
                 chain: None,
                 tuple: Some(parts),
+                keyed_first: false,
             }),
             (None, None) => make_ordering(key, lt, !reversed),
         }),
@@ -3451,7 +3458,14 @@ fn ordering_method(
         // functions is not modeled, so an `on` over an already-keyed ordering is
         // rejected rather than silently dropping one of them.
         ("on", 1) => match key {
-            Value::Undef => Ok(make_ordering(args[0].clone(), lt, reversed)),
+            Value::Undef => Ok(heap_push(HeapVal::Ordering {
+                key: args[0].clone(),
+                lt,
+                reversed,
+                chain: None,
+                tuple: None,
+                keyed_first: reversed,
+            })),
             _ => Err("scalars: Ordering.on over an already-keyed Ordering is not modeled".into()),
         },
         // `Ordering.Double.TotalOrdering` / `.IeeeOrdering` select an ordering of
@@ -3513,15 +3527,38 @@ fn as_ordering(v: &Value) -> Option<(Value, Value, bool)> {
 /// reversed `fromLessThan` asks `lt(y, x)` first.
 fn ordering_cmp(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Ordering, String> {
     match as_ordering(ord) {
-        Some((_, _, true)) => ordering_cmp_outer(vm, ord, b, a),
-        Some(_) => ordering_cmp_outer(vm, ord, a, b),
+        Some((_, _, true)) if ordering_keyed_first(ord) => ordering_cmp_outer(vm, ord, a, b, true),
+        Some((_, _, true)) => ordering_cmp_outer(vm, ord, b, a, false),
+        Some(_) => ordering_cmp_outer(vm, ord, a, b, false),
         None => Err("scalars: expected an Ordering".into()),
     }
 }
 
+/// Whether `ord` keys its operands before its reversal swaps them (see
+/// [`HeapVal::Ordering`]'s `keyed_first`).
+fn ordering_keyed_first(ord: &Value) -> bool {
+    let Value::Obj(id) = ord else { return false };
+    HEAP.with(|h| {
+        matches!(
+            h.borrow().get(*id as usize),
+            Some(HeapVal::Ordering {
+                keyed_first: true,
+                ..
+            })
+        )
+    })
+}
+
 /// [`ordering_cmp`] under the ordering a `reverse` wraps: extract the sort
-/// keys, then apply the ordering's own comparison.
-fn ordering_cmp_outer(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Ordering, String> {
+/// keys, then apply the ordering's own comparison — to the keys swapped when
+/// `swap_keys` (a reversal inside the key, see [`ordering_keyed_first`]).
+fn ordering_cmp_outer(
+    vm: &mut VM,
+    ord: &Value,
+    a: &Value,
+    b: &Value,
+    swap_keys: bool,
+) -> Result<Ordering, String> {
     let Some((key, lt, _)) = as_ordering(ord) else {
         return Err("scalars: expected an Ordering".into());
     };
@@ -3556,6 +3593,7 @@ fn ordering_cmp_outer(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<
             invoke_closure(vm, &f, std::slice::from_ref(b))?,
         ),
     };
+    let (a, b) = if swap_keys { (b, a) } else { (a, b) };
     let base = match lt {
         Value::Undef => cmp_vm(vm, &a, &b)?,
         // `Ordering.fromLessThan(lt)` is defined by its `lt` alone: equal when
@@ -3590,7 +3628,6 @@ fn ordering_lt(
     let Some((key, lt, reversed)) = as_ordering(ord) else {
         return Err("scalars: expected an Ordering".into());
     };
-    let (a, b) = if reversed { (b, a) } else { (a, b) };
     let by_compare = |o: Ordering| {
         if or_equal {
             o != Ordering::Greater
@@ -3598,8 +3635,13 @@ fn ordering_lt(
             o == Ordering::Less
         }
     };
+    // `ord.on(f)` overrides only `compare`.
+    if ordering_keyed_first(ord) {
+        return Ok(by_compare(ordering_cmp(vm, ord, a, b)?));
+    }
+    let (a, b) = if reversed { (b, a) } else { (a, b) };
     if ordering_tuple_parts(ord).is_some() || ordering_chain(ord).is_some() {
-        return Ok(by_compare(ordering_cmp_outer(vm, ord, a, b)?));
+        return Ok(by_compare(ordering_cmp_outer(vm, ord, a, b, false)?));
     }
     let (a, b) = match key {
         Value::Undef => (a.clone(), b.clone()),
@@ -6135,16 +6177,6 @@ fn best_by_ordering(
         }
     }
     Ok(best)
-}
-
-/// Sort `items` under `ord`, stably. Goes through [`merge_sort_idx`] rather than
-/// `slice::sort_by` because the comparison runs a user closure, which may raise
-/// and which `sort_by` would panic on if it were inconsistent.
-fn sort_by_ordering(vm: &mut VM, ord: &Value, items: &[Value]) -> Result<Vec<Value>, String> {
-    let idx = merge_sort_idx(vm, items.len(), &mut |vm, i, j| {
-        ordering_cmp(vm, ord, &items[i], &items[j])
-    })?;
-    Ok(idx.into_iter().map(|i| items[i].clone()).collect())
 }
 
 /// The JVM class a collection, option, either or tuple value has — what
@@ -12248,12 +12280,18 @@ fn seq_method_inner(
             }
             Ok(new_map(HashRep::Small, mut_table_order(acc)))
         }
+        // `sortBy(f)` is `sorted(ord.on(f))`: `f` runs on both operands of
+        // every comparison, the left one first.
         ("sortBy", 1) => {
-            // Sorted by INDEX so `f` runs exactly once per element, as Scala's
-            // `sortBy` (a `map`-then-sort over the keys) does.
-            let ks = keys_of(vm, &args[0], &items)?;
-            let idx = merge_sort_idx(vm, items.len(), &mut |vm, i, j| cmp_vm(vm, &ks[i], &ks[j]))?;
-            Ok(same(idx.into_iter().map(|i| items[i].clone()).collect()))
+            let f = &args[0];
+            let out = sort_custom(vm, kind, &items, &mut |vm, x, y| {
+                let (kx, ky) = (
+                    invoke_closure(vm, f, std::slice::from_ref(x))?,
+                    invoke_closure(vm, f, std::slice::from_ref(y))?,
+                );
+                cmp_vm(vm, &kx, &ky)
+            })?;
+            Ok(same(out))
         }
         // The implicit ordering. A user class that extends `Ordered` supplies it
         // through its own `compare`, which needs the VM — so this cannot be
@@ -12264,11 +12302,18 @@ fn seq_method_inner(
         // `xs.sorted(ord)` arrives with one argument and `xs.sortBy(f)(ord)`
         // with two.
         ("sorted", 1) if as_ordering(&args[0]).is_some() => {
-            Ok(same(sort_by_ordering(vm, &args[0], &items)?))
+            let ord = &args[0];
+            let out = sort_custom(vm, kind, &items, &mut |vm, x, y| {
+                ordering_cmp(vm, ord, x, y)
+            })?;
+            Ok(same(out))
         }
         ("sortBy", 2) if as_ordering(&args[1]).is_some() => {
             let keyed = make_keyed_ordering(vm, &args[0], &args[1])?;
-            Ok(same(sort_by_ordering(vm, &keyed, &items)?))
+            let out = sort_custom(vm, kind, &items, &mut |vm, x, y| {
+                ordering_cmp(vm, &keyed, x, y)
+            })?;
+            Ok(same(out))
         }
         ("max" | "min", 1) if as_ordering(&args[0]).is_some() => {
             best_by_ordering(vm, &args[0], &items, name)
@@ -12277,23 +12322,21 @@ fn seq_method_inner(
             let keyed = make_keyed_ordering(vm, &args[0], &args[1])?;
             best_by_ordering(vm, &keyed, &items, name)
         }
+        // `sortWith(lt)` is `sorted(Ordering.fromLessThan(lt))`, whose
+        // `compare(x, y)` asks `lt(x, y)` and, when that is false, `lt(y, x)`.
         ("sortWith", 1) => {
-            // A user `lt` may be inconsistent, and `sort_by` panics on a bad
-            // comparator, so the merge is written out (stably) instead.
-            let mut out: Vec<Value> = Vec::with_capacity(items.len());
-            for it in &items {
-                let mut at = out.len();
-                while at > 0
-                    && truthy(&invoke_closure(
-                        vm,
-                        &args[0],
-                        &[it.clone(), out[at - 1].clone()],
-                    )?)
-                {
-                    at -= 1;
-                }
-                out.insert(at, it.clone());
-            }
+            let lt = &args[0];
+            let out = sort_custom(vm, kind, &items, &mut |vm, x, y| {
+                Ok(
+                    if truthy(&invoke_closure(vm, lt, &[x.clone(), y.clone()])?) {
+                        Ordering::Less
+                    } else if truthy(&invoke_closure(vm, lt, &[y.clone(), x.clone()])?) {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Equal
+                    },
+                )
+            })?;
             Ok(same(out))
         }
         ("maxBy" | "minBy", 1) => {
@@ -13817,55 +13860,51 @@ fn ordered_derived_method(
 }
 
 /// A STABLE sort of `0..len` under a comparator that may re-enter the VM and
-/// fail, returning the sorted index permutation.
-///
-/// `slice::sort_by` cannot be used: its comparator answers a bare `Ordering`,
-/// with nowhere to report a user `compare` that raised. The obvious alternative
-/// — inserting each element into a growing sorted run — is O(n²), which a
-/// reverse-ordered 4000-element `sorted` feels immediately (measured at 57s
-/// before this became a merge). This is a bottom-up merge instead: O(n log n)
-/// comparisons, and stable because a tie never takes from the right run.
-fn merge_sort_idx(
+/// fail, returning the sorted index permutation. It is `java.util.TimSort`
+/// (see [`crate::timsort`]) — what `Arrays.sort(Object[], Comparator)`, and so
+/// `Seq.sorted`/`sortBy`/`sortWith`, run — so a user comparison is asked
+/// exactly what the JVM asks it, in the same order.
+fn sort_idx(
     vm: &mut VM,
     len: usize,
     cmp: &mut dyn FnMut(&mut VM, usize, usize) -> Result<Ordering, String>,
 ) -> Result<Vec<usize>, String> {
-    let mut cur: Vec<usize> = (0..len).collect();
-    let mut buf: Vec<usize> = vec![0; len];
-    let mut width = 1;
-    while width < len {
-        let mut lo = 0;
-        while lo < len {
-            let mid = (lo + width).min(len);
-            let hi = (lo + 2 * width).min(len);
-            let (mut i, mut j, mut k) = (lo, mid, lo);
-            while i < mid && j < hi {
-                // Strictly-less is what makes this stable: on a tie the left run
-                // goes first, so equal elements keep their input order.
-                if cmp(vm, cur[j], cur[i])? == Ordering::Less {
-                    buf[k] = cur[j];
-                    j += 1;
-                } else {
-                    buf[k] = cur[i];
-                    i += 1;
-                }
-                k += 1;
-            }
-            buf[k..k + (mid - i)].copy_from_slice(&cur[i..mid]);
-            k += mid - i;
-            buf[k..k + (hi - j)].copy_from_slice(&cur[j..hi]);
-            lo = hi;
-        }
-        std::mem::swap(&mut cur, &mut buf);
-        width *= 2;
+    let mut idx: Vec<usize> = (0..len).collect();
+    crate::timsort::tim_sort(&mut idx, &mut |i, j| cmp(vm, i, j))?;
+    Ok(idx)
+}
+
+/// `items`, the elements of a collection of `kind`, sorted under a
+/// comparison that is not the element type's default ordering — `sortWith`,
+/// `sortBy`, `sorted(ord)`. `ArrayOps.sorted` sorts an array of primitives of
+/// fewer than 300 elements with `scala.util.Sorting.stableSort` (its
+/// `boxed`); every other collection, and a reference array, goes through
+/// `Arrays.sort` and so TimSort. The two ask different comparisons.
+fn sort_custom(
+    vm: &mut VM,
+    kind: SeqKind,
+    items: &[Value],
+    cmp: &mut dyn FnMut(&mut VM, &Value, &Value) -> Result<Ordering, String>,
+) -> Result<Vec<Value>, String> {
+    let primitive = |v: &Value| {
+        matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_)) || as_char(v).is_some()
+    };
+    let stable =
+        kind == SeqKind::Array && items.len() < 300 && items.first().is_some_and(primitive);
+    let mut idx: Vec<usize> = (0..items.len()).collect();
+    let mut by_index = |i: usize, j: usize| cmp(vm, &items[i], &items[j]);
+    if stable {
+        crate::timsort::stable_merge_sort(&mut idx, &mut by_index)?;
+    } else {
+        crate::timsort::tim_sort(&mut idx, &mut by_index)?;
     }
-    Ok(cur)
+    Ok(idx.into_iter().map(|i| items[i].clone()).collect())
 }
 
 /// Sort `items` stably under [`cmp_vm`] — the implicit ordering, including a
 /// user class's own `compare`.
 fn sort_values(vm: &mut VM, items: &[Value]) -> Result<Vec<Value>, String> {
-    let idx = merge_sort_idx(vm, items.len(), &mut |vm, i, j| {
+    let idx = sort_idx(vm, items.len(), &mut |vm, i, j| {
         cmp_vm(vm, &items[i], &items[j])
     })?;
     Ok(idx.into_iter().map(|i| items[i].clone()).collect())
@@ -23932,6 +23971,24 @@ fn java_static(vm: &mut VM, which: &str, args: &[Value]) -> Result<Value, String
             set_seq_items(&args[0], SeqKind::Array, xs);
             Ok(unit_value())
         }
+        // `Arrays.sort(a[, from, to], comparator)` — `TimSort` over the
+        // range, by a `Comparator` (an `Ordering`) or a two-argument function.
+        ("Arrays.sort", 2 | 4) => {
+            let mut xs =
+                array_items(&args[0]).ok_or_else(|| format!("scalars: {which}: not an Array"))?;
+            let (a, b) = if args.len() == 4 {
+                java_range(xs.len(), args[1].to_int(), args[2].to_int())?
+            } else {
+                (0, xs.len())
+            };
+            let cmp = args[args.len() - 1].clone();
+            if let Some(r) = java_list_mutate(vm, &xs[a..b], "sort", &[cmp]) {
+                let sorted = r?.0;
+                xs.splice(a..b, sorted);
+            }
+            set_seq_items(&args[0], SeqKind::Array, xs);
+            Ok(unit_value())
+        }
         ("Arrays.fill", 2 | 4) => {
             let mut xs =
                 array_items(&args[0]).ok_or_else(|| format!("scalars: {which}: not an Array"))?;
@@ -24165,7 +24222,7 @@ fn java_list_mutate(
                 let cmp = args[0].clone();
                 let mut err = None;
                 let mut keyed: Vec<Value> = out.clone();
-                let idx = merge_sort_idx(vm, keyed.len(), &mut |vm, i, j| {
+                let idx = sort_idx(vm, keyed.len(), &mut |vm, i, j| {
                     if matches!(cmp, Value::Undef) {
                         return Ok(value_cmp(&keyed[i], &keyed[j]));
                     }
@@ -25112,6 +25169,7 @@ fn chained_ordering(first: Value, second: Value, reversed: bool) -> Value {
         reversed,
         chain: Some((first, second)),
         tuple: None,
+        keyed_first: false,
     })
 }
 
@@ -25164,7 +25222,7 @@ fn sort_distinct_by(
     keep_last: bool,
     key: &dyn Fn(&Value) -> Value,
 ) -> Result<Vec<Value>, String> {
-    let idx = merge_sort_idx(vm, items.len(), &mut |vm, i, j| {
+    let idx = sort_idx(vm, items.len(), &mut |vm, i, j| {
         ordering_cmp(vm, ord, &key(&items[i]), &key(&items[j]))
     })?;
     let mut out: Vec<Value> = Vec::with_capacity(items.len());
@@ -26188,6 +26246,7 @@ fn tuple_ordering(parts: Vec<Value>) -> Value {
         reversed: false,
         chain: None,
         tuple: Some(parts),
+        keyed_first: false,
     })
 }
 

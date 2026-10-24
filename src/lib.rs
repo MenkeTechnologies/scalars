@@ -25,6 +25,7 @@ pub mod rbtree;
 pub mod resolve;
 pub mod rust_ffi;
 pub mod tiers;
+pub mod timsort;
 
 pub use banner::version_banner;
 use fusevm::{VMResult, Value, VM};

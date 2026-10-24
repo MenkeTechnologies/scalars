@@ -5264,6 +5264,11 @@ impl Compiler {
         ) {
             return None;
         }
+        // `sort(T[], Comparator)` and `sort(T[], int, int, Comparator)` are
+        // generic, so any reference array matches them.
+        if name == "sort" && matches!(args.len(), 2 | 4) {
+            return None;
+        }
         let ty = normalize_type(&self.static_type_name(args.first()?)?);
         let elem = ty.strip_prefix("Array[")?.strip_suffix(']')?;
         let fine = match elem {

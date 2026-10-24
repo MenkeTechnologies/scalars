@@ -511,7 +511,8 @@ Implemented and checked against the reference `scala`:
   (`sum`/`product`/`min`/`max`/`minBy`/`maxBy`/`count`), predicates
   (`exists`/`forall`/`find`/`indexOf`/`indexWhere`/`contains`), ordering
   (`sorted` — with or without an explicit `Ordering` — `sortBy`/`sortWith`/
-  `reverse`/`distinct`), slicing
+  `reverse`/`distinct`; the sorts are the JDK's `TimSort` and
+  `scala.util.Sorting`'s merge, so a comparison runs as often as on the JVM), slicing
   (`take`/`drop`/`slice`/`splitAt`/`span`/`partition`/`partitionMap`/
   `takeWhile`/`dropWhile`/`init`/`tail`/`headOption`), in-place sorting
   (`sortInPlace`/`sortInPlaceBy`/`sortInPlaceWith`, `scala.util.Sorting.quickSort`), pairing (`zip`/`zipWithIndex`/`unzip`/`flatten`/

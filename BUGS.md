@@ -672,10 +672,19 @@ reported as parse/compile errors, never silently mis-run.
   Scala passes it in a second
   (implicit) parameter list, which this frontend flattens into the same call, so
   `xs.sorted(ord)` arrives with one argument and `xs.sortBy(f)(ord)` with two;
-  `sorted`, `sortBy`, `max`, `min`, `maxBy` and `minBy` all take it. The sort is
-  stable and the comparison may run a user closure, so it is an insertion merge
-  rather than `slice::sort_by` (which would panic on an inconsistent
-  comparator). The NAMED orderings all collapse onto the one natural ordering,
+  `sorted`, `sortBy`, `max`, `min`, `maxBy` and `minBy` all take it. A sort asks
+  its comparison exactly what the JVM asks it: `sorted`/`sortBy`/`sortWith` (and
+  `java.util` `List.sort`, `Collections.sort`, `Arrays.sort(a, cmp)`) run a port
+  of `java.util.TimSort` (`src/timsort.rs`) — binary insertion under 32
+  elements, galloping run merges above — and an array of primitives under a
+  non-default ordering and below 300 elements runs `scala.util.Sorting`'s merge
+  sort, as `ArrayOps.sorted` does. `sortBy(f)` is `sorted(ord.on(f))`, so `f`
+  runs on both operands of every comparison (left first), and `sortWith(lt)` is
+  `fromLessThan(lt)`, which asks `lt(y, x)` when `lt(x, y)` is false. An
+  inconsistent comparator raises the JDK's `IllegalArgumentException:
+  Comparison method violates its general contract!` exactly where TimSort
+  detects it. `ord.on(f)` over a reversed ordering keys both operands before the
+  reversal swaps them, where `Ordering.by(f).reverse` swaps first. The NAMED orderings all collapse onto the one natural ordering,
   because there are no static types here to tell `Ordering.Int` from
   `Ordering.String` at a call site and nothing observable distinguishes them
   once applied to values of that type.
