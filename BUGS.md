@@ -468,7 +468,7 @@ reported as parse/compile errors, never silently mis-run.
 - **The standard `Numeric[T]` / `Integral[T]` / `Fractional[T]`.** An
   implicit parameter or context bound of one, `implicitly[Numeric[Int]]` and
   `Numeric[Double]` (the companion's `apply`) receive the library's instance
-  for `Int`, `Long`, `Short`, `Byte`, `Double`, `Float`, `BigInt` or
+  for `Int`, `Long`, `Short`, `Byte`, `Char`, `Double`, `Float`, `BigInt` or
   `BigDecimal` — `Integral` only for the integral types, `Fractional` only for
   `Double`/`Float`/`BigDecimal`, as in the library. Its members answer at the
   instance's type, so an `Int` one's `plus`/`times`/`negate`/`fromInt` wrap at
@@ -477,8 +477,13 @@ reported as parse/compile errors, never silently mis-run.
   (a `Double` saturating), `toDouble`, `toFloat`, `quot`/`rem` (`/ by zero`),
   `div`, `compare`, `lt`/`lteq`/`gt`/`gteq`/`equiv`, `max`/`min`. `n.plus`
   used as a function value eta-expands (`xs.foldLeft(n.zero)(n.plus)`), and
-  `xs.sum(n)` / `xs.product(n)` fold through the instance given.
-  `Numeric[Char]`, `parseString` and `mkNumericOps` are not modelled.
+  `xs.sum(n)` / `xs.product(n)` fold through the instance given. A `Char`
+  one wraps its arithmetic to 16 bits (`negate('a')` is `\uFF9F`) and enters
+  it as the code unit. `parseString` is the library's exception-free parse:
+  `StringParsers`' for the primitives (no trimming for an integral type,
+  `None` past its range, so `Numeric[Byte].parseString("300")` is `None`),
+  `Try(BigInt(s))`/`Try(BigDecimal(s))` for the big ones and
+  `Try(s.toInt.toChar)` for `Char`. `mkNumericOps` is not modelled.
 - **`implicit class`.** `implicit class Rich(n: Int) { def squared = n * n }`
   registers each method as the Scala 3 extension `extension (n: Int)` it is
   equivalent to, so `4.squared` resolves; the class stays declared for an
@@ -725,11 +730,14 @@ reported as parse/compile errors, never silently mis-run.
   runtime subclass (`s"${getClass.getSimpleName}(…)"`). A collection's
   `getClass` answers the reference's representation class: `$colon$colon` for a
   non-empty `List`, `Vector1`/`Vector2`/`Vector3` by length, `Map1`..`Map4` then
-  `HashMap`, `Set1`..`Set4` then `HashSet`, `Some`, `None$`, and
+  `HashMap`, `Set1`..`Set4` then `HashSet`, `Some`, `None$`, `Range$Inclusive`/
+  `NumericRange$Exclusive` and the rest, and
   `Tuple2$mc<A><B>$sp` for a pair of `Int`/`Double`/`Boolean`/`Char`
   components (a `Long` component is an `Int` here, so a `(Boolean, Long)` reads
   `Tuple2$mcZI$sp`). A class declared inside an `object` carries the enclosing
   names (`T$O$In`); its `getSimpleName` stays `In`.
+  A library member class's `getSimpleName` is its own name too: `Set2`,
+  `EmptyMap$`, `Inclusive`.
   There is one `Class` object per class, so `a.getClass == b.getClass` (and
   `eq`) holds for two values of one class. `classOf[T]` answers that same
   object under the JVM erasure: a value type is its primitive (`classOf[Int]`
@@ -1152,8 +1160,18 @@ reported as parse/compile errors, never silently mis-run.
 - **`java.util.Locale`.** The constants (`US`, `UK`, `ROOT`, `GERMANY`,
   `FRANCE`, `ITALY`, `JAPAN`, `KOREA`, `CHINA`, `TAIWAN`, `CANADA`, …), `new
   Locale(language[, country[, variant]])`, `Locale.of`, `forLanguageTag`,
-  `getDefault` (`en_US`, the reference's pinned locale), `getLanguage`/
-  `getCountry`/`getVariant`/`toLanguageTag`/`toString`, equality.
+  `getDefault` (`en_US`, the reference's pinned locale, until `setDefault`),
+  `getLanguage`/`getScript`/`getCountry`/`getVariant`/`getExtension`/
+  `getUnicodeLocaleType`/`toLanguageTag`/`toString`, equality. A locale is its
+  language, script, region and variant plus its extensions, ported from the
+  JDK's `BaseLocale`/`LanguageTag`/`InternalLocaleBuilder`
+  (`src/jlocale.rs`): `forLanguageTag` keeps the script, variants, extensions
+  (the `u` extension canonicalized) and a private-use `lvariant` as the
+  variant, the obsolete `iw`/`ji`/`in` become `he`/`yi`/`id`, the legacy
+  constructor gives `ja_JP_JP` its `u-ca-japanese` and `th_TH_TH` its
+  `u-nu-thai` (`ja_JP_JP_#u-ca-japanese`,
+  `ja-JP-u-ca-japanese-x-lvariant-JP`), and `toLanguageTag` moves an
+  ill-formed variant into private use and spells `no_NO_NY` `nn-NO`.
   `String.format(locale, …)` and `formatLocal(locale, …)` localize the decimal
   conversions (`%d`, `%f`, `%e`, `%g`): the decimal and grouping separators
   and the digits are the locale's CLDR ones, which the JDK formats with —
@@ -1161,17 +1179,30 @@ reported as parse/compile errors, never silently mis-run.
   `FRANCE`, `’` for `de-CH`, Arabic-Indic digits for `ar`. Measured for about
   fifty languages and countries; a locale outside the table formats as
   `en_US`. `toUpperCase(locale)` / `toLowerCase(locale)` pair the dotted and
-  dotless `i` for Turkish and Azerbaijani. Display names, the JDK's
-  `ja_JP_JP`/`th_TH_TH` compatibility locales and `Locale.setDefault` are not
-  modelled.
+  dotless `i` for Turkish and Azerbaijani. A `nu` extension picks the digits
+  (`th_TH_TH` formats `42` as `๔๒`; `arab`/`arabext` bring their own
+  separators too). `Locale.setDefault` changes what `String.format`, `format`,
+  `formatted`, the `f` interpolator and the argument-less
+  `toUpperCase`/`toLowerCase` localize by. `getDisplayName`/
+  `getDisplayLanguage`/`getDisplayScript`/`getDisplayCountry`/
+  `getDisplayVariant` answer the JDK's English names (`src/locale_names.rs`,
+  measured from its CLDR and COMPAT bundles: `Chinese (Traditional, Taiwan)`,
+  `English (United States, Computer)`, `Japanese (Japan, JP, Japanese
+  Calendar)`, `xx (YY)` for codes it has no name for); display names in any
+  locale but `en`/`en_US` (an explicit `inLocale`, or the default after
+  `setDefault`) are refused rather than guessed.
 - **`m()(x)` applies `m()`'s result.** An empty argument list ends a member
   call, so `e.getSuppressed()(0)` and `sb.toString()(1)` index the result;
   they used to fold into `m(x)`. A `def` declared with an empty first clause
   (`def m()(x: Int)`) still takes both clauses as one call.
 - **`List.range` / `Vector.range` / `Seq.range` elements carry the endpoints'
   width**, so `List.range(0, n).map(x => x - 1).sum` wraps at 32 bits as
-  Scala's `Int` sum does. (`Seq.range`/`IndexedSeq.range` answer a `List`/
-  `Vector` here where Scala answers a `NumericRange`.)
+  Scala's `Int` sum does. `Seq.range`/`IndexedSeq.range`/`Iterable.range`
+  answer the `NumericRange` itself, as Scala's do (`IterableFactory.range` is
+  `from(NumericRange(…))`, and those factories hand an `IndexedSeq` back):
+  `NumericRange 1 until 4`, class `NumericRange$Exclusive`. A zero step is
+  still refused when the range is built, where the library's `NumericRange`
+  waits for the first member that counts its elements.
 - **`Regex.unanchored`** is an `UnanchoredRegex`: its `matches`, `unapplySeq`
   and its extractor in a pattern find the first match anywhere in the input
   (`case u(n)` binds the first group of it), and `anchored` turns it back.

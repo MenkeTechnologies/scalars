@@ -323,7 +323,8 @@ Implemented and checked against the reference `scala`:
   so the ordering runs exactly as often as on the JVM and an unchanged result
   is the receiver itself (`eq`).
 - **Numeric type classes** — the library's `Numeric`/`Integral`/`Fractional`
-  instances for an implicit parameter, `implicitly` or `Numeric[T]`.
+  instances for an implicit parameter, `implicitly` or `Numeric[T]`, `Char`'s
+  included, with `parseString`.
 - **`scala.util.Using`** — `Using(res)(f)`, `Using.resource` and
   `Using.resources` and `Using.Manager { use => … }`, closing in reverse and suppressing a close's
   exception into the body's (`addSuppressed`/`getSuppressed`).
@@ -429,8 +430,10 @@ Implemented and checked against the reference `scala`:
   does, so it may declare and sequence: `s"${ val q = 3; q * 2 }"` is `6`.
   Any other `id"…"` is a custom interpolator, `StringContext(parts…).id(args…)`,
   supplied by an `extension` or `implicit class` on `StringContext`.
-  `java.util.Locale` formatting (`String.format(locale, …)`, `formatLocal`) and
-  the Turkish case mappings follow the JDK's CLDR data.
+  `java.util.Locale` formatting (`String.format(locale, …)`, `formatLocal`, and
+  everything after `Locale.setDefault`), the Turkish case mappings, BCP 47
+  tags with their extensions and the English display names follow the JDK's
+  CLDR data.
 - **Pattern matching** — `expr match { case … }` over literal, `_` wildcard,
   variable-binding, typed (`case s: String`), guarded (`case x if x > 0`), and
   constructor / case-class patterns (`case Point(x, y)`, `case Some(v)`,

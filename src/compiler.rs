@@ -8599,7 +8599,13 @@ impl Compiler {
             // non-integer one answers `Unknown` through `combine`. An EMPTY
             // literal has no element type here (`Nil`, `List()`), which is the
             // conservative answer.
+            // A `Char` element makes it a collection of `Char`s, whose `sum` is a
+            // `Char` (`CharIsIntegral.plus`), not the `Int` a `Char` widens to
+            // in arithmetic — the rule `'a' to 'e'` follows below.
             Expr::Collection { ctor, elems, .. } if SEQ_CTORS.contains(&ctor.as_str()) => {
+                if elems.iter().any(|x| matches!(x, Expr::Char(_))) {
+                    return NumTy::Unknown;
+                }
                 combine_all(elems.iter().map(|x| self.num_ty(x)))
             }
             Expr::Method {
@@ -9740,7 +9746,7 @@ fn numeric_instance(ty: &str) -> Option<Expr> {
         .strip_prefix("scala.math.")
         .or_else(|| arg.strip_prefix("scala."))
         .unwrap_or(arg);
-    let integral = matches!(arg, "Int" | "Long" | "Short" | "Byte" | "BigInt");
+    let integral = matches!(arg, "Int" | "Long" | "Short" | "Byte" | "Char" | "BigInt");
     let fractional = matches!(arg, "Double" | "Float" | "BigDecimal");
     let fits = match class {
         "Numeric" => integral || fractional,
@@ -10377,6 +10383,17 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
                     partial: false,
                 }],
             ))
+        }
+        // `Seq`/`IndexedSeq`/`Iterable.range` answer the `NumericRange` itself:
+        // `IterableFactory.range` is `from(NumericRange(start, end, step))`,
+        // and those factories' `from` return an `IndexedSeq` unchanged.
+        ("range", [a, b, ..]) if matches!(owner, "Seq" | "IndexedSeq" | "Iterable") => {
+            let r = m(a.clone(), "until", vec![b.clone()]);
+            let r = match args.get(2) {
+                Some(step) => m(r, "by", vec![step.clone()]),
+                None => r,
+            };
+            m(r, crate::parser::NUMERIC_RANGE, Vec::new())
         }
         ("range", [a, b]) => rebuild(m(a.clone(), "until", vec![b.clone()])),
         ("range", [a, b, step]) => rebuild(m(

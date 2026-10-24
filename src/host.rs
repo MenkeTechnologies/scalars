@@ -2811,6 +2811,17 @@ fn char_range_method(
 /// `sum` (`add`) or `product` over `Char`s under `Numeric[Char]`, which adds and
 /// multiplies in `Char` and so wraps at 16 bits: the answer is a `Char`
 /// (`"abc".sum` is `Ħ`, U+0126).
+/// The code units of `items` when they are all `Char`s (and there is one).
+fn all_char_codes(items: &[Value]) -> Option<Vec<i64>> {
+    if items.is_empty() {
+        return None;
+    }
+    items
+        .iter()
+        .map(|x| as_char(x).map(|c| i64::from(u32::from(c))))
+        .collect()
+}
+
 fn char_fold(add: bool, codes: impl Iterator<Item = i64>) -> Value {
     let mut acc: i64 = if add { 0 } else { 1 };
     for c in codes {
@@ -2936,6 +2947,7 @@ pub fn reset_heap() {
     RB_TREES.with(|t| t.borrow_mut().clear());
     OVERRIDE_ORD.with(|o| *o.borrow_mut() = None);
     SUPPRESSED.with(|t| t.borrow_mut().clear());
+    DEFAULT_LOCALE.with(|d| *d.borrow_mut() = None);
     MANAGERS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
@@ -6272,7 +6284,17 @@ fn class_of(recv: &Value) -> Result<Value, String> {
         }
         Value::Obj(_) if jvm_collection_class(recv).is_some() => {
             let n = jvm_collection_class(recv).unwrap_or_default();
-            let simple = n.rsplit('.').next().unwrap_or(&n).to_string();
+            let binary = n.rsplit('.').next().unwrap_or(&n);
+            // `Class.getSimpleName` of a MEMBER class is its own name, without
+            // the enclosing class: `Set$Set2` is `Set2`, `Map$EmptyMap$` is
+            // `EmptyMap$`, `NumericRange$Exclusive` is `Exclusive`. The
+            // top-level `$colon$colon`, `Nil$`, `Vector0$` and the specialized
+            // `Tuple2$mcII$sp` keep their whole binary name.
+            let simple = ["Set$", "Map$", "Range$", "NumericRange$"]
+                .iter()
+                .find_map(|outer| binary.strip_prefix(outer))
+                .unwrap_or(binary)
+                .to_string();
             (n, simple, false)
         }
         // A user `class`/`case class`/`object`. There are no packages here, so
@@ -6435,12 +6457,7 @@ fn obj_to_string(v: &Value) -> String {
         match h.get(id as usize) {
             Some(HeapVal::Record(o)) => {
                 if &*o.class == LOCALE_CLASS {
-                    let part = |i: usize| {
-                        o.fields
-                            .get(i)
-                            .map_or(String::new(), |(_, v)| v.as_str_cow().into_owned())
-                    };
-                    return locale_string(&(part(0), part(1), part(2)));
+                    return locale_of_fields(&o.fields).to_jstring();
                 }
                 if &*o.class == ENUM_CLASS {
                     if let Some((_, n)) = o.fields.iter().find(|(f, _)| &**f == "name") {
@@ -8063,7 +8080,9 @@ fn b_format(vm: &mut VM, argc: u8) -> Value {
     let spec = vm.pop().as_str_cow().into_owned();
     let v = vm.pop();
     match format_one(&spec, &v, bx, Some(vm)) {
-        Ok(s) => Value::str(s),
+        // The `f` interpolator is `String.format`, so the default locale's
+        // separators and digits apply.
+        Ok(s) => Value::str(localize_number(s, spec.chars().last().unwrap_or('s'))),
         Err(e) => fault(vm, e),
     }
 }
@@ -9832,6 +9851,15 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
                 _ => 0,
             },
         }));
+    }
+    // `Seq.range(a, b)` — see [`crate::parser::NUMERIC_RANGE`].
+    if name == crate::parser::NUMERIC_RANGE && args.is_empty() {
+        if matches!(seq_kind(recv), Some(SeqKind::Range { .. }))
+            && numeric_range_kind(recv).is_none()
+        {
+            mark_numeric_range(recv, NumRange::Int);
+        }
+        return Ok(recv.clone());
     }
     // An explicitly ordered `TreeSet`/`TreeMap` answers its range views and
     // neighbour searches on its tree, under its own ordering.
@@ -12646,6 +12674,11 @@ fn seq_method_inner(
 ///
 /// The integral accumulator wraps, for the reason given on [`seq_sum`].
 fn seq_product(items: &[Value]) -> Value {
+    // A `List[Char]` multiplies with `Numeric.CharIsIntegral.times`, wrapping
+    // to 16 bits.
+    if let Some(codes) = all_char_codes(items) {
+        return char_fold(false, codes.into_iter());
+    }
     if items.iter().any(|v| as_dec(v).is_some()) {
         if let Some(xs) = items.iter().map(dec_operand).collect::<Option<Vec<_>>>() {
             return make_dec(xs.iter().fold(BigDec::from_int(1), |acc, x| acc.mul(x)));
@@ -14065,6 +14098,10 @@ fn seq_slice_method(items: &[Value], name: &str, args: &[Value]) -> Option<Vec<V
 /// case; a `List[Int]` is narrowed to 32 bits by `member_width` on the compiler
 /// side, so both widths overflow where Scala does.
 fn seq_sum(items: &[Value]) -> Value {
+    // A `List[Char]` sums with `Numeric.CharIsIntegral.plus`, a `Char`.
+    if let Some(codes) = all_char_codes(items) {
+        return char_fold(true, codes.into_iter());
+    }
     // A `List[BigDecimal]` sums with `BigDecimal.+`.
     if items.iter().any(|v| as_dec(v).is_some()) {
         if let Some(xs) = items.iter().map(dec_operand).collect::<Option<Vec<_>>>() {
@@ -16296,8 +16333,9 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
             s.bytes().map(|b| Value::int(i64::from(b as i8))).collect(),
         )),
         ("nonEmpty", 0) => Ok(Value::bool(!s.is_empty())),
-        ("toUpperCase", 0) => Ok(Value::str(s.to_uppercase())),
-        ("toLowerCase", 0) => Ok(Value::str(s.to_lowercase())),
+        // `String.toUpperCase()` is `toUpperCase(Locale.getDefault())`.
+        ("toUpperCase", 0) => Ok(Value::str(locale_case(s, true, &default_locale()))),
+        ("toLowerCase", 0) => Ok(Value::str(locale_case(s, false, &default_locale()))),
         ("trim", 0) => Ok(Value::str(java_trim(s))),
         ("strip", 0) => Ok(Value::str(java_strip(s))),
         ("stripLeading", 0) => Ok(Value::str(
@@ -24332,10 +24370,14 @@ fn stream_known_size(src: &[Value], unbounded: bool, ops: &[StreamOp]) -> Option
     })
 }
 
-/// The element type of a `NumericRange` — a range of `Long`s or `BigInt`s,
-/// laid out as the `Range` of its values (see [`NUMERIC_RANGES`]).
+/// The element type of a `NumericRange` — a range of `Int`s, `Long`s or
+/// `BigInt`s, laid out as the `Range` of its values (see [`NUMERIC_RANGES`]).
+/// An `Int` one is what `Seq.range`/`IndexedSeq.range`/`Iterable.range`
+/// answer: `IterableFactory.range` is `from(NumericRange(start, end, step))`,
+/// and those factories' `from` hand an `IndexedSeq` back unchanged.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum NumRange {
+    Int,
     Long,
     BigInt,
 }
@@ -27008,60 +27050,60 @@ struct NumberSymbols {
     zero: char,
 }
 
-/// A `Locale` value. The language is lower-cased and the country upper-cased,
-/// as the constructor normalizes them.
-fn make_locale(language: &str, country: &str, variant: &str) -> Value {
+thread_local! {
+    /// The default locale `Locale.setDefault` installed; `None` is `en_US`,
+    /// the locale the reference runs under. It is what `String.format`, the
+    /// `f` interpolator and the argument-less `toUpperCase`/`toLowerCase`
+    /// localize by, and what the display names are rendered in.
+    static DEFAULT_LOCALE: RefCell<Option<crate::jlocale::JLocale>> = const { RefCell::new(None) };
+}
+
+/// `Locale.getDefault`.
+fn default_locale() -> crate::jlocale::JLocale {
+    DEFAULT_LOCALE
+        .with(|d| d.borrow().clone())
+        .unwrap_or_else(|| crate::jlocale::JLocale::of("en", "US", ""))
+}
+
+/// A `Locale` value: a record of its base subtags and its extensions' ID
+/// (see [`crate::jlocale::JLocale`]), equal by value as `Locale.equals` is.
+fn make_locale(loc: &crate::jlocale::JLocale) -> Value {
     heap_alloc(ScalaObj {
         class: Arc::from(LOCALE_CLASS),
         is_case: true,
         is_object: false,
         fields: vec![
-            (Arc::from("language"), Value::str(language.to_lowercase())),
-            (Arc::from("country"), Value::str(country.to_uppercase())),
-            (Arc::from("variant"), Value::str(variant.to_string())),
+            (Arc::from("language"), Value::str(loc.language.clone())),
+            (Arc::from("country"), Value::str(loc.region.clone())),
+            (Arc::from("variant"), Value::str(loc.variant.clone())),
+            (Arc::from("script"), Value::str(loc.script.clone())),
+            (Arc::from("extensions"), Value::str(loc.extension_id())),
         ],
     })
 }
 
-/// `(language, country, variant)` of a `Locale` value, `None` for anything else.
-fn as_locale(v: &Value) -> Option<(String, String, String)> {
+/// The locale a `Locale` record's fields describe.
+fn locale_of_fields(fields: &[(Arc<str>, Value)]) -> crate::jlocale::JLocale {
+    let f = |i: usize| {
+        fields
+            .get(i)
+            .map_or(String::new(), |(_, v)| v.as_str_cow().into_owned())
+    };
+    crate::jlocale::JLocale {
+        language: f(0),
+        region: f(1),
+        variant: f(2),
+        script: f(3),
+        extensions: crate::jlocale::parse_extension_id(&f(4)),
+    }
+}
+
+/// The locale a `Locale` value is, `None` for anything else.
+fn as_locale(v: &Value) -> Option<crate::jlocale::JLocale> {
     with_obj(v, |o| {
-        if &*o.class != LOCALE_CLASS {
-            return None;
-        }
-        let f = |i: usize| {
-            o.fields
-                .get(i)
-                .map_or(String::new(), |(_, v)| v.as_str_cow().into_owned())
-        };
-        Some((f(0), f(1), f(2)))
+        (&*o.class == LOCALE_CLASS).then(|| locale_of_fields(&o.fields))
     })
     .flatten()
-}
-
-/// `Locale.toString`: `language_COUNTRY_variant` with empty trailing parts left
-/// off (`en_US`, `de`, `_US`), the empty string for `ROOT`.
-fn locale_string((l, c, v): &(String, String, String)) -> String {
-    let mut s = l.clone();
-    if !c.is_empty() || !v.is_empty() {
-        s.push('_');
-        s.push_str(c);
-    }
-    if !v.is_empty() {
-        s.push('_');
-        s.push_str(v);
-    }
-    s
-}
-
-/// `Locale.toLanguageTag`: `language-COUNTRY`, `und` for an empty language.
-fn locale_tag((l, c, _): &(String, String, String)) -> String {
-    let lang = if l.is_empty() { "und" } else { l };
-    if c.is_empty() {
-        lang.to_string()
-    } else {
-        format!("{lang}-{c}")
-    }
 }
 
 /// The `Locale` constants (`Locale.US`, `Locale.GERMANY`, …).
@@ -27090,29 +27132,31 @@ fn locale_constant(name: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
-/// The static members of `java.util.Locale`: the constants, `getDefault`
-/// (`en_US`, the locale the reference runs under), `of`, `forLanguageTag`.
+/// The static members of `java.util.Locale`: the constants, `getDefault` /
+/// `setDefault`, `of`, `forLanguageTag`.
 fn locale_static(member: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    use crate::jlocale::JLocale;
     let s = |i: usize| args[i].as_str_cow().into_owned();
     Some(Ok(match (member, args.len()) {
         (c, 0) if locale_constant(c).is_some() => {
             let (l, c) = locale_constant(c).expect("checked");
-            make_locale(l, c, "")
+            make_locale(&JLocale::of(l, c, ""))
         }
-        ("getDefault", 0) => make_locale("en", "US", ""),
-        ("of", 1) => make_locale(&s(0), "", ""),
-        ("of", 2) => make_locale(&s(0), &s(1), ""),
-        ("of", 3) => make_locale(&s(0), &s(1), &s(2)),
-        ("forLanguageTag", 1) => {
-            let tag = s(0);
-            let mut parts = tag.split(['-', '_']);
-            let lang = parts.next().unwrap_or("");
-            let lang = if lang == "und" { "" } else { lang };
-            let country = parts
-                .find(|p| p.len() == 2 || (p.len() == 3 && p.bytes().all(|b| b.is_ascii_digit())))
-                .unwrap_or("");
-            make_locale(lang, country, "")
+        ("getDefault", 0) => make_locale(&default_locale()),
+        ("setDefault", 1) => {
+            let Some(loc) = as_locale(&args[0]) else {
+                return Some(Err(
+                    "scalars: java.lang.NullPointerException: Can't set default locale to NULL"
+                        .to_string(),
+                ));
+            };
+            DEFAULT_LOCALE.with(|d| *d.borrow_mut() = Some(loc));
+            unit_value()
         }
+        ("of", 1) => make_locale(&JLocale::of(&s(0), "", "")),
+        ("of", 2) => make_locale(&JLocale::of(&s(0), &s(1), "")),
+        ("of", 3) => make_locale(&JLocale::of(&s(0), &s(1), &s(2))),
+        ("forLanguageTag", 1) => make_locale(&JLocale::for_language_tag(&s(0))),
         _ => return None,
     }))
 }
@@ -27124,7 +27168,11 @@ fn locale_new(args: &[Value]) -> Result<Value, String> {
             .map_or(String::new(), |v| v.as_str_cow().into_owned())
     };
     match args.len() {
-        1..=3 => Ok(make_locale(&s(0), &s(1), &s(2))),
+        1..=3 => Ok(make_locale(&crate::jlocale::JLocale::of(
+            &s(0),
+            &s(1),
+            &s(2),
+        ))),
         n => Err(format!(
             "scalars: no java.util.Locale constructor takes {n} arguments"
         )),
@@ -27134,7 +27182,50 @@ fn locale_new(args: &[Value]) -> Result<Value, String> {
 /// The number symbols of a locale, from the CLDR data the JDK formats with.
 /// Countries whose symbols differ from their language's are listed first;
 /// a locale in neither table formats as the default (`en_US`) one does.
-fn locale_symbols((l, c, _): &(String, String, String)) -> NumberSymbols {
+fn locale_symbols(loc: &crate::jlocale::JLocale) -> NumberSymbols {
+    let (l, c) = (&loc.language, &loc.region);
+    let base = locale_base_symbols(l, c);
+    match loc.unicode_type("nu").as_deref() {
+        // The Arabic-Indic systems bring their own separators.
+        Some(nu @ ("arab" | "arabext")) => NumberSymbols {
+            decimal: '\u{66b}',
+            group: '\u{66c}',
+            zero: if nu == "arab" { '\u{660}' } else { '\u{6f0}' },
+        },
+        Some(nu) => match numbering_zero(nu) {
+            Some(zero) => NumberSymbols { zero, ..base },
+            None => base,
+        },
+        None => base,
+    }
+}
+
+/// The digit zero of a decimal numbering system a `nu` Unicode extension names
+/// (`th-TH-u-nu-thai` formats `42` as `๔๒`), measured against JDK 21; `None`
+/// for `latn` and for a system the JDK does not format with (`hanidec`).
+fn numbering_zero(nu: &str) -> Option<char> {
+    Some(match nu {
+        "beng" => '\u{9e6}',
+        "deva" => '\u{966}',
+        "gujr" => '\u{ae6}',
+        "guru" => '\u{a66}',
+        "knda" => '\u{ce6}',
+        "khmr" => '\u{17e0}',
+        "laoo" => '\u{ed0}',
+        "mlym" => '\u{d66}',
+        "mymr" => '\u{1040}',
+        "orya" => '\u{b66}',
+        "tamldec" => '\u{be6}',
+        "telu" => '\u{c66}',
+        "thai" => '\u{e50}',
+        "tibt" => '\u{f20}',
+        "fullwide" => '\u{ff10}',
+        _ => return None,
+    })
+}
+
+/// [`locale_symbols`] of a language and country, before a `nu` extension.
+fn locale_base_symbols(l: &str, c: &str) -> NumberSymbols {
     const NBSP: char = '\u{a0}';
     const NNBSP: char = '\u{202f}';
     const APOS: char = '\u{2019}';
@@ -27143,7 +27234,7 @@ fn locale_symbols((l, c, _): &(String, String, String)) -> NumberSymbols {
         group,
         zero: '0',
     };
-    let by_country = match (l.as_str(), c.as_str()) {
+    let by_country = match (l, c) {
         ("de" | "it" | "rm", "CH") | ("de", "LI") => Some(sym('.', APOS)),
         ("de", "AT") | ("fr", "CA") | ("en", "ZA") | ("pt", "PT") => Some(sym(',', NBSP)),
         ("fr", "CH") => Some(sym(',', NNBSP)),
@@ -27154,7 +27245,7 @@ fn locale_symbols((l, c, _): &(String, String, String)) -> NumberSymbols {
     if let Some(s) = by_country {
         return s;
     }
-    match l.as_str() {
+    match l {
         "de" | "it" | "es" | "tr" | "nl" | "da" | "el" | "ro" | "hr" | "is" | "vi" | "id"
         | "sl" | "sr" | "ca" | "eu" | "gl" | "fo" | "pt" => sym(',', '.'),
         "fr" => sym(',', NNBSP),
@@ -27190,7 +27281,7 @@ fn locale_symbols((l, c, _): &(String, String, String)) -> NumberSymbols {
 }
 
 /// Run `f` with the formatter localizing numbers to `locale`.
-fn with_format_locale<R>(locale: &(String, String, String), f: impl FnOnce() -> R) -> R {
+fn with_format_locale<R>(locale: &crate::jlocale::JLocale, f: impl FnOnce() -> R) -> R {
     let saved = FORMAT_SYMBOLS.with(|s| s.borrow_mut().replace(locale_symbols(locale)));
     let r = f();
     FORMAT_SYMBOLS.with(|s| *s.borrow_mut() = saved);
@@ -27201,7 +27292,8 @@ fn with_format_locale<R>(locale: &(String, String, String), f: impl FnOnce() -> 
 /// conversions (`d`, `f`, `e`, `g`) the separators and digits are the
 /// locale's; every other conversion, and the default locale, as written.
 fn localize_number(out: String, conv: char) -> String {
-    let Some(sym) = FORMAT_SYMBOLS.with(|s| *s.borrow()) else {
+    let default = || DEFAULT_LOCALE.with(|d| d.borrow().as_ref().map(locale_symbols));
+    let Some(sym) = FORMAT_SYMBOLS.with(|s| *s.borrow()).or_else(default) else {
         return out;
     };
     if !matches!(conv, 'd' | 'f' | 'e' | 'E' | 'g' | 'G') {
@@ -27220,8 +27312,8 @@ fn localize_number(out: String, conv: char) -> String {
 /// `String.toUpperCase(locale)` / `toLowerCase(locale)`: the root mapping,
 /// except that Turkish and Azerbaijani pair a dotted and a dotless `i`
 /// (`i` ⇄ `İ`, `ı` ⇄ `I`).
-fn locale_case(s: &str, upper: bool, (l, _, _): &(String, String, String)) -> String {
-    let turkic = matches!(l.as_str(), "tr" | "az");
+fn locale_case(s: &str, upper: bool, loc: &crate::jlocale::JLocale) -> String {
+    let turkic = matches!(loc.language.as_str(), "tr" | "az");
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match (turkic, upper, c) {
@@ -27262,11 +27354,54 @@ fn locale_member(
             let fmt = args[0].as_str_cow().into_owned();
             with_format_locale(&loc, || format_all(&fmt, &args[1..], Some(vm))).map(Value::str)
         }
-        ("getLanguage", 0) => Ok(Value::str(loc.0.clone())),
-        ("getCountry", 0) => Ok(Value::str(loc.1.clone())),
-        ("getVariant", 0) => Ok(Value::str(loc.2.clone())),
-        ("toLanguageTag", 0) => Ok(Value::str(locale_tag(&loc))),
-        ("toString", 0) => Ok(Value::str(locale_string(&loc))),
+        ("getLanguage", 0) => Ok(Value::str(loc.language.clone())),
+        ("getCountry", 0) => Ok(Value::str(loc.region.clone())),
+        ("getVariant", 0) => Ok(Value::str(loc.variant.clone())),
+        ("getScript", 0) => Ok(Value::str(loc.script.clone())),
+        ("toLanguageTag", 0) => Ok(Value::str(loc.to_language_tag())),
+        ("toString", 0) => Ok(Value::str(loc.to_jstring())),
+        ("hasExtensions", 0) => Ok(Value::bool(!loc.extensions.is_empty())),
+        ("getExtension", 1) => {
+            let key = as_char(&args[0]).unwrap_or('\0');
+            if !key.is_ascii_alphanumeric() {
+                return Some(Err(format!(
+                    "scalars: java.lang.IllegalArgumentException: Ill-formed extension key: {key}"
+                )));
+            }
+            Ok(match loc.extension(key) {
+                Some(v) => Value::str(v.to_string()),
+                None => Value::Undef,
+            })
+        }
+        ("getUnicodeLocaleType", 1) => {
+            let key = args[0].as_str_cow().into_owned();
+            Ok(loc.unicode_type(&key).map_or(Value::Undef, Value::str))
+        }
+        // The display names, in the default locale or the one given: the
+        // English ones only (see [`crate::locale_names`]).
+        (
+            "getDisplayName" | "getDisplayLanguage" | "getDisplayCountry" | "getDisplayScript"
+            | "getDisplayVariant",
+            0 | 1,
+        ) => {
+            let shown_in = match args.first() {
+                Some(a) => as_locale(a)?,
+                None => default_locale(),
+            };
+            if !shown_in.displays_in_english() {
+                return Some(Err(format!(
+                    "scalars: Locale display names in {} are not modelled",
+                    shown_in.to_jstring()
+                )));
+            }
+            Ok(Value::str(match name {
+                "getDisplayName" => loc.display_name(),
+                "getDisplayLanguage" => loc.display_language(),
+                "getDisplayCountry" => loc.display_country(),
+                "getDisplayScript" => loc.display_script(),
+                _ => loc.display_variant(),
+            }))
+        }
         _ => return None,
     })
 }
@@ -27302,6 +27437,9 @@ fn numeric_type(v: &Value) -> Option<String> {
 /// `n` as a value of the numeric type `ty`: an integral type wraps to its
 /// width, as the library's `IntIsIntegral.fromInt` / `plus` do.
 fn numeric_narrow(ty: &str, n: i64) -> Value {
+    if ty == "Char" {
+        return make_char(char_of_code(n));
+    }
     Value::int(match ty {
         "Int" => i64::from(n as i32),
         "Short" => i64::from(n as i16),
@@ -27329,11 +27467,13 @@ fn numeric_member(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Val
     let ty = numeric_type(recv)?;
     // A generic `A` argument arrives boxed; the instance answers at its own type.
     let args: Vec<Value> = args.iter().map(unboxed).collect();
-    let integral = matches!(ty.as_str(), "Int" | "Long" | "Short" | "Byte");
+    let integral = matches!(ty.as_str(), "Int" | "Long" | "Short" | "Byte" | "Char");
     let a = |i: usize| args.get(i).cloned().unwrap_or(Value::Undef);
-    let int_of = |v: &Value| match v {
-        Value::Int(n) => *n,
-        other => other.to_int(),
+    // A `Char` enters arithmetic as its code unit (`(x + y).toChar`).
+    let int_of = |v: &Value| match (v, as_char(v)) {
+        (Value::Int(n), _) => *n,
+        (_, Some(c)) => i64::from(u32::from(c)),
+        (other, None) => other.to_int(),
     };
     let from_i64 = |n: i64| -> Value {
         match ty.as_str() {
@@ -27436,11 +27576,35 @@ fn numeric_member(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Val
                 _ => int_of(&x),
             }))
         }
+        // `parseString` is `StringParsers`' exception-free parse for the
+        // primitives — the `toIntOption` family: no trimming for an integral
+        // type, `None` past its range — `Try(BigInt(s))`/`Try(BigDecimal(s))`
+        // for the big ones, and `Try(s.toInt.toChar)` for `Char`.
+        ("parseString", 1) => {
+            let s = a(0).as_str_cow().into_owned();
+            let parsed = match ty.as_str() {
+                "Int" => java_parse_int(&s, 10).ok().map(Value::int),
+                "Long" => java_parse_long(&s, 10).ok().map(Value::int),
+                "Short" => java_parse_narrow(&s, 10, i64::from(i16::MIN), i64::from(i16::MAX))
+                    .ok()
+                    .map(Value::int),
+                "Byte" => java_parse_narrow(&s, 10, i64::from(i8::MIN), i64::from(i8::MAX))
+                    .ok()
+                    .map(Value::int),
+                "Char" => java_parse_int(&s, 10).ok().map(from_i64),
+                "Double" | "Float" => java_parse_float(&s, ty == "Float").ok(),
+                "BigInt" => big_apply(&[Value::str(s)]).ok(),
+                _ => dec_apply(&[Value::str(s)]).ok(),
+            };
+            Ok(opt(parsed))
+        }
         ("toDouble", 1) => Ok(Value::float(match ty.as_str() {
+            "Char" => int_of(&a(0)) as f64,
             "BigInt" | "BigDecimal" => scala_str(&a(0)).parse().unwrap_or(f64::NAN),
             _ => num_f64(&a(0)),
         })),
         ("toFloat", 1) => Ok(make_f32(match ty.as_str() {
+            "Char" => int_of(&a(0)) as f32,
             "BigInt" | "BigDecimal" => scala_str(&a(0)).parse().unwrap_or(f32::NAN),
             _ => num_f64(&a(0)) as f32,
         })),

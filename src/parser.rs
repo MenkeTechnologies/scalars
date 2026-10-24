@@ -34,6 +34,10 @@ pub const USING_RELEASE: &str = "$using_release";
 /// The desugar target of `TreeSet(…)(using ord)`: the collection, then the
 /// ordering it is held under.
 pub const WITH_ORDERING: &str = "$with_ordering";
+/// The member that makes an `Int` range the `NumericRange[Int]` an
+/// `IterableFactory.range` builds (`Seq.range(1, 4)`); a `Long`, `BigInt` or
+/// `Char` range already is one.
+pub const NUMERIC_RANGE: &str = "$numeric_range";
 /// The `java.util` classes `new` builds as the JDK's own.
 pub const JAVA_UTIL_CLASSES: &[&str] = &[
     "Locale",
