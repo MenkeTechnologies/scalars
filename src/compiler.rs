@@ -1970,8 +1970,10 @@ impl Compiler {
                     0,
                 );
             }
-            Expr::Collection { ctor, elems } if ctor == REF_CAPTURE => self.ref_capture(elems)?,
-            Expr::Collection { ctor, elems } => self.collection(ctor, elems)?,
+            Expr::Collection { ctor, elems, .. } if ctor == REF_CAPTURE => {
+                self.ref_capture(elems)?
+            }
+            Expr::Collection { ctor, elems, .. } => self.collection(ctor, elems)?,
         }
         Ok(())
     }
@@ -4761,6 +4763,7 @@ impl Compiler {
             let packed = match spread_operand(rest) {
                 Some(e) => e,
                 None => Expr::Collection {
+                    targs: Vec::new(),
                     ctor: "ArraySeq".to_string(),
                     elems: rest.to_vec(),
                 },
@@ -5065,7 +5068,7 @@ impl Compiler {
     /// unresolved given, it failed on `value head is not a member of Null`,
     /// where the reference runs it.
     fn element_type_name(&self, e: &Expr) -> Option<String> {
-        let Expr::Collection { ctor, elems } = e else {
+        let Expr::Collection { ctor, elems, .. } = e else {
             return None;
         };
         if !SEQ_CTORS.contains(&ctor.as_str()) {
@@ -5115,7 +5118,15 @@ impl Compiler {
         }
         // A sequence literal of nameable elements: `List(1, 2)` is a `List[Int]`,
         // which is what lets a `using Show[A]` resolve at `p(List(1, 2))`.
-        if let Expr::Collection { ctor, elems } = e {
+        if let Expr::Collection { ctor, elems, targs } = e {
+            // Written type arguments ARE the type (`Array[AnyRef]("a")`).
+            if !targs.is_empty() {
+                return Some(format!(
+                    "{}[{}]",
+                    simple_type_name_of(ctor),
+                    targs.join(", ")
+                ));
+            }
             if SEQ_CTORS.contains(&ctor.as_str()) && !elems.is_empty() {
                 let first = self.static_type_name(&elems[0])?;
                 let same = elems[1..]
@@ -5154,6 +5165,35 @@ impl Compiler {
             }
             .to_string(),
         )
+    }
+
+    /// The error scalac reports for a `java.util.Arrays` member whose array
+    /// argument has no matching overload. The JDK declares each over the
+    /// primitive arrays and `Object[]`; a Scala `Array[String]` (or of any
+    /// reference type but `AnyRef`/`Any`) is invariant and matches none of them,
+    /// and `sort`/`binarySearch` have no `boolean[]` form. `None` when the
+    /// call is fine — or when the element type cannot be named, which is left
+    /// to run rather than guessed.
+    fn arrays_overload_error(&self, name: &str, args: &[Expr], line: u32) -> Option<String> {
+        if !matches!(
+            name,
+            "sort" | "toString" | "binarySearch" | "fill" | "equals"
+        ) {
+            return None;
+        }
+        let ty = normalize_type(&self.static_type_name(args.first()?)?);
+        let elem = ty.strip_prefix("Array[")?.strip_suffix(']')?;
+        let fine = match elem {
+            "Int" | "Long" | "Double" | "Float" | "Char" | "Short" | "Byte" | "AnyRef" | "Any"
+            | "Object" | "java.lang.Object" => true,
+            "Boolean" => !matches!(name, "sort" | "binarySearch"),
+            _ => false,
+        };
+        (!fine).then(|| {
+            format!(
+                "scalars: None of the overloaded alternatives of method {name} in object Arrays match arguments ({ty}) (line {line})"
+            )
+        })
     }
 
     /// The static type of a member of a value type (`String`, the numeric
@@ -5416,6 +5456,7 @@ impl Compiler {
                 match spread_operand(&rest) {
                     Some(e) => e,
                     None => Expr::Collection {
+                        targs: Vec::new(),
                         ctor: "ArraySeq".to_string(),
                         elems: rest,
                     },
@@ -5872,6 +5913,11 @@ impl Compiler {
             _ => false,
         });
         if let Some(class) = java_util_class {
+            if class == "Arrays" {
+                if let Some(e) = self.arrays_overload_error(name, args, line) {
+                    return Err(e);
+                }
+            }
             for a in args {
                 self.expr(a)?;
             }
@@ -6489,6 +6535,7 @@ impl Compiler {
                 ("empty", []) => return self.collection(ctor, &[]),
                 ("from", [xs]) => {
                     let spread = Expr::Collection {
+                        targs: Vec::new(),
                         ctor: crate::parser::SPREAD.to_string(),
                         elems: vec![xs.clone()],
                     };
@@ -6512,6 +6559,7 @@ impl Compiler {
                 {
                     if let Some(list) = companion_factory("List", name, args, line) {
                         let spread = Expr::Collection {
+                            targs: Vec::new(),
                             ctor: crate::parser::SPREAD.to_string(),
                             elems: vec![list],
                         };
@@ -7626,6 +7674,15 @@ impl Compiler {
                 .emit(Op::CallBuiltin(crate::host::MAKE_OPTION, 1), line);
             return Ok(());
         }
+        // `TreeSet(…)(using ord)` — the collection rebuilt under `ord`.
+        if name == crate::parser::WITH_ORDERING {
+            for a in args {
+                self.expr(a)?;
+            }
+            self.b
+                .emit(Op::CallBuiltin(crate::host::WITH_ORDERING, 2), line);
+            return Ok(());
+        }
         // `new java.util.ArrayList[T](…)` — the class name, then the arguments.
         if name == crate::parser::JAVA_NEW {
             for a in args {
@@ -8310,7 +8367,7 @@ impl Compiler {
             // non-integer one answers `Unknown` through `combine`. An EMPTY
             // literal has no element type here (`Nil`, `List()`), which is the
             // conservative answer.
-            Expr::Collection { ctor, elems } if SEQ_CTORS.contains(&ctor.as_str()) => {
+            Expr::Collection { ctor, elems, .. } if SEQ_CTORS.contains(&ctor.as_str()) => {
                 combine_all(elems.iter().map(|x| self.num_ty(x)))
             }
             Expr::Method {
@@ -8621,7 +8678,7 @@ impl Compiler {
                 }
             }
         }
-        let Expr::Collection { ctor, elems } = e else {
+        let Expr::Collection { ctor, elems, .. } = e else {
             // A sequence that is not a literal, reaching `C[Any]`: its elements
             // are boxed at run time when their static width is PROVEN (`val ys:
             // List[Long] = …; val xs: List[Any] = ys`). An unproven element type —
@@ -8698,6 +8755,7 @@ impl Compiler {
             _ => return None,
         };
         Some(Expr::Collection {
+            targs: Vec::new(),
             ctor: ctor.clone(),
             elems,
         })
@@ -9332,7 +9390,7 @@ fn library_by_name_arg(name: &str, argc: usize) -> Option<usize> {
 fn ref_captures_in(e: &Expr) -> Vec<String> {
     let found = std::cell::RefCell::new(Vec::new());
     expr_any(e, &|x| {
-        if let Expr::Collection { ctor, elems } = x {
+        if let Expr::Collection { ctor, elems, .. } = x {
             if let (true, [Expr::Var(n)]) = (ctor == REF_CAPTURE, elems.as_slice()) {
                 found.borrow_mut().push(n.clone());
             }
@@ -9550,7 +9608,7 @@ fn program_any(
 /// The operand of a lone `xs: _*` spread argument, if that is what `args` is.
 fn spread_operand(args: &[Expr]) -> Option<Expr> {
     match args {
-        [Expr::Collection { ctor, elems }] if ctor == crate::parser::SPREAD => {
+        [Expr::Collection { ctor, elems, .. }] if ctor == crate::parser::SPREAD => {
             elems.first().cloned()
         }
         _ => None,
@@ -9715,6 +9773,7 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
     if owner == "Iterator" && name == "single" && args.len() == 1 {
         return Some(m(
             Expr::Collection {
+                targs: Vec::new(),
                 ctor: "List".to_string(),
                 elems: args.to_vec(),
             },
@@ -9742,6 +9801,7 @@ fn companion_factory(owner: &str, name: &str, args: &[Expr], line: u32) -> Optio
             || crate::parser::sorted_ctor(owner).is_some())
     {
         let empty = Expr::Collection {
+            targs: Vec::new(),
             ctor: crate::parser::sorted_ctor(owner)
                 .unwrap_or(owner)
                 .to_string(),
@@ -11490,7 +11550,7 @@ impl<'a> BoxScan<'a> {
             }
             // A by-reference capture: the lifted `def` it is passed to writes the
             // binding, exactly as a closure assigning it would.
-            Expr::Collection { ctor, elems } if ctor == REF_CAPTURE => {
+            Expr::Collection { ctor, elems, .. } if ctor == REF_CAPTURE => {
                 if let [Expr::Var(name)] = elems.as_slice() {
                     self.assigned.insert(name.clone());
                     self.assigned_in_lambda.insert(name.clone());

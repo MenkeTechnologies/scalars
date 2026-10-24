@@ -213,6 +213,7 @@ impl Sig {
         let var = Expr::Var(c.to_string());
         if self.refs.contains(c) {
             Expr::Collection {
+                targs: Vec::new(),
                 ctor: REF_CAPTURE.to_string(),
                 elems: vec![var],
             }

@@ -629,6 +629,11 @@ pub enum Expr {
     Collection {
         ctor: String,
         elems: Vec<Expr>,
+        /// The explicit type arguments written on the literal (`Array[AnyRef](…)`
+        /// is `["AnyRef"]`), empty when there are none. They change nothing at
+        /// run time except where Scala's typing does (a declared element type);
+        /// the compiler's static typing reads them.
+        targs: Vec<String>,
     },
 }
 

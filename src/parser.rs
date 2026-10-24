@@ -20,6 +20,9 @@ pub const NEW_ARRAY: &str = "$new_array";
 /// The desugar target of `new java.util.ArrayList[T](…)` and the other
 /// [`JAVA_UTIL_CLASSES`]: the class's simple name, then the arguments.
 pub const JAVA_NEW: &str = "$java_new";
+/// The desugar target of `TreeSet(…)(using ord)`: the collection, then the
+/// ordering it is held under.
+pub const WITH_ORDERING: &str = "$with_ordering";
 /// The `java.util` collection classes `new` builds as the JDK's own.
 pub const JAVA_UTIL_CLASSES: &[&str] = &[
     "ArrayList",
@@ -1460,6 +1463,18 @@ impl Parser {
     }
 
     /// Consume a `[ … ]` group, balancing nested brackets. The cursor is on `[`.
+    /// A `[T, U]` type-argument list (cursor on `[`), as the types written.
+    fn type_args(&mut self) -> Result<Vec<String>, String> {
+        self.eat(&Tok::LBracket)?;
+        let mut targs = vec![self.type_ref()?];
+        while self.is(&Tok::Comma) {
+            self.advance();
+            targs.push(self.type_ref()?);
+        }
+        self.eat(&Tok::RBracket)?;
+        Ok(targs)
+    }
+
     fn skip_bracket_group(&mut self) {
         let mut depth = 0;
         loop {
@@ -3862,15 +3877,23 @@ impl Parser {
                 if self.is(&Tok::LParen) {
                     let line = self.line();
                     // `TreeSet(3, 1)(using Ordering[Int].reverse)` supplies the
-                    // collection's ORDERING, which the sorted collections here
-                    // do not carry; read as `apply` it would answer
-                    // `contains`, so it is refused instead.
+                    // collection's ORDERING (its factory's `using` clause), not
+                    // an `apply` argument.
                     if matches!(self.peek_at(1), Tok::Ident(w) if w == "using")
                         && ordered_literal(&e)
                     {
-                        return Err(format!(
-                            "scalars: an explicit Ordering for a sorted collection or PriorityQueue is not modelled (line {line})"
-                        ));
+                        let mut args = self.arg_list()?;
+                        if args.len() != 1 {
+                            return Err(format!(
+                                "scalars: an ordering clause takes one Ordering (line {line})"
+                            ));
+                        }
+                        e = Expr::Call {
+                            name: WITH_ORDERING.to_string(),
+                            args: vec![e, args.remove(0)],
+                            line,
+                        };
+                        continue;
                     }
                     let args = self.arg_list()?;
                     e = eta_bare_args(Expr::Method {
@@ -4089,8 +4112,20 @@ impl Parser {
                 continue;
             }
             let factory = is_mutable_pkg(&e) && mutable_factory_name(&name);
+            // `TreeSet.empty[Int](using ord)` / `mutable.PriorityQueue(1, 2)(using
+            // ord)`: the `using` clause is the ordering, taken by the
+            // application loop below rather than flattened into the arguments.
+            let ordered = ordered_literal(&Expr::Method {
+                recv: Box::new(e.clone()),
+                name: name.clone(),
+                args: Vec::new(),
+                line,
+            });
             let mut args = Vec::new();
             while self.is(&Tok::LParen) {
+                if ordered && matches!(self.peek_at(1), Tok::Ident(w) if w == "using") {
+                    break;
+                }
                 args.extend(self.arg_list()?);
                 if factory {
                     break;
@@ -4130,11 +4165,19 @@ impl Parser {
         // two disagree about a name.
         if let Some(ctor) = self.imported_mutable_ctor(&name) {
             let elems = self.arg_list()?;
-            return Ok(eta_bare_args(Expr::Collection { ctor, elems }));
+            return Ok(eta_bare_args(Expr::Collection {
+                ctor,
+                elems,
+                targs: Vec::new(),
+            }));
         }
         if name == IMMUTABLE_QUEUE {
             let elems = self.arg_list()?;
-            return Ok(eta_bare_args(Expr::Collection { ctor: name, elems }));
+            return Ok(eta_bare_args(Expr::Collection {
+                ctor: name,
+                elems,
+                targs: Vec::new(),
+            }));
         }
         // `ListBuffer`/`ArrayBuffer`/`Buffer` are the mutable names
         // that can only mean the mutable collection, so they work
@@ -4153,7 +4196,11 @@ impl Parser {
                 | "Iterator"
         ) {
             let elems = self.arg_list()?;
-            return Ok(eta_bare_args(Expr::Collection { ctor: name, elems }));
+            return Ok(eta_bare_args(Expr::Collection {
+                ctor: name,
+                elems,
+                targs: Vec::new(),
+            }));
         }
         // `Try(e)` — `scala.util.Try`'s factory. Desugared HERE,
         // not in the compiler, because the expansion introduces a
@@ -4171,6 +4218,7 @@ impl Parser {
         if let Some(ctor) = mutable_buffer_ctor(&name) {
             let elems = self.arg_list()?;
             return Ok(eta_bare_args(Expr::Collection {
+                targs: Vec::new(),
                 ctor: ctor.to_string(),
                 elems,
             }));
@@ -4180,6 +4228,7 @@ impl Parser {
         if let Some(ctor) = sorted_ctor(&name) {
             let elems = self.arg_list()?;
             return Ok(eta_bare_args(Expr::Collection {
+                targs: Vec::new(),
                 ctor: ctor.to_string(),
                 elems,
             }));
@@ -4644,34 +4693,30 @@ impl Parser {
                     self.eat(&Tok::RBracket)?;
                     return self.postfix_from(Expr::Var(format!("super[{ty}]")));
                 }
-                // `List[Int]()` — an EMPTY literal, typed only by its type
-                // argument, which is kept (see [`TYPED`]).
-                if TYPED_EMPTY_OWNERS.contains(&name.as_str()) && self.is(&Tok::LBracket) {
-                    let save = self.pos;
-                    self.advance();
-                    let mut targs = vec![self.type_ref()?];
-                    while self.is(&Tok::Comma) {
-                        self.advance();
-                        targs.push(self.type_ref()?);
-                    }
-                    self.eat(&Tok::RBracket)?;
-                    if self.is(&Tok::LParen) && matches!(self.peek_at(1), Tok::RParen) {
-                        let ty = format!("{name}[{}]", targs.join(", "));
-                        let e = self.bare_application(name, line)?;
-                        return self.postfix_from(Expr::Call {
-                            name: TYPED.to_string(),
-                            args: vec![e, Expr::Str(ty)],
-                            line,
-                        });
-                    }
-                    self.pos = save;
-                }
-                // Optional generic type arguments (`List[Int](…)`, `foo[T](…)`).
-                if self.is(&Tok::LBracket) {
-                    self.skip_bracket_group();
-                }
+                // Explicit type arguments on a bare name — `List[Int](…)`,
+                // `Array[AnyRef](…)`, `Ordering[Int]`, `foo[T](…)`. A collection
+                // literal keeps them (`Expr::Collection::targs`), and so does
+                // `Ordering[T]` (a [`TYPED`] instance, which tells it from the
+                // companion); anywhere else they are a typing concern only.
+                let targs = if self.is(&Tok::LBracket) {
+                    self.type_args()?
+                } else {
+                    Vec::new()
+                };
                 if self.is(&Tok::LParen) {
-                    return self.bare_application(name, line);
+                    let mut e = self.bare_application(name, line)?;
+                    if let Expr::Collection { targs: t, .. } = &mut e {
+                        *t = targs;
+                    }
+                    return Ok(e);
+                }
+                if name == "Ordering" && !targs.is_empty() {
+                    let ty = format!("Ordering[{}]", targs.join(", "));
+                    return self.postfix_from(Expr::Call {
+                        name: TYPED.to_string(),
+                        args: vec![Expr::Var(name), Expr::Str(ty)],
+                        line,
+                    });
                 }
                 // `once { … }` — a brace group standing in for a plain call's
                 // single parenthesized argument, the same substitution
@@ -4868,6 +4913,7 @@ impl Parser {
         };
         if let Some(ctor) = ctor {
             return Ok(Expr::Collection {
+                targs: Vec::new(),
                 ctor: ctor.to_string(),
                 elems: args,
             });
@@ -4954,6 +5000,7 @@ impl Parser {
         }
         self.advance(); // `*`
         Ok(Expr::Collection {
+            targs: Vec::new(),
             ctor: SPREAD.to_string(),
             elems: vec![e],
         })

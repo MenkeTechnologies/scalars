@@ -312,7 +312,10 @@ Implemented and checked against the reference `scala`:
 - **Ranges of every element type** — `Int` ranges, `Long`/`BigInt`/
   `BigDecimal` `NumericRange`s (`Range.Long(…)` included) and `Char` ranges,
   each printing as Scala does; a range too long to hold is answered from its
-  bounds (`(0 until Int.MaxValue by 2).length`).
+  bounds (`(0 until Int.MaxValue by 2).length`) and traversed by streaming.
+- **Explicit orderings** — `TreeSet(…)(using ord)`, `TreeMap`, `SortedSet`,
+  `SortedMap` and `mutable.PriorityQueue` literals held under the ordering
+  given, `Ordering.Tuple2(o1, o2)` … `Tuple5`, `orElse`/`orElseBy`, `on`.
 - **Bindings** — `val` / `var` with optional type ascription
   (`val x: Int = …`, `var s = …`), type inferred as storage; plain and compound
   assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`). Reassigning a `val`

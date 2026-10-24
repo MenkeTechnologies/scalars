@@ -558,6 +558,10 @@ pub const JAVA_NEW: u16 = 830;
 /// Builtin id for a `java.util.Arrays`/`java.util.Collections` static member:
 /// pops `"Class.member"` and the arguments.
 pub const JAVA_STATIC: u16 = 831;
+/// Builtin id for a sorted collection or `PriorityQueue` literal given an
+/// explicit `Ordering` (`TreeSet(3, 1)(using ord)`): pops the ordering and the
+/// collection.
+pub const WITH_ORDERING: u16 = 832;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -830,6 +834,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(OBJ_NCDFE, b_obj_ncdfe);
     vm.register_builtin(JAVA_NEW, b_java_new);
     vm.register_builtin(JAVA_STATIC, b_java_static);
+    vm.register_builtin(WITH_ORDERING, b_with_ordering);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -1582,6 +1587,9 @@ enum HeapVal {
         /// `first.orElse(second)`: the second breaks the first's ties. A
         /// chained ordering has no `key`/`lt` of its own.
         chain: Option<(Value, Value)>,
+        /// `Ordering.Tuple2(o1, o2)` …: tuples compared component by component,
+        /// component `i` under ordering `i`.
+        tuple: Option<Vec<Value>>,
     },
     /// A `scala.util.matching.Regex` (`"…".r`). The *source* pattern is stored,
     /// which is what `toString`/`regex` answer; the compiled automaton lives in
@@ -2564,6 +2572,8 @@ pub fn reset_heap() {
     DEC_RANGES.with(|t| t.borrow_mut().clear());
     JAVA_CMP.with(|t| t.borrow_mut().clear());
     JAVA_VIEWS.with(|t| t.borrow_mut().clear());
+    CUSTOM_ORD.with(|t| t.borrow_mut().clear());
+    OVERRIDE_ORD.with(|o| *o.borrow_mut() = None);
     reset_regex_cache();
 }
 
@@ -2981,6 +2991,7 @@ fn make_ordering(key: Value, lt: Value, reversed: bool) -> Value {
         lt,
         reversed,
         chain: None,
+        tuple: None,
     })
 }
 
@@ -3001,9 +3012,14 @@ fn b_make_ordering(vm: &mut VM, argc: u8) -> Value {
     args.reverse();
     match (name.as_str(), args.len()) {
         ("by", 1) => make_ordering(args[0].clone(), Value::Undef, false),
-        // `Ordering[T].on(f)` — the natural ordering keyed by `f`. (`Ordering[T]`
-        // reaches here as the companion, its type argument erased.)
-        ("on", 1) => make_ordering(args[0].clone(), Value::Undef, false),
+        // `Ordering.Tuple2(o1, o2)` … — each component under its own ordering.
+        ("Tuple2" | "Tuple3" | "Tuple4" | "Tuple5", n)
+            if n >= 2
+                && n == name[5..].parse::<usize>().unwrap_or(0)
+                && args.iter().all(|a| as_ordering(a).is_some()) =>
+        {
+            tuple_ordering(args)
+        }
         ("fromLessThan", 1) => make_ordering(Value::Undef, args[0].clone(), false),
         // Every other companion member names the natural ordering, for the
         // reason `MAKE_ORDERING` gives: the member picks the element TYPE, which
@@ -3032,9 +3048,16 @@ fn ordering_method(
     let (key, lt, reversed) = as_ordering(recv)?;
     let cmp = |vm: &mut VM| ordering_cmp(vm, recv, &args[0], &args[1]);
     Some(match (name, args.len()) {
-        ("reverse", 0) => Ok(match ordering_chain(recv) {
-            Some((first, second)) => chained_ordering(first, second, !reversed),
-            None => make_ordering(key, lt, !reversed),
+        ("reverse", 0) => Ok(match (ordering_chain(recv), ordering_tuple_parts(recv)) {
+            (Some((first, second)), _) => chained_ordering(first, second, !reversed),
+            (None, Some(parts)) => heap_push(HeapVal::Ordering {
+                key: Value::Undef,
+                lt: Value::Undef,
+                reversed: !reversed,
+                chain: None,
+                tuple: Some(parts),
+            }),
+            (None, None) => make_ordering(key, lt, !reversed),
         }),
         // `orElse(other)` breaks ties with `other`; `orElseBy(f)` with the
         // natural ordering of `f`'s result.
@@ -3113,6 +3136,23 @@ fn ordering_cmp(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Orderi
     let Some((key, lt, reversed)) = as_ordering(ord) else {
         return Err("scalars: expected an Ordering".into());
     };
+    if let Some(parts) = ordering_tuple_parts(ord) {
+        let (xs, ys) = (
+            as_tuple_items(a).unwrap_or_default(),
+            as_tuple_items(b).unwrap_or_default(),
+        );
+        let mut o = Ordering::Equal;
+        for (i, p) in parts.iter().enumerate() {
+            let (Some(x), Some(y)) = (xs.get(i), ys.get(i)) else {
+                break;
+            };
+            o = ordering_cmp(vm, p, x, y)?;
+            if o != Ordering::Equal {
+                break;
+            }
+        }
+        return Ok(if reversed { o.reverse() } else { o });
+    }
     if let Some((first, second)) = ordering_chain(ord) {
         let mut o = ordering_cmp(vm, &first, a, b)?;
         if o == Ordering::Equal {
@@ -10466,6 +10506,9 @@ fn multiset_filter(
 /// answered as the `Range` it is laid out as, and a `Range` it derives —
 /// `reverse`, `take`, `by` — is a `NumericRange` of the same element type.
 fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some(ord) = custom_ordering(recv) {
+        return custom_ordered_method(vm, recv, &ord, name, args, seq_method_inner);
+    }
     if name == "reverse" && args.is_empty() && java_flavor(recv) == Some(JFlavor::JavaStringBuilder)
     {
         if let Some((k, mut items)) = seq_kind_items(recv) {
@@ -10485,9 +10528,12 @@ fn seq_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<V
                 "scalars: value {name} is not a member of scala.collection.immutable.Range.Partial"
             ));
         }
+        if let Some(r) = dec_range_slice(recv, name, args) {
+            return r;
+        }
     }
     if is_big_range(recv) {
-        let out = big_range_method(recv, name, args)?;
+        let out = big_range_method(vm, recv, name, args)?;
         if let (Some(kind), Some(SeqKind::Range { .. })) =
             (numeric_range_kind(recv), seq_kind(&out))
         {
@@ -11953,7 +11999,21 @@ fn seq_product(items: &[Value]) -> Value {
 /// the receiver's representation (a `HashMap` stays hashed however few entries
 /// survive); one that answers a bare sequence answers a `List`, as Scala's
 /// `Map.to*` do.
+/// A `Map` member; a `TreeMap` built with an explicit ordering goes through
+/// [`custom_ordered_method`].
 fn map_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some(ord) = custom_ordering(recv) {
+        return custom_ordered_method(vm, recv, &ord, name, args, map_method_inner);
+    }
+    map_method_inner(vm, recv, name, args)
+}
+
+fn map_method_inner(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     // Asked BEFORE the entries are copied: the in-place reads and writes need
     // neither a copy nor a rebuild, and paying for one on every `m(k) = v` is
     // what made filling a map quadratic.
@@ -12985,6 +13045,9 @@ fn declared_ordering_cmp(vm: &mut VM, a: &Value, b: &Value) -> Option<Result<Ord
 /// consulting the user's `compare` all the way down: `List((1, V(2)))` sorts by
 /// `V`'s order in its second position.
 fn cmp_vm(vm: &mut VM, a: &Value, b: &Value) -> Result<Ordering, String> {
+    if let Some(r) = override_cmp(vm, a, b) {
+        return r;
+    }
     if let Some(r) = declared_ordering_cmp(vm, a, b) {
         return r;
     }
@@ -19740,6 +19803,9 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         // non-String) has no `+` method and is a compile error in Scala 3; reject
         // it rather than silently concatenating. (The hook only fires when an
         // operand is non-numeric, so a numeric `a` here implies a non-numeric `b`.)
+        NumOp::Add | NumOp::Sub if custom_ordering(a).is_some() => {
+            custom_ordered_op(op == NumOp::Add, a, b)
+        }
         NumOp::Add => match a {
             Value::Str(_) => Ok(Value::str(format!("{}{}", scala_str(a), scala_str(b)))),
             // A `null` LEFT operand at run time is a `String`-typed value that
@@ -21089,6 +21155,11 @@ fn java_list_method(
         }
     }
     if let (Some(JFlavor::TreeSet), Some(c)) = (flavor, &cmp) {
+        if let Some(r) = java_cmp_set_nav(vm, items, c, name, args) {
+            let (out, answer) = r?;
+            set_seq_items(recv, SeqKind::JavaList, out);
+            return Ok(answer);
+        }
         if let Some(r) = java_cmp_tree_set(vm, items, c, name, args) {
             let (out, answer) = r?;
             set_seq_items(recv, SeqKind::JavaList, out);
@@ -22216,6 +22287,12 @@ fn java_map_method(
     }
     let tree = java_flavor(recv) == Some(JFlavor::TreeMap);
     if let (true, Some(c)) = (tree, java_comparator(recv)) {
+        if let Some(r) = java_cmp_map_nav(vm, &pairs, &c, name, args) {
+            let (out, answer) = r?;
+            let items = out.into_iter().map(new_pair_of).collect();
+            set_seq_items(recv, SeqKind::JavaMap, items);
+            return Ok(answer);
+        }
         if let Some(r) = java_cmp_tree_map(vm, &pairs, &c, name, args) {
             let (out, answer) = r?;
             let items = out.into_iter().map(new_pair_of).collect();
@@ -23638,7 +23715,12 @@ fn is_big_range(v: &Value) -> bool {
 /// `length`, `apply`, `contains`, `head`/`last`, `min`/`max`, the closed-form
 /// `sum`, and the slices and `reverse`/`by`, which are ranges again. Anything
 /// that has to visit every element is refused as the out-of-memory it would be.
-fn big_range_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+fn big_range_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
     let Some(
         kind @ SeqKind::Range {
             start,
@@ -23740,6 +23822,36 @@ fn big_range_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             } else {
                 i64::from(total as i32)
             }))
+        }
+        // `Range.takeWhile` is the `take` of the run that passes.
+        ("takeWhile", 1) => {
+            let mut k = 0u64;
+            while k < n
+                && truthy(&invoke_closure(
+                    vm,
+                    &args[0],
+                    &[elem(start + step * k as i64)],
+                )?)
+            {
+                k += 1;
+            }
+            match range_slice_method(kind, "take", &[Value::int(k as i64)]) {
+                Some(out) => out,
+                None => Err(no_such_method(recv, name)),
+            }
+        }
+        // The traversals STREAM the range: each element is computed, handed
+        // to the function, and dropped; only a result collection is held, and
+        // one past the materialization cap is the out-of-memory it would be.
+        (
+            "foreach" | "filter" | "withFilter" | "filterNot" | "map" | "count" | "exists"
+            | "forall" | "find" | "foldLeft" | "indexWhere" | "toList" | "toVector" | "iterator",
+            _,
+        ) => {
+            if name == "iterator" && numeric == Some(NumRange::BigInt) {
+                return Err("scalars: java.lang.OutOfMemoryError: Range too large".to_string());
+            }
+            big_range_traverse(vm, start, step, n, &elem, name, args)
         }
         _ => match range_slice_method(kind, name, args) {
             Some(out) => out,
@@ -24214,5 +24326,750 @@ fn chained_ordering(first: Value, second: Value, reversed: bool) -> Value {
         lt: Value::Undef,
         reversed,
         chain: Some((first, second)),
+        tuple: None,
     })
+}
+
+thread_local! {
+    /// The explicit `Ordering` an immutable `TreeSet`/`TreeMap` or a
+    /// `mutable.PriorityQueue` was built with (`TreeSet(3, 1)(using ord)`), by
+    /// heap id. Its elements are held in THAT order; absent is the natural one.
+    static CUSTOM_ORD: RefCell<HashMap<usize, Value>> = RefCell::new(HashMap::new());
+    /// An ordering every [`cmp_vm`] comparison answers by while a
+    /// custom-ordered collection's member runs — how a `PriorityQueue`'s heap
+    /// sifts by it.
+    static OVERRIDE_ORD: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+fn custom_ordering(v: &Value) -> Option<Value> {
+    as_obj_id(v).and_then(|id| CUSTOM_ORD.with(|t| t.borrow().get(&id).cloned()))
+}
+
+fn mark_custom_ordering(v: &Value, ord: &Value) {
+    if let Some(id) = as_obj_id(v) {
+        CUSTOM_ORD.with(|t| t.borrow_mut().insert(id, ord.clone()));
+    }
+}
+
+/// [`cmp_vm`]'s answer under the [`OVERRIDE_ORD`] in force, if one is.
+fn override_cmp(vm: &mut VM, a: &Value, b: &Value) -> Option<Result<Ordering, String>> {
+    let ord = OVERRIDE_ORD.with(|o| o.borrow_mut().take())?;
+    let r = ordering_cmp(vm, &ord, a, b);
+    OVERRIDE_ORD.with(|o| *o.borrow_mut() = Some(ord));
+    Some(r)
+}
+
+/// Run `f` with `ord` as the [`OVERRIDE_ORD`].
+fn with_override<R>(ord: &Value, f: impl FnOnce() -> R) -> R {
+    let saved = OVERRIDE_ORD.with(|o| o.borrow_mut().replace(ord.clone()));
+    let r = f();
+    OVERRIDE_ORD.with(|o| *o.borrow_mut() = saved);
+    r
+}
+
+/// `items` in `ord`'s order, stable, keeping the FIRST of any run `ord` calls
+/// equal — a sorted set's membership is its ordering's, not `equals`.
+fn sort_distinct_by(
+    vm: &mut VM,
+    ord: &Value,
+    items: Vec<Value>,
+    keep_last: bool,
+    key: &dyn Fn(&Value) -> Value,
+) -> Result<Vec<Value>, String> {
+    let idx = merge_sort_idx(vm, items.len(), &mut |vm, i, j| {
+        ordering_cmp(vm, ord, &key(&items[i]), &key(&items[j]))
+    })?;
+    let mut out: Vec<Value> = Vec::with_capacity(items.len());
+    for i in idx {
+        if let Some(last) = out.last() {
+            if ordering_cmp(vm, ord, &key(last), &key(&items[i]))? == Ordering::Equal {
+                if keep_last {
+                    *out.last_mut().expect("non-empty") = items[i].clone();
+                }
+                continue;
+            }
+        }
+        out.push(items[i].clone());
+    }
+    Ok(out)
+}
+
+/// The key of a map entry held as a pair.
+fn pair_key(p: &Value) -> Value {
+    as_seq_or_tuple(p)
+        .and_then(|kv| kv.first().cloned())
+        .unwrap_or(Value::Undef)
+}
+
+/// `coll` rebuilt under the explicit ordering `ord`: a sorted set's elements
+/// or a sorted map's entries (the LAST value for a key) in `ord`'s order, or a
+/// `PriorityQueue`'s heap sifted by it.
+fn with_ordering(vm: &mut VM, coll: &Value, ord: &Value) -> Result<Value, String> {
+    if as_ordering(ord).is_none() {
+        return Err("scalars: an explicit ordering must be an Ordering".to_string());
+    }
+    if let Some((rep, entries)) = map_rep_entries(coll) {
+        if rep != HashRep::Sorted {
+            return Err("scalars: an explicit Ordering for this map is not modelled".to_string());
+        }
+        let pairs: Vec<Value> = entries.into_iter().map(new_pair_of).collect();
+        let sorted = sort_distinct_by(vm, ord, pairs, true, &pair_key)?;
+        let entries = sorted
+            .iter()
+            .filter_map(|p| {
+                let kv = as_seq_or_tuple(p)?;
+                Some((kv.first()?.clone(), kv.get(1)?.clone()))
+            })
+            .collect();
+        let out = heap_push(HeapVal::Map(HashRep::Sorted, entries));
+        mark_custom_ordering(&out, ord);
+        return Ok(out);
+    }
+    match seq_kind_items(coll) {
+        Some((SeqKind::Set(HashRep::Sorted), items)) => {
+            let sorted = sort_distinct_by(vm, ord, items, false, &Clone::clone)?;
+            let out = heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), sorted));
+            mark_custom_ordering(&out, ord);
+            Ok(out)
+        }
+        Some((SeqKind::PriorityQueue, items)) => {
+            let out = with_override(ord, || new_priority_queue_vm(vm, items));
+            mark_custom_ordering(&out, ord);
+            Ok(out)
+        }
+        _ => Err("scalars: an explicit Ordering for this collection is not modelled".to_string()),
+    }
+}
+
+/// The members after which a sorted collection keeps its EXPLICIT ordering:
+/// the ones answering the same `SortedSet[A]`/`SortedMap[K, V]` (a `map` builds
+/// a new collection under the result type's own implicit ordering instead).
+fn keeps_ordering(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-"
+            | "++"
+            | "--"
+            | "incl"
+            | "excl"
+            | "concat"
+            | "union"
+            | "diff"
+            | "intersect"
+            | "|"
+            | "&"
+            | "&~"
+            | "filter"
+            | "filterNot"
+            | "take"
+            | "drop"
+            | "takeRight"
+            | "dropRight"
+            | "takeWhile"
+            | "dropWhile"
+            | "slice"
+            | "tail"
+            | "init"
+            | "partition"
+            | "span"
+            | "splitAt"
+            | "range"
+            | "rangeFrom"
+            | "rangeUntil"
+            | "rangeTo"
+            | "updated"
+            | "removed"
+            | "clone"
+    )
+}
+
+/// `out` — the answer of a member on a collection held under `ord` — put back
+/// in `ord`'s order when it is (or is a tuple of) the same sorted kind.
+fn reorder_custom(vm: &mut VM, out: Value, ord: &Value) -> Result<Value, String> {
+    if let Some(parts) = as_tuple_items(&out) {
+        let mut fixed = Vec::with_capacity(parts.len());
+        for p in parts {
+            fixed.push(reorder_custom(vm, p, ord)?);
+        }
+        return Ok(heap_push(HeapVal::Tuple(fixed)));
+    }
+    if let Some((HashRep::Sorted, entries)) = map_rep_entries(&out) {
+        let pairs: Vec<Value> = entries.into_iter().map(new_pair_of).collect();
+        let sorted = sort_distinct_by(vm, ord, pairs, true, &pair_key)?;
+        let entries = sorted
+            .iter()
+            .filter_map(|p| {
+                let kv = as_seq_or_tuple(p)?;
+                Some((kv.first()?.clone(), kv.get(1)?.clone()))
+            })
+            .collect();
+        let m = heap_push(HeapVal::Map(HashRep::Sorted, entries));
+        mark_custom_ordering(&m, ord);
+        return Ok(m);
+    }
+    match seq_kind_items(&out) {
+        Some((SeqKind::Set(HashRep::Sorted), items)) => {
+            let sorted = sort_distinct_by(vm, ord, items, false, &Clone::clone)?;
+            let s = heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), sorted));
+            mark_custom_ordering(&s, ord);
+            Ok(s)
+        }
+        Some((SeqKind::PriorityQueue, _)) => {
+            mark_custom_ordering(&out, ord);
+            Ok(out)
+        }
+        _ => Ok(out),
+    }
+}
+
+/// A member of a collection held under the explicit ordering `ord`. Membership
+/// is the ordering's (`compare == 0`); `min`/`max` are the IMPLICIT natural
+/// ones Scala resolves at the call; a `PriorityQueue` sifts its heap by `ord`;
+/// and a member answering the same sorted kind (see [`keeps_ordering`]) is
+/// put back in `ord`'s order. `inner` is the ordinary dispatch.
+fn custom_ordered_method(
+    vm: &mut VM,
+    recv: &Value,
+    ord: &Value,
+    name: &str,
+    args: &[Value],
+    inner: fn(&mut VM, &Value, &str, &[Value]) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let is_pq = seq_kind(recv) == Some(SeqKind::PriorityQueue);
+    let is_map = map_rep_entries(recv).is_some();
+    if !is_pq {
+        let keys: Vec<Value> = match map_rep_entries(recv) {
+            Some((_, entries)) => entries.iter().map(|(k, _)| k.clone()).collect(),
+            None => seq_kind_items(recv).map(|(_, xs)| xs).unwrap_or_default(),
+        };
+        let find = |vm: &mut VM, x: &Value| -> Result<Option<usize>, String> {
+            for (i, k) in keys.iter().enumerate() {
+                if ordering_cmp(vm, ord, k, x)? == Ordering::Equal {
+                    return Ok(Some(i));
+                }
+            }
+            Ok(None)
+        };
+        // Removal is by the ordering too: `excl(x)` drops the element `x`
+        // compares equal to.
+        if matches!((name, args.len()), ("excl" | "-" | "removed", 1)) {
+            if let Some(i) = find(vm, &args[0])? {
+                let out = match map_rep_entries(recv) {
+                    Some((rep, mut entries)) => {
+                        entries.remove(i);
+                        heap_push(HeapVal::Map(rep, entries))
+                    }
+                    None => {
+                        let (kind, mut items) = seq_kind_items(recv).expect("a sorted set");
+                        items.remove(i);
+                        heap_push(HeapVal::Seq(kind, items))
+                    }
+                };
+                mark_custom_ordering(&out, ord);
+                return Ok(out);
+            }
+            return Ok(recv.clone());
+        }
+        match (name, args.len(), is_map) {
+            ("contains", 1, _) | ("apply", 1, false) => {
+                return Ok(Value::bool(find(vm, &args[0])?.is_some()))
+            }
+            ("get", 1, true) => {
+                let found = find(vm, &args[0])?;
+                let entries = map_rep_entries(recv).map(|(_, e)| e).unwrap_or_default();
+                return Ok(match found {
+                    Some(i) => make_some(entries[i].1.clone()),
+                    None => make_none(),
+                });
+            }
+            ("min" | "max", 0, false) => {
+                let want = if name == "max" {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+                let mut it = keys.into_iter();
+                let Some(mut best) = it.next() else {
+                    return inner(vm, recv, name, args);
+                };
+                for x in it {
+                    if cmp_vm(vm, &x, &best)? == want {
+                        best = x;
+                    }
+                }
+                return Ok(best);
+            }
+            _ => {}
+        }
+    }
+    let out = if is_pq {
+        with_override(ord, || inner(vm, recv, name, args))?
+    } else {
+        inner(vm, recv, name, args)?
+    };
+    if keeps_ordering(name) || (is_pq && !matches!(name, "map" | "flatMap" | "collect")) {
+        return reorder_custom(vm, out, ord);
+    }
+    Ok(out)
+}
+
+/// `WITH_ORDERING` builtin — see [`WITH_ORDERING`].
+fn b_with_ordering(vm: &mut VM, _argc: u8) -> Value {
+    let ord = vm.pop();
+    let coll = vm.pop();
+    with_ordering(vm, &coll, &ord).unwrap_or_else(|e| fault(vm, e))
+}
+
+/// `ord.compare(a, b)` for an `Ordering` that runs no user code — the natural
+/// order, reversed or not, and `orElse` chains of such. `None` when `ord`
+/// needs a closure (`Ordering.by(f)`), which only a VM can run.
+fn ordering_cmp_pure(ord: &Value, a: &Value, b: &Value) -> Option<Ordering> {
+    let (key, lt, reversed) = as_ordering(ord)?;
+    if let Some(parts) = ordering_tuple_parts(ord) {
+        let (xs, ys) = (as_tuple_items(a)?, as_tuple_items(b)?);
+        let mut o = Ordering::Equal;
+        for (i, p) in parts.iter().enumerate() {
+            o = ordering_cmp_pure(p, xs.get(i)?, ys.get(i)?)?;
+            if o != Ordering::Equal {
+                break;
+            }
+        }
+        return Some(if reversed { o.reverse() } else { o });
+    }
+    let base = match ordering_chain(ord) {
+        Some((first, second)) => match ordering_cmp_pure(&first, a, b)? {
+            Ordering::Equal => ordering_cmp_pure(&second, a, b)?,
+            o => o,
+        },
+        None => {
+            if !matches!(key, Value::Undef) || !matches!(lt, Value::Undef) {
+                return None;
+            }
+            value_cmp(a, b)
+        }
+    };
+    Some(if reversed { base.reverse() } else { base })
+}
+
+/// `set + x` / `set - x` / `map + (k -> v)` / `map - k` on a collection held
+/// under an explicit ordering (see [`CUSTOM_ORD`]), from the arithmetic hook,
+/// which has no VM: answered for an ordering that runs no user code.
+fn custom_ordered_op(add: bool, a: &Value, b: &Value) -> Result<Value, String> {
+    let ord = custom_ordering(a).expect("checked by the caller");
+    let unsupported = || {
+        "scalars: an operator on a collection under a function-keyed Ordering is not modelled"
+            .to_string()
+    };
+    let cmp = |x: &Value, y: &Value| ordering_cmp_pure(&ord, x, y);
+    if let Some((rep, mut entries)) = map_rep_entries(a) {
+        let key = if add {
+            as_seq_or_tuple(b)
+                .filter(|t| t.len() == 2)
+                .ok_or_else(|| "scalars: Map `+` expects a `key -> value` pair".to_string())?
+        } else {
+            vec![b.clone()]
+        };
+        let mut at = None;
+        for (i, (k, _)) in entries.iter().enumerate() {
+            if cmp(k, &key[0]).ok_or_else(unsupported)? == Ordering::Equal {
+                at = Some(i);
+                break;
+            }
+        }
+        match (at, add) {
+            (Some(i), true) => entries[i].1 = key[1].clone(),
+            (None, true) => entries.push((key[0].clone(), key[1].clone())),
+            (Some(i), false) => {
+                entries.remove(i);
+            }
+            (None, false) => {}
+        }
+        let mut err = false;
+        entries.sort_by(|x, y| {
+            cmp(&x.0, &y.0).unwrap_or_else(|| {
+                err = true;
+                Ordering::Equal
+            })
+        });
+        if err {
+            return Err(unsupported());
+        }
+        let out = heap_push(HeapVal::Map(rep, entries));
+        mark_custom_ordering(&out, &ord);
+        return Ok(out);
+    }
+    let Some((kind, mut items)) = seq_kind_items(a) else {
+        return Err(unsupported());
+    };
+    let mut at = None;
+    for (i, x) in items.iter().enumerate() {
+        if cmp(x, b).ok_or_else(unsupported)? == Ordering::Equal {
+            at = Some(i);
+            break;
+        }
+    }
+    match (at, add) {
+        (None, true) => items.push(b.clone()),
+        (Some(i), false) => {
+            items.remove(i);
+        }
+        _ => {}
+    }
+    let mut err = false;
+    items.sort_by(|x, y| {
+        cmp(x, y).unwrap_or_else(|| {
+            err = true;
+            Ordering::Equal
+        })
+    });
+    if err {
+        return Err(unsupported());
+    }
+    let out = heap_push(HeapVal::Seq(kind, items));
+    mark_custom_ordering(&out, &ord);
+    Ok(out)
+}
+
+/// `Ordering.TupleN(o1, …, oN)`: tuples compared component by component.
+fn tuple_ordering(parts: Vec<Value>) -> Value {
+    heap_push(HeapVal::Ordering {
+        key: Value::Undef,
+        lt: Value::Undef,
+        reversed: false,
+        chain: None,
+        tuple: Some(parts),
+    })
+}
+
+/// The component orderings of an `Ordering.TupleN(…)` value.
+fn ordering_tuple_parts(v: &Value) -> Option<Vec<Value>> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::Ordering { tuple, .. }) => tuple.clone(),
+        _ => None,
+    })
+}
+
+/// A traversal of a range too long to hold (see [`big_range_method`]): element
+/// `i` is `start + step * i`, each built only as it is visited.
+fn big_range_traverse(
+    vm: &mut VM,
+    start: i64,
+    step: i64,
+    n: u64,
+    elem: &dyn Fn(i64) -> Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    let too_large = || "scalars: java.lang.OutOfMemoryError: Range too large".to_string();
+    let f = args.first().cloned().unwrap_or(Value::Undef);
+    let call = |vm: &mut VM, x: Value| invoke_closure(vm, &f, &[x]);
+    let mut kept: Vec<Value> = Vec::new();
+    let keep = |kept: &mut Vec<Value>, v: Value| -> Result<(), String> {
+        if kept.len() as u64 >= RANGE_MATERIALIZE_CAP {
+            return Err(too_large());
+        }
+        kept.push(v);
+        Ok(())
+    };
+    if name == "iterator" {
+        if !args.is_empty() {
+            return Err(no_such_method(&Value::Undef, name));
+        }
+        let ints = new_lazy(Vec::new(), LazySrc::Ints { next: start, step });
+        let it = new_lazy(
+            Vec::new(),
+            LazySrc::Take {
+                src: ints,
+                n: usize::try_from(n).map_err(|_| too_large())?,
+            },
+        );
+        if let Some(mut l) = as_lazy(&it) {
+            l.iter = true;
+            set_lazy(&it, l);
+        }
+        return Ok(it);
+    }
+    let mut acc = args.first().cloned().unwrap_or(Value::Undef);
+    let mut count = 0i64;
+    for i in 0..n {
+        let x = elem(start + step * i as i64);
+        match name {
+            "foreach" => {
+                call(vm, x)?;
+            }
+            "filter" | "withFilter" | "filterNot" => {
+                if truthy(&call(vm, x.clone())?) == (name != "filterNot") {
+                    keep(&mut kept, x)?;
+                }
+            }
+            "map" => {
+                let y = call(vm, x)?;
+                keep(&mut kept, y)?;
+            }
+            "toList" | "toVector" => keep(&mut kept, x)?,
+            "count" => {
+                if truthy(&call(vm, x)?) {
+                    count += 1;
+                }
+            }
+            "exists" => {
+                if truthy(&call(vm, x)?) {
+                    return Ok(Value::bool(true));
+                }
+            }
+            "forall" => {
+                if !truthy(&call(vm, x)?) {
+                    return Ok(Value::bool(false));
+                }
+            }
+            "find" => {
+                if truthy(&call(vm, x.clone())?) {
+                    return Ok(make_some(x));
+                }
+            }
+            "indexWhere" => {
+                if truthy(&call(vm, x)?) {
+                    return Ok(Value::int(i as i64));
+                }
+            }
+            // `foldLeft(z)(op)`: the zero, then the operator.
+            _ => {
+                let op = args.get(1).cloned().unwrap_or(Value::Undef);
+                acc = invoke_closure(vm, &op, &[acc, x])?;
+            }
+        }
+    }
+    Ok(match name {
+        "foreach" => unit_value(),
+        "count" => Value::int(count),
+        "exists" => Value::bool(false),
+        "forall" => Value::bool(true),
+        "find" => make_none(),
+        "indexWhere" => Value::int(-1),
+        "foldLeft" => acc,
+        "toList" => new_list(kept),
+        _ => new_seq(SeqKind::Vector, kept),
+    })
+}
+
+/// `take`/`drop`/`reverse` of a `BigDecimal` range, which are `NumericRange`s
+/// again — with the bounds `NumericRange.scala` computes: `take(n)` ends at
+/// element `n - 1` inclusively, `drop(n)` starts at element `n` and keeps the
+/// end, an exhausted one is the empty `start until start` (or `end until end`),
+/// and `reverse` runs from the last element back to `start`.
+fn dec_range_slice(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let (start, end, step, inclusive) = dec_range_bounds(recv)?;
+    let step = step?;
+    let items = seq_kind_items(recv).map(|(_, xs)| xs).unwrap_or_default();
+    let len = items.len() as i64;
+    let at = |i: i64| start.add(&step.mul(&BigDec::from_int(i)));
+    let empty_at = |x: BigDec| dec_range_value(x.clone(), x, step.clone(), false);
+    Some(match (name, args.len()) {
+        ("take", 1) => {
+            let n = args[0].to_int();
+            if n <= 0 || len == 0 {
+                empty_at(start.clone())
+            } else if n >= len {
+                Ok(recv.clone())
+            } else {
+                dec_range_value(start.clone(), at(n - 1), step.clone(), true)
+            }
+        }
+        ("drop", 1) => {
+            let n = args[0].to_int();
+            if n <= 0 || len == 0 {
+                Ok(recv.clone())
+            } else if n >= len {
+                empty_at(end.clone())
+            } else {
+                dec_range_value(at(n), end.clone(), step.clone(), inclusive)
+            }
+        }
+        ("reverse", 0) => {
+            if len == 0 {
+                Ok(recv.clone())
+            } else {
+                dec_range_value(at(len - 1), start.clone(), step.neg(), true)
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The index a `NavigableSet`/`NavigableMap` query names among `keys` (held in
+/// `cmp`'s order): `floor`/`lower` the LAST key at or below / strictly below
+/// `x`, `ceiling`/`higher` the FIRST at or above / strictly above it.
+fn java_cmp_nav(
+    vm: &mut VM,
+    cmp: &Value,
+    keys: &[Value],
+    x: &Value,
+    query: &str,
+) -> Result<Option<usize>, String> {
+    let mut found = None;
+    for (i, k) in keys.iter().enumerate() {
+        let o = java_compare(vm, Some(cmp), k, x)?;
+        let hit = match query {
+            "floor" => o != Ordering::Greater,
+            "lower" => o == Ordering::Less,
+            "ceiling" => o != Ordering::Less,
+            _ => o == Ordering::Greater,
+        };
+        match query {
+            "floor" | "lower" if hit => found = Some(i),
+            "ceiling" | "higher" if hit => return Ok(Some(i)),
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
+/// The `NavigableSet` queries of a `TreeSet` under a `Comparator`. `None` when
+/// `name` is not one; a set it answers keeps the comparator.
+fn java_cmp_set_nav(
+    vm: &mut VM,
+    items: &[Value],
+    cmp: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<(Vec<Value>, Value), String>> {
+    let sub = |xs: Vec<Value>| {
+        let s = java_marked(new_seq(SeqKind::JavaList, xs), true);
+        set_java_flavor(&s, JFlavor::TreeSet);
+        set_java_cmp(&s, Some(cmp.clone()));
+        s
+    };
+    let r = (|| -> Result<(Vec<Value>, Value), String> {
+        Ok(match (name, args.len()) {
+            ("floor" | "lower" | "ceiling" | "higher", 1) => {
+                let at = java_cmp_nav(vm, cmp, items, &args[0], name)?;
+                (
+                    items.to_vec(),
+                    at.map_or(Value::Undef, |i| items[i].clone()),
+                )
+            }
+            ("headSet" | "tailSet", 1) => {
+                let mut kept = Vec::new();
+                for x in items {
+                    let o = java_compare(vm, Some(cmp), x, &args[0])?;
+                    if (name == "headSet") == (o == Ordering::Less) {
+                        kept.push(x.clone());
+                    }
+                }
+                (items.to_vec(), sub(kept))
+            }
+            ("pollFirst", 0) => {
+                let mut out = items.to_vec();
+                let v = if out.is_empty() {
+                    Value::Undef
+                } else {
+                    out.remove(0)
+                };
+                (out, v)
+            }
+            ("pollLast", 0) => {
+                let mut out = items.to_vec();
+                let v = out.pop().unwrap_or(Value::Undef);
+                (out, v)
+            }
+            ("descendingSet", 0) => (
+                items.to_vec(),
+                new_seq(SeqKind::JavaList, items.iter().rev().cloned().collect()),
+            ),
+            _ => return Err(String::new()),
+        })
+    })();
+    match r {
+        Err(e) if e.is_empty() => None,
+        other => Some(other),
+    }
+}
+
+/// The `NavigableMap` queries of a `TreeMap` under a `Comparator` (see
+/// [`java_cmp_set_nav`]).
+fn java_cmp_map_nav(
+    vm: &mut VM,
+    pairs: &[(Value, Value)],
+    cmp: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<MapMutation, String>> {
+    let keys: Vec<Value> = pairs.iter().map(|(k, _)| k.clone()).collect();
+    let entry = |i: Option<usize>| match i {
+        Some(i) => new_seq(
+            SeqKind::JavaEntry,
+            vec![pairs[i].0.clone(), pairs[i].1.clone()],
+        ),
+        None => Value::Undef,
+    };
+    let sub = |kept: Vec<(Value, Value)>| {
+        let m = new_seq(
+            SeqKind::JavaMap,
+            kept.into_iter().map(new_pair_of).collect(),
+        );
+        set_java_flavor(&m, JFlavor::TreeMap);
+        set_java_cmp(&m, Some(cmp.clone()));
+        java_marked(m, true)
+    };
+    let r = (|| -> Result<MapMutation, String> {
+        let same = pairs.to_vec();
+        Ok(match (name, args.len()) {
+            ("floorKey" | "lowerKey" | "ceilingKey" | "higherKey", 1) => {
+                let at = java_cmp_nav(vm, cmp, &keys, &args[0], name.trim_end_matches("Key"))?;
+                (same, at.map_or(Value::Undef, |i| keys[i].clone()))
+            }
+            ("floorEntry" | "lowerEntry" | "ceilingEntry" | "higherEntry", 1) => {
+                let at = java_cmp_nav(vm, cmp, &keys, &args[0], name.trim_end_matches("Entry"))?;
+                (same, entry(at))
+            }
+            ("firstEntry", 0) => (same, entry((!pairs.is_empty()).then_some(0))),
+            ("lastEntry", 0) => (same, entry(pairs.len().checked_sub(1))),
+            ("pollFirstEntry", 0) => {
+                let e = entry((!pairs.is_empty()).then_some(0));
+                (pairs.iter().skip(1).cloned().collect(), e)
+            }
+            ("pollLastEntry", 0) => {
+                let e = entry(pairs.len().checked_sub(1));
+                (pairs[..pairs.len().saturating_sub(1)].to_vec(), e)
+            }
+            ("headMap" | "tailMap", 1) => {
+                let mut kept = Vec::new();
+                for (k, v) in pairs {
+                    let o = java_compare(vm, Some(cmp), k, &args[0])?;
+                    if (name == "headMap") == (o == Ordering::Less) {
+                        kept.push((k.clone(), v.clone()));
+                    }
+                }
+                (same, sub(kept))
+            }
+            ("subMap", 2) => {
+                let mut kept = Vec::new();
+                for (k, v) in pairs {
+                    let lo = java_compare(vm, Some(cmp), k, &args[0])?;
+                    let hi = java_compare(vm, Some(cmp), k, &args[1])?;
+                    if lo != Ordering::Less && hi == Ordering::Less {
+                        kept.push((k.clone(), v.clone()));
+                    }
+                }
+                (same, sub(kept))
+            }
+            ("descendingMap", 0) => (
+                same,
+                new_seq(
+                    SeqKind::JavaMap,
+                    pairs
+                        .iter()
+                        .rev()
+                        .map(|(k, v)| new_pair(k.clone(), v.clone()))
+                        .collect(),
+                ),
+            ),
+            _ => return Err(String::new()),
+        })
+    })();
+    match r {
+        Err(e) if e.is_empty() => None,
+        other => Some(other),
+    }
 }
