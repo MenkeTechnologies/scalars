@@ -660,7 +660,11 @@ reported as parse/compile errors, never silently mis-run.
 - **An explicit `Ordering`.** `Ordering.Int` and its siblings (the natural
   ordering), `.reverse`, `Ordering.by(f)`, `Ordering.fromLessThan(lt)`,
   `Ordering[T]` and `ord.on(f)`, plus the value's own `compare`, `lt`, `gt`,
-  `lteq`, `gteq`, `equiv`, `max` and `min`. Scala passes it in a second
+  `lteq`, `gteq`, `equiv`, `max` and `min`. A `reverse` swaps the operands
+  before the ordering it wraps runs (`Ordering.Reverse.compare(x, y)` is
+  `outer.compare(y, x)`), so `Ordering.by(f).reverse` applies `f` to the
+  right operand first and a reversed `fromLessThan` asks `lt(y, x)` first.
+  Scala passes it in a second
   (implicit) parameter list, which this frontend flattens into the same call, so
   `xs.sorted(ord)` arrives with one argument and `xs.sortBy(f)(ord)` with two;
   `sorted`, `sortBy`, `max`, `min`, `maxBy` and `minBy` all take it. The sort is
@@ -1538,8 +1542,26 @@ reported as parse/compile errors, never silently mis-run.
   literal inserts its elements in source order, so `TreeSet("xyz", "abc")(using
   Ordering.by(_.length))` is `TreeSet(xyz)` and `TreeMap("aa" -> 1, "zz" ->
   2)(…)` is `TreeMap(aa -> 2)`. `--`/`removedAll`/`diff` remove by the
-  ordering too. How many times the key function runs is not the tree's: a
-  side effect in it prints a different number of times), and
+  ordering too. An IMMUTABLE `TreeSet`/`TreeMap` under an explicit ordering is
+  stored in a port of `scala.collection.immutable.RedBlackTree`
+  (`src/rbtree.rs`), so the ordering is asked exactly the comparisons the
+  library asks — `compare` for insert, delete, lookup and `minAfter`/
+  `maxBefore`, ONE `lt`/`lteq` for the range views (one closure call for a
+  `fromLessThan`), `equiv` for `==` between two such trees on keys that are not
+  the same JVM box — and a member that changes nothing answers the receiver
+  itself (`(s + x) eq s` for an `x` held). The tree-to-tree `union`/
+  `intersect`/`diff`/`--` (against a tree under an `==` ordering), `filter`,
+  `partition`, `take`/`drop`/`slice` and `tail`/`init` are the library's
+  join-based algorithms; `filterNot` and a `diff` against any other set build
+  through the factory's insertion, as theirs do. The JVM box identity the
+  library tests before comparing (`k eq tree.key`) is modelled as the
+  `Integer`/`Character` caches decide it (a value in [-128, 127] shares one
+  box, a `Double` never does), and a `String` is taken to be an interned
+  literal. Measured (debug build, instructions retired) on 4000 inserts, 8000
+  lookups, 4000 `updated`s, two traversals and 1000 removals: 242.6G-242.8G on
+  the sorted vector, 41.4G on the tree. The MUTABLE `TreeSet`/`TreeMap` still
+  keep a sorted vector, so how many times their key function runs is not the
+  library's), and
   SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
   Double) => …` then `s.show(x)`).
 - **An integer's box is kept only where it is WIDENED to `Any` with a static
@@ -1769,8 +1791,12 @@ reported as parse/compile errors, never silently mis-run.
   whose function answers `None` hands back the receiver itself.
 
 - **`eq`/`ne` answer reference identity for class instances, singleton
-  `object`s and throwables only.** Those are heap records whose handle IS their
-  identity (every mention of an `object` answers the one record, so `O eq O`).
+  `object`s, throwables and collections.** Those are heap records whose handle
+  IS their identity (every mention of an `object` answers the one record, so
+  `O eq O`). A collection member that hands back its receiver (an immutable
+  `TreeSet`/`TreeMap` member that changes nothing, `Map.updatedWith` answering
+  `None` for an absent key) answers the same handle; one this frontend rebuilds
+  where the library would share answers `false`.
   A `String` has no identity in the value model — `"abc" eq "abc"` is true in
   Scala because literals are interned, while a concatenated copy is not `eq` —
   so `eq` on a `String` is refused (`not a member`) rather than guessed.

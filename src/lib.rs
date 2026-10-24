@@ -19,6 +19,7 @@ pub mod jrandom;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod rbtree;
 pub mod resolve;
 pub mod rust_ffi;
 pub mod tiers;

@@ -9420,7 +9420,11 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::LAZY_CONS, 2), 0);
             return Ok(());
         }
-        if self.has_user_equals && matches!(op, BinOp::Eq | BinOp::Ne) {
+        // `==` on an explicitly ordered `TreeSet`/`TreeMap` compares keys by the
+        // ordering's `equiv` (`RB.keysEqual`), which runs user code.
+        if (self.has_user_equals || self.may_be_collection(lhs))
+            && matches!(op, BinOp::Eq | BinOp::Ne)
+        {
             self.expr(lhs)?;
             self.expr(rhs)?;
             let id = if op == BinOp::Eq {

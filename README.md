@@ -318,7 +318,10 @@ Implemented and checked against the reference `scala`:
   given, `Ordering.Tuple2(o1, o2)` … `Tuple5`, `orElse`/`orElseBy`, `on`. `+`/
   `-` on such a collection is its member wherever it comes from (a parameter,
   a field, a result), so `Ordering.by(f)` runs `f`, and an element the
-  ordering calls equal to one held leaves that one in place.
+  ordering calls equal to one held leaves that one in place. The immutable
+  `TreeSet`/`TreeMap` are stored in a port of the library's `RedBlackTree`,
+  so the ordering runs exactly as often as on the JVM and an unchanged result
+  is the receiver itself (`eq`).
 - **Numeric type classes** — the library's `Numeric`/`Integral`/`Fractional`
   instances for an implicit parameter, `implicitly` or `Numeric[T]`.
 - **`scala.util.Using`** — `Using(res)(f)`, `Using.resource` and

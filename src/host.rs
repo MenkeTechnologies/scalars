@@ -2933,6 +2933,7 @@ pub fn reset_heap() {
     JAVA_SUBVIEWS.with(|t| t.borrow_mut().clear());
     BACKING_VIEWS.with(|t| t.borrow_mut().clear());
     CUSTOM_ORD.with(|t| t.borrow_mut().clear());
+    RB_TREES.with(|t| t.borrow_mut().clear());
     OVERRIDE_ORD.with(|o| *o.borrow_mut() = None);
     SUPPRESSED.with(|t| t.borrow_mut().clear());
     MANAGERS.with(|t| t.borrow_mut().clear());
@@ -3491,11 +3492,25 @@ fn as_ordering(v: &Value) -> Option<(Value, Value, bool)> {
     }
 }
 
-/// Compare `a` and `b` under `ord`: extract the sort keys, apply the ordering's
-/// own comparison, then flip for a `reverse`. Only this path needs the VM,
-/// because a keyed or `fromLessThan` ordering runs a user closure.
+/// Compare `a` and `b` under `ord`. Only this path needs the VM, because a
+/// keyed or `fromLessThan` ordering runs a user closure.
+///
+/// A `reverse` is `Ordering.Reverse`, whose `compare(x, y)` is
+/// `outer.compare(y, x)`: the operands swap BEFORE the outer ordering runs, so
+/// an `Ordering.by(f).reverse` applies `f` to the right operand first and a
+/// reversed `fromLessThan` asks `lt(y, x)` first.
 fn ordering_cmp(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Ordering, String> {
-    let Some((key, lt, reversed)) = as_ordering(ord) else {
+    match as_ordering(ord) {
+        Some((_, _, true)) => ordering_cmp_outer(vm, ord, b, a),
+        Some(_) => ordering_cmp_outer(vm, ord, a, b),
+        None => Err("scalars: expected an Ordering".into()),
+    }
+}
+
+/// [`ordering_cmp`] under the ordering a `reverse` wraps: extract the sort
+/// keys, then apply the ordering's own comparison.
+fn ordering_cmp_outer(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Ordering, String> {
+    let Some((key, lt, _)) = as_ordering(ord) else {
         return Err("scalars: expected an Ordering".into());
     };
     if let Some(parts) = ordering_tuple_parts(ord) {
@@ -3513,14 +3528,14 @@ fn ordering_cmp(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Orderi
                 break;
             }
         }
-        return Ok(if reversed { o.reverse() } else { o });
+        return Ok(o);
     }
     if let Some((first, second)) = ordering_chain(ord) {
         let mut o = ordering_cmp(vm, &first, a, b)?;
         if o == Ordering::Equal {
             o = ordering_cmp(vm, &second, a, b)?;
         }
-        return Ok(if reversed { o.reverse() } else { o });
+        return Ok(o);
     }
     let (a, b) = match key {
         Value::Undef => (a.clone(), b.clone()),
@@ -3543,7 +3558,124 @@ fn ordering_cmp(vm: &mut VM, ord: &Value, a: &Value, b: &Value) -> Result<Orderi
             }
         }
     };
-    Ok(if reversed { base.reverse() } else { base })
+    Ok(base)
+}
+
+/// `ord.lt(a, b)` — `lteq` with `or_equal` — as the library's orderings answer
+/// it: an `Ordering.by(f)` asks its inner ordering's `lt` of the two keys, a
+/// `fromLessThan(lt)` calls `lt` ONCE (`lteq(x, y)` is `!lt(y, x)`), a
+/// `Reverse` swaps the operands first, and every other ordering inherits
+/// `compare(x, y) < 0` (`<= 0`). The count matters: a red-black tree's range
+/// views decide with `lt`/`lteq`, and how often a user closure runs is
+/// observable.
+fn ordering_lt(
+    vm: &mut VM,
+    ord: &Value,
+    a: &Value,
+    b: &Value,
+    or_equal: bool,
+) -> Result<bool, String> {
+    let Some((key, lt, reversed)) = as_ordering(ord) else {
+        return Err("scalars: expected an Ordering".into());
+    };
+    let (a, b) = if reversed { (b, a) } else { (a, b) };
+    let by_compare = |o: Ordering| {
+        if or_equal {
+            o != Ordering::Greater
+        } else {
+            o == Ordering::Less
+        }
+    };
+    if ordering_tuple_parts(ord).is_some() || ordering_chain(ord).is_some() {
+        return Ok(by_compare(ordering_cmp_outer(vm, ord, a, b)?));
+    }
+    let (a, b) = match key {
+        Value::Undef => (a.clone(), b.clone()),
+        f => (
+            invoke_closure(vm, &f, std::slice::from_ref(a))?,
+            invoke_closure(vm, &f, std::slice::from_ref(b))?,
+        ),
+    };
+    match lt {
+        Value::Undef => Ok(by_compare(cmp_vm(vm, &a, &b)?)),
+        f if or_equal => Ok(!truthy(&invoke_closure(vm, &f, &[b, a])?)),
+        f => Ok(truthy(&invoke_closure(vm, &f, &[a, b])?)),
+    }
+}
+
+/// Whether two orderings are `==`, which is what lets a `TreeSet`/`TreeMap`
+/// operation with another tree take the tree-to-tree path (`RB.union`, …).
+/// An `Ordering.by`/`fromLessThan`/`orElse` instance is equal only to itself;
+/// the natural orderings are singletons and their `reverse` is cached, so two
+/// of those are equal when they point the same way.
+fn orderings_equal(a: &Value, b: &Value) -> bool {
+    if as_obj_id(a).is_some() && as_obj_id(a) == as_obj_id(b) {
+        return true;
+    }
+    let natural = |o: &Value| match as_ordering(o) {
+        Some((Value::Undef, Value::Undef, rev))
+            if ordering_chain(o).is_none() && ordering_tuple_parts(o).is_none() =>
+        {
+            Some(rev)
+        }
+        _ => None,
+    };
+    matches!((natural(a), natural(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// JVM reference identity (`eq`) of two values as the boxes the library sees
+/// them through: `Integer`/`Long`/`Short`/`Byte.valueOf` share one box per
+/// value in [-128, 127] and `Character.valueOf` one per code unit up to 127,
+/// while a `Double` is boxed afresh every time. A `String` is taken as the
+/// interned literal it nearly always is in a program, so equal text is the
+/// same object. This is the test `RedBlackTree.upd` makes before comparing
+/// (`k eq tree.key`) and before replacing a value (`v ne tree.value`).
+fn jvm_same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y && (-128..=127).contains(x),
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Undef, Value::Undef) => true,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Obj(x), Value::Obj(y)) if x == y => {
+            let id = *x as usize;
+            HEAP.with(|h| match h.borrow().get(id) {
+                Some(HeapVal::Char(c)) => (*c as u32) <= 127,
+                _ => true,
+            })
+        }
+        _ => false,
+    }
+}
+
+/// The ordering an immutable `TreeSet`/`TreeMap` is held under, as the
+/// [`crate::rbtree::Cx`] its tree operations compare through.
+struct OrdCx<'a> {
+    vm: &'a mut VM,
+    ord: &'a Value,
+}
+
+impl crate::rbtree::Cx<Value, Value> for OrdCx<'_> {
+    fn compare(&mut self, a: &Value, b: &Value) -> Result<Ordering, String> {
+        ordering_cmp(self.vm, self.ord, a, b)
+    }
+    fn lt(&mut self, a: &Value, b: &Value) -> Result<bool, String> {
+        ordering_lt(self.vm, self.ord, a, b, false)
+    }
+    fn lteq(&mut self, a: &Value, b: &Value) -> Result<bool, String> {
+        ordering_lt(self.vm, self.ord, a, b, true)
+    }
+    // `Ordering.equiv` is `compare(x, y) == 0` for every ordering the library
+    // builds (`Reverse.equiv(x, y)` is `outer.equiv(y, x)`, the swap
+    // `ordering_cmp` already makes).
+    fn equiv(&mut self, a: &Value, b: &Value) -> Result<bool, String> {
+        Ok(ordering_cmp(self.vm, self.ord, a, b)? == Ordering::Equal)
+    }
+    fn same_key(&self, a: &Value, b: &Value) -> bool {
+        jvm_same(a, b)
+    }
+    fn same_value(&self, a: &Value, b: &Value) -> bool {
+        jvm_same(a, b)
+    }
 }
 
 /// `RANDOM_NEW` builtin — `new Random()` seeds from the clock, `new Random(seed)`
@@ -7218,6 +7350,9 @@ fn user_equals_present(vm: &VM) -> bool {
 /// `List`/`Vector`/tuple/`Option` holding such instances, whose own `equals`
 /// compares element by element with `==`. Everything else is [`scala_eq`].
 fn eq_vm(vm: &mut VM, a: &Value, b: &Value) -> Result<bool, String> {
+    if let Some(r) = rb_equals(vm, a, b) {
+        return r;
+    }
     if !user_equals_present(vm) {
         return Ok(scala_eq(a, b));
     }
@@ -9669,12 +9804,22 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
         return Ok(Value::str(scala_str_vm(vm, recv)));
     }
     if (name == "equals" || name == "==") && args.len() == 1 {
+        if let Some(r) = rb_equals(vm, recv, &args[0]) {
+            return r.map(Value::bool);
+        }
         if user_equals_present(vm) {
             if let Some(r) = keyed_eq(vm, recv, &args[0]) {
                 return r.map(Value::bool);
             }
         }
         return Ok(Value::bool(obj_eq(recv, &args[0])));
+    }
+    // `AnyRef.eq`/`ne` on a collection — reference identity, which for a heap
+    // value is its handle: a member that returns its receiver unchanged
+    // (`TreeSet.incl` of an element it holds) answers the same handle.
+    if (name == "eq" || name == "ne") && args.len() == 1 {
+        let same = matches!((recv, &args[0]), (Value::Obj(a), Value::Obj(b)) if a == b);
+        return Ok(Value::bool(same == (name == "eq")));
     }
     // A collection's `hashCode` is its `MurmurHash3` seq/set/map hash; an
     // `Array` and a function value keep the JVM identity hash, which is not
@@ -9687,6 +9832,13 @@ fn heap_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Result<
                 _ => 0,
             },
         }));
+    }
+    // An explicitly ordered `TreeSet`/`TreeMap` answers its range views and
+    // neighbour searches on its tree, under its own ordering.
+    if let Some(ord) = custom_ordering(recv) {
+        if let Some(r) = rb_member(vm, recv, &ord, name, args) {
+            return r;
+        }
     }
     if let Some(r) = sorted_method(recv, name, args) {
         return r;
@@ -25185,6 +25337,14 @@ fn with_ordering(vm: &mut VM, coll: &Value, ord: &Value) -> Result<Value, String
     if as_ordering(ord).is_none() {
         return Err("scalars: an explicit ordering must be an Ordering".to_string());
     }
+    let contents = match (map_rep_entries(coll), seq_kind_items(coll)) {
+        (Some((_, entries)), _) => entries.into_iter().map(new_pair_of).collect(),
+        (None, Some((_, items))) => items,
+        _ => Vec::new(),
+    };
+    if let Some(r) = rb_from(vm, coll, contents, ord) {
+        return r;
+    }
     if let Some((rep, entries)) = map_rep_entries(coll) {
         if !matches!(rep, HashRep::Sorted | HashRep::MutSorted) {
             return Err("scalars: an explicit Ordering for this map is not modelled".to_string());
@@ -25228,6 +25388,9 @@ fn with_ordering_from(
 ) -> Result<Value, String> {
     if as_ordering(ord).is_none() {
         return Err("scalars: an explicit ordering must be an Ordering".to_string());
+    }
+    if let Some(r) = rb_from(vm, coll, iterable_arg(elems), ord) {
+        return r;
     }
     let operand = [elems.clone()];
     let out = match (map_rep_entries(coll), seq_kind_items(coll)) {
@@ -25345,6 +25508,9 @@ fn custom_ordered_method(
     args: &[Value],
     inner: fn(&mut VM, &Value, &str, &[Value]) -> Result<Value, String>,
 ) -> Result<Value, String> {
+    if let Some(r) = rb_member(vm, recv, ord, name, args) {
+        return r;
+    }
     let is_pq = seq_kind(recv) == Some(SeqKind::PriorityQueue);
     let is_map = map_rep_entries(recv).is_some();
     if !is_pq {
@@ -25432,6 +25598,418 @@ fn custom_ordered_method(
         return reorder_custom(vm, out, ord);
     }
     Ok(out)
+}
+
+/// `TreeSet.from(xs)(using ord)` / `TreeMap.from(xs)(using ord)` — also the
+/// companions' `apply`, which is `from` of the arguments — when `coll` is an
+/// immutable `TreeSet`/`TreeMap`: each of `xs` inserted in turn, as `from`'s
+/// `RB.update` loop does (a map's later value for a key wins). `None` for any
+/// other collection.
+fn rb_from(
+    vm: &mut VM,
+    coll: &Value,
+    xs: Vec<Value>,
+    ord: &Value,
+) -> Option<Result<Value, String>> {
+    let is_map = HEAP.with(|h| match h.borrow().get(as_obj_id(coll)?) {
+        Some(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), _)) => Some(false),
+        Some(HeapVal::Map(HashRep::Sorted, _)) => Some(true),
+        _ => None,
+    })?;
+    Some(rb_insert_all(vm, ord, &None, is_map, xs).map(|t| rb_publish(is_map, t, ord)))
+}
+
+/// A red-black tree of `Value` keys and values — see [`crate::rbtree`]. A
+/// set's values are `Undef`.
+type RbTree = crate::rbtree::Tree<Value, Value>;
+
+thread_local! {
+    /// The red-black tree an immutable `TreeSet`/`TreeMap` held under an
+    /// explicit ordering is stored in, by heap id. Every member that consults
+    /// the ordering — insert, delete, lookup, the range views and neighbour
+    /// searches, the tree-to-tree bulk operations, the positional slices —
+    /// runs on it, so the ordering is asked exactly the comparisons the library
+    /// asks and an unchanged result is the receiver itself. The heap value's
+    /// elements are the tree's in-order contents, which is all that a member
+    /// consulting no ordering (`toString`, `foreach`, `map`, `size`) reads.
+    static RB_TREES: RefCell<HashMap<usize, RbTree>> = RefCell::new(HashMap::new());
+}
+
+/// Whether `v` is an immutable `TreeMap` (`true`) or `TreeSet` (`false`) held
+/// under an explicit ordering.
+fn rb_shape(v: &Value) -> Option<bool> {
+    custom_ordering(v)?;
+    HEAP.with(|h| match h.borrow().get(as_obj_id(v)?) {
+        Some(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), _)) => Some(false),
+        Some(HeapVal::Map(HashRep::Sorted, _)) => Some(true),
+        _ => None,
+    })
+}
+
+/// The tree `v` is stored in. A collection some other path built without one
+/// (its contents already in order) gets `fromOrderedKeys`' balanced tree.
+fn rb_tree_of(v: &Value) -> Option<RbTree> {
+    let is_map = rb_shape(v)?;
+    let id = as_obj_id(v)?;
+    if let Some(t) = RB_TREES.with(|t| t.borrow().get(&id).cloned()) {
+        return Some(t);
+    }
+    let entries = if is_map {
+        map_rep_entries(v)?.1
+    } else {
+        let keys = seq_kind_items(v)?.1;
+        keys.into_iter().map(|k| (k, Value::Undef)).collect()
+    };
+    let t = crate::rbtree::from_ordered(entries);
+    RB_TREES.with(|m| m.borrow_mut().insert(id, t.clone()));
+    Some(t)
+}
+
+/// A new `TreeSet`/`TreeMap` instance under `ord` stored in `tree`.
+fn rb_publish(is_map: bool, tree: RbTree, ord: &Value) -> Value {
+    let entries = crate::rbtree::entries(&tree);
+    let v = if is_map {
+        heap_push(HeapVal::Map(HashRep::Sorted, entries))
+    } else {
+        let keys = entries.into_iter().map(|(k, _)| k).collect();
+        heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), keys))
+    };
+    mark_custom_ordering(&v, ord);
+    if let Some(id) = as_obj_id(&v) {
+        RB_TREES.with(|m| m.borrow_mut().insert(id, tree));
+    }
+    v
+}
+
+/// The tree of `arg` when it is a tree of the same kind under an ordering
+/// `==` to `ord` — the case where the library's `TreeSet`/`TreeMap` bulk
+/// operations work tree to tree.
+fn rb_peer(arg: &Value, ord: &Value, is_map: bool) -> Option<RbTree> {
+    let theirs = custom_ordering(arg)?;
+    (rb_shape(arg)? == is_map && orderings_equal(ord, &theirs)).then(|| rb_tree_of(arg))?
+}
+
+/// `that contains x` for the `Set` argument of a `diff`/`intersect` taking the
+/// generic path: a tree asks its own ordering, anything else its elements'
+/// `==`.
+fn rb_arg_contains(vm: &mut VM, that: &Value, x: &Value) -> Result<bool, String> {
+    if let (Some(t), Some(ord)) = (rb_tree_of(that), custom_ordering(that)) {
+        let mut cx = OrdCx { vm, ord: &ord };
+        return Ok(crate::rbtree::lookup(&mut cx, &t, x)?.is_some());
+    }
+    for y in iterable_arg(that) {
+        if eq_vm(vm, &y, x)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `tree` with each of `xs` inserted in turn — `RB.update` without overwrite
+/// for a set, with it for a map (whose `xs` are pairs), which is also what the
+/// library's builders and `TreeMap`'s `Adder` produce.
+fn rb_insert_all(
+    vm: &mut VM,
+    ord: &Value,
+    tree: &RbTree,
+    is_map: bool,
+    xs: Vec<Value>,
+) -> Result<RbTree, String> {
+    let mut cx = OrdCx { vm, ord };
+    let mut t = tree.clone();
+    for x in xs {
+        let (k, v) = if is_map {
+            entry_parts(&x)?
+        } else {
+            (x, Value::Undef)
+        };
+        t = crate::rbtree::update(&mut cx, &t, &k, &v, is_map)?;
+    }
+    Ok(t)
+}
+
+/// `a == b` for two immutable `TreeSet`s (or two `TreeMap`s) held under `==`
+/// orderings: `TreeSet.equals` is `RB.keysEqual` and `TreeMap.equals`
+/// `RB.entriesEqual`, which walk both trees in step and ask the ordering's
+/// `equiv` of every pair of keys that are not the same box. `None` when the
+/// two are not such a pair, which leaves the structural `Set`/`Map` equality.
+fn rb_equals(vm: &mut VM, a: &Value, b: &Value) -> Option<Result<bool, String>> {
+    let (ord, theirs) = (custom_ordering(a)?, custom_ordering(b)?);
+    let is_map = rb_shape(a)?;
+    if rb_shape(b)? != is_map || !orderings_equal(&ord, &theirs) {
+        return None;
+    }
+    let (ta, tb) = (rb_tree_of(a)?, rb_tree_of(b)?);
+    let mut values = |x: &Value, y: &Value| Ok(scala_eq(x, y));
+    let mut cx = OrdCx { vm, ord: &ord };
+    Some(crate::rbtree::equal(
+        &mut cx,
+        &ta,
+        &tb,
+        is_map.then_some(&mut values as &mut dyn FnMut(&Value, &Value) -> Result<bool, String>),
+    ))
+}
+
+/// A member of an immutable `TreeSet`/`TreeMap` held under `ord`, answered on
+/// its red-black tree as `TreeSet.scala`/`TreeMap.scala` answer it. `None` for
+/// a member that consults no ordering, which the ordinary dispatch answers from
+/// the in-order contents.
+fn rb_member(
+    vm: &mut VM,
+    recv: &Value,
+    ord: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    use crate::rbtree as rb;
+    let is_map = rb_shape(recv)?;
+    let tree = rb_tree_of(recv)?;
+    let size = rb::count(&tree) as i64;
+    // `newSetOrSelf` / `newMapOrSelf`: the receiver itself when the tree did
+    // not change; `fresh` is a `new TreeSet(t)` the library always allocates.
+    let or_self = |t: RbTree| {
+        if rb::same(&t, &tree) {
+            recv.clone()
+        } else {
+            rb_publish(is_map, t, ord)
+        }
+    };
+    let fresh = |t: RbTree| rb_publish(is_map, t, ord);
+    let entry = |k: &Value, v: &Value| {
+        if is_map {
+            new_pair(k.clone(), v.clone())
+        } else {
+            k.clone()
+        }
+    };
+    let take = |n: i64| {
+        if n <= 0 {
+            fresh(None)
+        } else if n >= size {
+            recv.clone()
+        } else {
+            fresh(rb::take(&tree, n as usize))
+        }
+    };
+    let drop = |n: i64| {
+        if n <= 0 {
+            recv.clone()
+        } else if n >= size {
+            fresh(None)
+        } else {
+            fresh(rb::drop(&tree, n as usize))
+        }
+    };
+    // `countWhile`: how many leading entries `p` holds for.
+    let count_while = |vm: &mut VM, p: &Value| -> Result<i64, String> {
+        let mut n = 0;
+        for (k, v) in rb::entries(&tree) {
+            if !truthy(&invoke_closure(vm, p, &[entry(&k, &v)])?) {
+                break;
+            }
+            n += 1;
+        }
+        Ok(n)
+    };
+    let pair = |a: Value, b: Value| heap_push(HeapVal::Tuple(vec![a, b]));
+    let set = !is_map;
+    let r = (|| -> Result<Option<Value>, String> {
+        Ok(Some(match (name, args) {
+            ("+" | "incl", [x]) if set => {
+                let t = rb::update(&mut OrdCx { vm, ord }, &tree, x, &Value::Undef, false)?;
+                or_self(t)
+            }
+            ("+", [p]) if is_map => {
+                let (k, v) = entry_parts(p)?;
+                or_self(rb::update(&mut OrdCx { vm, ord }, &tree, &k, &v, true)?)
+            }
+            ("updated", [k, v]) if is_map => {
+                or_self(rb::update(&mut OrdCx { vm, ord }, &tree, k, v, true)?)
+            }
+            ("-" | "excl", [x]) if set => or_self(rb::delete(&mut OrdCx { vm, ord }, &tree, x)?),
+            ("-" | "removed", [k]) if is_map => {
+                or_self(rb::delete(&mut OrdCx { vm, ord }, &tree, k)?)
+            }
+            ("++" | "concat" | "union" | "|", [xs]) if set || matches!(name, "++" | "concat") => {
+                match rb_peer(xs, ord, is_map) {
+                    Some(t2) => or_self(rb::union(&mut OrdCx { vm, ord }, &tree, &t2)?),
+                    None => or_self(rb_insert_all(vm, ord, &tree, is_map, iterable_arg(xs))?),
+                }
+            }
+            ("--" | "removedAll", [xs]) => match rb_peer(xs, ord, false) {
+                Some(t2) => or_self(rb::difference(&mut OrdCx { vm, ord }, &tree, &t2)?),
+                None => {
+                    let mut cx = OrdCx { vm, ord };
+                    let mut t = tree.clone();
+                    for k in iterable_arg(xs) {
+                        t = rb::delete(&mut cx, &t, &k)?;
+                    }
+                    or_self(t)
+                }
+            },
+            ("diff" | "&~", [that]) if set => match rb_peer(that, ord, false) {
+                Some(t2) => or_self(rb::difference(&mut OrdCx { vm, ord }, &tree, &t2)?),
+                // `foldLeft(empty)((r, e) => if (that contains e) r else r + e)`.
+                None => {
+                    let mut t: RbTree = None;
+                    for (k, _) in rb::entries(&tree) {
+                        if !rb_arg_contains(vm, that, &k)? {
+                            t = rb::update(&mut OrdCx { vm, ord }, &t, &k, &Value::Undef, false)?;
+                        }
+                    }
+                    fresh(t)
+                }
+            },
+            ("intersect" | "&", [that]) if set => match rb_peer(that, ord, false) {
+                Some(t2) => or_self(rb::intersect(&mut OrdCx { vm, ord }, &tree, &t2)?),
+                // `this.filter(that)`.
+                None => or_self(rb::filter(&tree, &mut |k, _| rb_arg_contains(vm, that, k))?),
+            },
+            ("contains" | "apply", [x]) if set => {
+                Value::bool(rb::lookup(&mut OrdCx { vm, ord }, &tree, x)?.is_some())
+            }
+            ("contains" | "isDefinedAt", [k]) if is_map => {
+                Value::bool(rb::lookup(&mut OrdCx { vm, ord }, &tree, k)?.is_some())
+            }
+            ("get", [k]) if is_map => match rb::lookup(&mut OrdCx { vm, ord }, &tree, k)? {
+                Some(n) => make_some(n.value.clone()),
+                None => make_none(),
+            },
+            ("getOrElse", [k, d]) if is_map => {
+                match rb::lookup(&mut OrdCx { vm, ord }, &tree, k)? {
+                    Some(n) => n.value.clone(),
+                    None => d.clone(),
+                }
+            }
+            ("apply", [k]) if is_map => match rb::lookup(&mut OrdCx { vm, ord }, &tree, k)? {
+                Some(n) => n.value.clone(),
+                None => {
+                    return Err(format!(
+                        "scalars: java.util.NoSuchElementException: key not found: {}",
+                        scala_str(k)
+                    ))
+                }
+            },
+            ("range", [from, until]) => {
+                let b = rb::Bound::Range(from.clone(), until.clone());
+                or_self(rb::range(&mut OrdCx { vm, ord }, &tree, &b)?)
+            }
+            ("rangeFrom", [k]) => or_self(rb::range(
+                &mut OrdCx { vm, ord },
+                &tree,
+                &rb::Bound::From(k.clone()),
+            )?),
+            ("rangeUntil", [k]) => or_self(rb::range(
+                &mut OrdCx { vm, ord },
+                &tree,
+                &rb::Bound::Until(k.clone()),
+            )?),
+            // `SortedSetOps.rangeTo` / `SortedMapOps.rangeTo`: the first key
+            // from `to` on decides, by `compare`, where an exclusive bound
+            // goes.
+            ("rangeTo", [to]) => {
+                let mut cx = OrdCx { vm, ord };
+                let from = rb::range(&mut cx, &tree, &rb::Bound::From(to.clone()))?;
+                let keys: Vec<Value> = rb::entries(&from)
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .take(2)
+                    .collect();
+                let until = match keys.as_slice() {
+                    [] => None,
+                    [next, rest @ ..] => {
+                        if crate::rbtree::Cx::compare(&mut cx, next, to)? == Ordering::Equal {
+                            rest.first().cloned()
+                        } else {
+                            Some(next.clone())
+                        }
+                    }
+                };
+                match until {
+                    None => recv.clone(),
+                    Some(u) => or_self(rb::range(&mut cx, &tree, &rb::Bound::Until(u))?),
+                }
+            }
+            ("minAfter", [k]) => {
+                opt(rb::min_after(&mut OrdCx { vm, ord }, &tree, k)?
+                    .map(|n| entry(&n.key, &n.value)))
+            }
+            ("maxBefore", [k]) => {
+                opt(rb::max_before(&mut OrdCx { vm, ord }, &tree, k)?
+                    .map(|n| entry(&n.key, &n.value)))
+            }
+            ("tail" | "init", []) => {
+                if tree.is_none() {
+                    return Err("scalars: java.util.NoSuchElementException: empty tree".into());
+                }
+                fresh(if name == "tail" {
+                    rb::tail(&tree)
+                } else {
+                    rb::init(&tree)
+                })
+            }
+            ("take", [n]) => take(n.to_int()),
+            ("drop", [n]) => drop(n.to_int()),
+            ("takeRight", [n]) => drop(size - n.to_int().max(0)),
+            ("dropRight", [n]) => take(size - n.to_int().max(0)),
+            ("slice", [from, until]) => {
+                let (from, until) = (from.to_int(), until.to_int());
+                if until <= from {
+                    fresh(None)
+                } else if from <= 0 {
+                    take(until)
+                } else if until >= size {
+                    drop(from)
+                } else {
+                    fresh(rb::slice(&tree, from as usize, until as usize))
+                }
+            }
+            ("splitAt", [n]) => pair(take(n.to_int()), drop(n.to_int())),
+            ("takeWhile", [p]) => take(count_while(vm, p)?),
+            ("dropWhile", [p]) => drop(count_while(vm, p)?),
+            ("span", [p]) => {
+                let n = count_while(vm, p)?;
+                pair(take(n), drop(n))
+            }
+            ("filter", [p]) => or_self(rb::filter(&tree, &mut |k, v| {
+                Ok(truthy(&invoke_closure(vm, p, &[entry(k, v)])?))
+            })?),
+            // `StrictOptimizedIterableOps.filterImpl`: the survivors go
+            // through the factory's builder, which inserts them one by one.
+            ("filterNot", [p]) => {
+                let mut kept = Vec::new();
+                for (k, v) in rb::entries(&tree) {
+                    let e = entry(&k, &v);
+                    if !truthy(&invoke_closure(vm, p, std::slice::from_ref(&e))?) {
+                        kept.push(e);
+                    }
+                }
+                fresh(rb_insert_all(vm, ord, &None, is_map, kept)?)
+            }
+            ("partition", [p]) => {
+                let (yes, no) = rb::partition(&tree, &mut |k, v| {
+                    Ok(truthy(&invoke_closure(vm, p, &[entry(k, v)])?))
+                })?;
+                pair(or_self(yes), or_self(no))
+            }
+            // `TreeMap.keySet` is `new TreeSet(tree)`: the same tree.
+            ("keySet" | "keys", []) if is_map => rb_publish(false, tree.clone(), ord),
+            ("iteratorFrom", [k]) | ("keysIteratorFrom" | "valuesIteratorFrom", [k]) => {
+                let es = rb::entries_from(&mut OrdCx { vm, ord }, &tree, k)?;
+                let items = es
+                    .iter()
+                    .map(|(k, v)| match name {
+                        "keysIteratorFrom" => k.clone(),
+                        "valuesIteratorFrom" => v.clone(),
+                        _ => entry(k, v),
+                    })
+                    .collect();
+                new_seq(SeqKind::Iterator, items)
+            }
+            _ => return Ok(None),
+        }))
+    })();
+    r.transpose()
 }
 
 /// `WITH_ORDERING` builtin — see [`WITH_ORDERING`]. With three operands the
