@@ -475,6 +475,9 @@ pub enum Expr {
     MainArg {
         index: usize,
         ty: String,
+        /// A repeated last parameter (`rest: Int*`): every argument from
+        /// `index` on, as a `List` (see [`crate::host::MAIN_REST`]).
+        rest: bool,
     },
     /// The `args: Array[String]` parameter of a `def main` entry point: the
     /// program arguments as an `Array` of `String`.

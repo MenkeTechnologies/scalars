@@ -228,6 +228,19 @@ impl fmt::Display for Tok {
     }
 }
 
+/// Whether the tokens so far end in Scala 3's wildcard selector `a.b.*`.
+///
+/// There the `*` is an identifier closing an `import`/`export` clause, not an
+/// operator awaiting its right operand, so a line break after it separates
+/// statements. Without this the next line (`@main def go()`, `def f`) was read
+/// as part of the import clause.
+fn ends_wildcard_import(out: &[Token]) -> bool {
+    matches!(
+        out,
+        [.., Token { kind: Tok::Dot, .. }, Token { kind: Tok::Star, .. }]
+    )
+}
+
 /// Lex `src` into a token vector terminated by `Tok::Eof`, with inferred
 /// [`Tok::Newline`] statement separators.
 ///
@@ -266,7 +279,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             let kind = $kind;
             if pending_newline
                 && paren_depth == 0
-                && out.last().map(|t| t.kind.can_end()).unwrap_or(false)
+                && (out.last().map(|t| t.kind.can_end()).unwrap_or(false)
+                    || ends_wildcard_import(&out))
                 && kind.can_begin()
             {
                 out.push(Token {

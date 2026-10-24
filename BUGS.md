@@ -331,7 +331,7 @@ reported as parse/compile errors, never silently mis-run.
   `": "`. `AssertionError` extends `Error`, so `catch { case e: Exception }`
   does not catch one.
 - **Classes, objects, `case class` (host-side object model).** `class C(x: Int)
-  { def m = … }` with `new C(…)`, constructor params + body `val`/`var` fields,
+  { def m = … }` with `new C(…)` or Scala 3's creator application `C(…)`, constructor params + body `val`/`var` fields,
   `this`, in-place `var`-field mutation, and instance-method dispatch (runtime
   class-tag dispatch off a `Value::Obj` handle into the frontend heap in
   `src/host.rs`). `object` singletons dispatch `def`s statically and expose
@@ -1332,9 +1332,9 @@ reported as parse/compile errors, never silently mis-run.
 - **The wider standard library.** `scala.io`, `scala.collection.*` as a
   namespace, and the many `String`/numeric methods beyond the wired subset
   above. Members a differential sweep reached and found missing (each an
-  honest `not a member` error, never a wrong answer): `prefixLength` on a
-  sequence instance, `Ordering.Tuple2(o1, o2)`, and the JDK `String` member
-  `lines`. `Map.foreachEntry`, `Map.applyOrElse`, `Map.updatedWith`
+  honest `not a member` error, never a wrong answer) were `prefixLength` on a
+  sequence instance, `Ordering.Tuple2(o1, o2)` and the JDK `String` member
+  `lines`; all three are now modelled. `Map.foreachEntry`, `Map.applyOrElse`, `Map.updatedWith`
   (`updateWith` on the mutable one), `Map --`/`removedAll`, `sizeIs`/`lengthIs`,
   an instance's `empty` and `toBooleanOption` were found the same way and are
   now modelled.
@@ -1617,13 +1617,41 @@ reported as parse/compile errors, never silently mis-run.
   `SortedMap`/`SortedSet` and `mutable.BitSet`, and `scala.util.boundary` with
   `break(v)` (bare through `import scala.util.boundary.break` or the relative
   `import scala.util.boundary, boundary.break`, or as `boundary.break(v)`).
-  Still open: a bare `getClass` inside a TOP-LEVEL `def` (Scala answers
-  `scala.Predef$` there) still reads `null`; a `break` whose `Label` arrives
-  through a `using` parameter rather than lexically is refused; `println(this)`
-  in the entry object prints `Main@0` where Scala prints the unreproducible
-  identity form `Main$@<hash>`; and `Function.untupled`/`Function.const`/
-  `Function.chain` still read `null` (the same catchable
-  `NullPointerException`).
+  A bare `getClass` inside a TOP-LEVEL `def`, an `@main` body or a lambda in
+  either now answers `scala.Predef$` (Scala 3.10.0 resolves it to
+  `Predef.getClass`, with a warning), and one inside a lambda in a class
+  method captures `this` and answers the class; `Function.untupled` (at any
+  arity it is applied), `Function.const` (its argument evaluated once) and
+  `Function.chain` are modelled, and so is a trailing application folded into
+  any of them or `Function.tupled` (`Function.tupled(f)((1, 2))`).
+  Still open: a `break` whose `Label` arrives through a `using` parameter
+  rather than lexically is refused (`break` outside any `boundary`), and so is
+  `boundary[T]` with an explicit type argument; `println(this)` in the entry
+  object prints `Main@0` where Scala prints the unreproducible identity form
+  `Main$@<hash>`.
+- **Found by the October 2026 Scala 3 feature sweep.** Each failed to compile
+  or ran wrong where Scala 3.10.0 runs, and is now modelled: Scala 3's
+  wildcard `import a.b.*` (it recorded nothing, so `import Units.*` left the
+  object's members reading `null`, and it ended no line, so a following
+  `@main def` was swallowed into the import and the file had `no entry
+  point`), `{x, *}` and the `as` rename (`import U.{v as vv}`, `import a.b.c
+  as d`); an `import` BELOW the prologue (`import Units.*` after `object
+  Units`), which the top-level loop stepped over token by token, losing the
+  import and any `@main` after it; a `derives CanEqual` clause on a class,
+  which consumed the following `@main` the same way; `extends A, B` (Scala 3's
+  comma between parents); the creator application `C(args)` for a plain class
+  (`new` was required); `lazy val fib: LazyList[Int] = 0 #:: 1 #:: fib.zip(…)`
+  inside a `def` (its thunk captured the cell before it existed) and a lazy
+  `val` holding a function applied as `g(x)` (it was not forced); the
+  `h #:: t` extractor and `case _: LazyList[?]`; a `MatchError` on a
+  `LazyList` naming `scala.collection.immutable.LazyList`; `@main` with a
+  repeated last parameter (`rest: String*`, read by
+  `CommandLineParser.parseRemainingArguments`); `inline` parameters, `inline
+  if` and `inline x match`; the JDK `String.lines` stream and the deprecated
+  `prefixLength`. Still open from the same sweep: `export` clauses (`export
+  in.{hello}` in a class body, `export A.*` in an object — the forwarders are
+  not generated, so the member reports `not a member`), and `scala.io.Source`
+  (no reader at all; `Using(Source.fromString(s))(…)` answers a `Failure`).
   (`Regex.unapplySeq`, `super.m` inside a singleton `object`, the immutable
   `ListMap`, a `case class` with a SECOND parameter list — whose product is the
   first list only —, `BigDecimal.underlying` (a `java.math.BigDecimal` with
@@ -1637,6 +1665,17 @@ reported as parse/compile errors, never silently mis-run.
   reference compiler rejects it, so scalars does not implement it either.
 
 ## Modeled with a documented simplification
+
+- **`inline if` / `inline x match` choose their branch at run time.** The
+  reference reduces them at compile time, a type pattern against the
+  scrutinee's STATIC type. They agree whenever the condition is a constant or
+  the static type is the runtime class (`kind(3)` with `case _: Int`); they
+  differ for a scrutinee widened before the call (`val a: Any = 3; kind(a)`
+  takes `case _` in Scala and `case _: Int` here). `inline` parameters are
+  ordinary by-value parameters.
+- **`Function.untupled(f)` takes any number of arguments.** Scala overloads it
+  for `Tuple2` to `Tuple5`; with no static arity for `f`, the function built
+  here tuples however many arguments it is applied to.
 
 - **A member access on `null` raises `NullPointerException` without the
   JDK's message.** `s.length` on a `null` `String` is the catchable

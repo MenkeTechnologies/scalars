@@ -578,6 +578,12 @@ pub const USING_MANAGER: u16 = 834;
 pub const USING_RELEASE: u16 = 835;
 /// Builtin id for `StringContext(parts…)`: pops `argc` strings.
 pub const MAKE_STRING_CONTEXT: u16 = 836;
+/// Builtin id for a `@main` method's REPEATED parameter (`rest: Int*`): pops
+/// the type name and the first index, and answers every argument from there on
+/// read as that type, in a `List` — Scala's
+/// `CommandLineParser.parseRemainingArguments[T](args, i)`. The first argument
+/// that does not read halts the program exactly as [`MAIN_ARG`] does.
+pub const MAIN_REST: u16 = 837;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -687,6 +693,34 @@ fn b_main_arg(vm: &mut VM, _argc: u8) -> Value {
             Value::Undef
         }
     }
+}
+
+/// The reserved method name `Function.untupled(f)` lowers to on a function
+/// value: `(a, b, …) => f((a, b, …))`. Scala overloads `untupled` per tuple
+/// arity (2 to 5); this frontend has no static arity for `f`, so the function
+/// built takes its arguments as they come and tuples all of them. The `$`
+/// keeps the name out of reach of a program's own `f.untupled`, which Scala
+/// rejects.
+pub const UNTUPLED_METHOD: &str = "$untupled";
+
+/// `MAIN_REST` builtin — see [`MAIN_REST`].
+fn b_main_rest(vm: &mut VM, _argc: u8) -> Value {
+    let ty = vm.pop().as_str_cow().into_owned();
+    let first = vm.pop().to_int().max(0) as usize;
+    let args: Vec<String> = ARGV.with(|a| a.borrow().iter().skip(first).cloned().collect());
+    let mut items = Vec::with_capacity(args.len());
+    for (offset, text) in args.iter().enumerate() {
+        match parse_main_arg(text, &ty) {
+            Ok(v) => items.push(v),
+            Err(cause) => {
+                // A clean halt on stdout with exit 0, as in `b_main_arg`.
+                println!("Illegal command line{}: {cause}", arg_position(first + offset));
+                vm.request_halt();
+                return Value::Undef;
+            }
+        }
+    }
+    new_list(items)
 }
 
 thread_local! {
@@ -930,6 +964,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(CHAR_NEW, b_char_new);
     vm.register_builtin(UNAPPLY_SEQ, b_unapply_seq);
     vm.register_builtin(MAIN_ARG, b_main_arg);
+    vm.register_builtin(MAIN_REST, b_main_rest);
     vm.register_builtin(MAIN_ARGV, b_main_argv);
     vm.register_builtin(SF32, b_f32);
     vm.register_builtin(SF32_ARITH, b_f32_arith);
@@ -2823,6 +2858,8 @@ enum DerivedFn {
     Compose(Value, Value),
     /// `f.tupled` — `t => f(t._1, …, t._n)`.
     Tupled(Value),
+    /// `Function.untupled(f)` — `(a, …) => f((a, …))`; see [`UNTUPLED_METHOD`].
+    Untupled(Value),
     /// `f.curried` — one argument at a time: holds `f`, its arity, and the
     /// arguments taken so far; the last one applies `f` to all of them.
     Curried(Value, usize, Vec<Value>),
@@ -5679,6 +5716,10 @@ fn invoke_derived(vm: &mut VM, d: &DerivedFn, args: &[Value]) -> Result<Value, S
             let parts = as_seq_or_tuple(&arg).unwrap_or_else(|| vec![arg.clone()]);
             invoke_closure(vm, f, &parts)
         }
+        DerivedFn::Untupled(f) => {
+            let tuple = heap_push(HeapVal::Tuple(args.to_vec()));
+            invoke_closure(vm, f, std::slice::from_ref(&tuple))
+        }
         DerivedFn::Curried(f, arity, taken) => {
             let mut taken = taken.clone();
             taken.push(arg);
@@ -5706,6 +5747,7 @@ fn is_defined_at(vm: &mut VM, clo: &Value, arg: &Value) -> Result<bool, String> 
             // defined wherever the function they feed from is.
             DerivedFn::Lift(_)
             | DerivedFn::Tupled(_)
+            | DerivedFn::Untupled(_)
             | DerivedFn::Curried(..)
             | DerivedFn::ByName(_) => Ok(true),
             DerivedFn::AndThen(f, _) | DerivedFn::Compose(_, f) => is_defined_at(vm, f, arg),
@@ -6157,6 +6199,9 @@ fn class_of_type(ty: &str, user: bool) -> Result<Value, String> {
         "Option" => "scala.Option",
         "Some" => "scala.Some",
         "BigInt" => "scala.math.BigInt",
+        // Not a `classOf` spelling: the reserved key a bare `getClass` outside
+        // every class and object lowers to (see [`PREDEF_CLASS_KEY`]).
+        PREDEF_CLASS_KEY => "scala.Predef$",
         _ => "",
     };
     if !qualified.is_empty() {
@@ -6172,6 +6217,14 @@ fn class_of_type(ty: &str, user: bool) -> Result<Value, String> {
     }
     Err(format!("scalars: classOf[{ty}] is not modelled"))
 }
+
+/// The type key [`CLASS_OF`] answers `scala.Predef$`'s `Class` for. A bare
+/// `getClass` in a top-level `def` or `@main` body has no enclosing class to
+/// resolve to, so Scala 3 takes it from the `Predef` import (warning "Universal
+/// method getClass does not resolve to the enclosing class"): Scala 3.10.0
+/// prints `scala.Predef$` for `def nm = getClass.getName`. The `$` keeps the
+/// key out of reach of a written `classOf[…]`.
+pub const PREDEF_CLASS_KEY: &str = "$predef";
 
 /// `CLASS_OF` builtin — see [`CLASS_OF`].
 fn b_class_of(vm: &mut VM, _argc: u8) -> Value {
@@ -7960,6 +8013,13 @@ fn boxed_class_name(v: &Value) -> String {
             if let Some(e) = as_exc(v) {
                 return e.class.to_string();
             }
+            // A `LazyList` is one final class, empty or not (Scala 3.10.0:
+            // `MatchError: LazyList() (of class scala.collection.immutable.
+            // LazyList)`). `Stream`'s cons/empty classes and an iterator's
+            // anonymous class are not modelled.
+            if lazy_kind(v) == Some((false, false)) {
+                return "scala.collection.immutable.LazyList".to_string();
+            }
             match with_obj(v, |o| (o.class.to_string(), o.is_object)) {
                 Some((c, _)) if c == "Some" => "scala.Some".to_string(),
                 Some((c, _)) if c == "None" => "scala.None$".to_string(),
@@ -8083,6 +8143,10 @@ fn value_is_type(v: &Value, ty: &str) -> bool {
         "Array" => matches!(seq_kind(v), Some(SeqKind::Array)),
         "Set" => matches!(seq_kind(v), Some(k) if k.is_set()),
         "Map" => is_map(v),
+        // A `LazyList` (and `Stream`, its Scala 2 predecessor), which is also
+        // what the `h #:: t` extractor tests before splitting one.
+        "LazyList" => lazy_kind(v).is_some_and(|(iter, stream)| !iter && !stream),
+        "Stream" => lazy_kind(v).is_some_and(|(iter, stream)| !iter && stream),
         // `Nil` is the empty `List`; `::` is a non-empty one (the cons cell
         // class). Both are shape tests, not `==` against a singleton.
         "Nil" => with_seq(v, |k, xs| k == SeqKind::List && xs.is_empty()).unwrap_or(false),
@@ -12029,8 +12093,9 @@ fn seq_method_inner(
         }
         // The length of the longest segment all of whose elements hold, starting
         // at `from` (a negative one is 0, as `iterator.drop` makes it) — it stops
-        // at the first failure rather than counting every match.
-        ("segmentLength", 1 | 2) => {
+        // at the first failure rather than counting every match. The deprecated
+        // `prefixLength(p)` is `segmentLength(p, 0)`.
+        ("segmentLength", 1 | 2) | ("prefixLength", 1) => {
             let start = args
                 .get(1)
                 .map_or(0, |v| v.to_int().max(0) as usize)
@@ -12969,6 +13034,7 @@ fn closure_method(vm: &mut VM, recv: &Value, name: &str, args: &[Value]) -> Resu
         // `f.tupled` / `f.curried` on a function of two or more parameters.
         // A trailing application folded into the call applies the result.
         ("tupled", _) => derived(vm, DerivedFn::Tupled(recv.clone()), args),
+        (UNTUPLED_METHOD, _) => derived(vm, DerivedFn::Untupled(recv.clone()), args),
         ("curried", _) => match as_closure(recv).map(|c| usize::from(c.params)) {
             Some(arity) if arity >= 2 => {
                 let mut f = heap_push(HeapVal::Derived(DerivedFn::Curried(
@@ -16537,6 +16603,14 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         ("codePoints", 0) => Ok(new_int_stream(
             s.chars().map(|c| Value::int(i64::from(c as u32))).collect(),
         )),
+        // JDK 11 `String.lines()`: a `Stream<String>` of the lines split at
+        // `\n`, `\r` or `\r\n`, terminators dropped. A final terminator ends
+        // the last line rather than opening an empty one, so `""` has no lines.
+        ("lines", 0) => Ok(new_stream(
+            jdk_lines(&s).into_iter().map(Value::str).collect(),
+            SElem::Obj,
+            None,
+        )),
         ("toIndexedSeq", 0) => Ok(new_seq(
             SeqKind::WrappedStr,
             s.chars().map(make_char).collect(),
@@ -17201,6 +17275,7 @@ fn string_fn_method(
         "flatten",
         "lastIndexWhere",
         "segmentLength",
+        "prefixLength",
         "corresponds",
         "aggregate",
         "indexOfSlice",
@@ -19039,6 +19114,18 @@ fn as_lazy(v: &Value) -> Option<LazyList> {
     } else {
         None
     }
+}
+
+/// Whether `v` is the lazy machinery, as `(is an Iterator, is a Stream)`,
+/// without cloning its forced prefix the way [`as_lazy`] does.
+fn lazy_kind(v: &Value) -> Option<(bool, bool)> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HeapVal::Lazy(l)) => Some((l.iter, l.stream)),
+        _ => None,
+    })
 }
 
 /// Allocate a `LazyList` with the given prefix and rule.
@@ -20893,6 +20980,33 @@ thread_local! {
         RefCell::new(std::collections::HashSet::new());
 }
 
+/// The lines `java.lang.String.lines()` streams: split at `\n`, `\r` or
+/// `\r\n`, without terminators, and no empty line after a final terminator.
+fn jdk_lines(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let (mut start, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                out.push(&s[start..i]);
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                out.push(&s[start..i]);
+                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
 /// A new `IntStream` over `src` with no pipeline.
 fn new_int_stream(src: Vec<Value>) -> Value {
     new_seq(SeqKind::JStream, src)
@@ -21970,6 +22084,7 @@ const SEQ_MEMBERS: &[&str] = &[
     "combinations",
     "indices",
     "segmentLength",
+    "prefixLength",
     "sameElements",
     "search",
     "applyOrElse",

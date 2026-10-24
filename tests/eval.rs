@@ -4582,6 +4582,27 @@ fn main_parameters_are_read_from_the_command_line() {
 }
 
 #[test]
+fn a_repeated_main_parameter_takes_every_remaining_argument() {
+    // `CommandLineParser.parseRemainingArguments[Int]`: a `List` of the rest,
+    // empty when none are left, and the first unreadable one reported at its
+    // own position before the body runs (Scala 3.10.0, JDK 27).
+    let src = "@main def go(n: Int, rest: Int*) =\n  println(rest)\n  println(rest.sum + n)";
+    for (argv, expected) in [
+        (&["1", "2", "3"][..], "List(2, 3)\n6\n"),
+        (&["1"][..], "List()\n1\n"),
+        (
+            &["1", "2", "x"][..],
+            "Illegal command line after 2 arguments: \
+             java.lang.NumberFormatException: For input string: \"x\"\n",
+        ),
+    ] {
+        let (out, ok) = run_args(src, argv);
+        assert!(ok, "argv {argv:?}");
+        assert_eq!(out, expected, "argv {argv:?}");
+    }
+}
+
+#[test]
 fn extra_command_line_arguments_are_ignored() {
     let (out, ok) = run_args(
         "@main def go(n: Int): Unit = println(n)",

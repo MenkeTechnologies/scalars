@@ -382,6 +382,15 @@ impl Parser {
                 self.type_decl()?;
                 continue;
             }
+            // An `import`/`export` AFTER the prologue — `import Units.*` below
+            // the `object Units` it opens. The modifier skip below would step
+            // over it token by token to the next declaration keyword, which
+            // dropped the import (its names read `null`) and, when an `@main`
+            // followed, the annotation with it (`no entry point`).
+            if matches!(self.peek(), Tok::Ident(w) if w == "import" || w == "export") {
+                self.skip_import_clause();
+                continue;
+            }
             // Leading modifiers (`final`, `sealed`, `abstract`, …) arrive as
             // bare idents; skip to the declaration keyword.
             while !self.is(&Tok::Eof) && !self.at_declaration_start() {
@@ -515,11 +524,6 @@ impl Parser {
             .expect("the `@main` def was just pushed");
         let mut args = Vec::with_capacity(func.params.len());
         for (i, sig) in func.sig.iter().enumerate() {
-            if sig.vararg {
-                return Err(format!(
-                    "scalars: `@main def {name}`'s repeated parameter is not supported"
-                ));
-            }
             let ty = sig.ty.clone().ok_or_else(|| {
                 format!("scalars: `@main def {name}` needs a type on every parameter")
             })?;
@@ -531,7 +535,25 @@ impl Parser {
                     "scalars: `@main def {name}` cannot read a `{ty}` from the command line"
                 ));
             }
-            args.push(Expr::MainArg { index: i, ty });
+            // A repeated last parameter (`rest: String*`) takes every argument
+            // left, passed on as a spread so the `def` sees its own `Seq`.
+            if sig.vararg {
+                args.push(Expr::Collection {
+                    targs: Vec::new(),
+                    ctor: SPREAD.to_string(),
+                    elems: vec![Expr::MainArg {
+                        index: i,
+                        ty,
+                        rest: true,
+                    }],
+                });
+                break;
+            }
+            args.push(Expr::MainArg {
+                index: i,
+                ty,
+                rest: false,
+            });
         }
         Ok(Stmt {
             kind: StmtKind::Expr(Expr::Call {
@@ -817,6 +839,7 @@ impl Parser {
         } = self.ctor_params()?;
         // `extends Parent[(args)] [with T]*`.
         let (parents, super_args) = self.parents_clause()?;
+        self.skip_derives_clause();
         let ClassBody {
             body,
             methods,
@@ -1146,13 +1169,7 @@ impl Parser {
             None
         };
         let (mut parents, _) = self.parents_clause()?;
-        // `derives C1, C2` names type-class instances to derive; the runtime
-        // has no type classes to derive them for.
-        if matches!(self.peek(), Tok::Ident(w) if w == "derives") {
-            while !self.is(&Tok::LBrace) && !self.is(&Tok::Eof) {
-                self.advance();
-            }
-        }
+        self.skip_derives_clause();
         self.eat(&Tok::LBrace)?;
         self.skip_seps();
         let mut methods = Vec::new();
@@ -1391,13 +1408,46 @@ impl Parser {
                 }
             }
             parents.push(p);
-            if matches!(self.peek(), Tok::Ident(w) if w == "with") {
+            // Scala 2 chains mixins with `with`; Scala 3 also accepts a comma
+            // (`class AB extends A, B`).
+            if matches!(self.peek(), Tok::Ident(w) if w == "with")
+                || (self.is(&Tok::Comma) && matches!(self.peek_at(1), Tok::Ident(_)))
+            {
                 self.advance();
             } else {
                 break;
             }
         }
         Ok((parents, super_args))
+    }
+
+    /// Skip a `derives C1, C2` clause (`derives CanEqual`, `derives
+    /// scala.math.Ordering`). It asks the compiler for type-class instances;
+    /// the runtime has no type classes to derive them for, and whatever a
+    /// derived `CanEqual` permits the reference's type checker has already
+    /// accepted. Consuming exactly the clause matters: the old skip ran on to
+    /// the next declaration keyword, swallowing a following `@main`.
+    fn skip_derives_clause(&mut self) {
+        if !matches!(self.peek(), Tok::Ident(w) if w == "derives") {
+            return;
+        }
+        self.advance();
+        loop {
+            while matches!(self.peek(), Tok::Ident(_)) {
+                self.advance();
+                if !self.is(&Tok::Dot) {
+                    break;
+                }
+                self.advance();
+            }
+            if self.is(&Tok::LBracket) {
+                self.skip_bracket_group();
+            }
+            if !self.is(&Tok::Comma) {
+                break;
+            }
+            self.advance();
+        }
     }
 
     /// Skip the member modifiers that may precede a `def`/`val`/`var` inside a
@@ -1705,6 +1755,17 @@ impl Parser {
                         continue;
                     }
                     break;
+                }
+                // `inline x: Int` — an inline parameter of an `inline def`. It
+                // asks the compiler to substitute the argument expression rather
+                // than bind its value; the argument is still evaluated where the
+                // body reads it, which for the pure arguments the reference
+                // accepts prints the same.
+                if matches!(self.peek(), Tok::Ident(w) if w == "inline")
+                    && matches!(self.peek_at(1), Tok::Ident(_))
+                    && matches!(self.peek_at(2), Tok::Colon)
+                {
+                    self.advance();
                 }
                 let pname = self.ident()?;
                 let mut ps = ParamSig::default();
@@ -2243,6 +2304,9 @@ impl Parser {
         while i < end {
             match &self.toks[i].kind {
                 Tok::Ident(w) => path.push(w.clone()),
+                // Scala 3 spells the wildcard `*` (`import a.b.*`); Scala 2's
+                // `_` is the marker the rest of this function reads.
+                Tok::Star => path.push("_".to_string()),
                 Tok::Dot => {}
                 Tok::LBrace => break,
                 // `import a.b.this`, `import a.b.given` and the like name no
@@ -2258,6 +2322,16 @@ impl Parser {
                 path.pop();
                 if !path.is_empty() {
                     self.wildcards.push(path);
+                }
+                return;
+            }
+            // Scala 3's rename `import a.b.c as d` binds `d` to `a.b.c`, and
+            // `import a.b.c as _` binds nothing.
+            if path.len() >= 3 && path[path.len() - 2] == "as" {
+                let local = path.pop().unwrap_or_default();
+                path.pop(); // `as`
+                if local != "_" && path.len() >= 2 {
+                    self.imports.insert(local, path);
                 }
                 return;
             }
@@ -2278,14 +2352,23 @@ impl Parser {
         }
         let mut i = i + 1; // past `{`
         while i < end {
-            let Tok::Ident(member) = &self.toks[i].kind else {
-                i += 1;
-                continue;
+            let member = match &self.toks[i].kind {
+                Tok::Ident(member) => member.clone(),
+                // Scala 3's wildcard selector: `import a.{x, *}`.
+                Tok::Star => "_".to_string(),
+                _ => {
+                    i += 1;
+                    continue;
+                }
             };
-            let member = member.clone();
-            // `x => y` renames; `x => _` HIDES the name, and hiding one that was
-            // never bound is a no-op here.
+            // `x => y` (Scala 2) and `x as y` (Scala 3) rename; `x => _` and
+            // `x as _` HIDE the name, and hiding one that was never bound is a
+            // no-op here.
             let (local, next) = match self.toks.get(i + 1).map(|t| &t.kind) {
+                Some(Tok::Ident(w)) if w == "as" => match self.toks.get(i + 2).map(|t| &t.kind) {
+                    Some(Tok::Ident(alias)) => (alias.clone(), i + 3),
+                    _ => (String::new(), i + 3),
+                },
                 Some(Tok::FatArrow) => match self.toks.get(i + 2).map(|t| &t.kind) {
                     Some(Tok::Ident(alias)) => (alias.clone(), i + 3),
                     _ => (String::new(), i + 3),
@@ -3514,6 +3597,18 @@ impl Parser {
     // ── expressions (precedence climbing) ─────────────────────────────────
 
     fn expression(&mut self) -> Result<Expr, String> {
+        // `inline if c then a else b` / `inline x match { … }` — a conditional
+        // or match the reference reduces at compile time. Here the modifier is
+        // dropped and the branch is chosen at run time — the same branch
+        // whenever the condition is a constant or the scrutinee's static type
+        // is its runtime class (documented in BUGS.md).
+        if matches!(self.peek(), Tok::Ident(w) if w == "inline")
+            && (matches!(self.peek_at(1), Tok::If)
+                || (matches!(self.peek_at(1), Tok::Ident(_))
+                    && matches!(self.peek_at(2), Tok::Match)))
+        {
+            self.advance();
+        }
         // A function literal (`x => e`, `(a, b) => e`) is a complete expression.
         if self.at_lambda_start() {
             return self.lambda();
@@ -5439,6 +5534,16 @@ impl Parser {
             self.skip_seps();
             let tail = self.pattern_cons()?;
             return Ok(Pattern::Cons(Box::new(head), Box::new(tail)));
+        }
+        // `h #:: t` — `LazyList.#::`'s extractor, right-associative like `::`.
+        if self.is(&Tok::HashColonColon) {
+            self.advance();
+            self.skip_seps();
+            let tail = self.pattern_cons()?;
+            return Ok(Pattern::Constructor {
+                name: "#::".to_string(),
+                elems: vec![head, tail],
+            });
         }
         Ok(head)
     }

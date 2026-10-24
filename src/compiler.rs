@@ -1333,19 +1333,24 @@ impl Compiler {
                 // captures it.
                 if *is_lazy {
                     self.lazies.insert(name.clone());
-                    match init {
-                        Some(e) => {
-                            self.lambda(&[], e, false)?;
-                            self.b
-                                .emit(Op::CallBuiltin(crate::host::LAZY_NEW, 1), s.line);
-                        }
-                        None => {
-                            self.b.emit(Op::LoadUndef, 0);
-                        }
-                    }
-                    self.unwind_check_dropping(1);
+                    // The cell is stored BEFORE the thunk is built, because the
+                    // thunk may name the binding itself: `lazy val fib:
+                    // LazyList[Int] = 0 #:: 1 #:: fib.zip(fib.tail)…` inside a
+                    // `def`. A closure captures the cell handle by value, so
+                    // building it first captured the still-empty slot and the
+                    // forced tail read `null` (`value is not a LazyList`).
+                    self.b.emit(Op::LoadUndef, 0);
                     self.b.emit(Op::CallBuiltin(crate::host::CELL_NEW, 1), 0);
                     self.emit_store(place);
+                    if let Some(e) = init {
+                        self.lambda(&[], e, false)?;
+                        self.b
+                            .emit(Op::CallBuiltin(crate::host::LAZY_NEW, 1), s.line);
+                        self.unwind_check_dropping(1);
+                        self.emit_load(place);
+                        self.b.emit(Op::CallBuiltin(crate::host::CELL_SET, 2), 0);
+                        self.b.emit(Op::Pop, 0);
+                    }
                     return Ok(());
                 }
                 if self.is_boxed(name) {
@@ -1825,11 +1830,16 @@ impl Compiler {
             // The `@main` parameter binding: index and declared type go to the
             // host reader, which either answers the converted value or ends the
             // run the way `CommandLineParser.showError` does.
-            Expr::MainArg { index, ty } => {
+            Expr::MainArg { index, ty, rest } => {
                 self.b.emit(Op::LoadInt(*index as i64), 0);
                 let c = self.b.add_constant(Value::str(ty.clone()));
                 self.b.emit(Op::LoadConst(c), 0);
-                self.b.emit(Op::CallBuiltin(crate::host::MAIN_ARG, 2), 0);
+                let reader = if *rest {
+                    crate::host::MAIN_REST
+                } else {
+                    crate::host::MAIN_ARG
+                };
+                self.b.emit(Op::CallBuiltin(reader, 2), 0);
             }
             Expr::MainArgv => {
                 self.b.emit(Op::CallBuiltin(crate::host::MAIN_ARGV, 0), 0);
@@ -2086,11 +2096,15 @@ impl Compiler {
             None => Vec::new(),
         };
         // A lambda inside a class method that reads a field or calls a sibling
-        // method needs the enclosing `this` (slot 0) as an upvalue.
+        // method needs the enclosing `this` (slot 0) as an upvalue — as does a
+        // bare `getClass`/`toString`/`hashCode`, which are `this.`'s members of
+        // `Any` (`xs.map(_ => getClass.getName)` names the class).
         if let Some((cname, fields)) = self.current_class.clone() {
-            let uses_this = free_vars(params, body)
-                .iter()
-                .any(|n| fields.contains(n) || self.class_defines_method(&cname, n));
+            let uses_this = free_vars(params, body).iter().any(|n| {
+                fields.contains(n)
+                    || self.class_defines_method(&cname, n)
+                    || matches!(n.as_str(), "getClass" | "toString" | "hashCode")
+            });
             if uses_this
                 && self
                     .scope
@@ -2704,15 +2718,18 @@ impl Compiler {
             // receiver's kind (`init` of a `Vector` is a `Vector`), because
             // they come from its own `tail`/`init`.
             Pattern::Constructor { name, elems }
-                if matches!(name.as_str(), "+:" | ":+")
+                if matches!(name.as_str(), "+:" | ":+" | "#::")
                     && elems.len() == 2
                     && !self.classes.contains_key(name) =>
             {
-                self.emit_type_test(vplace, "Seq", fail_jumps);
+                // `#::` (`LazyList.#::.unapply`) accepts only a `LazyList`, split
+                // into `head` and `tail` like `+:`.
+                let ty = if name == "#::" { "LazyList" } else { "Seq" };
+                self.emit_type_test(vplace, ty, fail_jumps);
                 let ne = self.bind_accessor(vplace, "nonEmpty", "ne");
                 self.emit_load(ne);
                 fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
-                let (first, second) = if name == "+:" {
+                let (first, second) = if name != ":+" {
                     ("head", "tail")
                 } else {
                     ("init", "last")
@@ -3269,6 +3286,18 @@ impl Compiler {
             if name == "getClass" {
                 return self.emit_smethod(&Expr::Var("this".to_string()), name, &[], 0);
             }
+        }
+        // Outside every class, object and entry object — a top-level `def`, an
+        // `@main` body, a lambda inside either — a bare `getClass` is
+        // `Predef.getClass` (see [`crate::host::PREDEF_CLASS_KEY`]).
+        if name == "getClass" && self.current_class.is_none() && self.current_object.is_none() {
+            let key = self
+                .b
+                .add_constant(Value::str(crate::host::PREDEF_CLASS_KEY.to_string()));
+            self.b.emit(Op::LoadConst(key), 0);
+            self.b.emit(Op::LoadInt(0), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::CLASS_OF, 2), 0);
+            return Ok(());
         }
         // A bare `toString` / `hashCode` inside a class or object body is the
         // receiver's own — `this.toString` — which Scala resolves as an
@@ -5663,13 +5692,19 @@ impl Compiler {
     /// the narrowing covers EVERY lowering path — the math builtin, the operator
     /// spellings, and the generic `SMETHOD` fallback all funnel through here.
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
-        // `Function.tupled(f)` is the library spelling of `f.tupled`.
         if matches!(recv, Expr::Var(v) if v == "Function")
-            && name == "tupled"
-            && args.len() == 1
             && !self.objects.contains_key("Function")
         {
-            return self.method(&args[0], "tupled", &[], line);
+            if let Some(f) = function_combinator(name, args, line) {
+                // The parser folds a trailing application into the same
+                // argument list: `Function.tupled(f)((1, 2))` arrives as
+                // `(f, (1, 2))`, so whatever follows the combinator's own
+                // argument applies the function it builds.
+                return match &args[1..] {
+                    [] => self.expr(&f),
+                    rest => self.method(&f, "apply", rest, line),
+                };
+            }
         }
         // `this.h` / `this.v` / `this.f(x)` inside the entry object names the
         // entry's own member, which is lowered as the bare name. Only a member
@@ -7831,8 +7866,8 @@ impl Compiler {
             return Ok(());
         }
         // `Class(args)` — a `case class` companion `apply` (construct without
-        // `new`) / built-in `Some(v)`. A plain class has no companion `apply`, so
-        // it must be built with `new` (bare `PlainClass(args)` is not a call).
+        // `new`) / built-in `Some(v)`. A plain class's bare `PlainClass(args)`
+        // is Scala 3's creator application, resolved last (below).
         // `Pt(…)` where `Pt`'s companion declares `apply` is that `apply`: always
         // for a plain class, and for a case class whenever the arity is not the
         // constructor's (the synthesized `apply` keeps the constructor's).
@@ -7952,6 +7987,11 @@ impl Compiler {
         if is_bound {
             let place = self.resolve_place(name);
             self.emit_load(place);
+            // A `lazy val` holding a function (`lazy val g: Int => Int = …`)
+            // is forced before it is applied, as every other read forces it.
+            if self.lazies.contains(name) {
+                self.b.emit(Op::CallBuiltin(crate::host::LAZY_FORCE, 1), 0);
+            }
             for a in args {
                 self.expr(a)?;
             }
@@ -8007,6 +8047,14 @@ impl Compiler {
         // to shadow it.
         if name == "identity" && args.len() == 1 {
             return self.expr(&args[0]);
+        }
+        // `C(args)` for a PLAIN class is `new C(args)`: Scala 3's creator
+        // application (a constructor proxy on the companion). Scala adds the
+        // proxy only where no term `C` exists, so it is the last binding tried,
+        // after every method, local, companion `apply` and import above. A
+        // trait has no constructor to proxy.
+        if self.classes.get(name).is_some_and(|m| !m.is_trait) {
+            return self.construct(name, args, line);
         }
         // `Tuple1(a)` … `Tuple22(…)` — the case-class `apply` of `scala.TupleN`,
         // which builds the same value as the literal `(a, b)`. `Tuple1` has no
@@ -10631,6 +10679,69 @@ fn push_substituted(out: &mut String, word: &str, subst: &[(String, String)]) {
 /// A declared type's base name, with type arguments dropped: `List[A]` is
 /// `List`. Extension selection compares base names, since the arguments are a
 /// typing concern this frontend does not model.
+/// The function a `scala.Function` combinator builds from its first argument,
+/// or `None` for a name that is not one. The rest of `args` (a folded trailing
+/// application) is the caller's to apply.
+///
+/// * `tupled(f)` — `f.tupled`.
+/// * `untupled(f)` — `(a, b, …) => f((a, b, …))`, at whatever arity it is
+///   applied (see [`crate::host::UNTUPLED_METHOD`]).
+/// * `const(x)` — `_ => x`; `x` is evaluated once, when the function is built,
+///   as the eta-expansion of `def const[T, U](x: T)(y: U): T` lifts it.
+/// * `chain(fs)` — `x => fs.foldLeft(x)((x, f) => f(x))`, the library body.
+fn function_combinator(name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+    let first = args.first()?.clone();
+    let var = |n: &str| Expr::Var(n.to_string());
+    let lambda = |params: &[&str], body: Expr| Expr::Lambda {
+        params: params.iter().map(|p| p.to_string()).collect(),
+        body: Box::new(body),
+        partial: false,
+    };
+    // `{ val <name> = first; <body> }` — binds the argument once.
+    let bind_first = |name: &str, body: Expr| {
+        Expr::Block(vec![
+            Stmt {
+                line,
+                kind: StmtKind::Local {
+                    is_val: true,
+                    is_lazy: false,
+                    ty: None,
+                    name: name.to_string(),
+                    init: Some(first.clone()),
+                },
+            },
+            Stmt {
+                line,
+                kind: StmtKind::Expr(body),
+            },
+        ])
+    };
+    let method = |recv: Expr, name: &str, args: Vec<Expr>| Expr::Method {
+        recv: Box::new(recv),
+        name: name.to_string(),
+        args,
+        line,
+    };
+    Some(match name {
+        "tupled" => method(first, "tupled", Vec::new()),
+        "untupled" => method(first, crate::host::UNTUPLED_METHOD, Vec::new()),
+        "const" => bind_first("$fn_const", lambda(&["$fn_y"], var("$fn_const"))),
+        "chain" => {
+            let step = lambda(
+                &["$fn_acc", "$fn_f"],
+                Expr::Call {
+                    name: "$fn_f".to_string(),
+                    args: vec![var("$fn_acc")],
+                    line,
+                },
+            );
+            let body = method(var("$fn_fs"), "foldLeft", vec![var("$fn_x"), step]);
+            bind_first("$fn_fs", lambda(&["$fn_x"], body))
+        }
+        _ => return None,
+    })
+}
+
 /// The synthetic call a `LazyList` factory lowers to; its last argument is the
 /// tag naming which rule to build.
 const LAZYLIST_CALL: &str = "lazylist$";

@@ -431,7 +431,8 @@ Implemented and checked against the reference `scala`:
   the 2.13 `StringContext.glob` algorithm) — nested and guarded; a
   non-exhaustive match throws `scala.MatchError`. Pattern definitions take the
   `: @unchecked` ascription Scala 3 asks for on a refutable one.
-- **Object model** — `class C(x: Int) { def m = … }` with `new C(…)`, fields,
+- **Object model** — `class C(x: Int) { def m = … }` with `new C(…)` or Scala 3's
+  creator application `C(…)`, fields,
   `this`, in-place `var`-field mutation, and instance-method dispatch; `object`
   singletons (static `def`s, `Name.val` members); and `case class` with an
   ordered-field `toString` (`Point(1,2)`), structural `equals`/`hashCode`,
