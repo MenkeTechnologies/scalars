@@ -464,7 +464,21 @@ reported as parse/compile errors, never silently mis-run.
   List[T])(implicit ord: Ordering[T])`, its `using` spelling and a `[T:
   Ordering]` context bound, called with no given `Ordering` in the program,
   receive the natural ordering, as Scala finds it in `Ordering`'s companion. A
-  given the program declares still wins. (`Numeric[T]` has no such fallback.)
+  given the program declares still wins.
+- **The standard `Numeric[T]` / `Integral[T]` / `Fractional[T]`.** An
+  implicit parameter or context bound of one, `implicitly[Numeric[Int]]` and
+  `Numeric[Double]` (the companion's `apply`) receive the library's instance
+  for `Int`, `Long`, `Short`, `Byte`, `Double`, `Float`, `BigInt` or
+  `BigDecimal` — `Integral` only for the integral types, `Fractional` only for
+  `Double`/`Float`/`BigDecimal`, as in the library. Its members answer at the
+  instance's type, so an `Int` one's `plus`/`times`/`negate`/`fromInt` wrap at
+  32 bits and a `Short` one's at 16: `zero`, `one`, `fromInt`, `plus`,
+  `minus`, `times`, `negate`, `abs`, `sign`, `signum`, `toInt`/`toLong`
+  (a `Double` saturating), `toDouble`, `toFloat`, `quot`/`rem` (`/ by zero`),
+  `div`, `compare`, `lt`/`lteq`/`gt`/`gteq`/`equiv`, `max`/`min`. `n.plus`
+  used as a function value eta-expands (`xs.foldLeft(n.zero)(n.plus)`), and
+  `xs.sum(n)` / `xs.product(n)` fold through the instance given.
+  `Numeric[Char]`, `parseString` and `mkNumericOps` are not modelled.
 - **`implicit class`.** `implicit class Rich(n: Int) { def squared = n * n }`
   registers each method as the Scala 3 extension `extension (n: Int)` it is
   equivalent to, so `4.squared` resolves; the class stays declared for an
@@ -1106,8 +1120,11 @@ reported as parse/compile errors, never silently mis-run.
   first close's) is the `Failure`, with the later ones suppressed into it. A
   resource registered after the manager closed is `IllegalStateException:
   Manager has already been closed`. `Throwable.addSuppressed`/`getSuppressed`
-  work, with the JDK's self-suppression and `null` checks. `Using.resources`
-  and a `Releasable` other than `close()` are not modelled.
+  work, with the JDK's self-suppression and `null` checks.
+  `Using.resources(r1, …, rn)(f)` (two to four resources) is the library's
+  nested `resource` calls: each later resource is evaluated after the earlier
+  ones are acquired and released before them. A `Releasable` other than
+  `close()` is not modelled.
 - **A constructor that throws inside a `try` reaches the handler.** An
   exception from a class body (`require` failing), a supertype argument, or a
   constructor argument returns to the `new` site; it used to stop the run as
@@ -1121,8 +1138,36 @@ reported as parse/compile errors, never silently mis-run.
   `StringContext$InvalidEscapeException` — and `raw(args…)`, both also in the
   `xs: _*` form, and an argument count other than one less than the parts' is
   `IllegalArgumentException: wrong number of arguments (n) for interpolated
-  string with m parts`. `StringContext.f` and a custom interpolator in a
-  PATTERN are not modelled.
+  string with m parts`. `StringContext(…).f(args…)` on a literal
+  `StringContext` is the `f` interpolator — each argument formatted by the
+  conversion opening the part after it, `%s` by default — and on any other
+  receiver the compile error Scala gives (`Expected statically known
+  StringContext`). In a PATTERN, `case id"a${x}b" =>` matches through
+  `StringContext("a", "b").id`'s `unapplySeq` (preferred) or `unapply`, the
+  splices binding what its `Option` holds.
+- **`java.util.Locale`.** The constants (`US`, `UK`, `ROOT`, `GERMANY`,
+  `FRANCE`, `ITALY`, `JAPAN`, `KOREA`, `CHINA`, `TAIWAN`, `CANADA`, …), `new
+  Locale(language[, country[, variant]])`, `Locale.of`, `forLanguageTag`,
+  `getDefault` (`en_US`, the reference's pinned locale), `getLanguage`/
+  `getCountry`/`getVariant`/`toLanguageTag`/`toString`, equality.
+  `String.format(locale, …)` and `formatLocal(locale, …)` localize the decimal
+  conversions (`%d`, `%f`, `%e`, `%g`): the decimal and grouping separators
+  and the digits are the locale's CLDR ones, which the JDK formats with —
+  `1.234.567,89` for `GERMANY`, a narrow no-break space grouping for
+  `FRANCE`, `’` for `de-CH`, Arabic-Indic digits for `ar`. Measured for about
+  fifty languages and countries; a locale outside the table formats as
+  `en_US`. `toUpperCase(locale)` / `toLowerCase(locale)` pair the dotted and
+  dotless `i` for Turkish and Azerbaijani. Display names, the JDK's
+  `ja_JP_JP`/`th_TH_TH` compatibility locales and `Locale.setDefault` are not
+  modelled.
+- **`m()(x)` applies `m()`'s result.** An empty argument list ends a member
+  call, so `e.getSuppressed()(0)` and `sb.toString()(1)` index the result;
+  they used to fold into `m(x)`. A `def` declared with an empty first clause
+  (`def m()(x: Int)`) still takes both clauses as one call.
+- **`List.range` / `Vector.range` / `Seq.range` elements carry the endpoints'
+  width**, so `List.range(0, n).map(x => x - 1).sum` wraps at 32 bits as
+  Scala's `Int` sum does. (`Seq.range`/`IndexedSeq.range` answer a `List`/
+  `Vector` here where Scala answers a `NumericRange`.)
 - **`Regex.unanchored`** is an `UnanchoredRegex`: its `matches`, `unapplySeq`
   and its extractor in a pattern find the first match anywhere in the input
   (`case u(n)` binds the first group of it), and `anchored` turns it back.
@@ -1482,10 +1527,10 @@ reported as parse/compile errors, never silently mis-run.
   collection (the only source of one) routes nothing. Measured (debug build,
   instructions retired): a three-million-iteration `Int` `while` loop of
   `s = s + i - 1` is 140.5M before and 139.7M after in a program that builds
-  an ordered `TreeSet` (the loop stays `Add`/`Sub`); a `foldLeft(0L)(_ + _)`
-  over two million elements in such a program, whose lambda parameters are
-  untyped here, goes from 24.9G to 28.9G, and the same fold in a program with
-  no explicit ordering is unchanged (42.39G / 42.35G). An element the ordering
+  an ordered `TreeSet` (the loop stays `Add`/`Sub`); a fold's lambda
+  parameters take the seed's and the elements' widths, so
+  `(1 to 2000000).foldLeft(0L)(_ + _)` stays native too: 24.75G in a program
+  with an explicit ordering against 24.66G without one. An element the ordering
   calls equal to one already held leaves that one in place, as the red-black
   tree does — `+`/`incl`/`++`/`concat`/`union` and the mutable
   `+=`/`add`/`++=` keep the existing element, `+`/`updated`/`++` and
@@ -1599,8 +1644,10 @@ reported as parse/compile errors, never silently mis-run.
   the intersection and its writes are range-checked against it; a
   `subSet`/`subMap` with its low bound above its high one is `fromKey >
   toKey`. The one-argument `headSet(e)`/`tailSet(e)`/`subSet(a, b)` answer a
-  `SortedSet`, on which Scala rejects the two- and four-argument forms; this
-  frontend accepts them. `Collections.unmodifiableList`/`Set`/`Map`/`Collection` are VIEWS: a
+  `java.util.SortedSet` (and `headMap(k)`/`tailMap(k)`/`subMap(a, b)` a
+  `SortedMap`), statically typed so: the inclusive-flag forms and the
+  navigation members (`floor`, `ceiling`, `pollFirst`, `firstEntry`, …) are
+  refused on one, as scalac refuses them. `Collections.unmodifiableList`/`Set`/`Map`/`Collection` are VIEWS: a
   write to the backing collection shows through, and their own mutators raise
   `UnsupportedOperationException`. `new java.lang.StringBuilder` is Scala's
   builder except that `reverse()` reverses in place. Not modelled: the

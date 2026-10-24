@@ -34,8 +34,9 @@ pub const USING_RELEASE: &str = "$using_release";
 /// The desugar target of `TreeSet(…)(using ord)`: the collection, then the
 /// ordering it is held under.
 pub const WITH_ORDERING: &str = "$with_ordering";
-/// The `java.util` collection classes `new` builds as the JDK's own.
+/// The `java.util` classes `new` builds as the JDK's own.
 pub const JAVA_UTIL_CLASSES: &[&str] = &[
+    "Locale",
     "ArrayList",
     "LinkedList",
     "HashMap",
@@ -64,6 +65,10 @@ pub const SPREAD: &str = "$spread";
 /// `StringContext.s.unapplySeq` performs. The name is reserved: an extractor
 /// a program itself names `$sglob$…` is not supported.
 pub const SGLOB_PATTERN: &str = "$sglob$";
+/// The name a custom interpolator pattern `case id"…"` carries: this prefix,
+/// the interpolator's name and the RAW literal parts, `\u{1}`-separated. The
+/// extractor is `StringContext(parts…).id`.
+pub const SCPAT_PATTERN: &str = "$scpat$";
 
 /// The collection-constructor name of `scala.collection.immutable.Queue`, which
 /// a bare `Queue` (the mutable one) cannot spell.
@@ -136,11 +141,17 @@ struct Parser {
     /// where it is read — otherwise `val x: Num = 3` with `type Num = Double`
     /// loses the `Double` and prints `3`.
     type_aliases: HashMap<String, String>,
+    /// The `def`s declared with an EMPTY first parameter clause and more after
+    /// it (`def m()(x: Int)`) — collected by [`scan_empty_first_clause`]. Only
+    /// for these does `o.m()(5)` supply one call's two clauses; for any other
+    /// method an empty clause ends the call and `(5)` applies its result.
+    empty_first_clause: HashSet<String>,
 }
 
 impl Parser {
     fn new(toks: Vec<Token>) -> Self {
         let enums = scan_enums(&toks);
+        let empty_first_clause = scan_empty_first_clause(&toks);
         Parser {
             toks,
             pos: 0,
@@ -163,6 +174,7 @@ impl Parser {
             usings: 0,
             enums,
             type_aliases: HashMap::new(),
+            empty_first_clause,
         }
     }
 }
@@ -218,6 +230,42 @@ fn scan_enums(toks: &[Token]) -> HashMap<String, Vec<String>> {
         i = j;
     }
     enums
+}
+
+/// The names of the `def`s a token stream declares with an empty first
+/// parameter clause followed by another (`def m()(x: Int)`, `def m[A]()(…)`).
+fn scan_empty_first_clause(toks: &[Token]) -> HashSet<String> {
+    let kind = |i: usize| toks.get(i).map(|t| &t.kind);
+    let mut out = HashSet::new();
+    for i in 0..toks.len() {
+        let (Some(Tok::Def), Some(Tok::Ident(name))) = (kind(i), kind(i + 1)) else {
+            continue;
+        };
+        let mut j = i + 2;
+        if matches!(kind(j), Some(Tok::LBracket)) {
+            let mut depth = 0usize;
+            while let Some(k) = kind(j) {
+                j += 1;
+                match k {
+                    Tok::LBracket => depth += 1,
+                    Tok::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if matches!(
+            (kind(j), kind(j + 1), kind(j + 2)),
+            (Some(Tok::LParen), Some(Tok::RParen), Some(Tok::LParen))
+        ) {
+            out.insert(name.clone());
+        }
+    }
+    out
 }
 
 /// What a class or trait body declares — see [`Parser::class_body`].
@@ -4244,8 +4292,12 @@ impl Parser {
                 if ordered && matches!(self.peek_at(1), Tok::Ident(w) if w == "using") {
                     break;
                 }
-                args.extend(self.arg_list()?);
-                if factory {
+                let clause = self.arg_list()?;
+                // `m()(x)` is `m()` applied to `x` — unless `m` is a `def`
+                // declared with that empty first clause.
+                let ends = clause.is_empty() && !self.empty_first_clause.contains(&name);
+                args.extend(clause);
+                if factory || ends {
                     break;
                 }
             }
@@ -4261,6 +4313,41 @@ impl Parser {
                         let f = args.pop().expect("two arguments");
                         let res = args.pop().expect("two arguments");
                         e = using_expr(res, f, binder, false, line)?;
+                        continue;
+                    }
+                    // `Using.resources(r1, …, rn)(f)` — the library's nested
+                    // `resource` calls: each later resource is acquired inside
+                    // the earlier ones' bodies and released first.
+                    ("resources", 3..=5) => {
+                        self.usings += 1;
+                        let tag = self.usings;
+                        let f = args.pop().expect("a body");
+                        let fname = format!("_$using{tag}_body");
+                        let vars: Vec<String> = (0..args.len())
+                            .map(|i| format!("_$using{tag}_x{i}"))
+                            .collect();
+                        let mut body = Expr::Method {
+                            recv: Box::new(Expr::Var(fname.clone())),
+                            name: "apply".to_string(),
+                            args: vars.iter().cloned().map(Expr::Var).collect(),
+                            line,
+                        };
+                        for (i, res) in args.drain(..).enumerate().rev() {
+                            let lambda = Expr::Lambda {
+                                params: vec![vars[i].clone()],
+                                body: Box::new(body),
+                                partial: false,
+                            };
+                            body =
+                                using_expr(res, lambda, format!("_$using{tag}_{i}"), false, line)?;
+                        }
+                        e = Expr::Block(vec![
+                            binder_stmt(&fname, f, line),
+                            Stmt {
+                                line,
+                                kind: StmtKind::Expr(body),
+                            },
+                        ]);
                         continue;
                     }
                     ("Manager", 1) => {
@@ -4891,6 +4978,18 @@ impl Parser {
                         *t = targs;
                     }
                     return Ok(e);
+                }
+                // `Numeric[T]` / `Integral[T]` / `Fractional[T]` — the companion's
+                // `apply`, which is `implicitly`.
+                if matches!(name.as_str(), "Numeric" | "Integral" | "Fractional")
+                    && targs.len() == 1
+                {
+                    let ty = format!("{name}[{}]", targs[0]);
+                    return self.postfix_from(Expr::Call {
+                        name: SUMMON.to_string(),
+                        args: vec![Expr::Str(ty)],
+                        line,
+                    });
                 }
                 if name == "Ordering" && !targs.is_empty() {
                     let ty = format!("Ordering[{}]", targs.join(", "));
@@ -5748,14 +5847,17 @@ impl Parser {
             // `StringContext.s.unapplySeq`, a glob over the literal parts. Each
             // spliced name binds the text its wildcard matched. Carried as a
             // value-position extractor whose name holds the parts (see
-            // [`SGLOB_PATTERN`]); `$_` binds nothing.
+            // [`SGLOB_PATTERN`]); `$_` binds nothing. A CUSTOM interpolator
+            // `case id"…"` is `StringContext(parts…).id`'s extractor, carried
+            // the same way under [`SCPAT_PATTERN`].
             Tok::InterpStr {
-                raw: false,
+                raw,
                 is_f: false,
                 parts,
                 exprs,
+                custom,
                 ..
-            } => {
+            } if !raw || custom.is_some() => {
                 let line = self.line();
                 self.advance();
                 let mut elems = Vec::with_capacity(exprs.len());
@@ -5776,7 +5878,10 @@ impl Parser {
                         }
                     });
                 }
-                let mut name = SGLOB_PATTERN.to_string();
+                let mut name = match &custom {
+                    Some(id) => format!("{SCPAT_PATTERN}{id}\u{1}"),
+                    None => SGLOB_PATTERN.to_string(),
+                };
                 name.push_str(&parts.join("\u{1}"));
                 Ok(Pattern::Constructor { name, elems })
             }
@@ -6329,6 +6434,9 @@ fn conversion_args(ty: &str) -> Option<(String, String)> {
 /// The synthetic call `summon[T]` parses to: one argument, the type's name,
 /// resolved against the implicit scope by [`crate::compiler`].
 pub const SUMMON: &str = "summon$";
+/// The standard library's `Numeric`/`Integral`/`Fractional` instance for a
+/// numeric type: two arguments, the type-class name and the type's.
+pub const NUMERIC_INSTANCE: &str = "numeric$";
 /// The synthetic call an expression WIDENED to `Any` is wrapped in, so the
 /// compiler can keep the box of an integer whose static type it knows.
 pub const ANY_WIDEN: &str = "any$widen";

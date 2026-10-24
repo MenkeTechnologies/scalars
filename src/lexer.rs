@@ -237,7 +237,14 @@ impl fmt::Display for Tok {
 fn ends_wildcard_import(out: &[Token]) -> bool {
     matches!(
         out,
-        [.., Token { kind: Tok::Dot, .. }, Token { kind: Tok::Star, .. }]
+        [
+            ..,
+            Token { kind: Tok::Dot, .. },
+            Token {
+                kind: Tok::Star,
+                ..
+            }
+        ]
     )
 }
 

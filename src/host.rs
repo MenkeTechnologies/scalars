@@ -578,6 +578,9 @@ pub const USING_MANAGER: u16 = 834;
 pub const USING_RELEASE: u16 = 835;
 /// Builtin id for `StringContext(parts…)`: pops `argc` strings.
 pub const MAKE_STRING_CONTEXT: u16 = 836;
+/// Builtin id for the standard library's `Numeric`/`Integral`/`Fractional`
+/// instance: pops the type-class name and the numeric type's.
+pub const MAKE_NUMERIC: u16 = 838;
 /// Builtin id for a `@main` method's REPEATED parameter (`rest: Int*`): pops
 /// the type name and the first index, and answers every argument from there on
 /// read as that type, in a `List` — Scala's
@@ -714,7 +717,10 @@ fn b_main_rest(vm: &mut VM, _argc: u8) -> Value {
             Ok(v) => items.push(v),
             Err(cause) => {
                 // A clean halt on stdout with exit 0, as in `b_main_arg`.
-                println!("Illegal command line{}: {cause}", arg_position(first + offset));
+                println!(
+                    "Illegal command line{}: {cause}",
+                    arg_position(first + offset)
+                );
                 vm.request_halt();
                 return Value::Undef;
             }
@@ -889,6 +895,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(USING_MANAGER, b_using_manager);
     vm.register_builtin(USING_RELEASE, b_using_release);
     vm.register_builtin(MAKE_STRING_CONTEXT, b_make_string_context);
+    vm.register_builtin(MAKE_NUMERIC, b_make_numeric);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -1629,7 +1636,7 @@ fn string_context_member(
 /// `StringContext.processEscapes`: the escapes `\b \t \n \f \s \r \ \" \'`
 /// and `\uXXXX` decoded; any other backslash is `StringContext.
 /// InvalidEscapeException`, worded as the library words it.
-fn process_escapes(s: &str) -> Result<String, String> {
+pub(crate) fn process_escapes(s: &str) -> Result<String, String> {
     let cs: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -3997,6 +4004,37 @@ fn b_unapply_seq(vm: &mut VM, _argc: u8) -> Value {
             None => Value::Undef,
         };
     }
+    // An extractor VALUE of a program type — what a custom interpolator in a
+    // pattern selects (`case ver"$a.$b" =>` is `StringContext(…).ver`'s
+    // extractor): its `unapplySeq` (preferred, as Scala prefers it) or
+    // `unapply`, the `Option` it answers opened into the bound values.
+    for (method, seq) in [("unapplySeq", true), ("unapply", false)] {
+        let Some(r) = call_user_method(vm, &extractor, method, std::slice::from_ref(&scrutinee))
+        else {
+            continue;
+        };
+        let opt = match r {
+            Ok(v) => v,
+            Err(e) => return fault(vm, e),
+        };
+        let Some(inner) = as_option(&opt) else {
+            return fault(vm, format!("scalars: {method} must answer an Option"));
+        };
+        let Some(got) = inner else {
+            return Value::Undef;
+        };
+        let items = if seq {
+            iterable_arg(&got)
+        } else if want == 1 {
+            vec![got]
+        } else {
+            as_tuple_items(&got).unwrap_or_default()
+        };
+        if items.len() as i64 != want {
+            return Value::Undef;
+        }
+        return heap_push(HeapVal::Tuple(items));
+    }
     let Some(pat) = (match &extractor {
         Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
             Some(HeapVal::Regex(p)) => Some(p.clone()),
@@ -6264,6 +6302,14 @@ fn obj_to_string(v: &Value) -> String {
         let h = h.borrow();
         match h.get(id as usize) {
             Some(HeapVal::Record(o)) => {
+                if &*o.class == LOCALE_CLASS {
+                    let part = |i: usize| {
+                        o.fields
+                            .get(i)
+                            .map_or(String::new(), |(_, v)| v.as_str_cow().into_owned())
+                    };
+                    return locale_string(&(part(0), part(1), part(2)));
+                }
                 if &*o.class == ENUM_CLASS {
                     if let Some((_, n)) = o.fields.iter().find(|(f, _)| &**f == "name") {
                         return scala_str(n);
@@ -8344,7 +8390,8 @@ fn format_all_typed(
                 };
                 format_arg_check(conv, v, bx)?;
                 let spec = format!("%{inner}{conv}");
-                out.push_str(&format_one(&spec, v, bx, vm.as_deref_mut())?);
+                let one = format_one(&spec, v, bx, vm.as_deref_mut())?;
+                out.push_str(&localize_number(one, conv));
             }
         }
     }
@@ -9252,6 +9299,36 @@ fn method_call(vm: &mut VM, recv: Value, name: String, args: Vec<Value>) -> Valu
 }
 
 fn method_call_inner(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value>) -> Value {
+    if let Some(r) = numeric_member(&recv, &name, &args) {
+        return r.unwrap_or_else(|e| fault(vm, e));
+    }
+    // `xs.sum(num)` / `xs.product(num)` with the instance written out: a fold
+    // from its `zero` (`one`) through its `plus` (`times`).
+    if let ([num], "sum" | "product") = (args.as_slice(), name.as_str()) {
+        if numeric_type(num).is_some() {
+            let (unit, op) = if name == "sum" {
+                ("zero", "plus")
+            } else {
+                ("one", "times")
+            };
+            let mut acc = match numeric_member(num, unit, &[]) {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => return fault(vm, e),
+                None => unreachable!("a Numeric instance"),
+            };
+            for x in iterable_arg(&recv) {
+                match numeric_member(num, op, &[acc, x]) {
+                    Some(Ok(v)) => acc = v,
+                    Some(Err(e)) => return fault(vm, e),
+                    None => unreachable!("a Numeric instance"),
+                }
+            }
+            return acc;
+        }
+    }
+    if let Some(r) = locale_member(vm, &recv, &name, &args) {
+        return r.unwrap_or_else(|e| fault(vm, e));
+    }
     if let Some(r) = string_context_member(vm, &recv, &name, &args) {
         return r.unwrap_or_else(|e| fault(vm, e));
     }
@@ -16607,7 +16684,7 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
         // `\n`, `\r` or `\r\n`, terminators dropped. A final terminator ends
         // the last line rather than opening an empty one, so `""` has no lines.
         ("lines", 0) => Ok(new_stream(
-            jdk_lines(&s).into_iter().map(Value::str).collect(),
+            jdk_lines(s).into_iter().map(Value::str).collect(),
             SElem::Obj,
             None,
         )),
@@ -20995,7 +21072,11 @@ fn jdk_lines(s: &str) -> Vec<&str> {
             }
             b'\r' => {
                 out.push(&s[start..i]);
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
                 start = i;
             }
             _ => i += 1,
@@ -23172,6 +23253,9 @@ fn b_java_new(vm: &mut VM, argc: u8) -> Value {
             );
         }
     }
+    if class == "Locale" {
+        return locale_new(&args).unwrap_or_else(|e| fault(vm, e));
+    }
     if class == "java.lang.StringBuilder" {
         let v = new_seq(SeqKind::StrBuf, args.iter().flat_map(str_chars).collect());
         set_java_flavor(&v, JFlavor::JavaStringBuilder);
@@ -23629,6 +23713,9 @@ fn java_static(vm: &mut VM, which: &str, args: &[Value]) -> Result<Value, String
             .and_then(java_source_items)
             .ok_or_else(|| format!("scalars: {which}: argument {i} is not a java.util collection"))
     };
+    if let Some(member) = which.strip_prefix("Locale.") {
+        return locale_static(member, args).unwrap_or_else(not_member);
+    }
     match (which, args.len()) {
         ("Arrays.asList", _) => {
             let v = java_marked(new_seq(SeqKind::JavaList, args.to_vec()), false);
@@ -26319,4 +26406,489 @@ fn java_navigable_method(
         resync_subviews(vm, recv)?;
     }
     Ok(out)
+}
+
+// ── java.util.Locale ─────────────────────────────────────────────────────────
+
+/// The class tag of a `java.util.Locale`: a record of its `language`,
+/// `country` and `variant`, equal by value.
+const LOCALE_CLASS: &str = "java.util.Locale";
+
+thread_local! {
+    /// The number symbols the formatter is localizing to while a
+    /// `String.format(locale, …)` / `formatLocal` runs; `None` is the default
+    /// locale's (`en_US`).
+    static FORMAT_SYMBOLS: RefCell<Option<NumberSymbols>> = const { RefCell::new(None) };
+}
+
+/// A locale's decimal separator, grouping separator and zero digit, as the
+/// JDK's (CLDR) `DecimalFormatSymbols` give them.
+#[derive(Clone, Copy)]
+struct NumberSymbols {
+    decimal: char,
+    group: char,
+    zero: char,
+}
+
+/// A `Locale` value. The language is lower-cased and the country upper-cased,
+/// as the constructor normalizes them.
+fn make_locale(language: &str, country: &str, variant: &str) -> Value {
+    heap_alloc(ScalaObj {
+        class: Arc::from(LOCALE_CLASS),
+        is_case: true,
+        is_object: false,
+        fields: vec![
+            (Arc::from("language"), Value::str(language.to_lowercase())),
+            (Arc::from("country"), Value::str(country.to_uppercase())),
+            (Arc::from("variant"), Value::str(variant.to_string())),
+        ],
+    })
+}
+
+/// `(language, country, variant)` of a `Locale` value, `None` for anything else.
+fn as_locale(v: &Value) -> Option<(String, String, String)> {
+    with_obj(v, |o| {
+        if &*o.class != LOCALE_CLASS {
+            return None;
+        }
+        let f = |i: usize| {
+            o.fields
+                .get(i)
+                .map_or(String::new(), |(_, v)| v.as_str_cow().into_owned())
+        };
+        Some((f(0), f(1), f(2)))
+    })
+    .flatten()
+}
+
+/// `Locale.toString`: `language_COUNTRY_variant` with empty trailing parts left
+/// off (`en_US`, `de`, `_US`), the empty string for `ROOT`.
+fn locale_string((l, c, v): &(String, String, String)) -> String {
+    let mut s = l.clone();
+    if !c.is_empty() || !v.is_empty() {
+        s.push('_');
+        s.push_str(c);
+    }
+    if !v.is_empty() {
+        s.push('_');
+        s.push_str(v);
+    }
+    s
+}
+
+/// `Locale.toLanguageTag`: `language-COUNTRY`, `und` for an empty language.
+fn locale_tag((l, c, _): &(String, String, String)) -> String {
+    let lang = if l.is_empty() { "und" } else { l };
+    if c.is_empty() {
+        lang.to_string()
+    } else {
+        format!("{lang}-{c}")
+    }
+}
+
+/// The `Locale` constants (`Locale.US`, `Locale.GERMANY`, …).
+fn locale_constant(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        "US" => ("en", "US"),
+        "UK" => ("en", "GB"),
+        "ENGLISH" => ("en", ""),
+        "CANADA" => ("en", "CA"),
+        "CANADA_FRENCH" => ("fr", "CA"),
+        "ROOT" => ("", ""),
+        "GERMANY" => ("de", "DE"),
+        "GERMAN" => ("de", ""),
+        "FRANCE" => ("fr", "FR"),
+        "FRENCH" => ("fr", ""),
+        "ITALY" => ("it", "IT"),
+        "ITALIAN" => ("it", ""),
+        "JAPAN" => ("ja", "JP"),
+        "JAPANESE" => ("ja", ""),
+        "KOREA" => ("ko", "KR"),
+        "KOREAN" => ("ko", ""),
+        "CHINA" | "PRC" | "SIMPLIFIED_CHINESE" => ("zh", "CN"),
+        "TAIWAN" | "TRADITIONAL_CHINESE" => ("zh", "TW"),
+        "CHINESE" => ("zh", ""),
+        _ => return None,
+    })
+}
+
+/// The static members of `java.util.Locale`: the constants, `getDefault`
+/// (`en_US`, the locale the reference runs under), `of`, `forLanguageTag`.
+fn locale_static(member: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let s = |i: usize| args[i].as_str_cow().into_owned();
+    Some(Ok(match (member, args.len()) {
+        (c, 0) if locale_constant(c).is_some() => {
+            let (l, c) = locale_constant(c).expect("checked");
+            make_locale(l, c, "")
+        }
+        ("getDefault", 0) => make_locale("en", "US", ""),
+        ("of", 1) => make_locale(&s(0), "", ""),
+        ("of", 2) => make_locale(&s(0), &s(1), ""),
+        ("of", 3) => make_locale(&s(0), &s(1), &s(2)),
+        ("forLanguageTag", 1) => {
+            let tag = s(0);
+            let mut parts = tag.split(['-', '_']);
+            let lang = parts.next().unwrap_or("");
+            let lang = if lang == "und" { "" } else { lang };
+            let country = parts
+                .find(|p| p.len() == 2 || (p.len() == 3 && p.bytes().all(|b| b.is_ascii_digit())))
+                .unwrap_or("");
+            make_locale(lang, country, "")
+        }
+        _ => return None,
+    }))
+}
+
+/// `new Locale(language[, country[, variant]])`.
+fn locale_new(args: &[Value]) -> Result<Value, String> {
+    let s = |i: usize| {
+        args.get(i)
+            .map_or(String::new(), |v| v.as_str_cow().into_owned())
+    };
+    match args.len() {
+        1..=3 => Ok(make_locale(&s(0), &s(1), &s(2))),
+        n => Err(format!(
+            "scalars: no java.util.Locale constructor takes {n} arguments"
+        )),
+    }
+}
+
+/// The number symbols of a locale, from the CLDR data the JDK formats with.
+/// Countries whose symbols differ from their language's are listed first;
+/// a locale in neither table formats as the default (`en_US`) one does.
+fn locale_symbols((l, c, _): &(String, String, String)) -> NumberSymbols {
+    const NBSP: char = '\u{a0}';
+    const NNBSP: char = '\u{202f}';
+    const APOS: char = '\u{2019}';
+    let sym = |decimal, group| NumberSymbols {
+        decimal,
+        group,
+        zero: '0',
+    };
+    let by_country = match (l.as_str(), c.as_str()) {
+        ("de" | "it" | "rm", "CH") | ("de", "LI") => Some(sym('.', APOS)),
+        ("de", "AT") | ("fr", "CA") | ("en", "ZA") | ("pt", "PT") => Some(sym(',', NBSP)),
+        ("fr", "CH") => Some(sym(',', NNBSP)),
+        ("ar", "MA") | ("en", "DK") => Some(sym(',', '.')),
+        ("es", "MX") | ("en", "IN") => Some(sym('.', ',')),
+        _ => None,
+    };
+    if let Some(s) = by_country {
+        return s;
+    }
+    match l.as_str() {
+        "de" | "it" | "es" | "tr" | "nl" | "da" | "el" | "ro" | "hr" | "is" | "vi" | "id"
+        | "sl" | "sr" | "ca" | "eu" | "gl" | "fo" | "pt" => sym(',', '.'),
+        "fr" => sym(',', NNBSP),
+        "ru" | "sv" | "pl" | "fi" | "nb" | "no" | "cs" | "uk" | "hu" | "sk" | "bg" | "lt"
+        | "lv" | "et" => sym(',', NBSP),
+        "ar" => NumberSymbols {
+            decimal: '\u{66b}',
+            group: '\u{66c}',
+            zero: '\u{660}',
+        },
+        "fa" => NumberSymbols {
+            decimal: '\u{66b}',
+            group: '\u{66c}',
+            zero: '\u{6f0}',
+        },
+        "bn" => NumberSymbols {
+            decimal: '.',
+            group: ',',
+            zero: '\u{9e6}',
+        },
+        "mr" | "ne" => NumberSymbols {
+            decimal: '.',
+            group: ',',
+            zero: '\u{966}',
+        },
+        "my" => NumberSymbols {
+            decimal: '.',
+            group: ',',
+            zero: '\u{1040}',
+        },
+        _ => sym('.', ','),
+    }
+}
+
+/// Run `f` with the formatter localizing numbers to `locale`.
+fn with_format_locale<R>(locale: &(String, String, String), f: impl FnOnce() -> R) -> R {
+    let saved = FORMAT_SYMBOLS.with(|s| s.borrow_mut().replace(locale_symbols(locale)));
+    let r = f();
+    FORMAT_SYMBOLS.with(|s| *s.borrow_mut() = saved);
+    r
+}
+
+/// One conversion's output in the locale being formatted to: for the decimal
+/// conversions (`d`, `f`, `e`, `g`) the separators and digits are the
+/// locale's; every other conversion, and the default locale, as written.
+fn localize_number(out: String, conv: char) -> String {
+    let Some(sym) = FORMAT_SYMBOLS.with(|s| *s.borrow()) else {
+        return out;
+    };
+    if !matches!(conv, 'd' | 'f' | 'e' | 'E' | 'g' | 'G') {
+        return out;
+    }
+    out.chars()
+        .map(|c| match c {
+            '.' => sym.decimal,
+            ',' => sym.group,
+            '0'..='9' => char::from_u32(sym.zero as u32 + (c as u32 - '0' as u32)).unwrap_or(c),
+            _ => c,
+        })
+        .collect()
+}
+
+/// `String.toUpperCase(locale)` / `toLowerCase(locale)`: the root mapping,
+/// except that Turkish and Azerbaijani pair a dotted and a dotless `i`
+/// (`i` ⇄ `İ`, `ı` ⇄ `I`).
+fn locale_case(s: &str, upper: bool, (l, _, _): &(String, String, String)) -> String {
+    let turkic = matches!(l.as_str(), "tr" | "az");
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match (turkic, upper, c) {
+            (true, true, 'i') => out.push('\u{130}'),
+            (true, false, 'I') => out.push('\u{131}'),
+            (true, false, '\u{130}') => out.push('i'),
+            (_, true, c) => out.extend(c.to_uppercase()),
+            (_, false, c) => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
+/// The members of a `Locale` value, and the locale-taking `String` members:
+/// `String.format(locale, fmt, args…)` (which arrives as `format` on the
+/// locale), `fmt.formatLocal(locale, args…)`, and `toUpperCase(locale)` /
+/// `toLowerCase(locale)`.
+fn locale_member(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    if let Value::Str(s) = recv {
+        let loc = args.first().and_then(as_locale)?;
+        return Some(match (name, args.len()) {
+            ("formatLocal", _) => {
+                with_format_locale(&loc, || format_all(s, &args[1..], Some(vm))).map(Value::str)
+            }
+            ("toUpperCase", 1) => Ok(Value::str(locale_case(s, true, &loc))),
+            ("toLowerCase", 1) => Ok(Value::str(locale_case(s, false, &loc))),
+            _ => return None,
+        });
+    }
+    let loc = as_locale(recv)?;
+    Some(match (name, args.len()) {
+        ("format", n) if n >= 1 => {
+            let fmt = args[0].as_str_cow().into_owned();
+            with_format_locale(&loc, || format_all(&fmt, &args[1..], Some(vm))).map(Value::str)
+        }
+        ("getLanguage", 0) => Ok(Value::str(loc.0.clone())),
+        ("getCountry", 0) => Ok(Value::str(loc.1.clone())),
+        ("getVariant", 0) => Ok(Value::str(loc.2.clone())),
+        ("toLanguageTag", 0) => Ok(Value::str(locale_tag(&loc))),
+        ("toString", 0) => Ok(Value::str(locale_string(&loc))),
+        _ => return None,
+    })
+}
+
+// ── scala.math.Numeric / Integral / Fractional ───────────────────────────────
+
+/// The class tag of a library `Numeric` instance; its one field is the
+/// numeric type it is the instance for (`Int`, `Double`, `BigInt`, …).
+const NUMERIC_CLASS: &str = "scala.math.Numeric";
+
+/// `MAKE_NUMERIC` builtin — see [`MAKE_NUMERIC`].
+fn b_make_numeric(vm: &mut VM, _argc: u8) -> Value {
+    let ty = vm.pop();
+    let class = vm.pop();
+    heap_alloc(ScalaObj {
+        class: Arc::from(NUMERIC_CLASS),
+        is_case: false,
+        is_object: true,
+        fields: vec![(Arc::from("class"), class), (Arc::from("type"), ty)],
+    })
+}
+
+/// The numeric type a library `Numeric` instance is for.
+fn numeric_type(v: &Value) -> Option<String> {
+    with_obj(v, |o| {
+        (&*o.class == NUMERIC_CLASS)
+            .then(|| o.fields.get(1).map(|(_, t)| t.as_str_cow().into_owned()))
+            .flatten()
+    })
+    .flatten()
+}
+
+/// `n` as a value of the numeric type `ty`: an integral type wraps to its
+/// width, as the library's `IntIsIntegral.fromInt` / `plus` do.
+fn numeric_narrow(ty: &str, n: i64) -> Value {
+    Value::int(match ty {
+        "Int" => i64::from(n as i32),
+        "Short" => i64::from(n as i16),
+        "Byte" => i64::from(n as i8),
+        _ => n,
+    })
+}
+
+/// A `Double`'s `toInt`/`toLong`: truncated toward zero and saturated, `NaN`
+/// being 0, as the JVM's `d2i`/`d2l` are.
+fn saturating_f64_to_i64(d: f64, bits32: bool) -> i64 {
+    if bits32 {
+        i64::from(d as i32)
+    } else {
+        d as i64
+    }
+}
+
+/// The members of a library `Numeric`/`Integral`/`Fractional` instance, each
+/// answered at the instance's type: `plus`/`minus`/`times`/`negate`/`abs`/
+/// `sign` (and `quot`/`rem`, `div`) in that type's arithmetic — an `Int` one
+/// wraps at 32 bits — `zero`/`one`/`fromInt` building a value of it, the
+/// conversions, `signum`, and the `Ordering` members.
+fn numeric_member(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let ty = numeric_type(recv)?;
+    // A generic `A` argument arrives boxed; the instance answers at its own type.
+    let args: Vec<Value> = args.iter().map(unboxed).collect();
+    let integral = matches!(ty.as_str(), "Int" | "Long" | "Short" | "Byte");
+    let a = |i: usize| args.get(i).cloned().unwrap_or(Value::Undef);
+    let int_of = |v: &Value| match v {
+        Value::Int(n) => *n,
+        other => other.to_int(),
+    };
+    let from_i64 = |n: i64| -> Value {
+        match ty.as_str() {
+            "Double" => Value::float(n as f64),
+            "Float" => make_f32(n as f32),
+            "BigInt" => make_big(BigInt::from(n)),
+            "BigDecimal" => make_dec(BigDec::from_int(n)),
+            t => numeric_narrow(t, n),
+        }
+    };
+    let arith = |op: NumOp, x: &Value, y: &Value| -> Result<Value, String> {
+        if integral {
+            let (p, q) = (int_of(x), int_of(y));
+            let r = match op {
+                NumOp::Add => p.wrapping_add(q),
+                NumOp::Sub => p.wrapping_sub(q),
+                NumOp::Mul => p.wrapping_mul(q),
+                NumOp::Div | NumOp::Mod if q == 0 => {
+                    return Err("scalars: java.lang.ArithmeticException: / by zero".to_string())
+                }
+                NumOp::Div => p.wrapping_div(q),
+                NumOp::Mod => p.wrapping_rem(q),
+                _ => unreachable!("arithmetic only"),
+            };
+            return Ok(numeric_narrow(&ty, r));
+        }
+        match ty.as_str() {
+            "Double" => {
+                let (p, q) = (num_f64(x), num_f64(y));
+                Ok(Value::float(match op {
+                    NumOp::Add => p + q,
+                    NumOp::Sub => p - q,
+                    NumOp::Mul => p * q,
+                    NumOp::Div => p / q,
+                    _ => p % q,
+                }))
+            }
+            "Float" => {
+                let (p, q) = (num_f64(x) as f32, num_f64(y) as f32);
+                Ok(make_f32(match op {
+                    NumOp::Add => p + q,
+                    NumOp::Sub => p - q,
+                    NumOp::Mul => p * q,
+                    NumOp::Div => p / q,
+                    _ => p % q,
+                }))
+            }
+            _ => numeric_hook(op, x, y),
+        }
+    };
+    let cmp = |x: &Value, y: &Value| value_cmp(x, y);
+    Some(match (name, args.len()) {
+        ("zero", 0) => Ok(from_i64(0)),
+        ("one", 0) => Ok(from_i64(1)),
+        ("fromInt", 1) => Ok(from_i64(int_of(&a(0)))),
+        ("plus", 2) => arith(NumOp::Add, &a(0), &a(1)),
+        ("minus", 2) => arith(NumOp::Sub, &a(0), &a(1)),
+        ("times", 2) => arith(NumOp::Mul, &a(0), &a(1)),
+        ("quot", 2) if integral || ty == "BigInt" => arith(NumOp::Div, &a(0), &a(1)),
+        ("rem", 2) if integral || ty == "BigInt" => arith(NumOp::Mod, &a(0), &a(1)),
+        ("div", 2) if matches!(ty.as_str(), "Double" | "Float" | "BigDecimal") => {
+            arith(NumOp::Div, &a(0), &a(1))
+        }
+        ("negate", 1) => arith(NumOp::Sub, &from_i64(0), &a(0)),
+        ("abs", 1) => {
+            if cmp(&a(0), &from_i64(0)) == Ordering::Less {
+                arith(NumOp::Sub, &from_i64(0), &a(0))
+            } else {
+                Ok(a(0))
+            }
+        }
+        ("signum", 1) => Ok(Value::int(match cmp(&a(0), &from_i64(0)) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        })),
+        ("sign", 1) => Ok(from_i64(match cmp(&a(0), &from_i64(0)) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        })),
+        ("toInt" | "toLong", 1) => {
+            let bits32 = name == "toInt";
+            let x = a(0);
+            Ok(Value::int(match ty.as_str() {
+                "Double" | "Float" => saturating_f64_to_i64(num_f64(&x), bits32),
+                "BigInt" | "BigDecimal" => {
+                    let b = as_big(&x)
+                        .or_else(|| as_dec(&x).map(|d| d.to_bigint()))
+                        .unwrap_or_default();
+                    let low = b & BigInt::from(u64::MAX);
+                    let n = low.to_u64().unwrap_or(0) as i64;
+                    if bits32 {
+                        i64::from(n as i32)
+                    } else {
+                        n
+                    }
+                }
+                _ if bits32 => i64::from(int_of(&x) as i32),
+                _ => int_of(&x),
+            }))
+        }
+        ("toDouble", 1) => Ok(Value::float(match ty.as_str() {
+            "BigInt" | "BigDecimal" => scala_str(&a(0)).parse().unwrap_or(f64::NAN),
+            _ => num_f64(&a(0)),
+        })),
+        ("toFloat", 1) => Ok(make_f32(match ty.as_str() {
+            "BigInt" | "BigDecimal" => scala_str(&a(0)).parse().unwrap_or(f32::NAN),
+            _ => num_f64(&a(0)) as f32,
+        })),
+        ("compare", 2) => Ok(Value::int(match cmp(&a(0), &a(1)) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        })),
+        ("lt", 2) => Ok(Value::bool(cmp(&a(0), &a(1)) == Ordering::Less)),
+        ("lteq", 2) => Ok(Value::bool(cmp(&a(0), &a(1)) != Ordering::Greater)),
+        ("gt", 2) => Ok(Value::bool(cmp(&a(0), &a(1)) == Ordering::Greater)),
+        ("gteq", 2) => Ok(Value::bool(cmp(&a(0), &a(1)) != Ordering::Less)),
+        ("equiv", 2) => Ok(Value::bool(cmp(&a(0), &a(1)) == Ordering::Equal)),
+        // `Ordering.max`/`min` keep the first argument on a tie.
+        ("max", 2) => Ok(if cmp(&a(0), &a(1)) == Ordering::Less {
+            a(1)
+        } else {
+            a(0)
+        }),
+        ("min", 2) => Ok(if cmp(&a(0), &a(1)) == Ordering::Greater {
+            a(1)
+        } else {
+            a(0)
+        }),
+        _ => Err(format!(
+            "scalars: value {name} is not a member of scala.math.Numeric[{ty}]"
+        )),
+    })
 }

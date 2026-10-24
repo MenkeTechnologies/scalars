@@ -6552,3 +6552,30 @@ fn boundary_break_needs_an_enclosing_boundary() {
     assert!(ok, "{out}");
     assert_eq!(out, "12\n");
 }
+
+#[test]
+fn a_java_sorted_view_has_no_navigable_members() {
+    // `headSet(e)`/`tailSet(e)`/`subSet(a, b)` answer a `java.util.SortedSet`
+    // and `headMap(k)` a `SortedMap`; scalac rejects the inclusive-flag forms
+    // and the navigation members on them ("value floor is not a member of
+    // java.util.SortedSet[Integer]"), while the `NavigableSet` the flag forms
+    // answer keeps them.
+    let set = "val s = new java.util.TreeSet[Integer](); for (i <- 1 to 9) s.add(i); ";
+    rejects(
+        &wrap(&format!("{set}println(s.headSet(8).headSet(3, true))")),
+        "headSet with 2 argument(s) is not a member of java.util.SortedSet",
+    );
+    rejects(
+        &wrap(&format!("{set}val t = s.tailSet(3); println(t.floor(5))")),
+        "floor with 1 argument(s) is not a member of java.util.SortedSet",
+    );
+    rejects(
+        &wrap("val m = new java.util.TreeMap[Integer, String](); println(m.subMap(1, 5).firstEntry())"),
+        "firstEntry with 0 argument(s) is not a member of java.util.SortedMap",
+    );
+    let (out, ok) = run(&wrap(&format!(
+        "{set}println(s.headSet(8, false).headSet(3, true)); println(s.tailSet(3, true).floor(5))"
+    )));
+    assert!(ok, "{out}");
+    assert_eq!(out, "[1, 2, 3]\n5\n");
+}

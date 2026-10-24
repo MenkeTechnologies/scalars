@@ -2846,17 +2846,34 @@ impl Compiler {
             fail_jumps.push(self.b.emit(Op::JumpIfFalse(0), 0));
             return self.match_pattern(inner, vplace, fail_jumps);
         }
-        match name.strip_prefix(crate::parser::SGLOB_PATTERN) {
-            // An `s"…"` pattern: the extractor is the list of literal parts.
-            Some(parts) => {
-                let parts: Vec<Value> = parts
-                    .split('\u{1}')
-                    .map(|p| Value::str(p.to_string()))
-                    .collect();
-                let c = self.b.add_constant(Value::Array(parts.into()));
-                self.b.emit(Op::LoadConst(c), 0);
+        // `case id"…"`: the extractor is `StringContext(parts…).id`.
+        if let Some(rest) = name.strip_prefix(crate::parser::SCPAT_PATTERN) {
+            let mut fields = rest.split('\u{1}');
+            let id = fields.next().unwrap_or_default().to_string();
+            let extractor = Expr::Method {
+                recv: Box::new(Expr::Call {
+                    name: "StringContext".to_string(),
+                    args: fields.map(|p| Expr::Str(p.to_string())).collect(),
+                    line: 0,
+                }),
+                name: id,
+                args: Vec::new(),
+                line: 0,
+            };
+            self.expr(&extractor)?;
+        } else {
+            match name.strip_prefix(crate::parser::SGLOB_PATTERN) {
+                // An `s"…"` pattern: the extractor is the list of literal parts.
+                Some(parts) => {
+                    let parts: Vec<Value> = parts
+                        .split('\u{1}')
+                        .map(|p| Value::str(p.to_string()))
+                        .collect();
+                    let c = self.b.add_constant(Value::Array(parts.into()));
+                    self.b.emit(Op::LoadConst(c), 0);
+                }
+                None => self.var_ref(name)?,
             }
-            None => self.var_ref(name)?,
         }
         self.emit_load(vplace);
         self.b.emit(Op::LoadInt(elems.len() as i64), 0);
@@ -5175,6 +5192,9 @@ impl Compiler {
             if name == "StringContext" && self.is_library_name(name) {
                 return Some(name.clone());
             }
+            if matches!(name.as_str(), "BigInt" | "BigDecimal") && self.is_library_name(name) {
+                return Some(name.clone());
+            }
             if name == "Option" && args.len() == 1 && self.is_library_name(name) {
                 return Some(format!("Option[{}]", self.static_type_name(&args[0])?));
             }
@@ -5319,6 +5339,9 @@ impl Compiler {
     /// `get`), an `Option` of it (`headOption`, `lastOption`, `find`), or the
     /// receiver's own type (`filter`, `take`, `sorted`, …).
     fn method_result_type(&self, e: &Expr) -> Option<String> {
+        if let Some(t) = sorted_view_type(e) {
+            return Some(t.to_string());
+        }
         let Expr::Method {
             recv, name, args, ..
         } = e
@@ -5423,7 +5446,7 @@ impl Compiler {
             let found = self
                 .resolve_implicit(&ty, 0)
                 .ok()
-                .or_else(|| natural_ordering(&ty));
+                .or_else(|| library_instance(&ty));
             out.push(found?);
         }
         Some(out)
@@ -5692,8 +5715,31 @@ impl Compiler {
     /// the narrowing covers EVERY lowering path — the math builtin, the operator
     /// spellings, and the generic `SMETHOD` fallback all funnel through here.
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
-        if matches!(recv, Expr::Var(v) if v == "Function")
-            && !self.objects.contains_key("Function")
+        if let Some(e) = self.sorted_view_rejection(recv, name, args.len(), line) {
+            return Err(e);
+        }
+        // `StringContext(…).f(args…)` — the `f` interpolator, which Scala
+        // expands at compile time and so only on a literal `StringContext`.
+        if name == "f" && self.static_type_name(recv).as_deref() == Some("StringContext") {
+            let parts: Option<Vec<String>> = match recv {
+                Expr::Call { args: ps, .. } => ps
+                    .iter()
+                    .map(|p| match p {
+                        Expr::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => None,
+            };
+            let Some(parts) = parts else {
+                return Err(format!(
+                    "scalars: Expected statically known StringContext (line {line})"
+                ));
+            };
+            let e = string_context_f(&parts, args, line)?;
+            return self.expr(&e);
+        }
+        if matches!(recv, Expr::Var(v) if v == "Function") && !self.objects.contains_key("Function")
         {
             if let Some(f) = function_combinator(name, args, line) {
                 // The parser folds a trailing application into the same
@@ -5963,24 +6009,27 @@ impl Compiler {
         // `java.util.Arrays.sort(a)` / `Collections.reverse(l)` — the static
         // members of the two `java.util` utility classes, named in full or
         // imported.
-        let java_util_class = ["Arrays", "Collections"].into_iter().find(|c| match recv {
-            Expr::Var(n) => {
-                n == c
-                    && self.is_library_name(n)
-                    && !self.vals.contains_key(n)
-                    && self
-                        .imports
-                        .get(n)
-                        .is_some_and(|p| p.join(".") == format!("java.util.{c}"))
-            }
-            Expr::Method {
-                recv: pkg,
-                name: n,
-                args: a,
-                ..
-            } => n == c && a.is_empty() && is_package_path(pkg, &["java", "util"]),
-            _ => false,
-        });
+        let java_util_class =
+            ["Arrays", "Collections", "Locale"]
+                .into_iter()
+                .find(|c| match recv {
+                    Expr::Var(n) => {
+                        n == c
+                            && self.is_library_name(n)
+                            && !self.vals.contains_key(n)
+                            && self
+                                .imports
+                                .get(n)
+                                .is_some_and(|p| p.join(".") == format!("java.util.{c}"))
+                    }
+                    Expr::Method {
+                        recv: pkg,
+                        name: n,
+                        args: a,
+                        ..
+                    } => n == c && a.is_empty() && is_package_path(pkg, &["java", "util"]),
+                    _ => false,
+                });
         if let Some(class) = java_util_class {
             if class == "Arrays" {
                 if let Some(e) = self.arrays_overload_error(name, args, line) {
@@ -6264,15 +6313,26 @@ impl Compiler {
         if !args.is_empty() {
             return None;
         }
-        let owner = match recv {
-            Expr::Var(o) if self.objects.contains_key(o) => o.clone(),
-            _ => self.class_of(recv)?,
+        // A library type-class instance's member (`n.plus` on a `Numeric[A]`).
+        let typeclass = self.static_type_name(recv).is_some_and(|t| {
+            matches!(
+                base_type(&normalize_type(&t)).as_str(),
+                "Numeric" | "Integral" | "Fractional" | "scala.math.Numeric"
+            )
+        });
+        let arity = if typeclass {
+            numeric_member_arity(name)?
+        } else {
+            let owner = match recv {
+                Expr::Var(o) if self.objects.contains_key(o) => o.clone(),
+                _ => self.class_of(recv)?,
+            };
+            // A binding's recorded class keeps whatever the annotation said, type
+            // arguments included, and the method table is keyed by the bare name.
+            *self
+                .member_arity
+                .get(&method_sub_name(&base_type(&owner), name))?
         };
-        // A binding's recorded class keeps whatever the annotation said, type
-        // arguments included, and the method table is keyed by the bare name.
-        let arity = *self
-            .member_arity
-            .get(&method_sub_name(&base_type(&owner), name))?;
         if arity == 0 {
             return None;
         }
@@ -7724,7 +7784,7 @@ impl Compiler {
                 // to the standard library's instance in `Ordering`'s companion.
                 let found = self
                     .resolve_implicit(ty, line)
-                    .or_else(|e| natural_ordering(ty).ok_or(e))?;
+                    .or_else(|e| library_instance(ty).ok_or(e))?;
                 return self.expr(&found);
             }
         }
@@ -7785,6 +7845,14 @@ impl Compiler {
                 Op::CallBuiltin(crate::host::MAKE_STRING_CONTEXT, argc),
                 line,
             );
+            return Ok(());
+        }
+        if name == crate::parser::NUMERIC_INSTANCE {
+            for a in args {
+                self.expr(a)?;
+            }
+            self.b
+                .emit(Op::CallBuiltin(crate::host::MAKE_NUMERIC, 2), line);
             return Ok(());
         }
         if let Some(id) = using_step {
@@ -8548,6 +8616,14 @@ impl Compiler {
         // `NumericRange[Long]`, which does not wrap.
         // A `Char` endpoint makes it a `NumericRange[Char]`, whose elements are
         // `Char`s, not the `Int` a `Char` widens to in arithmetic.
+        // `List.range(a, b[, step])` / `Vector.range(…)` / `Seq.range(…)` —
+        // elements of the endpoints' width.
+        if name == "range"
+            && (2..=3).contains(&args.len())
+            && matches!(recv, Expr::Var(c) if SEQ_CTORS.contains(&c.as_str()) && self.is_library_name(c))
+        {
+            return combine_all(args.iter().map(|a| self.num_ty(a)));
+        }
         if args.len() == 1 && matches!(name, "to" | "until") {
             if matches!(recv, Expr::Char(_)) || matches!(&args[0], Expr::Char(_)) {
                 return NumTy::Unknown;
@@ -9545,12 +9621,92 @@ impl Compiler {
     }
 }
 
+/// The static type of a `java.util` sorted view whose member names only the
+/// JDK's navigable collections declare: `headSet(e)`/`tailSet(e)`/
+/// `subSet(a, b)` answer a `java.util.SortedSet`, and `headMap(k)`/
+/// `tailMap(k)`/`subMap(a, b)` a `java.util.SortedMap` — not the
+/// `NavigableSet`/`NavigableMap` the inclusive-flag forms answer.
+fn sorted_view_type(e: &Expr) -> Option<&'static str> {
+    let Expr::Method { name, args, .. } = e else {
+        return None;
+    };
+    match (name.as_str(), args.len()) {
+        ("headSet" | "tailSet", 1) | ("subSet", 2) => Some("java.util.SortedSet"),
+        ("headMap" | "tailMap", 1) | ("subMap", 2) => Some("java.util.SortedMap"),
+        _ => None,
+    }
+}
+
+impl Compiler {
+    /// The error scalac reports for a member a `java.util.SortedSet`/
+    /// `SortedMap` receiver does not have: the inclusive-flag sub-view forms
+    /// and the navigation members are `NavigableSet`/`NavigableMap`'s.
+    fn sorted_view_rejection(
+        &self,
+        recv: &Expr,
+        name: &str,
+        argc: usize,
+        line: u32,
+    ) -> Option<String> {
+        let ty = self.static_type_name(recv)?;
+        let ty = base_type(&normalize_type(&ty));
+        let missing = match ty.as_str() {
+            "java.util.SortedSet" => matches!(
+                (name, argc),
+                ("headSet" | "tailSet", 2)
+                    | ("subSet", 4)
+                    | (
+                        "floor"
+                            | "ceiling"
+                            | "higher"
+                            | "lower"
+                            | "pollFirst"
+                            | "pollLast"
+                            | "descendingSet"
+                            | "descendingIterator",
+                        _
+                    )
+            ),
+            "java.util.SortedMap" => matches!(
+                (name, argc),
+                ("headMap" | "tailMap", 2)
+                    | ("subMap", 4)
+                    | (
+                        "floorKey"
+                            | "ceilingKey"
+                            | "higherKey"
+                            | "lowerKey"
+                            | "floorEntry"
+                            | "ceilingEntry"
+                            | "higherEntry"
+                            | "lowerEntry"
+                            | "firstEntry"
+                            | "lastEntry"
+                            | "pollFirstEntry"
+                            | "pollLastEntry"
+                            | "descendingMap"
+                            | "navigableKeySet"
+                            | "descendingKeySet",
+                        _
+                    )
+            ),
+            _ => false,
+        };
+        missing.then(|| {
+            format!("scalars: {name} with {argc} argument(s) is not a member of {ty} (line {line})")
+        })
+    }
+}
+
 /// The standard library's own instance for an implicit of type `Ordering[T]`
 /// that no given in the program supplies: the natural ordering (`Ordering.Int`
 /// stands for it here, as for `Ordering[T]` written out; it compares any two
 /// values the way `sorted` does). Scala finds it in `Ordering`'s companion,
 /// which is in the implicit scope of every `Ordering[T]`.
-fn natural_ordering(ty: &str) -> Option<Expr> {
+fn library_instance(ty: &str) -> Option<Expr> {
+    if let Some(e) = numeric_instance(ty) {
+        return Some(e);
+    }
     let ty = ty.trim();
     let ty = ty
         .strip_prefix("scala.math.")
@@ -9561,6 +9717,118 @@ fn natural_ordering(ty: &str) -> Option<Expr> {
         name: "Int".to_string(),
         args: Vec::new(),
         line: 0,
+    })
+}
+
+/// The standard library's implicit `Numeric[T]` / `Integral[T]` /
+/// `Fractional[T]` for a numeric `T` (`Numeric.IntIsIntegral`,
+/// `Numeric.DoubleIsFractional`, …): `Integral` only for the integral types,
+/// `Fractional` only for `Double`/`Float`/`BigDecimal`, as in the library.
+fn numeric_instance(ty: &str) -> Option<Expr> {
+    let ty = normalize_type(ty);
+    let ty = ty
+        .strip_prefix("scala.math.")
+        .or_else(|| ty.strip_prefix("math."))
+        .unwrap_or(&ty);
+    let (class, arg) = ty.split_once('[')?;
+    let arg = arg.strip_suffix(']')?;
+    let arg = arg
+        .strip_prefix("scala.math.")
+        .or_else(|| arg.strip_prefix("scala."))
+        .unwrap_or(arg);
+    let integral = matches!(arg, "Int" | "Long" | "Short" | "Byte" | "BigInt");
+    let fractional = matches!(arg, "Double" | "Float" | "BigDecimal");
+    let fits = match class {
+        "Numeric" => integral || fractional,
+        "Integral" => integral,
+        "Fractional" => fractional,
+        _ => false,
+    };
+    fits.then(|| Expr::Call {
+        name: crate::parser::NUMERIC_INSTANCE.to_string(),
+        args: vec![Expr::Str(class.to_string()), Expr::Str(arg.to_string())],
+        line: 0,
+    })
+}
+
+/// `StringContext(parts…).f(args…)` as the `f` interpolator expands it: each
+/// argument formatted by the conversion that opens the part after it (`%s`
+/// when there is none), the parts' escapes decoded and `%%` / `%n` literal. A
+/// conversion anywhere else, or an argument count that does not fit the parts,
+/// is the compile error Scala reports.
+fn string_context_f(parts: &[String], args: &[Expr], line: u32) -> Result<Expr, String> {
+    if args.len() + 1 != parts.len() {
+        let which = if args.len() + 1 > parts.len() {
+            "many"
+        } else {
+            "few"
+        };
+        return Err(format!(
+            "scalars: too {which} arguments for interpolated string (line {line})"
+        ));
+    }
+    // A literal part: escapes decoded, `%%` and `%n` resolved, any other `%`
+    // rejected.
+    let literal = |p: &str| -> Result<String, String> {
+        let p = crate::host::process_escapes(p)?;
+        let mut out = String::new();
+        let mut cs = p.chars().peekable();
+        while let Some(c) = cs.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match cs.next() {
+                Some('%') => out.push('%'),
+                Some('n') => out.push('\n'),
+                _ => {
+                    return Err(format!(
+                        "scalars: conversions must follow a splice; use %% for literal %, %n for newline (line {line})"
+                    ))
+                }
+            }
+        }
+        Ok(out)
+    };
+    let mut e = Expr::Str(literal(&parts[0])?);
+    for (arg, part) in args.iter().zip(&parts[1..]) {
+        let (spec, rest) = match part.strip_prefix('%') {
+            Some(after) if !after.starts_with(['%', 'n']) => {
+                let end = after
+                    .find(|c: char| c.is_ascii_alphabetic())
+                    .map_or(after.len(), |i| i + 1);
+                (format!("%{}", &after[..end]), &after[end..])
+            }
+            _ => ("%s".to_string(), part.as_str()),
+        };
+        let formatted = Expr::Format {
+            value: Box::new(arg.clone()),
+            spec,
+            line,
+        };
+        e = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(e),
+            rhs: Box::new(formatted),
+        };
+        e = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(e),
+            rhs: Box::new(Expr::Str(literal(rest)?)),
+        };
+    }
+    Ok(e)
+}
+
+/// The members of a `Numeric`/`Integral`/`Fractional` value and their arity,
+/// for eta-expanding one used as a function value (`xs.foldLeft(n.zero)(n.plus)`).
+fn numeric_member_arity(name: &str) -> Option<usize> {
+    Some(match name {
+        "plus" | "minus" | "times" | "quot" | "rem" | "div" | "compare" | "lt" | "lteq" | "gt"
+        | "gteq" | "equiv" | "max" | "min" => 2,
+        "negate" | "abs" | "sign" | "signum" | "toInt" | "toLong" | "toDouble" | "toFloat"
+        | "fromInt" | "parseString" => 1,
+        _ => return None,
     })
 }
 
