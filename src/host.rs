@@ -2475,7 +2475,9 @@ fn char_fold(add: bool, codes: impl Iterator<Item = i64>) -> Value {
 struct Closure {
     name_idx: u16,
     params: u8,
-    captures: Vec<Value>,
+    /// Shared, so copying the closure record out of the heap for a call does
+    /// not copy its captures.
+    captures: Arc<[Value]>,
     /// For a `{ case … }` literal (Scala's `PartialFunction`), the name-pool
     /// index of the derived `isDefinedAt` body — the same patterns and guards
     /// answering `true`/`false` (see [`crate::compiler`]). `None` for a plain
@@ -2572,6 +2574,8 @@ pub fn reset_heap() {
     DEC_RANGES.with(|t| t.borrow_mut().clear());
     JAVA_CMP.with(|t| t.borrow_mut().clear());
     JAVA_VIEWS.with(|t| t.borrow_mut().clear());
+    JAVA_SUBVIEWS.with(|t| t.borrow_mut().clear());
+    BACKING_VIEWS.with(|t| t.borrow_mut().clear());
     CUSTOM_ORD.with(|t| t.borrow_mut().clear());
     OVERRIDE_ORD.with(|o| *o.borrow_mut() = None);
     reset_regex_cache();
@@ -4058,7 +4062,7 @@ fn make_closure(vm: &mut VM, argc: u8, partial: bool) -> Value {
     heap_push(HeapVal::Closure(Closure {
         name_idx,
         params,
-        captures,
+        captures: captures.into(),
         defined_idx,
         pair_body: flags & 1 != 0,
         char_body: flags & 2 != 0,
@@ -5290,19 +5294,20 @@ fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Result<Value, String
 /// with `null`, dropping extras), then the captured upvalues in declaration
 /// order, and run the body. The prologue pops params+captures into slots.
 fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Result<Value, String> {
+    // A plain closure first: it is nearly every call, and one heap lookup.
+    if let Some(meta) = as_closure(clo) {
+        return invoke_body(vm, &meta, meta.name_idx, args);
+    }
     if let Some(d) = as_derived(clo) {
         return invoke_derived(vm, &d, args);
     }
-    let Some(meta) = as_closure(clo) else {
-        // A `Seq`, `Set` or `Map` passed where a function is expected IS one —
-        // `(0 to n).filter(isPrime)` with `isPrime: Array[Boolean]`, or
-        // `keys.map(m)` — and applying it is its `apply`.
-        if seq_kind(clo).is_some() || is_map(clo) {
-            return apply_value(vm, clo, args);
-        }
-        return Err("scalars: value is not a function".to_string());
-    };
-    invoke_body(vm, &meta, meta.name_idx, args)
+    // A `Seq`, `Set` or `Map` passed where a function is expected IS one —
+    // `(0 to n).filter(isPrime)` with `isPrime: Array[Boolean]`, or
+    // `keys.map(m)` — and applying it is its `apply`.
+    if seq_kind(clo).is_some() || is_map(clo) {
+        return apply_value(vm, clo, args);
+    }
+    Err("scalars: value is not a function".to_string())
 }
 
 /// Apply a composed function value (see [`DerivedFn`]).
@@ -5394,7 +5399,18 @@ fn invoke_body(
         .chunk
         .find_sub(name_idx)
         .ok_or_else(|| "scalars: closure body not found".to_string())?;
-    let want = meta.params as usize;
+    run_body(vm, entry, meta.params as usize, &meta.captures, args)
+}
+
+/// Run the closure body at `entry`, which takes `want` parameters followed by
+/// `captures`, with `args`.
+fn run_body(
+    vm: &mut VM,
+    entry: usize,
+    want: usize,
+    captures: &[Value],
+    args: &[Value],
+) -> Result<Value, String> {
     // A pattern-matching anonymous function (`{ case (a, b) => … }`) is one
     // parameter matched against its argument, and Scala unifies that with the
     // `FunctionN` a two-argument caller like `foldLeft` wants by tupling the
@@ -5422,7 +5438,7 @@ fn invoke_body(
     for i in 0..want {
         vm.stack.push(args.get(i).cloned().unwrap_or(Value::Undef));
     }
-    for cap in &meta.captures {
+    for cap in captures {
         vm.stack.push(cap.clone());
     }
     run_sub(vm, entry, stack_base)
@@ -8819,7 +8835,17 @@ fn b_no_member_test(_vm: &mut VM, _argc: u8) -> Value {
 }
 
 /// The dispatch behind [`b_method`], with its operands already popped.
-fn method_call(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value>) -> Value {
+/// A member call. A MUTABLE `TreeSet`/`TreeMap` built with an explicit ordering
+/// is put back in that order after any member that may have changed it (see
+/// [`custom_mutable_method`]).
+fn method_call(vm: &mut VM, recv: Value, name: String, args: Vec<Value>) -> Value {
+    if let Some(ord) = custom_ordering(&recv).filter(|_| is_mutable_sorted(&recv)) {
+        return custom_mutable_method(vm, recv, &ord, name, args);
+    }
+    method_call_inner(vm, recv, name, args)
+}
+
+fn method_call_inner(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value>) -> Value {
     // A widened box answers every member as its number does, except `getClass`,
     // which reports the box.
     // `equals` between two boxes is the JDK's: same class and same value.
@@ -17480,6 +17506,12 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
     if unwinding() {
         return Value::Undef;
     }
+    // Two `Int`s — nearly every `/` — need none of the wider types' checks.
+    if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
+        if *y != 0 {
+            return Value::int(x.wrapping_div(*y));
+        }
+    }
     if let Some(r) = dec_binop(NumOp::Div, &a, &b) {
         return r.unwrap_or_else(|e| fault(vm, e));
     }
@@ -17531,6 +17563,12 @@ fn b_mod(vm: &mut VM, _argc: u8) -> Value {
     let a = vm.stack.pop().unwrap_or(Value::Undef);
     if unwinding() {
         return Value::Undef;
+    }
+    // Two `Int`s — nearly every `%` — need none of the wider types' checks.
+    if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
+        if *y != 0 {
+            return Value::int(x.wrapping_rem(*y));
+        }
     }
     if let Some(r) = dec_binop(NumOp::Mod, &a, &b) {
         return r.unwrap_or_else(|e| fault(vm, e));
@@ -21134,7 +21172,7 @@ fn java_optional_method(
 
 /// The `java.util.List` members a collected list answers (see
 /// [`SeqKind::JavaList`]).
-fn java_list_method(
+fn java_list_method_inner(
     vm: &mut VM,
     recv: &Value,
     items: &[Value],
@@ -22268,7 +22306,7 @@ fn java_map_value(entries: Vec<(Value, Value)>) -> Value {
 }
 
 /// The `java.util.Map` members a collected map answers.
-fn java_map_method(
+fn java_map_method_inner(
     vm: &mut VM,
     recv: &Value,
     items: &[Value],
@@ -22952,11 +22990,6 @@ fn java_tree_set_query(
         };
         found.cloned().unwrap_or(Value::Undef)
     };
-    let tree = |xs: Vec<Value>| {
-        let v = new_seq(SeqKind::JavaList, xs);
-        set_java_flavor(&v, JFlavor::TreeSet);
-        v
-    };
     Some(Ok(match (name, args.len()) {
         ("first", 0) => match items.first() {
             Some(v) => v.clone(),
@@ -22970,20 +23003,6 @@ fn java_tree_set_query(
         ("lower", 1) => pick(&|o| o == Ordering::Less, true),
         ("ceiling", 1) => pick(&|o| o != Ordering::Less, false),
         ("higher", 1) => pick(&|o| o == Ordering::Greater, false),
-        ("headSet", 1) => tree(
-            items
-                .iter()
-                .filter(|x| value_cmp(x, &args[0]) == Ordering::Less)
-                .cloned()
-                .collect(),
-        ),
-        ("tailSet", 1) => tree(
-            items
-                .iter()
-                .filter(|x| value_cmp(x, &args[0]) != Ordering::Less)
-                .cloned()
-                .collect(),
-        ),
         ("descendingSet", 0) => new_seq(SeqKind::JavaList, items.iter().rev().cloned().collect()),
         _ => return None,
     }))
@@ -23014,11 +23033,6 @@ fn java_tree_map_op(
         None => Value::Undef,
     };
     let key = |kv: Option<(Value, Value)>| kv.map_or(Value::Undef, |(k, _)| k);
-    let sub = |keep: &dyn Fn(&Value) -> bool| {
-        let m = tree_map_value(pairs.iter().filter(|(k, _)| keep(k)).cloned().collect());
-        set_java_flavor(&m, JFlavor::TreeMap);
-        m
-    };
     let floor = |o: Ordering| o != Ordering::Greater;
     let lower = |o: Ordering| o == Ordering::Less;
     let ceiling = |o: Ordering| o != Ordering::Less;
@@ -23053,14 +23067,6 @@ fn java_tree_map_op(
         ("lowerEntry", 1) => (None, entry(key_where(&lower, true))),
         ("ceilingEntry", 1) => (None, entry(key_where(&ceiling, false))),
         ("higherEntry", 1) => (None, entry(key_where(&higher, false))),
-        ("headMap", 1) => (None, sub(&|k| value_cmp(k, &args[0]) == Ordering::Less)),
-        ("tailMap", 1) => (None, sub(&|k| value_cmp(k, &args[0]) != Ordering::Less)),
-        ("subMap", 2) => (
-            None,
-            sub(&|k| {
-                value_cmp(k, &args[0]) != Ordering::Less && value_cmp(k, &args[1]) == Ordering::Less
-            }),
-        ),
         ("descendingMap", 0) => (
             None,
             new_seq(
@@ -23683,6 +23689,12 @@ fn range_count(start: i64, end: i64, inclusive: bool, step: i64) -> u64 {
 /// The largest range [`range_items`] materializes; a longer one is a
 /// [`BIG_RANGES`] value.
 const RANGE_MATERIALIZE_CAP: u64 = 8_000_000;
+
+/// The largest collection a traversal of a [`BIG_RANGES`] value builds
+/// (`r.map(f)`, `r.filter(p)`): a result Scala would hold in a `Vector` is held
+/// too, up to this bound, past which the run stops as the out-of-memory a
+/// default-sized JVM heap would reach first.
+const TRAVERSAL_RESULT_CAP: u64 = 64_000_000;
 
 /// A `Range` value over `start until|to end by step`: its elements
 /// materialized, or — past [`RANGE_MATERIALIZE_CAP`] — none, answered from the
@@ -24409,7 +24421,7 @@ fn with_ordering(vm: &mut VM, coll: &Value, ord: &Value) -> Result<Value, String
         return Err("scalars: an explicit ordering must be an Ordering".to_string());
     }
     if let Some((rep, entries)) = map_rep_entries(coll) {
-        if rep != HashRep::Sorted {
+        if !matches!(rep, HashRep::Sorted | HashRep::MutSorted) {
             return Err("scalars: an explicit Ordering for this map is not modelled".to_string());
         }
         let pairs: Vec<Value> = entries.into_iter().map(new_pair_of).collect();
@@ -24421,14 +24433,14 @@ fn with_ordering(vm: &mut VM, coll: &Value, ord: &Value) -> Result<Value, String
                 Some((kv.first()?.clone(), kv.get(1)?.clone()))
             })
             .collect();
-        let out = heap_push(HeapVal::Map(HashRep::Sorted, entries));
+        let out = heap_push(HeapVal::Map(rep, entries));
         mark_custom_ordering(&out, ord);
         return Ok(out);
     }
     match seq_kind_items(coll) {
-        Some((SeqKind::Set(HashRep::Sorted), items)) => {
+        Some((SeqKind::Set(rep @ (HashRep::Sorted | HashRep::MutSorted)), items)) => {
             let sorted = sort_distinct_by(vm, ord, items, false, &Clone::clone)?;
-            let out = heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), sorted));
+            let out = heap_push(HeapVal::Seq(SeqKind::Set(rep), sorted));
             mark_custom_ordering(&out, ord);
             Ok(out)
         }
@@ -24493,7 +24505,7 @@ fn reorder_custom(vm: &mut VM, out: Value, ord: &Value) -> Result<Value, String>
         }
         return Ok(heap_push(HeapVal::Tuple(fixed)));
     }
-    if let Some((HashRep::Sorted, entries)) = map_rep_entries(&out) {
+    if let Some((rep @ (HashRep::Sorted | HashRep::MutSorted), entries)) = map_rep_entries(&out) {
         let pairs: Vec<Value> = entries.into_iter().map(new_pair_of).collect();
         let sorted = sort_distinct_by(vm, ord, pairs, true, &pair_key)?;
         let entries = sorted
@@ -24503,14 +24515,14 @@ fn reorder_custom(vm: &mut VM, out: Value, ord: &Value) -> Result<Value, String>
                 Some((kv.first()?.clone(), kv.get(1)?.clone()))
             })
             .collect();
-        let m = heap_push(HeapVal::Map(HashRep::Sorted, entries));
+        let m = heap_push(HeapVal::Map(rep, entries));
         mark_custom_ordering(&m, ord);
         return Ok(m);
     }
     match seq_kind_items(&out) {
-        Some((SeqKind::Set(HashRep::Sorted), items)) => {
+        Some((SeqKind::Set(rep @ (HashRep::Sorted | HashRep::MutSorted)), items)) => {
             let sorted = sort_distinct_by(vm, ord, items, false, &Clone::clone)?;
-            let s = heap_push(HeapVal::Seq(SeqKind::Set(HashRep::Sorted), sorted));
+            let s = heap_push(HeapVal::Seq(SeqKind::Set(rep), sorted));
             mark_custom_ordering(&s, ord);
             Ok(s)
         }
@@ -24762,11 +24774,12 @@ fn big_range_traverse(
     args: &[Value],
 ) -> Result<Value, String> {
     let too_large = || "scalars: java.lang.OutOfMemoryError: Range too large".to_string();
-    let f = args.first().cloned().unwrap_or(Value::Undef);
-    let call = |vm: &mut VM, x: Value| invoke_closure(vm, &f, &[x]);
+    // The function resolved once for the whole traversal (see [`Callable`]).
+    let f = Callable::of(vm, &args.first().cloned().unwrap_or(Value::Undef));
+    let call = |vm: &mut VM, x: Value| f.call(vm, &[x]);
     let mut kept: Vec<Value> = Vec::new();
     let keep = |kept: &mut Vec<Value>, v: Value| -> Result<(), String> {
-        if kept.len() as u64 >= RANGE_MATERIALIZE_CAP {
+        if kept.len() as u64 >= TRAVERSAL_RESULT_CAP {
             return Err(too_large());
         }
         kept.push(v);
@@ -24790,6 +24803,7 @@ fn big_range_traverse(
         }
         return Ok(it);
     }
+    let fold_op = Callable::of(vm, &args.get(1).cloned().unwrap_or(Value::Undef));
     let mut acc = args.first().cloned().unwrap_or(Value::Undef);
     let mut count = 0i64;
     for i in 0..n {
@@ -24834,10 +24848,7 @@ fn big_range_traverse(
                 }
             }
             // `foldLeft(z)(op)`: the zero, then the operator.
-            _ => {
-                let op = args.get(1).cloned().unwrap_or(Value::Undef);
-                acc = invoke_closure(vm, &op, &[acc, x])?;
-            }
+            _ => acc = fold_op.call(vm, &[acc, x])?,
         }
     }
     Ok(match name {
@@ -24934,12 +24945,6 @@ fn java_cmp_set_nav(
     name: &str,
     args: &[Value],
 ) -> Option<Result<(Vec<Value>, Value), String>> {
-    let sub = |xs: Vec<Value>| {
-        let s = java_marked(new_seq(SeqKind::JavaList, xs), true);
-        set_java_flavor(&s, JFlavor::TreeSet);
-        set_java_cmp(&s, Some(cmp.clone()));
-        s
-    };
     let r = (|| -> Result<(Vec<Value>, Value), String> {
         Ok(match (name, args.len()) {
             ("floor" | "lower" | "ceiling" | "higher", 1) => {
@@ -24948,16 +24953,6 @@ fn java_cmp_set_nav(
                     items.to_vec(),
                     at.map_or(Value::Undef, |i| items[i].clone()),
                 )
-            }
-            ("headSet" | "tailSet", 1) => {
-                let mut kept = Vec::new();
-                for x in items {
-                    let o = java_compare(vm, Some(cmp), x, &args[0])?;
-                    if (name == "headSet") == (o == Ordering::Less) {
-                        kept.push(x.clone());
-                    }
-                }
-                (items.to_vec(), sub(kept))
             }
             ("pollFirst", 0) => {
                 let mut out = items.to_vec();
@@ -25003,15 +24998,6 @@ fn java_cmp_map_nav(
         ),
         None => Value::Undef,
     };
-    let sub = |kept: Vec<(Value, Value)>| {
-        let m = new_seq(
-            SeqKind::JavaMap,
-            kept.into_iter().map(new_pair_of).collect(),
-        );
-        set_java_flavor(&m, JFlavor::TreeMap);
-        set_java_cmp(&m, Some(cmp.clone()));
-        java_marked(m, true)
-    };
     let r = (|| -> Result<MapMutation, String> {
         let same = pairs.to_vec();
         Ok(match (name, args.len()) {
@@ -25033,27 +25019,6 @@ fn java_cmp_map_nav(
                 let e = entry(pairs.len().checked_sub(1));
                 (pairs[..pairs.len().saturating_sub(1)].to_vec(), e)
             }
-            ("headMap" | "tailMap", 1) => {
-                let mut kept = Vec::new();
-                for (k, v) in pairs {
-                    let o = java_compare(vm, Some(cmp), k, &args[0])?;
-                    if (name == "headMap") == (o == Ordering::Less) {
-                        kept.push((k.clone(), v.clone()));
-                    }
-                }
-                (same, sub(kept))
-            }
-            ("subMap", 2) => {
-                let mut kept = Vec::new();
-                for (k, v) in pairs {
-                    let lo = java_compare(vm, Some(cmp), k, &args[0])?;
-                    let hi = java_compare(vm, Some(cmp), k, &args[1])?;
-                    if lo != Ordering::Less && hi == Ordering::Less {
-                        kept.push((k.clone(), v.clone()));
-                    }
-                }
-                (same, sub(kept))
-            }
             ("descendingMap", 0) => (
                 same,
                 new_seq(
@@ -25072,4 +25037,473 @@ fn java_cmp_map_nav(
         Err(e) if e.is_empty() => None,
         other => Some(other),
     }
+}
+
+/// A function value resolved once for many calls — what a traversal of
+/// millions of elements hands its function. A plain closure's body entry and
+/// captures are looked up (and its record copied out of the heap) a single
+/// time instead of per element; anything else goes through
+/// [`invoke_closure`] each call.
+enum Callable {
+    Body {
+        entry: usize,
+        params: usize,
+        captures: Arc<[Value]>,
+    },
+    Value(Value),
+}
+
+impl Callable {
+    fn of(vm: &VM, f: &Value) -> Callable {
+        if as_derived(f).is_none() {
+            if let Some(meta) = as_closure(f) {
+                if let Some(entry) = vm.chunk.find_sub(meta.name_idx) {
+                    return Callable::Body {
+                        entry,
+                        params: meta.params as usize,
+                        captures: meta.captures,
+                    };
+                }
+            }
+        }
+        Callable::Value(f.clone())
+    }
+
+    fn call(&self, vm: &mut VM, args: &[Value]) -> Result<Value, String> {
+        match self {
+            Callable::Body {
+                entry,
+                params,
+                captures,
+            } => run_body(vm, *entry, *params, captures, args),
+            Callable::Value(f) => invoke_closure(vm, f, args),
+        }
+    }
+}
+
+/// Whether `v` is a mutable sorted set or map (`HashRep::MutSorted`).
+fn is_mutable_sorted(v: &Value) -> bool {
+    matches!(map_rep_entries(v), Some((HashRep::MutSorted, _)))
+        || matches!(seq_kind(v), Some(SeqKind::Set(HashRep::MutSorted)))
+}
+
+/// A member of a mutable `TreeSet`/`TreeMap` held under the explicit ordering
+/// `ord`. The ordering decides membership — `contains`/`get`, and the removals
+/// `-=`/`remove`/`subtractOne`, find the element it calls equal — and after any
+/// other member the collection is re-laid-out in `ord`'s order (an added
+/// element the ordering calls equal to one present is not a second element; a
+/// map keeps the value written last).
+fn custom_mutable_method(
+    vm: &mut VM,
+    recv: Value,
+    ord: &Value,
+    name: String,
+    args: Vec<Value>,
+) -> Value {
+    let is_map = map_rep_entries(&recv).is_some();
+    let keys: Vec<Value> = match map_rep_entries(&recv) {
+        Some((_, entries)) => entries.iter().map(|(k, _)| k.clone()).collect(),
+        None => seq_kind_items(&recv).map(|(_, xs)| xs).unwrap_or_default(),
+    };
+    let find = |vm: &mut VM, x: &Value| -> Result<Option<usize>, String> {
+        for (i, k) in keys.iter().enumerate() {
+            if ordering_cmp(vm, ord, k, x)? == Ordering::Equal {
+                return Ok(Some(i));
+            }
+        }
+        Ok(None)
+    };
+    let answered: Result<Option<Value>, String> = (|| {
+        Ok(match (name.as_str(), args.len()) {
+            ("contains", 1) => Some(Value::bool(find(vm, &args[0])?.is_some())),
+            ("apply", 1) if !is_map => Some(Value::bool(find(vm, &args[0])?.is_some())),
+            ("get", 1) if is_map => {
+                let entries = map_rep_entries(&recv).map(|(_, e)| e).unwrap_or_default();
+                Some(match find(vm, &args[0])? {
+                    Some(i) => make_some(entries[i].1.clone()),
+                    None => make_none(),
+                })
+            }
+            ("-=" | "subtractOne" | "remove", 1) => {
+                let at = find(vm, &args[0])?;
+                let removed = match (map_rep_entries(&recv), at) {
+                    (Some((_, mut entries)), Some(i)) => {
+                        let (_, v) = entries.remove(i);
+                        store_map_raw(&recv, entries);
+                        Some(v)
+                    }
+                    (None, Some(i)) => {
+                        let (_, mut items) = seq_kind_items(&recv).expect("a sorted set");
+                        items.remove(i);
+                        store_set_raw(&recv, items);
+                        None
+                    }
+                    _ => None,
+                };
+                Some(match name.as_str() {
+                    "remove" if is_map => removed.map_or_else(make_none, make_some),
+                    "remove" => Value::bool(at.is_some()),
+                    _ => recv.clone(),
+                })
+            }
+            _ => None,
+        })
+    })();
+    match answered {
+        Ok(Some(v)) => return v,
+        Ok(None) => {}
+        Err(e) => return fault(vm, e),
+    }
+    let out = method_call_inner(vm, recv.clone(), name.clone(), args);
+    if let Err(e) = relayout_custom(vm, &recv, ord) {
+        return fault(vm, e);
+    }
+    if keeps_ordering(&name) {
+        return reorder_custom(vm, out, ord).unwrap_or_else(|e| fault(vm, e));
+    }
+    out
+}
+
+/// Put the mutable sorted collection `v` back in `ord`'s order, in place.
+fn relayout_custom(vm: &mut VM, v: &Value, ord: &Value) -> Result<(), String> {
+    if let Some((_, entries)) = map_rep_entries(v) {
+        let pairs: Vec<Value> = entries.into_iter().map(new_pair_of).collect();
+        let sorted = sort_distinct_by(vm, ord, pairs, true, &pair_key)?;
+        let entries = sorted
+            .iter()
+            .filter_map(|p| {
+                let kv = as_seq_or_tuple(p)?;
+                Some((kv.first()?.clone(), kv.get(1)?.clone()))
+            })
+            .collect();
+        store_map_raw(v, entries);
+    } else if let Some((_, items)) = seq_kind_items(v) {
+        let sorted = sort_distinct_by(vm, ord, items, false, &Clone::clone)?;
+        store_set_raw(v, sorted);
+    }
+    Ok(())
+}
+
+/// Store `items` as the sorted set behind `v` exactly as given — the order an
+/// explicit ordering laid out, which [`set_seq_items`] would re-sort naturally.
+fn store_set_raw(v: &Value, items: Vec<Value>) {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Seq(_, xs)) = h.borrow_mut().get_mut(*id as usize) {
+                *xs = items;
+            }
+        });
+    }
+}
+
+/// [`store_set_raw`] for a sorted map's entries.
+fn store_map_raw(v: &Value, entries: Vec<(Value, Value)>) {
+    if let Value::Obj(id) = v {
+        HEAP.with(|h| {
+            if let Some(HeapVal::Map(_, m)) = h.borrow_mut().get_mut(*id as usize) {
+                *m = entries;
+            }
+        });
+    }
+}
+
+/// The key range a `NavigableSet`/`NavigableMap` sub-view covers: each bound
+/// with whether it is inclusive, `None` for an open end.
+#[derive(Clone)]
+struct SubRange {
+    lo: Option<(Value, bool)>,
+    hi: Option<(Value, bool)>,
+}
+
+thread_local! {
+    /// The live `headSet`/`tailSet`/`subSet`/`headMap`/`tailMap`/`subMap`
+    /// views, by heap id: the backing `TreeSet`/`TreeMap` and the range. A view
+    /// holds nothing of its own; every read is the backing collection's
+    /// elements in range NOW, and every write goes to the backing collection.
+    static JAVA_SUBVIEWS: RefCell<HashMap<usize, (Value, SubRange)>> = RefCell::new(HashMap::new());
+}
+
+fn java_subview_of(v: &Value) -> Option<(Value, SubRange)> {
+    as_obj_id(v).and_then(|id| JAVA_SUBVIEWS.with(|t| t.borrow().get(&id).cloned()))
+}
+
+/// Whether `k` lies in `r` under the backing collection's comparator.
+fn in_sub_range(vm: &mut VM, cmp: Option<&Value>, r: &SubRange, k: &Value) -> Result<bool, String> {
+    if let Some((lo, inc)) = &r.lo {
+        let o = java_compare(vm, cmp, k, lo)?;
+        if o == Ordering::Less || (o == Ordering::Equal && !inc) {
+            return Ok(false);
+        }
+    }
+    if let Some((hi, inc)) = &r.hi {
+        let o = java_compare(vm, cmp, k, hi)?;
+        if o == Ordering::Greater || (o == Ordering::Equal && !inc) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The range a `headSet`/`tailSet`/`subSet` (`…Map`) call names, with the
+/// JDK's defaults: a head is exclusive, a tail inclusive, a sub inclusive
+/// below and exclusive above. `None` for any other member or arity.
+fn sub_range_of(name: &str, args: &[Value]) -> Option<SubRange> {
+    let b = |i: usize| truthy(&args[i]);
+    let v = |i: usize| args[i].clone();
+    Some(match (name, args.len()) {
+        ("headSet" | "headMap", 1) => SubRange {
+            lo: None,
+            hi: Some((v(0), false)),
+        },
+        ("headSet" | "headMap", 2) => SubRange {
+            lo: None,
+            hi: Some((v(0), b(1))),
+        },
+        ("tailSet" | "tailMap", 1) => SubRange {
+            lo: Some((v(0), true)),
+            hi: None,
+        },
+        ("tailSet" | "tailMap", 2) => SubRange {
+            lo: Some((v(0), b(1))),
+            hi: None,
+        },
+        ("subSet" | "subMap", 2) => SubRange {
+            lo: Some((v(0), true)),
+            hi: Some((v(1), false)),
+        },
+        ("subSet" | "subMap", 4) => SubRange {
+            lo: Some((v(0), b(1))),
+            hi: Some((v(2), b(3))),
+        },
+        _ => return None,
+    })
+}
+
+/// A live sub-view of the `TreeSet`/`TreeMap` `backing` (see [`JAVA_SUBVIEWS`]).
+/// A range whose low bound is above its high one is the JDK's
+/// `IllegalArgumentException: fromKey > toKey`.
+fn java_subview(vm: &mut VM, backing: &Value, range: SubRange) -> Result<Value, String> {
+    let cmp = java_comparator(backing);
+    if let (Some((lo, _)), Some((hi, _))) = (&range.lo, &range.hi) {
+        if java_compare(vm, cmp.as_ref(), lo, hi)? == Ordering::Greater {
+            return Err("scalars: java.lang.IllegalArgumentException: fromKey > toKey".to_string());
+        }
+    }
+    let kind = seq_kind(backing).unwrap_or(SeqKind::JavaList);
+    let v = java_marked(new_seq(kind, Vec::new()), true);
+    if let Some(f) = java_flavor(backing) {
+        set_java_flavor(&v, f);
+    }
+    set_java_cmp(&v, cmp);
+    if let Some(id) = as_obj_id(&v) {
+        JAVA_SUBVIEWS.with(|t| t.borrow_mut().insert(id, (backing.clone(), range)));
+    }
+    Ok(v)
+}
+
+/// The view's current contents as a free-standing `TreeSet`/`TreeMap` value of
+/// the same flavor and comparator — what a read is answered off.
+fn java_subview_snapshot(vm: &mut VM, backing: &Value, range: &SubRange) -> Result<Value, String> {
+    let cmp = java_comparator(backing);
+    let (kind, items) = seq_kind_items(backing).unwrap_or((SeqKind::JavaList, Vec::new()));
+    let mut kept = Vec::new();
+    for x in items {
+        let key = if kind == SeqKind::JavaMap {
+            pair_key(&x)
+        } else {
+            x.clone()
+        };
+        if in_sub_range(vm, cmp.as_ref(), range, &key)? {
+            kept.push(x);
+        }
+    }
+    let v = java_marked(new_seq(kind, kept), true);
+    if let Some(f) = java_flavor(backing) {
+        set_java_flavor(&v, f);
+    }
+    set_java_cmp(&v, cmp);
+    Ok(v)
+}
+
+/// A member of a live sub-view. A write must fall in the view's range (the
+/// JDK's `IllegalArgumentException: key out of range` otherwise) and goes to
+/// the backing collection; a removal or lookup outside it finds nothing;
+/// `clear` empties the range in the backing collection; a read is answered off
+/// the contents in range now.
+fn java_subview_method(
+    vm: &mut VM,
+    backing: &Value,
+    range: &SubRange,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    let cmp = java_comparator(backing);
+    let dispatch = |vm: &mut VM, v: &Value, name: &str, args: &[Value]| {
+        let items = seq_kind_items(v).map(|(_, xs)| xs).unwrap_or_default();
+        if seq_kind(v) == Some(SeqKind::JavaMap) {
+            java_map_method(vm, v, &items, name, args)
+        } else {
+            java_list_method(vm, v, &items, name, args)
+        }
+    };
+    match (name, args.len()) {
+        ("add" | "put", 1 | 2) => {
+            if !in_sub_range(vm, cmp.as_ref(), range, &args[0])? {
+                return Err(
+                    "scalars: java.lang.IllegalArgumentException: key out of range".to_string(),
+                );
+            }
+            dispatch(vm, backing, name, args)
+        }
+        ("remove" | "remove$object" | "contains" | "containsKey" | "get", 1) => {
+            if !in_sub_range(vm, cmp.as_ref(), range, &args[0])? {
+                return Ok(match name {
+                    "get" | "remove" if seq_kind(backing) == Some(SeqKind::JavaMap) => Value::Undef,
+                    _ => Value::bool(false),
+                });
+            }
+            dispatch(vm, backing, name, args)
+        }
+        // A poll takes the first (last) element IN RANGE out of the backing
+        // collection.
+        ("pollFirst" | "pollLast" | "pollFirstEntry" | "pollLastEntry", 0) => {
+            let snap = java_subview_snapshot(vm, backing, range)?;
+            let items = seq_kind_items(&snap).map(|(_, xs)| xs).unwrap_or_default();
+            let pick = if name.starts_with("pollFirst") {
+                items.first()
+            } else {
+                items.last()
+            };
+            let Some(x) = pick.cloned() else {
+                return Ok(Value::Undef);
+            };
+            if seq_kind(backing) == Some(SeqKind::JavaMap) {
+                let kv = as_seq_or_tuple(&x).unwrap_or_default();
+                dispatch(vm, backing, "remove", &[pair_key(&x)])?;
+                return Ok(new_seq(SeqKind::JavaEntry, kv));
+            }
+            dispatch(vm, backing, "remove", std::slice::from_ref(&x))?;
+            Ok(x)
+        }
+        ("clear", 0) => {
+            let snap = java_subview_snapshot(vm, backing, range)?;
+            let doomed = seq_kind_items(&snap).map(|(_, xs)| xs).unwrap_or_default();
+            let is_map = seq_kind(backing) == Some(SeqKind::JavaMap);
+            for x in doomed {
+                let key = if is_map { pair_key(&x) } else { x };
+                dispatch(vm, backing, "remove", &[key])?;
+            }
+            Ok(unit_value())
+        }
+        _ if java_mutator_name(name) => {
+            Err(format!("scalars: {name} on a sub-view is not modelled"))
+        }
+        _ => {
+            let snap = java_subview_snapshot(vm, backing, range)?;
+            dispatch(vm, &snap, name, args)
+        }
+    }
+}
+
+thread_local! {
+    /// For each `TreeSet`/`TreeMap` with live sub-views, the views' heap ids:
+    /// whom to bring up to date after it changes.
+    static BACKING_VIEWS: RefCell<HashMap<usize, Vec<Value>>> = RefCell::new(HashMap::new());
+}
+
+/// Recompute the contents every live sub-view of `backing` holds.
+fn resync_subviews(vm: &mut VM, backing: &Value) -> Result<(), String> {
+    let Some(id) = as_obj_id(backing) else {
+        return Ok(());
+    };
+    let views = BACKING_VIEWS
+        .with(|t| t.borrow().get(&id).cloned())
+        .unwrap_or_default();
+    for view in views {
+        let Some((_, range)) = java_subview_of(&view) else {
+            continue;
+        };
+        let snap = java_subview_snapshot(vm, backing, &range)?;
+        let (kind, items) = seq_kind_items(&snap).unwrap_or((SeqKind::JavaList, Vec::new()));
+        set_seq_items(&view, kind, items);
+    }
+    Ok(())
+}
+
+/// A member of a `java.util` list, set, deque or queue (see
+/// [`java_list_method_inner`]); a live sub-view's writes go to its backing
+/// collection, a sub-view is made by `headSet`/`tailSet`/`subSet`, and every
+/// view of a changed collection is brought up to date.
+fn java_list_method(
+    vm: &mut VM,
+    recv: &Value,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    java_navigable_method(vm, recv, name, args, |vm| {
+        java_list_method_inner(vm, recv, items, name, args)
+    })
+}
+
+/// [`java_list_method`] for a `java.util` map.
+fn java_map_method(
+    vm: &mut VM,
+    recv: &Value,
+    items: &[Value],
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    java_navigable_method(vm, recv, name, args, |vm| {
+        java_map_method_inner(vm, recv, items, name, args)
+    })
+}
+
+fn java_navigable_method(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    inner: impl FnOnce(&mut VM) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let polls = matches!(
+        name,
+        "pollFirst" | "pollLast" | "pollFirstEntry" | "pollLastEntry"
+    );
+    if let Some((backing, range)) = java_subview_of(recv) {
+        if java_mutator_name(name) || polls {
+            let out = java_subview_method(vm, &backing, &range, name, args)?;
+            resync_subviews(vm, &backing)?;
+            return Ok(out);
+        }
+    }
+    let navigable = matches!(java_flavor(recv), Some(JFlavor::TreeSet | JFlavor::TreeMap));
+    if navigable && java_view_backing(recv).is_none() {
+        // A view of a view reads through to the collection that holds the
+        // elements, with the narrower range.
+        if let Some(range) = sub_range_of(name, args) {
+            let (backing, outer) = match java_subview_of(recv) {
+                Some((b, r)) => (b, Some(r)),
+                None => (recv.clone(), None),
+            };
+            let range = match outer {
+                Some(o) => SubRange {
+                    lo: range.lo.or(o.lo),
+                    hi: range.hi.or(o.hi),
+                },
+                None => range,
+            };
+            let view = java_subview(vm, &backing, range)?;
+            if let (Some(bid), Some(_)) = (as_obj_id(&backing), as_obj_id(&view)) {
+                BACKING_VIEWS.with(|t| t.borrow_mut().entry(bid).or_default().push(view.clone()));
+            }
+            resync_subviews(vm, &backing)?;
+            return Ok(view);
+        }
+    }
+    let out = inner(vm)?;
+    if java_mutator_name(name) || polls {
+        resync_subviews(vm, recv)?;
+    }
+    Ok(out)
 }

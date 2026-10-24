@@ -113,6 +113,8 @@ struct Parser {
     /// How many anonymous classes (`new T { … }`, `new C with M`) have been
     /// synthesized so far; each is declared under a fresh `$anon` name.
     anon_classes: usize,
+    /// Monotonic id for the resource binders `scala.util.Using` desugars to.
+    usings: usize,
     /// Every `enum` in the unit, mapped to its case names in declaration
     /// order — collected by [`scan_enums`] before parsing starts, so a
     /// qualified `Color.Red` resolves even where it is written above the `enum`.
@@ -147,6 +149,7 @@ impl Parser {
             jvm_prefixes: HashMap::new(),
             givens: 0,
             anon_classes: 0,
+            usings: 0,
             enums,
             type_aliases: HashMap::new(),
         }
@@ -1463,6 +1466,15 @@ impl Parser {
     }
 
     /// Consume a `[ … ]` group, balancing nested brackets. The cursor is on `[`.
+    /// Whether a bare `Using` names `scala.util.Using`: imported by name, or
+    /// under a `scala.util._` wildcard.
+    fn using_in_scope(&self) -> bool {
+        self.imports
+            .get("Using")
+            .is_some_and(|p| p.join(".") == "scala.util.Using")
+            || self.wildcards.iter().any(|w| w.join(".") == "scala.util")
+    }
+
     /// A `[T, U]` type-argument list (cursor on `[`), as the types written.
     fn type_args(&mut self) -> Result<Vec<String>, String> {
         self.eat(&Tok::LBracket)?;
@@ -4134,6 +4146,25 @@ impl Parser {
             if self.is(&Tok::LBrace) {
                 args.push(self.brace_arg()?);
             }
+            // `Using.resource(res)(f)` — the `Using` desugar without the `Try`.
+            if matches!(&e, Expr::Var(u) if u == "Using") && self.using_in_scope() {
+                match (name.as_str(), args.len()) {
+                    ("resource", 2) => {
+                        self.usings += 1;
+                        let binder = format!("_$using{}", self.usings);
+                        let f = args.pop().expect("two arguments");
+                        let res = args.pop().expect("two arguments");
+                        e = using_expr(res, f, binder, false, line);
+                        continue;
+                    }
+                    ("Manager", _) => {
+                        return Err(format!(
+                            "scalars: scala.util.Using.Manager is not modelled (line {line})"
+                        ))
+                    }
+                    _ => {}
+                }
+            }
             e = eta_bare_args(Expr::Method {
                 recv: Box::new(e),
                 name,
@@ -4214,6 +4245,27 @@ impl Parser {
                 return Ok(try_factory(body, line));
             }
             return Ok(eta_bare_args(Expr::Call { name, args, line }));
+        }
+        // `Using(res)(f)` — `scala.util.Using`, desugared here for the same
+        // reason as `Try`: its resource binder needs a frame slot.
+        if name == "Using" && self.using_in_scope() {
+            let mut args = self.arg_list()?;
+            let f = if self.is(&Tok::LParen) {
+                let mut fs = self.arg_list()?;
+                (fs.len() == 1).then(|| fs.remove(0))
+            } else if self.is(&Tok::LBrace) {
+                Some(self.brace_arg()?)
+            } else {
+                None
+            };
+            let (Some(f), 1) = (f, args.len()) else {
+                return Err(format!(
+                    "scalars: Using(resource)(f) expected (line {line})"
+                ));
+            };
+            self.usings += 1;
+            let binder = format!("_$using{}", self.usings);
+            return Ok(using_expr(args.remove(0), f, binder, true, line));
         }
         if let Some(ctor) = mutable_buffer_ctor(&name) {
             let elems = self.arg_list()?;
@@ -6725,5 +6777,42 @@ fn ordered_literal(e: &Expr) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// `scala.util.Using(res)(f)` (`wrap_try`) and `Using.resource(res)(f)`: the
+/// resource bound once, `f` applied to it, and `close()` run however `f` ends —
+/// `{ val r = res; try f(r) finally r.close() }`, inside `Try(…)` for the first
+/// form. A resource expression that throws is never closed, as in Scala.
+fn using_expr(res: Expr, f: Expr, binder: String, wrap_try: bool, line: u32) -> Expr {
+    let stmt = |kind: StmtKind| Stmt { line, kind };
+    let body = Expr::Block(vec![
+        stmt(StmtKind::Local {
+            is_val: true,
+            is_lazy: false,
+            ty: None,
+            name: binder.clone(),
+            init: Some(res),
+        }),
+        stmt(StmtKind::Expr(Expr::Try {
+            body: vec![stmt(StmtKind::Expr(Expr::Method {
+                recv: Box::new(f),
+                name: "apply".to_string(),
+                args: vec![Expr::Var(binder.clone())],
+                line,
+            }))],
+            catches: Vec::new(),
+            finalizer: Some(vec![stmt(StmtKind::Expr(Expr::Method {
+                recv: Box::new(Expr::Var(binder)),
+                name: "close".to_string(),
+                args: Vec::new(),
+                line,
+            }))]),
+        })),
+    ]);
+    if wrap_try {
+        try_factory(&body, line)
+    } else {
+        body
     }
 }

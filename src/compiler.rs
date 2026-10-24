@@ -252,6 +252,10 @@ struct Compiler {
     /// `val`s. Each has an `Obj$clinit` subroutine and an `Obj$init` flag, and
     /// every access from outside the object runs [`Compiler::emit_object_guard`].
     lazy_objects: HashSet<String>,
+    /// The bindings whose initializer is a collection built with an explicit
+    /// ordering, so `ts + x` on one is its member (see
+    /// [`Compiler::explicitly_ordered`]).
+    ordered_bindings: HashSet<String>,
     /// Whether the body currently being emitted is a LAMBDA body. A `return`
     /// there is non-local (it belongs to the enclosing `def`), so it lowers to
     /// `NLR_RAISE` + the unwind walk rather than a frame-local `ReturnValue`.
@@ -955,6 +959,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         // with either needs the per-statement checks even without a `try`.
         has_try: program_any(prog, &classes, &objects, body_has_try)
             || program_any(prog, &classes, &objects, body_has_lambda_return),
+        ordered_bindings: HashSet::new(),
         lazy_objects: objects
             .iter()
             .filter(|o| !o.body.iter().all(is_literal_val))
@@ -1293,6 +1298,11 @@ impl Compiler {
             } => {
                 let place = self.declare_place(name);
                 self.vals.insert(name.clone(), *is_val);
+                if init.as_ref().is_some_and(|e| self.explicitly_ordered(e)) {
+                    self.ordered_bindings.insert(name.clone());
+                } else {
+                    self.ordered_bindings.remove(name);
+                }
                 // The binding's numeric width: the declared type when there is
                 // one (`val n: Long = 1`), otherwise inferred from the
                 // initializer, which is how Scala itself types a bare `val`.
@@ -5194,6 +5204,16 @@ impl Compiler {
                 "scalars: None of the overloaded alternatives of method {name} in object Arrays match arguments ({ty}) (line {line})"
             )
         })
+    }
+
+    /// Whether `e` is statically a collection built with an explicit ordering
+    /// (`TreeSet(…)(using ord)`), directly or through a `val` bound to one.
+    fn explicitly_ordered(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Call { name, .. } => name == crate::parser::WITH_ORDERING,
+            Expr::Var(v) => self.ordered_bindings.contains(v),
+            _ => false,
+        }
     }
 
     /// The static type of a member of a value type (`String`, the numeric
@@ -9109,6 +9129,13 @@ impl Compiler {
             return Err(format!(
                 "scalars: `+` is not defined between `null` and `{shown}`"
             ));
+        }
+        // `ts + x` / `ts - x` on a sorted collection built with an explicit
+        // ordering is its `+`/`-` MEMBER, dispatched with the VM in hand — the
+        // arithmetic operator path has none, and an `Ordering.by(f)` must run `f`.
+        if matches!(op, BinOp::Add | BinOp::Sub) && self.explicitly_ordered(lhs) {
+            let name = if op == BinOp::Add { "+" } else { "-" };
+            return self.emit_smethod(lhs, name, std::slice::from_ref(rhs), 0);
         }
         // `&&` / `||` short-circuit: keep the deciding operand as the result.
         match op {

@@ -974,10 +974,14 @@ reported as parse/compile errors, never silently mis-run.
   is `1073741824`. Its traversals STREAM it — `foreach`, `filter`/`filterNot`,
   `map`, `count`, `exists`/`forall`/`find`/`indexWhere`, `foldLeft`, `takeWhile`
   (a `Range` again) and a lazy `iterator` — each element built as it is visited;
-  only a result collection is held, and one past the cap raises
-  `OutOfMemoryError: Range too large` (as does any other member that would
-  hold every element). Streaming is no faster than the elements are many: a
-  debug build runs about 0.6 million closure calls a second. Past `Int.MaxValue` elements `length` raises Scala's
+  only a result collection is held — `r.map(f)` over twenty million elements
+  is the twenty-million-element `Vector` Scala builds — and one past 64
+  million (where a default-sized JVM heap gives out first) raises
+  `OutOfMemoryError: Range too large`, as does any other member that would
+  hold every element of the range itself. The function is resolved once per
+  traversal rather than per element. Measured (debug build, instructions
+  retired, `(1 to 9000000).count(_ % 3 == 0)`): 156.2G before, 131.6G after
+  (17.4k to 14.6k per element); the rest is the interpreter running the body. Past `Int.MaxValue` elements `length` raises Scala's
   `IllegalArgumentException` (`… seqs cannot contain more than Int.MaxValue
   elements.` for a `Range`, `More than Int.MaxValue elements.` for a
   `NumericRange`, which raises it from `last`/`contains`/`apply`/`sum` too).
@@ -1085,6 +1089,13 @@ reported as parse/compile errors, never silently mis-run.
   is `throw new RuntimeException(m)`; a tuple has `copy(_1 = …)`.
 - **A `MatchError` names the scrutinee's JVM class** the way `getClass` does —
   `B(x) (of class B)`, `List(1, 2) (of class …$colon$colon)`.
+
+- **`scala.util.Using`** (imported by name or under `scala.util._`): `Using(res)(f)`
+  is `Try { val r = res; try f(r) finally r.close() }` and `Using.resource(res)(f)`
+  the same without the `Try`, so a resource is closed however `f` ends and a
+  resource expression that throws leaves nothing to close. `Using.Manager` is refused
+  as not modelled; it used to be a catchable `NullPointerException`, as plain
+  `Using` was.
 
 ## Not implemented (parse errors / unresolved today)
 
@@ -1425,10 +1436,14 @@ reported as parse/compile errors, never silently mis-run.
   order, membership is the ordering's `compare == 0`, `min`/`max` stay the
   implicit natural ones, the members answering the same sorted kind keep it
   while `map` builds under the result type's own, and a `PriorityQueue` sifts
-  by it. Still refused: an explicit ordering on the MUTABLE `TreeSet`/`TreeMap`,
-  and the `+`/`-` OPERATORS on a collection under a function-keyed ordering
-  (`Ordering.by(f)`), which the arithmetic hook cannot run — the method forms
-  `incl`/`excl`/`updated`/`removed` work), and
+  by it. The MUTABLE `TreeSet`/`TreeMap` take one too:
+  `+=`/`put`/`update` re-lay the collection out in that order, and
+  `-=`/`remove`/`contains`/`get` find the element it calls equal. `ts + x`/
+  `ts - x` on a binding or literal built with an explicit ordering is the
+  collection's `+`/`-` MEMBER, so an `Ordering.by(f)` runs `f`; the same
+  operators on such a collection reaching an operand position through a
+  parameter or field still go to the arithmetic hook, which answers a
+  closure-free ordering and refuses a function-keyed one), and
   SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
   Double) => …` then `s.show(x)`).
 - **An integer's box is kept only where it is WIDENED to `Any` with a static
@@ -1519,9 +1534,16 @@ reported as parse/compile errors, never silently mis-run.
   `add`/`put`/`get`/`contains`/`containsKey`/`remove`/`first`/`last`/
   `firstKey`/`lastKey`, the `NavigableSet`/`NavigableMap` queries
   (`floor`/`ceiling`/`higher`/`lower` and their `Key`/`Entry` forms,
-  `headSet`/`tailSet`/`headMap`/`tailMap`/`subMap` — copies, not views —,
   `pollFirst`/`pollLast`, the first/last entries, the descending forms) and the
-  read-only views. `Collections.unmodifiableList`/`Set`/`Map`/`Collection` are VIEWS: a
+  read-only views. `headSet`/`tailSet`/`subSet`/`headMap`/`tailMap`/`subMap`
+  (every arity, with the JDK's inclusive defaults) are LIVE views, natural
+  order or comparator: a write to the backing collection shows in them, a
+  write through one must fall in its range (`IllegalArgumentException: key
+  out of range`) and reaches the backing collection, and its `clear`/`poll…`
+  empty or take from the range there. A view of a view takes the inner call's
+  bounds in place of the outer ones rather than intersecting them, and a
+  `subSet`/`subMap` with its low bound above its high one is `fromKey >
+  toKey`. `Collections.unmodifiableList`/`Set`/`Map`/`Collection` are VIEWS: a
   write to the backing collection shows through, and their own mutators raise
   `UnsupportedOperationException`. `new java.lang.StringBuilder` is Scala's
   builder except that `reverse()` reverses in place. Not modelled: the
