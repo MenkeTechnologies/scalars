@@ -66,6 +66,10 @@ pub enum Tok {
         parts: Vec<String>,
         exprs: Vec<String>,
         fmts: Vec<Option<String>>,
+        /// A CUSTOM interpolator's name (`json"…"`): the token is then
+        /// `StringContext(parts…).json(splices…)`, its parts kept RAW (escapes
+        /// undecoded), as Scala hands them to every interpolator.
+        custom: Option<String>,
     },
     Ident(String),
     // keywords
@@ -359,7 +363,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // Interpolator prefix: `s"…"` / `f"…"` / `raw"…"` — the ident is an
             // interpolator only when a `"` follows with no intervening whitespace
             // (Scala requires adjacency). Otherwise it is a plain identifier.
-            if matches!(word, "s" | "f" | "raw") && i < bytes.len() && bytes[i] == b'"' {
+            // Any other identifier written against a `"` is a custom
+            // interpolator, `id"…"` being `StringContext(…).id(…)` — the soft
+            // keywords aside, which are not names here.
+            let custom = matches!(keyword_or_ident(word), Tok::Ident(_))
+                && !matches!(
+                    word,
+                    "_" | "then" | "do" | "end" | "using" | "as" | "derives"
+                );
+            if (matches!(word, "s" | "f" | "raw") || custom) && i < bytes.len() && bytes[i] == b'"'
+            {
                 let (tok, ni, nl) = lex_interp(word, bytes, src, i, line)?;
                 i = ni;
                 line = nl;
@@ -1028,7 +1041,8 @@ fn lex_interp(
     mut i: usize,
     mut line: u32,
 ) -> Result<(Tok, usize, u32), String> {
-    let raw = prefix == "raw";
+    let custom = (!matches!(prefix, "s" | "f" | "raw")).then(|| prefix.to_string());
+    let raw = prefix == "raw" || custom.is_some();
     let is_f = prefix == "f";
     let start_line = line;
     let triple = src[i..].starts_with("\"\"\"");
@@ -1160,6 +1174,7 @@ fn lex_interp(
             parts,
             exprs,
             fmts,
+            custom,
         },
         i,
         line,

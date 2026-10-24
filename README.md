@@ -315,7 +315,13 @@ Implemented and checked against the reference `scala`:
   bounds (`(0 until Int.MaxValue by 2).length`) and traversed by streaming.
 - **Explicit orderings** — `TreeSet(…)(using ord)`, `TreeMap`, `SortedSet`,
   `SortedMap` and `mutable.PriorityQueue` literals held under the ordering
-  given, `Ordering.Tuple2(o1, o2)` … `Tuple5`, `orElse`/`orElseBy`, `on`.
+  given, `Ordering.Tuple2(o1, o2)` … `Tuple5`, `orElse`/`orElseBy`, `on`. `+`/
+  `-` on such a collection is its member wherever it comes from (a parameter,
+  a field, a result), so `Ordering.by(f)` runs `f`, and an element the
+  ordering calls equal to one held leaves that one in place.
+- **`scala.util.Using`** — `Using(res)(f)`, `Using.resource` and
+  `Using.Manager { use => … }`, closing in reverse and suppressing a close's
+  exception into the body's (`addSuppressed`/`getSuppressed`).
 - **Bindings** — `val` / `var` with optional type ascription
   (`val x: Int = …`, `var s = …`), type inferred as storage; plain and compound
   assignment to a `var` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`). Reassigning a `val`
@@ -416,6 +422,8 @@ Implemented and checked against the reference `scala`:
   with Java-`Formatter` specs (`%d`, `%.2f`, `%-5s`, `%05d`, `%x`, `%b`, …), and
   `raw"…"` (escapes stay literal). A `${…}` splice holds a BLOCK, as Scala's
   does, so it may declare and sequence: `s"${ val q = 3; q * 2 }"` is `6`.
+  Any other `id"…"` is a custom interpolator, `StringContext(parts…).id(args…)`,
+  supplied by an `extension` or `implicit class` on `StringContext`.
 - **Pattern matching** — `expr match { case … }` over literal, `_` wildcard,
   variable-binding, typed (`case s: String`), guarded (`case x if x > 0`), and
   constructor / case-class patterns (`case Point(x, y)`, `case Some(v)`,

@@ -1090,12 +1090,46 @@ reported as parse/compile errors, never silently mis-run.
 - **A `MatchError` names the scrutinee's JVM class** the way `getClass` does —
   `B(x) (of class B)`, `List(1, 2) (of class …$colon$colon)`.
 
-- **`scala.util.Using`** (imported by name or under `scala.util._`): `Using(res)(f)`
-  is `Try { val r = res; try f(r) finally r.close() }` and `Using.resource(res)(f)`
-  the same without the `Try`, so a resource is closed however `f` ends and a
-  resource expression that throws leaves nothing to close. `Using.Manager` is refused
-  as not modelled; it used to be a catchable `NullPointerException`, as plain
-  `Using` was.
+- **`scala.util.Using`** (imported by name or under `scala.util._`):
+  `Using.resource(res)(f)` is the library's own body — a `null` resource is
+  `NullPointerException: null resource`, the resource is closed however `f`
+  ends, and when `f` threw, an exception from `close()` is SUPPRESSED into
+  `f`'s rather than replacing it (`Using`'s preference order decides which of
+  the two wins: `VirtualMachineError` > `LinkageError` >
+  `InterruptedException` > a non-fatal throwable > a `ControlThrowable`), so
+  a non-local `return` out of `f` still closes and returns. `Using(res)(f)` is
+  that inside `Try`, where a resource expression that throws is a `Failure`
+  with nothing to close. `Using.Manager { use => … }` hands `op` a manager:
+  `use(r)` registers `r` and answers it, `use.acquire(r)` registers it; once
+  `op` ends every resource is closed, the last registered first, each close
+  running whatever the others did; the first exception (`op`'s, else the
+  first close's) is the `Failure`, with the later ones suppressed into it. A
+  resource registered after the manager closed is `IllegalStateException:
+  Manager has already been closed`. `Throwable.addSuppressed`/`getSuppressed`
+  work, with the JDK's self-suppression and `null` checks. `Using.resources`
+  and a `Releasable` other than `close()` are not modelled.
+- **A constructor that throws inside a `try` reaches the handler.** An
+  exception from a class body (`require` failing), a supertype argument, or a
+  constructor argument returns to the `new` site; it used to stop the run as
+  uncaught, because the constructor had no unwind frame of its own.
+- **Custom string interpolators.** `id"a${x}b"` for any `id` other than
+  `s`/`f`/`raw` is `StringContext("a", "b").id(x)`, the parts kept raw
+  (escapes undecoded, `$$` a `$`), so an `extension (sc: StringContext) def
+  id(args: Any*)` or an `implicit class` over `StringContext` supplies it.
+  `StringContext(parts…)` is a case class of its `parts` (an `ArraySeq`),
+  with `s(args…)` — escapes decoded by `processEscapes`, an unknown one
+  `StringContext$InvalidEscapeException` — and `raw(args…)`, both also in the
+  `xs: _*` form, and an argument count other than one less than the parts' is
+  `IllegalArgumentException: wrong number of arguments (n) for interpolated
+  string with m parts`. `StringContext.f` and a custom interpolator in a
+  PATTERN are not modelled.
+- **`Regex.unanchored`** is an `UnanchoredRegex`: its `matches`, `unapplySeq`
+  and its extractor in a pattern find the first match anywhere in the input
+  (`case u(n)` binds the first group of it), and `anchored` turns it back.
+- **A fold's accumulator has the seed's width.** `xs.foldLeft(0)(_ + _)` over
+  `Int`s wraps at 32 bits as Scala's does (`foldRight`'s accumulator is its
+  second parameter, and `fold` when seed and elements agree); it used to
+  widen silently past `Int.MaxValue`.
 
 ## Not implemented (parse errors / unresolved today)
 
@@ -1439,11 +1473,28 @@ reported as parse/compile errors, never silently mis-run.
   by it. The MUTABLE `TreeSet`/`TreeMap` take one too:
   `+=`/`put`/`update` re-lay the collection out in that order, and
   `-=`/`remove`/`contains`/`get` find the element it calls equal. `ts + x`/
-  `ts - x` on a binding or literal built with an explicit ordering is the
-  collection's `+`/`-` MEMBER, so an `Ordering.by(f)` runs `f`; the same
-  operators on such a collection reaching an operand position through a
-  parameter or field still go to the arithmetic hook, which answers a
-  closure-free ordering and refuses a function-keyed one), and
+  `ts - x` (and `ts += x` on a `var`) is the collection's `+`/`-` MEMBER
+  wherever the receiver's static type is a collection or cannot be named — a
+  parameter, a field, a method's result, a chain — so an `Ordering.by(f)`
+  runs `f`. The choice is the receiver's type: a proven `Int`/`Long`/`Float`,
+  `Double`, `String`, `Char`, `Boolean`, big number or program class keeps the
+  native arithmetic op, and a program that builds no explicitly ordered
+  collection (the only source of one) routes nothing. Measured (debug build,
+  instructions retired): a three-million-iteration `Int` `while` loop of
+  `s = s + i - 1` is 140.5M before and 139.7M after in a program that builds
+  an ordered `TreeSet` (the loop stays `Add`/`Sub`); a `foldLeft(0L)(_ + _)`
+  over two million elements in such a program, whose lambda parameters are
+  untyped here, goes from 24.9G to 28.9G, and the same fold in a program with
+  no explicit ordering is unchanged (42.39G / 42.35G). An element the ordering
+  calls equal to one already held leaves that one in place, as the red-black
+  tree does — `+`/`incl`/`++`/`concat`/`union` and the mutable
+  `+=`/`add`/`++=` keep the existing element, `+`/`updated`/`++` and
+  `put`/`update` on a map keep the existing KEY and take the new value — and a
+  literal inserts its elements in source order, so `TreeSet("xyz", "abc")(using
+  Ordering.by(_.length))` is `TreeSet(xyz)` and `TreeMap("aa" -> 1, "zz" ->
+  2)(…)` is `TreeMap(aa -> 2)`. `--`/`removedAll`/`diff` remove by the
+  ordering too. How many times the key function runs is not the tree's: a
+  side effect in it prints a different number of times), and
   SAM conversion of a lambda to a user trait (`val s: Show[Double] = (t:
   Double) => …` then `s.show(x)`).
 - **An integer's box is kept only where it is WIDENED to `Any` with a static
@@ -1540,10 +1591,16 @@ reported as parse/compile errors, never silently mis-run.
   order or comparator: a write to the backing collection shows in them, a
   write through one must fall in its range (`IllegalArgumentException: key
   out of range`) and reaches the backing collection, and its `clear`/`poll…`
-  empty or take from the range there. A view of a view takes the inner call's
-  bounds in place of the outer ones rather than intersecting them, and a
+  empty or take from the range there. A view of a view is the JDK's
+  `NavigableSubMap` one: each bound the inner call names must lie in the outer
+  view (an exclusive bound may sit on an outer bound) —
+  `IllegalArgumentException: fromKey out of range` / `toKey out of range`
+  otherwise — and a bound it leaves open is the outer one, so the result is
+  the intersection and its writes are range-checked against it; a
   `subSet`/`subMap` with its low bound above its high one is `fromKey >
-  toKey`. `Collections.unmodifiableList`/`Set`/`Map`/`Collection` are VIEWS: a
+  toKey`. The one-argument `headSet(e)`/`tailSet(e)`/`subSet(a, b)` answer a
+  `SortedSet`, on which Scala rejects the two- and four-argument forms; this
+  frontend accepts them. `Collections.unmodifiableList`/`Set`/`Map`/`Collection` are VIEWS: a
   write to the backing collection shows through, and their own mutators raise
   `UnsupportedOperationException`. `new java.lang.StringBuilder` is Scala's
   builder except that `reverse()` reverses in place. Not modelled: the
@@ -1692,12 +1749,10 @@ reported as parse/compile errors, never silently mis-run.
   but `Char`. `filter`/`takeWhile`/`dropWhile`/`partition`/`span`/`sortWith`/
   `sortBy` are unaffected: they only select or reorder, so their result is
   always a `String`.
-- **A `catch` arm cannot see a non-local return, even as `Throwable`.** Scala's
-  `NonLocalReturnControl` extends `ControlThrowable`, so `case e: Exception`
-  misses it but a bare `case e =>` (i.e. `Throwable`) would catch it. Here the
-  parked control value is not a throwable at all, so NO arm matches it. The
-  difference is observable only for a `catch` that deliberately swallows
-  `Throwable` around a `return`, which is a bug in the Scala program either way.
+- **A non-local return is a `scala.runtime.NonLocalReturnControl`.** `case e:
+  Throwable` catches it and `case e: Exception` does not, as in Scala, and
+  rethrowing the caught value (`throw e`, which `Using` does) carries it on to
+  its `def`; a rethrow used to stop the run as an uncaught exception.
 - **`Array.toString` renders `Array(1, 2, 3)`.** Scala prints the JVM identity
   form (`[I@1b6d3586`), which no reimplementation can reproduce byte-for-byte,
   so the readable form is emitted instead. This is the one place a supported
@@ -2104,8 +2159,9 @@ Two consequences worth stating plainly:
 - **A program with no `try` pays nothing.** The checks are not emitted at all,
   and a fault halts the run exactly as it did before exceptions existed.
 
-`case NonFatal(e)`, exception chaining (`getCause`, `initCause`,
-`addSuppressed`), stack traces, and `Try`/`Success`/`Failure` are not modeled.
+Stack traces (`getStackTrace`, `printStackTrace`) and `initCause` are not
+modelled; `getCause`, `addSuppressed`/`getSuppressed`, `case NonFatal(e)` and
+`Try`/`Success`/`Failure` are.
 
 ## What a clean parity-fuzz run does not prove
 

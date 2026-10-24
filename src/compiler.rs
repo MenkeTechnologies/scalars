@@ -210,6 +210,11 @@ struct Compiler {
     /// lower to the `SEQ_VM`/`SNE_VM` builtins that can run it; otherwise they
     /// keep `Op::NumEq`/`Op::NumNe`.
     has_user_equals: bool,
+    /// Whether the program builds a collection under an explicit ordering
+    /// (`TreeSet(…)(using ord)` — the only source of one). Without it no
+    /// collection's `+`/`-` can run user code, so [`Compiler::may_be_collection`]
+    /// routes nothing and every `+`/`-` keeps the native op.
+    has_explicit_ordering: bool,
     /// `Some((name, fields))` while compiling a class method: the enclosing
     /// class's name and field-name set, so a bare identifier naming a field
     /// resolves to `this.field` and a bare sibling-method call to `this.m(...)`.
@@ -252,10 +257,6 @@ struct Compiler {
     /// `val`s. Each has an `Obj$clinit` subroutine and an `Obj$init` flag, and
     /// every access from outside the object runs [`Compiler::emit_object_guard`].
     lazy_objects: HashSet<String>,
-    /// The bindings whose initializer is a collection built with an explicit
-    /// ordering, so `ts + x` on one is its member (see
-    /// [`Compiler::explicitly_ordered`]).
-    ordered_bindings: HashSet<String>,
     /// Whether the body currently being emitted is a LAMBDA body. A `return`
     /// there is non-local (it belongs to the enclosing `def`), so it lowers to
     /// `NLR_RAISE` + the unwind walk rather than a frame-local `ReturnValue`.
@@ -959,7 +960,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
         // with either needs the per-statement checks even without a `try`.
         has_try: program_any(prog, &classes, &objects, body_has_try)
             || program_any(prog, &classes, &objects, body_has_lambda_return),
-        ordered_bindings: HashSet::new(),
+        has_explicit_ordering: program_any(prog, &classes, &objects, body_has_explicit_ordering),
         lazy_objects: objects
             .iter()
             .filter(|o| !o.body.iter().all(is_literal_val))
@@ -1298,11 +1299,6 @@ impl Compiler {
             } => {
                 let place = self.declare_place(name);
                 self.vals.insert(name.clone(), *is_val);
-                if init.as_ref().is_some_and(|e| self.explicitly_ordered(e)) {
-                    self.ordered_bindings.insert(name.clone());
-                } else {
-                    self.ordered_bindings.remove(name);
-                }
                 // The binding's numeric width: the declared type when there is
                 // one (`val n: Long = 1`), otherwise inferred from the
                 // initializer, which is how Scala itself types a bare `val`.
@@ -4000,7 +3996,13 @@ impl Compiler {
     /// `target` is the width of the binding being updated; the result's width is
     /// that combined with the operand's, exactly as for the `x = x op e` form
     /// Scala expands this to.
-    fn compound_tail(&mut self, op: AssignOp, value: &Expr, target: NumTy) -> Result<(), String> {
+    fn compound_tail(
+        &mut self,
+        op: AssignOp,
+        value: &Expr,
+        target: NumTy,
+        place: Option<&Expr>,
+    ) -> Result<(), String> {
         let w = target.combine(self.num_ty(value));
         // `f += x` on a `Float` is ONE 32-bit operation, not a 64-bit one
         // narrowed afterwards — the same reason the binary path routes through
@@ -4031,7 +4033,7 @@ impl Compiler {
         // No mutable collection in the program: `+=` can only be arithmetic,
         // so emit exactly the two ops it emitted before this feature existed.
         if !self.has_mutable {
-            self.compound_arith(op, value, w)?;
+            self.compound_arith(op, value, w, place)?;
             self.assign_result_is_unit();
             return Ok(());
         }
@@ -4050,7 +4052,7 @@ impl Compiler {
         self.b.patch_jump(to_arith, arith);
         // Only this branch is arithmetic — the growable one answers a collection,
         // which must not be narrowed.
-        self.compound_arith(op, value, w)?;
+        self.compound_arith(op, value, w, place)?;
         self.assign_result_is_unit();
         let end = self.b.current_pos();
         self.b.patch_jump(to_end, end);
@@ -4065,12 +4067,28 @@ impl Compiler {
     /// numeric hook cannot run. It takes the same [`crate::host::SADD`] reroute
     /// the binary `+` takes, under the same [`Compiler::needs_render`] gate, so
     /// an ordinary `n += 1` keeps the two ops it always had.
-    fn compound_arith(&mut self, op: AssignOp, value: &Expr, w: NumTy) -> Result<(), String> {
+    ///
+    /// `place` is the target being updated, `None` where it is not a plain
+    /// binding. A target that may be a collection takes the binary path's
+    /// reroute too ([`Compiler::may_be_collection`]): `ts += x` on an immutable
+    /// sorted set is `ts = ts + x`, its member.
+    fn compound_arith(
+        &mut self,
+        op: AssignOp,
+        value: &Expr,
+        w: NumTy,
+        place: Option<&Expr>,
+    ) -> Result<(), String> {
         if self.compound_user_op(op, value, w)? {
             return Ok(());
         }
         self.expr(value)?;
-        if op == AssignOp::Add && self.needs_render(value) {
+        let collection = w == NumTy::Unknown
+            && self.has_explicit_ordering
+            && place.map_or(true, |p| self.may_be_collection(p));
+        if op == AssignOp::Sub && collection {
+            self.b.emit(Op::CallBuiltin(crate::host::SSUB_VM, 2), 0);
+        } else if op == AssignOp::Add && (collection || self.needs_render(value)) {
             self.b.emit(Op::CallBuiltin(crate::host::SADD, 2), 0);
         } else {
             self.b.emit(compound_op(op), 0);
@@ -4250,7 +4268,7 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(crate::host::CELL_GET, 1), 0);
             }
             let target = self.widths.get(name).map_or(NumTy::Unknown, |w| w.num);
-            self.compound_tail(op, value, target)?;
+            self.compound_tail(op, value, target, Some(&Expr::Var(name.to_string())))?;
         }
         self.unwind_check_dropping(1);
         // A boxed `var` is written through its cell, so the write is
@@ -4344,7 +4362,7 @@ impl Compiler {
             Op::CallBuiltin(crate::host::SMETHOD, idx.len() as u8 + 2),
             line,
         );
-        self.compound_tail(op, value, NumTy::Unknown)?;
+        self.compound_tail(op, value, NumTy::Unknown, None)?;
         let uc = self.b.add_constant(Value::str("update".to_string()));
         self.b.emit(Op::LoadConst(uc), line);
         self.b.emit(
@@ -4504,7 +4522,7 @@ impl Compiler {
         line: u32,
     ) -> Result<(), String> {
         let (r, r_name) = target;
-        self.compound_tail(op, value, NumTy::Unknown)?;
+        self.compound_tail(op, value, NumTy::Unknown, None)?;
         if let Some(c) = conv {
             self.emit_conv(c, line);
         }
@@ -4547,7 +4565,7 @@ impl Compiler {
             self.expr(value)?;
         } else {
             self.emit_field_get_this(field);
-            self.compound_tail(op, value, NumTy::Unknown)?;
+            self.compound_tail(op, value, NumTy::Unknown, None)?;
         }
         // The field's declared type converts what is stored, as its declaration
         // did: `var z: Double = 0` then `z = n` holds `n.toDouble`.
@@ -4579,7 +4597,7 @@ impl Compiler {
             self.expr(value)?;
         } else {
             self.b.emit(Op::GetVar(g), 0);
-            self.compound_tail(op, value, NumTy::Unknown)?;
+            self.compound_tail(op, value, NumTy::Unknown, None)?;
         }
         self.unwind_check_dropping(1);
         self.b.emit(Op::SetVar(g), 0);
@@ -4618,6 +4636,9 @@ impl Compiler {
             "prepend" => "prependAll",
             "enqueue" => "++=",
             "format" => crate::host::FORMAT_SPREAD,
+            // `StringContext`'s interpolators.
+            "s" => "s$spread",
+            "raw" => "raw$spread",
             _ => return None,
         };
         let (last, init) = args.split_last()?;
@@ -5122,6 +5143,9 @@ impl Compiler {
             }
         }
         if let Expr::Call { name, args, .. } = e {
+            if name == "StringContext" && self.is_library_name(name) {
+                return Some(name.clone());
+            }
             if name == "Option" && args.len() == 1 && self.is_library_name(name) {
                 return Some(format!("Option[{}]", self.static_type_name(&args[0])?));
             }
@@ -5204,16 +5228,6 @@ impl Compiler {
                 "scalars: None of the overloaded alternatives of method {name} in object Arrays match arguments ({ty}) (line {line})"
             )
         })
-    }
-
-    /// Whether `e` is statically a collection built with an explicit ordering
-    /// (`TreeSet(…)(using ord)`), directly or through a `val` bound to one.
-    fn explicitly_ordered(&self, e: &Expr) -> bool {
-        match e {
-            Expr::Call { name, .. } => name == crate::parser::WITH_ORDERING,
-            Expr::Var(v) => self.ordered_bindings.contains(v),
-            _ => false,
-        }
     }
 
     /// The static type of a member of a value type (`String`, the numeric
@@ -6170,7 +6184,7 @@ impl Compiler {
         // later, out of a queue, with no memory of the call it came from. Saved
         // and restored so `xs.map(x => ys.filter(y => …))` gives each body its
         // own element type instead of the innermost winning both.
-        let pw = self.traversal_param_widths(recv, name);
+        let pw = self.traversal_param_widths(recv, name, args);
         let saved = std::mem::replace(&mut self.lambda_param_widths, pw);
         let r = self.method_inner(recv, name, args, line);
         self.lambda_param_widths = saved;
@@ -6312,10 +6326,22 @@ impl Compiler {
     ///
     /// Every traversal here hands the lambda ELEMENTS of the receiver, so one
     /// element width types every parameter: `map`/`filter`/`forall` take one,
-    /// and `reduce` takes two of the same type. Deliberately absent are the
-    /// folds (`foldLeft`'s accumulator is the width of the seed, not of an
-    /// element) and `zip`ped traversals, whose parameter is a pair.
-    fn traversal_param_widths(&self, recv: &Expr, name: &str) -> Vec<NumTy> {
+    /// and `reduce` takes two of the same type. The folds type their
+    /// ACCUMULATOR by the seed (`foldLeft[B](z: B)(op: (B, A) => B)`, and
+    /// `foldRight`'s second parameter), so `xs.foldLeft(0)(_ + _)` over `Int`s
+    /// wraps at 32 bits; `fold[A1 >: A]` only when seed and elements agree,
+    /// since any other pair is a type Scala's `+` rejects. Absent are the
+    /// `zip`ped traversals, whose parameter is a pair.
+    fn traversal_param_widths(&self, recv: &Expr, name: &str, args: &[Expr]) -> Vec<NumTy> {
+        if let ("foldLeft" | "foldRight" | "fold", [seed, _]) = (name, args) {
+            let (acc, elem) = (self.num_ty(seed), self.elem_ty(recv));
+            return match name {
+                "foldLeft" => vec![acc, elem],
+                "foldRight" => vec![elem, acc],
+                _ if acc == elem => vec![acc, acc],
+                _ => Vec::new(),
+            };
+        }
         let arity = match name {
             _ if ELEMENT_TRAVERSALS.contains(&name) => 1,
             "reduce" | "reduceLeft" | "reduceRight" | "reduceOption" => 2,
@@ -7257,6 +7283,12 @@ impl Compiler {
             self.b.emit(Op::SetSlot(i as u16), 0);
         }
         self.emit_f32_param_tys(&cd.param_tys, 0);
+        // An exception raised anywhere in construction — an argument, a
+        // supertype argument, the body — returns to the `new` site, whose own
+        // check carries it on; with no frame here the check was the top-level
+        // one, and a `require` failing in a class body inside a `try` stopped
+        // the run instead of reaching the handler.
+        self.push_unwind(UnwindKind::Def);
         // Supertype initialization, in Scala's order: every `extends P(args)`
         // argument list is evaluated first, walking *up* the superclass chain
         // (each level's arguments are written in terms of the level below it),
@@ -7344,6 +7376,7 @@ impl Compiler {
             Op::CallBuiltin(crate::host::OBJ_NEW, field_names.len() as u8 + 4),
             0,
         );
+        self.pop_unwind_to(self.b.current_pos());
         self.b.emit(Op::ReturnValue, 0);
 
         self.scope = None;
@@ -7694,8 +7727,71 @@ impl Compiler {
                 .emit(Op::CallBuiltin(crate::host::MAKE_OPTION, 1), line);
             return Ok(());
         }
+        // The `scala.util.Using` desugar's library steps.
+        let using_step = match name {
+            crate::parser::USING_SUPPRESS => Some(crate::host::USING_SUPPRESS),
+            crate::parser::USING_MANAGER => Some(crate::host::USING_MANAGER),
+            crate::parser::USING_RELEASE => Some(crate::host::USING_RELEASE),
+            _ => None,
+        };
+        // `StringContext(parts…)` — what a custom interpolator `id"…"` is
+        // applied to.
+        if name == "StringContext"
+            && self.is_library_name(name)
+            && !self.func_arity.contains_key(name)
+            && spread_operand(args).is_none()
+        {
+            for a in args {
+                self.expr(a)?;
+            }
+            let argc = u8::try_from(args.len())
+                .map_err(|_| format!("scalars: too many arguments on line {line}"))?;
+            self.b.emit(
+                Op::CallBuiltin(crate::host::MAKE_STRING_CONTEXT, argc),
+                line,
+            );
+            return Ok(());
+        }
+        if let Some(id) = using_step {
+            for a in args {
+                self.expr(a)?;
+            }
+            self.b.emit(Op::CallBuiltin(id, args.len() as u8), line);
+            return Ok(());
+        }
         // `TreeSet(…)(using ord)` — the collection rebuilt under `ord`.
         if name == crate::parser::WITH_ORDERING {
+            // A sorted set/map literal hands over its elements in SOURCE order
+            // beside the empty collection: which of two elements the ordering
+            // calls equal survives is the first inserted, and building the
+            // literal first would have kept the naturally-first instead.
+            if let [lit, ord] = args {
+                let sorted_tree = |c: &str| {
+                    matches!(
+                        c.rsplit('.').next(),
+                        Some("TreeSet" | "TreeMap" | "SortedSet" | "SortedMap")
+                    )
+                };
+                let parts: Option<(String, &[Expr])> = match lit {
+                    Expr::Collection { ctor, elems, .. } if sorted_tree(ctor) => {
+                        Some((ctor.clone(), elems))
+                    }
+                    Expr::Method {
+                        recv, name, args, ..
+                    } if mutable_module(recv) => mutable_ctor(name)
+                        .filter(|c| sorted_tree(c))
+                        .map(|c| (c.to_string(), args.as_slice())),
+                    _ => None,
+                };
+                if let Some((ctor, elems)) = parts.filter(|(_, e)| !e.is_empty()) {
+                    self.collection(&ctor, &[])?;
+                    self.collection("List", elems)?;
+                    self.expr(ord)?;
+                    self.b
+                        .emit(Op::CallBuiltin(crate::host::WITH_ORDERING, 3), line);
+                    return Ok(());
+                }
+            }
             for a in args {
                 self.expr(a)?;
             }
@@ -9130,13 +9226,6 @@ impl Compiler {
                 "scalars: `+` is not defined between `null` and `{shown}`"
             ));
         }
-        // `ts + x` / `ts - x` on a sorted collection built with an explicit
-        // ordering is its `+`/`-` MEMBER, dispatched with the VM in hand — the
-        // arithmetic operator path has none, and an `Ordering.by(f)` must run `f`.
-        if matches!(op, BinOp::Add | BinOp::Sub) && self.explicitly_ordered(lhs) {
-            let name = if op == BinOp::Add { "+" } else { "-" };
-            return self.emit_smethod(lhs, name, std::slice::from_ref(rhs), 0);
-        }
         // `&&` / `||` short-circuit: keep the deciding operand as the result.
         match op {
             BinOp::And => {
@@ -9244,13 +9333,19 @@ impl Compiler {
         // A `+`/`-` on an immutable `Set`/`Map` compares the element or key it
         // adds or removes with the program's `equals` override, which the hook
         // cannot run either.
-        if op == BinOp::Sub && self.may_be_keyed(lhs) {
+        // A `+`/`-` whose receiver may be a collection is that collection's
+        // MEMBER, and one held under an explicit `Ordering.by(f)` runs `f` to
+        // place or find the operand — user code the hook cannot run either.
+        if op == BinOp::Sub && (self.may_be_keyed(lhs) || self.may_be_collection(lhs)) {
             self.b.emit(Op::CallBuiltin(crate::host::SSUB_VM, 2), 0);
             self.narrow(w, 0);
             return Ok(());
         }
         if op == BinOp::Add
-            && (self.needs_render(lhs) || self.needs_render(rhs) || self.may_be_keyed(lhs))
+            && (self.needs_render(lhs)
+                || self.needs_render(rhs)
+                || self.may_be_keyed(lhs)
+                || self.may_be_collection(lhs))
         {
             self.b.emit(Op::CallBuiltin(crate::host::SADD, 2), 0);
             self.narrow(w, 0);
@@ -9330,6 +9425,65 @@ impl Compiler {
                 e,
                 Expr::Int(_) | Expr::Long(_) | Expr::Float(_) | Expr::Char(_) | Expr::Bool(_)
             )
+    }
+
+    /// Whether the receiver of a `+`/`-` may statically be a collection — the
+    /// test that selects [`crate::host::SADD`] / [`crate::host::SSUB_VM`],
+    /// which hold the VM, over the native op. A collection's `+`/`-` is a
+    /// member, and under an explicit function-keyed ordering it runs user code.
+    ///
+    /// Decided by the receiver's static type: false once it is proved a value
+    /// type (`Int`/`Long`/`Float` by the width analysis, `String`, `Double`,
+    /// `Char`, `Boolean`, the big numbers) or a program class, true for a
+    /// collection type and for a type this frontend cannot name. A `+`/`-`
+    /// keeps its receiver's kind — a collection's answers a collection, a
+    /// number's or a `String`'s does not — so a chain is decided by its head:
+    /// `ts + "a" + "b"` is two members, `"n=" + k + 1` two concatenations.
+    ///
+    /// Only in a program that builds an explicitly ordered collection: nothing
+    /// else gives a `+`/`-` user code to run (see `has_explicit_ordering`).
+    fn may_be_collection(&self, e: &Expr) -> bool {
+        if !self.has_explicit_ordering {
+            return false;
+        }
+        const VALUE_TYPES: &[&str] = &[
+            "String",
+            "java.lang.String",
+            "Int",
+            "Long",
+            "Short",
+            "Byte",
+            "Double",
+            "Float",
+            "Char",
+            "Boolean",
+            "Unit",
+            "BigInt",
+            "BigDecimal",
+        ];
+        match e {
+            Expr::Binary {
+                op: BinOp::Add | BinOp::Sub,
+                lhs,
+                ..
+            } => self.may_be_collection(lhs),
+            Expr::Int(_)
+            | Expr::Long(_)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Char(_)
+            | Expr::Bool(_)
+            | Expr::Str(_)
+            | Expr::Null => false,
+            _ if self.num_ty(e) != NumTy::Unknown => false,
+            _ => match self.static_type_name(e) {
+                None => true,
+                Some(t) => {
+                    let t = base_type(&normalize_type(&t));
+                    !VALUE_TYPES.contains(&t.as_str()) && !self.classes.contains_key(t.as_str())
+                }
+            },
+        }
     }
 
     fn needs_render(&self, e: &Expr) -> bool {
@@ -9541,6 +9695,14 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
 /// expressions), which is what arms the per-statement unwind checks.
 fn body_has_try(stmts: &[Stmt]) -> bool {
     body_any(stmts, &|e| matches!(e, Expr::Try { .. }))
+}
+
+/// True if a statement list builds a collection under an explicit ordering.
+fn body_has_explicit_ordering(stmts: &[Stmt]) -> bool {
+    body_any(
+        stmts,
+        &|e| matches!(e, Expr::Call { name, .. } if name == crate::parser::WITH_ORDERING),
+    )
 }
 
 /// True if a statement list contains a `return` inside something that becomes a

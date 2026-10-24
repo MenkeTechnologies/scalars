@@ -273,7 +273,8 @@ pub const IS_GROWABLE: u16 = 744;
 /// except that a concatenation renders through [`scala_str_vm`] and so can run a
 /// user `toString` override. `Op::Add`'s numeric hook is a plain
 /// `Fn(NumOp, &Value, &Value)` with no VM to re-enter, which is the whole reason
-/// this exists; see `Compiler::concat_add`.
+/// this exists; see `Compiler::concat_add`. A collection held under an explicit
+/// ordering answers its own `+` member here (see `Compiler::may_be_collection`).
 pub const SADD: u16 = 770;
 /// Builtin id for the `Option(x)` factory: pops one value and answers `None` for
 /// `null` (fusevm's `Undef`), `Some(x)` for anything else.
@@ -464,7 +465,9 @@ pub const MAKE_IMMQUEUE: u16 = 791;
 /// Builtin id for Scala `-` on an operand that may be an immutable `Set`/`Map`
 /// in a program that overrides `equals`: removing an element or key compares it
 /// with that override, which `Op::Sub`'s VM-less numeric hook cannot run.
-/// Everything else answers what `Op::Sub` would. See `Compiler::may_be_keyed`.
+/// A collection held under an explicit ordering answers its own `-` member, and
+/// everything else what `Op::Sub` would. See `Compiler::may_be_keyed` and
+/// `Compiler::may_be_collection`.
 pub const SSUB_VM: u16 = 792;
 /// Builtin id for `classOf[T]`: pops whether the program declares the type and its
 /// source text, and answers the
@@ -560,8 +563,21 @@ pub const JAVA_NEW: u16 = 830;
 pub const JAVA_STATIC: u16 = 831;
 /// Builtin id for a sorted collection or `PriorityQueue` literal given an
 /// explicit `Ordering` (`TreeSet(3, 1)(using ord)`): pops the ordering and the
-/// collection.
+/// collection. A sorted set/map literal arrives as three operands — the empty
+/// collection, its elements in source order as a `List`, the ordering — so
+/// which of two elements the ordering calls equal is kept is the first.
 pub const WITH_ORDERING: u16 = 832;
+/// Builtin id for `scala.util.Using`'s `preferentiallySuppress`: pops the
+/// primary and the secondary exception and answers the winner, the other
+/// added to its suppressed list (see `parser::USING_SUPPRESS`).
+pub const USING_SUPPRESS: u16 = 833;
+/// Builtin id for a fresh `Using.Manager` (no operands).
+pub const USING_MANAGER: u16 = 834;
+/// Builtin id for closing a `Using.Manager`: pops it and answers the
+/// resources it registered as a `List`, the last registered first.
+pub const USING_RELEASE: u16 = 835;
+/// Builtin id for `StringContext(parts…)`: pops `argc` strings.
+pub const MAKE_STRING_CONTEXT: u16 = 836;
 
 /// The hidden record field holding a user throwable's `(message, cause)` pair
 /// (see [`THROWABLE_STATE`]). The leading space keeps it out of every name a
@@ -835,6 +851,10 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JAVA_NEW, b_java_new);
     vm.register_builtin(JAVA_STATIC, b_java_static);
     vm.register_builtin(WITH_ORDERING, b_with_ordering);
+    vm.register_builtin(USING_SUPPRESS, b_using_suppress);
+    vm.register_builtin(USING_MANAGER, b_using_manager);
+    vm.register_builtin(USING_RELEASE, b_using_release);
+    vm.register_builtin(MAKE_STRING_CONTEXT, b_make_string_context);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -1175,6 +1195,10 @@ const THROWABLE_PARENTS: &[(&str, &str)] = &[
     ),
     ("IllegalFormatConversionException", "IllegalFormatException"),
     ("PatternSyntaxException", "IllegalArgumentException"),
+    (
+        "StringContext$InvalidEscapeException",
+        "IllegalArgumentException",
+    ),
     ("NegativeArraySizeException", "RuntimeException"),
     ("VirtualMachineError", "Error"),
     ("StackOverflowError", "VirtualMachineError"),
@@ -1323,6 +1347,16 @@ pub fn throwable_takes_cause(fqn: &str) -> bool {
 /// `EXC_THROW` builtin — see [`EXC_THROW`].
 fn b_exc_throw(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.pop();
+    // A caught non-local return rethrown (`catch { case t: Throwable => throw t
+    // }`, as `scala.util.Using` does) travels on to its `def` exactly as
+    // [`NLR_RAISE`] sent it: parked whatever the try depth, for the `def`'s
+    // frame to take.
+    if with_obj(&v, |o| &*o.class == NLR_CLASS).unwrap_or(false) {
+        if !unwinding() {
+            PENDING.with(|p| *p.borrow_mut() = Some(v));
+        }
+        return Value::Undef;
+    }
     raise(vm, v)
 }
 
@@ -1407,6 +1441,283 @@ fn b_nonfatal(vm: &mut VM, _argc: u8) -> Value {
         .any(|f| throwable_conforms(&c, f))
     });
     Value::bool(!fatal)
+}
+
+thread_local! {
+    /// Each throwable's suppressed exceptions (`addSuppressed`), by heap id,
+    /// in the order added.
+    static SUPPRESSED: RefCell<HashMap<usize, Vec<Value>>> = RefCell::new(HashMap::new());
+    /// Each live `Using.Manager`, by heap id: whether it has been closed, and
+    /// the resources registered with it, in registration order.
+    static MANAGERS: RefCell<HashMap<usize, (bool, Vec<Value>)>> = RefCell::new(HashMap::new());
+}
+
+/// `Throwable.addSuppressed(t)` / `getSuppressed()`, with the JDK's checks:
+/// suppressing itself is `IllegalArgumentException: Self-suppression not
+/// permitted`, a `null` is `NullPointerException: Cannot suppress a null
+/// exception.`. `getSuppressed` answers an `Array[Throwable]`.
+fn suppressed_member(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let id = as_obj_id(recv).ok_or_else(|| "scalars: dangling throwable handle".to_string())?;
+    match (name, args) {
+        ("addSuppressed", [t]) => {
+            if matches!(t, Value::Undef) {
+                return Err(
+                    "scalars: java.lang.NullPointerException: Cannot suppress a null exception."
+                        .to_string(),
+                );
+            }
+            if as_obj_id(t) == Some(id) {
+                return Err(
+                    "scalars: java.lang.IllegalArgumentException: Self-suppression not permitted"
+                        .to_string(),
+                );
+            }
+            SUPPRESSED.with(|s| s.borrow_mut().entry(id).or_default().push(t.clone()));
+            Ok(unit_value())
+        }
+        ("getSuppressed", []) => {
+            let items = SUPPRESSED.with(|s| s.borrow().get(&id).cloned().unwrap_or_default());
+            Ok(new_seq(SeqKind::Array, items))
+        }
+        _ => Err(format!("scalars: wrong arguments for Throwable.{name}")),
+    }
+}
+
+/// `USING_SUPPRESS` builtin — see [`USING_SUPPRESS`]. `Using`'s ranking:
+/// `VirtualMachineError` 4, `LinkageError` 3, `InterruptedException` /
+/// `ThreadDeath` 2, a `ControlThrowable` 0, a non-fatal one -1 (the library's
+/// 1 for "any other fatal throwable" names none these do not already cover);
+/// the secondary wins only by ranking strictly higher.
+fn b_using_suppress(vm: &mut VM, _argc: u8) -> Value {
+    let secondary = vm.pop();
+    let primary = vm.pop();
+    let score = |t: &Value| {
+        let class = thrown_class(t).unwrap_or_default();
+        let is = |c: &str| throwable_conforms(&class, c);
+        if is("VirtualMachineError") {
+            4
+        } else if is("LinkageError") {
+            3
+        } else if is("InterruptedException") || is("ThreadDeath") {
+            2
+        } else if is("ControlThrowable") {
+            0
+        } else {
+            -1
+        }
+    };
+    let (winner, loser) = if score(&secondary) > score(&primary) {
+        (secondary, primary)
+    } else {
+        (primary, secondary)
+    };
+    match suppressed_member(&winner, "addSuppressed", &[loser]) {
+        Ok(_) => winner,
+        Err(e) => fault(vm, e),
+    }
+}
+
+/// The class tag of a `StringContext`, a case class of its `parts`.
+const STRING_CONTEXT_CLASS: &str = "StringContext";
+
+/// `MAKE_STRING_CONTEXT` builtin — see [`MAKE_STRING_CONTEXT`].
+fn b_make_string_context(vm: &mut VM, argc: u8) -> Value {
+    let mut parts: Vec<Value> = (0..argc).map(|_| vm.pop()).collect();
+    parts.reverse();
+    heap_alloc(ScalaObj {
+        class: Arc::from(STRING_CONTEXT_CLASS),
+        is_case: true,
+        is_object: false,
+        fields: vec![(Arc::from("parts"), new_seq(SeqKind::ArraySeq, parts))],
+    })
+}
+
+/// `StringContext`'s interpolators, run on its parts: `s` decodes each part's
+/// escapes ([`process_escapes`]) and `raw` keeps them, both interleaving the
+/// arguments' `toString`s. The argument count must be one less than the
+/// parts': `IllegalArgumentException: wrong number of arguments (n) for
+/// interpolated string with m parts` otherwise. `s$spread`/`raw$spread` are
+/// the `xs: _*` forms, the arguments arriving as one sequence.
+fn string_context_member(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let parts = with_obj(recv, |o| {
+        (&*o.class == STRING_CONTEXT_CLASS && o.is_case)
+            .then(|| o.fields.first().map(|(_, p)| p.clone()))
+            .flatten()
+    })
+    .flatten()?;
+    let (escapes, spread) = match name {
+        "s" => (true, false),
+        "raw" => (false, false),
+        "s$spread" => (true, true),
+        "raw$spread" => (false, true),
+        _ => return None,
+    };
+    let parts: Vec<String> = as_seq(&parts)
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p.as_str_cow().into_owned())
+        .collect();
+    let args = if spread {
+        iterable_arg(&args[0])
+    } else {
+        args.to_vec()
+    };
+    if args.len() + 1 != parts.len() {
+        return Some(Err(format!(
+            "scalars: java.lang.IllegalArgumentException: wrong number of arguments ({}) for interpolated string with {} parts",
+            args.len(),
+            parts.len()
+        )));
+    }
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if escapes {
+            match process_escapes(part) {
+                Ok(p) => out.push_str(&p),
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            out.push_str(part);
+        }
+        if let Some(a) = args.get(i) {
+            out.push_str(&scala_str_vm(vm, a));
+        }
+    }
+    Some(Ok(Value::str(out)))
+}
+
+/// `StringContext.processEscapes`: the escapes `\b \t \n \f \s \r \ \" \'`
+/// and `\uXXXX` decoded; any other backslash is `StringContext.
+/// InvalidEscapeException`, worded as the library words it.
+fn process_escapes(s: &str) -> Result<String, String> {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '\\' {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        let decoded = match cs.get(i + 1) {
+            Some('b') => Some('\u{8}'),
+            Some('t') => Some('\t'),
+            Some('n') => Some('\n'),
+            Some('f') => Some('\u{c}'),
+            Some('s') => Some(' '),
+            Some('r') => Some('\r'),
+            Some('\\') => Some('\\'),
+            Some('"') => Some('"'),
+            Some('\'') => Some('\''),
+            _ => None,
+        };
+        if let Some(c) = decoded {
+            out.push(c);
+            i += 2;
+            continue;
+        }
+        // `\u` (any number of `u`s) and four hex digits.
+        let mut j = i + 1;
+        while cs.get(j) == Some(&'u') {
+            j += 1;
+        }
+        let hex: String = cs.iter().skip(j).take(4).collect();
+        if j > i + 1 && hex.len() == 4 {
+            if let Some(c) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                out.push(c);
+                i = j + 4;
+                continue;
+            }
+        }
+        let bad = cs.get(i + 1).map_or(String::new(), |c| c.to_string());
+        return Err(format!(
+            "scalars: scala.StringContext$InvalidEscapeException: invalid escape '\\{bad}' not one of [\\b, \\t, \\n, \\f, \\s, \\r, \\\\, \\\", \\', \\uxxxx] at index {i} in \"{s}\". Use \\\\ for literal \\."
+        ));
+    }
+    Ok(out)
+}
+
+/// The class tag of a `Using.Manager`.
+const MANAGER_CLASS: &str = "scala.util.Using$Manager";
+
+/// `USING_MANAGER` builtin — see [`USING_MANAGER`].
+fn b_using_manager(_vm: &mut VM, _argc: u8) -> Value {
+    let m = heap_alloc(ScalaObj {
+        class: Arc::from(MANAGER_CLASS),
+        is_case: false,
+        is_object: false,
+        fields: Vec::new(),
+    });
+    if let Some(id) = as_obj_id(&m) {
+        MANAGERS.with(|t| t.borrow_mut().insert(id, (false, Vec::new())));
+    }
+    m
+}
+
+/// `USING_RELEASE` builtin — see [`USING_RELEASE`].
+fn b_using_release(vm: &mut VM, _argc: u8) -> Value {
+    let m = vm.pop();
+    let mut resources = as_obj_id(&m)
+        .and_then(|id| {
+            MANAGERS.with(|t| {
+                t.borrow_mut().get_mut(&id).map(|(closed, rs)| {
+                    *closed = true;
+                    std::mem::take(rs)
+                })
+            })
+        })
+        .unwrap_or_default();
+    resources.reverse();
+    new_list(resources)
+}
+
+/// A `Using.Manager`'s members: `apply(r)` registers `r` and answers it,
+/// `acquire(r)` registers it and answers `()`. A `null` resource is
+/// `NullPointerException: null resource`; one registered once the manager
+/// has closed, `IllegalStateException: Manager has already been closed`.
+fn using_manager_member(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let id = as_obj_id(recv)?;
+    if !MANAGERS.with(|t| t.borrow().contains_key(&id)) {
+        return None;
+    }
+    let [r] = args else {
+        return Some(Err(format!(
+            "scalars: value {name} is not a member of scala.util.Using.Manager"
+        )));
+    };
+    if !matches!(name, "apply" | "acquire") {
+        return Some(Err(format!(
+            "scalars: value {name} is not a member of scala.util.Using.Manager"
+        )));
+    }
+    if matches!(r, Value::Undef) {
+        return Some(Err(
+            "scalars: java.lang.NullPointerException: null resource".to_string(),
+        ));
+    }
+    let closed = MANAGERS.with(|t| {
+        let mut t = t.borrow_mut();
+        let (closed, rs) = t.get_mut(&id).expect("checked above");
+        if !*closed {
+            rs.push(r.clone());
+        }
+        *closed
+    });
+    if closed {
+        return Some(Err(
+            "scalars: java.lang.IllegalStateException: Manager has already been closed".to_string(),
+        ));
+    }
+    Some(Ok(if name == "apply" {
+        r.clone()
+    } else {
+        unit_value()
+    }))
 }
 
 /// Whether the thrown class `class` is `want` or a subclass of it — through
@@ -2564,6 +2875,7 @@ pub fn reset_heap() {
     LAZY_ZIPS.with(|t| t.borrow_mut().clear());
     JSTREAMS.with(|t| t.borrow_mut().clear());
     MATCH_DATA.with(|t| t.borrow_mut().clear());
+    UNANCHORED.with(|t| t.borrow_mut().clear());
     JAVA_MUT.with(|t| t.borrow_mut().clear());
     JAVA_DECS.with(|t| t.borrow_mut().clear());
     CHAR_ARRAYS.with(|t| t.borrow_mut().clear());
@@ -2578,6 +2890,8 @@ pub fn reset_heap() {
     BACKING_VIEWS.with(|t| t.borrow_mut().clear());
     CUSTOM_ORD.with(|t| t.borrow_mut().clear());
     OVERRIDE_ORD.with(|o| *o.borrow_mut() = None);
+    SUPPRESSED.with(|t| t.borrow_mut().clear());
+    MANAGERS.with(|t| t.borrow_mut().clear());
     reset_regex_cache();
 }
 
@@ -3664,8 +3978,16 @@ fn b_unapply_seq(vm: &mut VM, _argc: u8) -> Value {
         );
     };
     // `unapplySeq` is a whole-input match, as `Regex`'s is (the non-capturing
-    // wrapper keeps the user's own group numbers intact).
-    let re = match regex_compile(&format!("\\A(?:{pat})\\z")) {
+    // wrapper keeps the user's own group numbers intact) — except on an
+    // `UnanchoredRegex`, whose extractor takes the first match anywhere.
+    let unanchored =
+        as_obj_id(&extractor).is_some_and(|id| UNANCHORED.with(|t| t.borrow().contains(&id)));
+    let source = if unanchored {
+        pat.to_string()
+    } else {
+        format!("\\A(?:{pat})\\z")
+    };
+    let re = match regex_compile(&source) {
         Ok(re) => re,
         Err(e) => return fault(vm, e),
     };
@@ -4716,8 +5038,15 @@ fn b_sub_vm(vm: &mut VM, _argc: u8) -> Value {
     if unwinding() {
         return Value::Undef;
     }
+    if custom_ordering(&a).is_some() {
+        return method_call(vm, a, "-".to_string(), vec![b]);
+    }
     if let Some(r) = keyed_binop(vm, &a, "-", &b) {
         return r;
+    }
+    // Two `Double`s never reach the hook (the VM subtracts them itself).
+    if let (Value::Float(x), Value::Float(y)) = (&a, &b) {
+        return Value::float(x - y);
     }
     match numeric_hook(NumOp::Sub, &a, &b) {
         Ok(v) => v,
@@ -4742,6 +5071,11 @@ fn b_add(vm: &mut VM, _argc: u8) -> Value {
     // and rejecting it here would displace the real exception.
     if unwinding() {
         return Value::Undef;
+    }
+    // A collection held under an explicit ordering answers its own `+`
+    // member, which runs the ordering (an `Ordering.by(f)` runs `f`).
+    if custom_ordering(&a).is_some() {
+        return method_call(vm, a, "+".to_string(), vec![b]);
     }
     if let Some(r) = keyed_binop(vm, &a, "+", &b) {
         return r;
@@ -5158,6 +5492,10 @@ fn apply_value(vm: &mut VM, recv: &Value, args: &[Value]) -> Result<Value, Strin
             return r;
         }
     }
+    // `use(r)` on a `Using.Manager`.
+    if let Some(r) = using_manager_member(recv, "apply", args) {
+        return r;
+    }
     if user_equals_present(vm) && map_default(recv).is_none() {
         if let Some(r) = keyed_user_method(vm, recv, "apply", args) {
             return r;
@@ -5474,6 +5812,9 @@ fn obj_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         {
             let (msg, cause) = user_throwable_state(recv).unwrap_or((Value::Undef, Value::Undef));
             Ok(if name == "getCause" { cause } else { msg })
+        }
+        ("addSuppressed", 1) | ("getSuppressed", 0) if user_throwable_state(recv).is_some() => {
+            suppressed_member(recv, name, args)
         }
         // `scala.Product`, which every `case class`/`case object` implements.
         // The primary-constructor prefix is what Scala exposes, matching the
@@ -8823,6 +9164,7 @@ pub fn own_member_of(ty: &str, name: &str) -> Option<bool> {
         "Double" | "Float" => FLOATING.contains(&name),
         "Boolean" => matches!(name, "&&" | "||" | "&" | "|" | "^" | "unary_!"),
         "Array" => matches!(name, "length" | "apply" | "update" | "clone"),
+        "StringContext" => matches!(name, "parts" | "s" | "raw" | "f"),
         _ => return None,
     };
     Some(own || ANY.contains(&name))
@@ -8846,6 +9188,9 @@ fn method_call(vm: &mut VM, recv: Value, name: String, args: Vec<Value>) -> Valu
 }
 
 fn method_call_inner(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value>) -> Value {
+    if let Some(r) = string_context_member(vm, &recv, &name, &args) {
+        return r.unwrap_or_else(|e| fault(vm, e));
+    }
     // A widened box answers every member as its number does, except `getClass`,
     // which reports the box.
     // `equals` between two boxes is the JDK's: same class and same value.
@@ -8907,6 +9252,10 @@ fn method_call_inner(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value
         }
     }
 
+    if let Some(r) = using_manager_member(&recv, &name, &args) {
+        return r.unwrap_or_else(|e| fault(vm, e));
+    }
+
     // `java.lang.Throwable`'s observable surface. Handled before the collection
     // and pure dispatchers because a throwable is neither.
     if let Some(e) = as_exc(&recv) {
@@ -8917,6 +9266,10 @@ fn method_call_inner(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value
             },
             "toString" => Value::str(exc_to_string(&e)),
             "getCause" => e.cause.clone().unwrap_or(Value::Undef),
+            "addSuppressed" | "getSuppressed" => match suppressed_member(&recv, &name, &args) {
+                Ok(v) => v,
+                Err(msg) => fault(vm, msg),
+            },
             // Reference identity, as for any class instance.
             "eq" | "ne" if args.len() == 1 => {
                 let same = matches!((&recv, &args[0]), (Value::Obj(a), Value::Obj(b)) if a == b);
@@ -16633,8 +16986,22 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
         Err(e) => return Some(Err(e)),
     };
     let target = || args[0].as_str_cow().into_owned();
+    let unanchored = UNANCHORED.with(|t| t.borrow().contains(&(*id as usize)));
     Some(match (name, args.len()) {
         ("regex" | "toString", 0) => Ok(Value::str(pat.to_string())),
+        // An `UnanchoredRegex`'s `matches` and extractor run `Matcher.find`.
+        ("matches", 1) if unanchored => Ok(Value::bool(!regex_matches(&re, &target()).is_empty())),
+        ("unapplySeq", 1) if unanchored => {
+            let s = target();
+            Ok(match re.captures(&s) {
+                Ok(Some(caps)) => make_some(new_list(
+                    (1..caps.len())
+                        .map(|i| caps.get(i).map_or(Value::Undef, |m| Value::str(m.as_str())))
+                        .collect(),
+                )),
+                _ => make_none(),
+            })
+        }
         // `Regex.matches` (2.13+) is the anchored test, like `String.matches`.
         ("matches", 1) => regex_full_match(&pat, &target()),
         // `unapplySeq(s)` — the extractor itself: `Some` of every group of a
@@ -16702,7 +17069,13 @@ fn regex_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value
         ("replaceFirstIn", 2) => regex_replace(&target(), &pat, &args[1].as_str_cow(), true),
         ("split", 1) => java_split(&target(), &pat, 0)
             .map(|parts| new_seq(SeqKind::Array, parts.into_iter().map(Value::str).collect())),
-        ("unanchored", 0) => Ok(recv.clone()),
+        ("unanchored" | "anchored", 0) => {
+            let out = heap_push(HeapVal::Regex(pat.clone()));
+            if let (Some(oid), true) = (as_obj_id(&out), name == "unanchored") {
+                UNANCHORED.with(|t| t.borrow_mut().insert(oid));
+            }
+            Ok(out)
+        }
         _ => Err(no_such_obj_member("Regex", name)),
     })
 }
@@ -20501,6 +20874,10 @@ thread_local! {
     /// The `Match` values behind each `findAllIn` result, by heap id: what its
     /// `matchData` iterates.
     static MATCH_DATA: RefCell<HashMap<usize, Vec<Value>>> = RefCell::new(HashMap::new());
+    /// The `Regex` values that are `UnanchoredRegex`es (`r.unanchored`), by heap
+    /// id: their `matches` and extractor SEARCH the input instead of matching
+    /// the whole of it.
+    static UNANCHORED: RefCell<std::collections::HashSet<usize>> = RefCell::new(std::collections::HashSet::new());
     /// Whether each collected `java.util` List/Map (by heap id) is MUTABLE
     /// (`Collectors.toList`/`toMap`/`groupingBy` build an `ArrayList`/`HashMap`)
     /// or not (`List.of`, `Stream.toList`). A value absent here is one whose
@@ -24380,7 +24757,10 @@ fn with_override<R>(ord: &Value, f: impl FnOnce() -> R) -> R {
 }
 
 /// `items` in `ord`'s order, stable, keeping the FIRST of any run `ord` calls
-/// equal — a sorted set's membership is its ordering's, not `equals`.
+/// equal — a sorted set's membership is its ordering's, not `equals`. With
+/// `keep_last` the items are `(key, value)` pairs and the run keeps its first
+/// KEY with its last VALUE, as a red-black tree's insert does: `TreeMap("aa" ->
+/// 1, "zz" -> 2)(using Ordering.by(_.length))` is `TreeMap(aa -> 2)`.
 fn sort_distinct_by(
     vm: &mut VM,
     ord: &Value,
@@ -24396,7 +24776,11 @@ fn sort_distinct_by(
         if let Some(last) = out.last() {
             if ordering_cmp(vm, ord, &key(last), &key(&items[i]))? == Ordering::Equal {
                 if keep_last {
-                    *out.last_mut().expect("non-empty") = items[i].clone();
+                    let kept = pair_key(last);
+                    let value = as_seq_or_tuple(&items[i])
+                        .and_then(|kv| kv.get(1).cloned())
+                        .unwrap_or(Value::Undef);
+                    *out.last_mut().expect("non-empty") = new_pair(kept, value);
                 }
                 continue;
             }
@@ -24411,6 +24795,185 @@ fn pair_key(p: &Value) -> Value {
     as_seq_or_tuple(p)
         .and_then(|kv| kv.first().cloned())
         .unwrap_or(Value::Undef)
+}
+
+/// Insert `x` into `items`, a sorted set's elements in `ord`'s order: an
+/// element `ord` calls equal to `x` stays where it is and `x` is dropped
+/// (`false`); otherwise `x` goes in at its place (`true`). Scala's `TreeSet`
+/// keeps the element it already holds: `TreeSet("xyz")(using
+/// Ordering.by(_.length)) + "abc"` is `TreeSet(xyz)`.
+fn ordered_incl(
+    vm: &mut VM,
+    ord: &Value,
+    items: &mut Vec<Value>,
+    x: Value,
+) -> Result<bool, String> {
+    match ordered_slot(vm, ord, items.len(), |i| items[i].clone(), &x)? {
+        Ok(_) => Ok(false),
+        Err(i) => {
+            items.insert(i, x);
+            Ok(true)
+        }
+    }
+}
+
+/// [`ordered_incl`] for a sorted map's entries: a key `ord` calls equal to `k`
+/// keeps its place and its own key and takes `v`, answering the value it
+/// held; a new key goes in at its place.
+fn ordered_put(
+    vm: &mut VM,
+    ord: &Value,
+    entries: &mut Vec<(Value, Value)>,
+    k: Value,
+    v: Value,
+) -> Result<Option<Value>, String> {
+    match ordered_slot(vm, ord, entries.len(), |i| entries[i].0.clone(), &k)? {
+        Ok(i) => Ok(Some(std::mem::replace(&mut entries[i].1, v))),
+        Err(i) => {
+            entries.insert(i, (k, v));
+            Ok(None)
+        }
+    }
+}
+
+/// Binary search of `len` keys already in `ord`'s order (`key(i)` the i-th)
+/// for `x`: `Ok(i)` for the key `ord` calls equal to it, `Err(i)` for where it
+/// would go.
+fn ordered_slot(
+    vm: &mut VM,
+    ord: &Value,
+    len: usize,
+    key: impl Fn(usize) -> Value,
+    x: &Value,
+) -> Result<Result<usize, usize>, String> {
+    let (mut lo, mut hi) = (0, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match ordering_cmp(vm, ord, &key(mid), x)? {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+            Ordering::Equal => return Ok(Ok(mid)),
+        }
+    }
+    Ok(Err(lo))
+}
+
+/// The position of the element or key `ord` calls equal to `x`, in `keys`
+/// already in `ord`'s order.
+fn ordered_find(
+    vm: &mut VM,
+    ord: &Value,
+    keys: &[Value],
+    x: &Value,
+) -> Result<Option<usize>, String> {
+    Ok(ordered_slot(vm, ord, keys.len(), |i| keys[i].clone(), x)?.ok())
+}
+
+/// A `(key, value)` operand of a sorted map's `+`/`+=`, as its two parts.
+fn entry_parts(p: &Value) -> Result<(Value, Value), String> {
+    as_seq_or_tuple(p)
+        .filter(|t| t.len() == 2)
+        .map(|t| (t[0].clone(), t[1].clone()))
+        .ok_or_else(|| "scalars: Map `+` expects a `key -> value` pair".to_string())
+}
+
+/// What one of the insert or remove members does to the elements of a sorted
+/// SET held under `ord`, one operand at a time in order — `None` for any other
+/// member. `add` is `+`/`incl` and the bulk `++`/`concat`/`union`/`|` (and
+/// their mutable forms); the rest remove. Answers the new elements and how
+/// many operands changed them.
+fn ordered_set_edit(
+    vm: &mut VM,
+    ord: &Value,
+    mut items: Vec<Value>,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<(Vec<Value>, usize), String>> {
+    let (add, operands) = match (name, args) {
+        ("+" | "incl" | "+=" | "addOne" | "add", [x]) => (true, vec![x.clone()]),
+        ("++" | "concat" | "union" | "|" | "++=" | "addAll", [xs]) => (true, iterable_arg(xs)),
+        ("-" | "excl" | "-=" | "subtractOne", [x]) => (false, vec![x.clone()]),
+        ("--" | "removedAll" | "diff" | "&~" | "--=" | "subtractAll", [xs]) => {
+            (false, iterable_arg(xs))
+        }
+        _ => return None,
+    };
+    let mut changed = 0;
+    for x in operands {
+        let hit = if add {
+            ordered_incl(vm, ord, &mut items, x)
+        } else {
+            ordered_find(vm, ord, &items, &x).map(|at| at.map(|i| items.remove(i)).is_some())
+        };
+        match hit {
+            Ok(true) => changed += 1,
+            Ok(false) => {}
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(Ok((items, changed)))
+}
+
+/// A sorted map's entries in order, and the value the last edited key held.
+type MapEdit = (Vec<(Value, Value)>, Option<Value>);
+
+/// [`ordered_set_edit`] for a sorted MAP's entries: `+`/`updated`/`++`/
+/// `concat` (and the mutable `+=`/`put`/`update`/`++=`) put, `-`/`removed`/
+/// `--` remove. Also answers the value the last operand's key held.
+fn ordered_map_edit(
+    vm: &mut VM,
+    ord: &Value,
+    mut entries: Vec<(Value, Value)>,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<MapEdit, String>> {
+    let run = |vm: &mut VM, entries: &mut Vec<(Value, Value)>| -> Result<Option<Value>, String> {
+        let mut prior = None;
+        match (name, args) {
+            ("+" | "+=" | "addOne", [p]) => {
+                let (k, v) = entry_parts(p)?;
+                prior = ordered_put(vm, ord, entries, k, v)?;
+            }
+            ("updated" | "put" | "update", [k, v]) => {
+                prior = ordered_put(vm, ord, entries, k.clone(), v.clone())?;
+            }
+            ("++" | "concat" | "++=" | "addAll", [ps]) => {
+                for p in iterable_arg(ps) {
+                    let (k, v) = entry_parts(&p)?;
+                    prior = ordered_put(vm, ord, entries, k, v)?;
+                }
+            }
+            ("-" | "removed" | "-=" | "subtractOne", [k]) => {
+                let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+                if let Some(i) = ordered_find(vm, ord, &keys, k)? {
+                    prior = Some(entries.remove(i).1);
+                }
+            }
+            ("--" | "removedAll" | "--=" | "subtractAll", [ks]) => {
+                for k in iterable_arg(ks) {
+                    let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+                    if let Some(i) = ordered_find(vm, ord, &keys, &k)? {
+                        prior = Some(entries.remove(i).1);
+                    }
+                }
+            }
+            _ => unreachable!("filtered below"),
+        }
+        Ok(prior)
+    };
+    let edits = matches!(
+        (name, args.len()),
+        (
+            "+" | "+=" | "addOne" | "++" | "concat" | "++=" | "addAll",
+            1
+        ) | ("updated" | "put" | "update", 2)
+            | ("-" | "removed" | "-=" | "subtractOne", 1)
+            | ("--" | "removedAll" | "--=" | "subtractAll", 1)
+    );
+    if !edits {
+        return None;
+    }
+    Some(run(vm, &mut entries).map(|prior| (entries, prior)))
 }
 
 /// `coll` rebuilt under the explicit ordering `ord`: a sorted set's elements
@@ -24451,6 +25014,39 @@ fn with_ordering(vm: &mut VM, coll: &Value, ord: &Value) -> Result<Value, String
         }
         _ => Err("scalars: an explicit Ordering for this collection is not modelled".to_string()),
     }
+}
+
+/// The sorted set or map `coll` (empty) holding `elems` inserted in order under
+/// `ord` — see [`b_with_ordering`].
+fn with_ordering_from(
+    vm: &mut VM,
+    coll: &Value,
+    elems: &Value,
+    ord: &Value,
+) -> Result<Value, String> {
+    if as_ordering(ord).is_none() {
+        return Err("scalars: an explicit ordering must be an Ordering".to_string());
+    }
+    let operand = [elems.clone()];
+    let out = match (map_rep_entries(coll), seq_kind_items(coll)) {
+        (Some((rep, entries)), _) => {
+            let (entries, _) =
+                ordered_map_edit(vm, ord, entries, "++", &operand).expect("`++` is an edit")?;
+            heap_push(HeapVal::Map(rep, entries))
+        }
+        (None, Some((kind @ SeqKind::Set(HashRep::Sorted | HashRep::MutSorted), items))) => {
+            let (items, _) =
+                ordered_set_edit(vm, ord, items, "++", &operand).expect("`++` is an edit")?;
+            heap_push(HeapVal::Seq(kind, items))
+        }
+        _ => {
+            return Err(
+                "scalars: an explicit Ordering for this collection is not modelled".to_string(),
+            )
+        }
+    };
+    mark_custom_ordering(&out, ord);
+    Ok(out)
 }
 
 /// The members after which a sorted collection keeps its EXPLICIT ordering:
@@ -24550,6 +25146,37 @@ fn custom_ordered_method(
     let is_pq = seq_kind(recv) == Some(SeqKind::PriorityQueue);
     let is_map = map_rep_entries(recv).is_some();
     if !is_pq {
+        // The inserts and removals, one operand at a time under `ord`. The
+        // mutable collections' own forms are answered by
+        // [`custom_mutable_method`]; only the immutable members are here.
+        const MUTABLE_ONLY: &[&str] = &[
+            "+=",
+            "addOne",
+            "add",
+            "++=",
+            "addAll",
+            "-=",
+            "subtractOne",
+            "--=",
+            "subtractAll",
+            "put",
+            "update",
+        ];
+        if !MUTABLE_ONLY.contains(&name) {
+            if let Some((rep, entries)) = map_rep_entries(recv) {
+                if let Some(r) = ordered_map_edit(vm, ord, entries, name, args) {
+                    let out = heap_push(HeapVal::Map(rep, r?.0));
+                    mark_custom_ordering(&out, ord);
+                    return Ok(out);
+                }
+            } else if let Some((kind, items)) = seq_kind_items(recv) {
+                if let Some(r) = ordered_set_edit(vm, ord, items, name, args) {
+                    let out = heap_push(HeapVal::Seq(kind, r?.0));
+                    mark_custom_ordering(&out, ord);
+                    return Ok(out);
+                }
+            }
+        }
         let keys: Vec<Value> = match map_rep_entries(recv) {
             Some((_, entries)) => entries.iter().map(|(k, _)| k.clone()).collect(),
             None => seq_kind_items(recv).map(|(_, xs)| xs).unwrap_or_default(),
@@ -24562,26 +25189,6 @@ fn custom_ordered_method(
             }
             Ok(None)
         };
-        // Removal is by the ordering too: `excl(x)` drops the element `x`
-        // compares equal to.
-        if matches!((name, args.len()), ("excl" | "-" | "removed", 1)) {
-            if let Some(i) = find(vm, &args[0])? {
-                let out = match map_rep_entries(recv) {
-                    Some((rep, mut entries)) => {
-                        entries.remove(i);
-                        heap_push(HeapVal::Map(rep, entries))
-                    }
-                    None => {
-                        let (kind, mut items) = seq_kind_items(recv).expect("a sorted set");
-                        items.remove(i);
-                        heap_push(HeapVal::Seq(kind, items))
-                    }
-                };
-                mark_custom_ordering(&out, ord);
-                return Ok(out);
-            }
-            return Ok(recv.clone());
-        }
         match (name, args.len(), is_map) {
             ("contains", 1, _) | ("apply", 1, false) => {
                 return Ok(Value::bool(find(vm, &args[0])?.is_some()))
@@ -24625,10 +25232,19 @@ fn custom_ordered_method(
     Ok(out)
 }
 
-/// `WITH_ORDERING` builtin — see [`WITH_ORDERING`].
-fn b_with_ordering(vm: &mut VM, _argc: u8) -> Value {
+/// `WITH_ORDERING` builtin — see [`WITH_ORDERING`]. With three operands the
+/// middle one is a sorted literal's elements in SOURCE order, inserted one at a
+/// time into the (empty) collection beneath them, as the factory's builder
+/// does: of the elements (keys) `ord` calls equal the first stays, a map
+/// taking the last value — `TreeSet("xyz", "abc")(using Ordering.by(_.length))`
+/// is `TreeSet(xyz)`.
+fn b_with_ordering(vm: &mut VM, argc: u8) -> Value {
     let ord = vm.pop();
+    let elems = (argc == 3).then(|| vm.pop());
     let coll = vm.pop();
+    if let Some(elems) = elems {
+        return with_ordering_from(vm, &coll, &elems, &ord).unwrap_or_else(|e| fault(vm, e));
+    }
     with_ordering(vm, &coll, &ord).unwrap_or_else(|e| fault(vm, e))
 }
 
@@ -25154,6 +25770,49 @@ fn custom_mutable_method(
         Ok(None) => {}
         Err(e) => return fault(vm, e),
     }
+    // The in-place inserts and bulk removals, one operand at a time under
+    // `ord`: an element (key) it calls equal to one already held leaves that
+    // one in place. Only the mutable forms edit in place; `+`/`-`/`++` on a
+    // mutable sorted collection answer a new one, through the ordinary dispatch.
+    const IN_PLACE: &[&str] = &[
+        "+=",
+        "addOne",
+        "add",
+        "++=",
+        "addAll",
+        "--=",
+        "subtractAll",
+        "put",
+        "update",
+    ];
+    if IN_PLACE.contains(&name.as_str()) {
+        let edited: Option<Result<Value, String>> = match map_rep_entries(&recv) {
+            Some((_, entries)) => ordered_map_edit(vm, ord, entries, &name, &args).map(|r| {
+                r.map(|(entries, prior)| {
+                    store_map_raw(&recv, entries);
+                    match name.as_str() {
+                        "put" => prior.map_or_else(make_none, make_some),
+                        "update" => unit_value(),
+                        _ => recv.clone(),
+                    }
+                })
+            }),
+            None => seq_kind_items(&recv).and_then(|(_, items)| {
+                ordered_set_edit(vm, ord, items, &name, &args).map(|r| {
+                    r.map(|(items, changed)| {
+                        store_set_raw(&recv, items);
+                        match name.as_str() {
+                            "add" => Value::bool(changed > 0),
+                            _ => recv.clone(),
+                        }
+                    })
+                })
+            }),
+        };
+        if let Some(r) = edited {
+            return r.unwrap_or_else(|e| fault(vm, e));
+        }
+    }
     let out = method_call_inner(vm, recv.clone(), name.clone(), args);
     if let Err(e) = relayout_custom(vm, &recv, ord) {
         return fault(vm, e);
@@ -25276,6 +25935,48 @@ fn sub_range_of(name: &str, args: &[Value]) -> Option<SubRange> {
             hi: Some((v(2), b(3))),
         },
         _ => return None,
+    })
+}
+
+/// The range of a sub-view taken of the sub-view `outer`, as the JDK's
+/// `NavigableSubMap.subMap`/`headMap`/`tailMap` make it: each bound the call
+/// names must lie in `outer` (an exclusive bound may sit ON an outer bound) —
+/// `IllegalArgumentException: fromKey out of range` / `toKey out of range`
+/// otherwise — and a bound it leaves open is `outer`'s. So the result is the
+/// intersection of the two.
+fn nested_sub_range(
+    vm: &mut VM,
+    cmp: Option<&Value>,
+    outer: &SubRange,
+    range: SubRange,
+) -> Result<SubRange, String> {
+    for (bound, what) in [(&range.lo, "fromKey"), (&range.hi, "toKey")] {
+        let Some((k, inclusive)) = bound else {
+            continue;
+        };
+        let fits = if *inclusive {
+            in_sub_range(vm, cmp, outer, k)?
+        } else {
+            // `inClosedRange`: the outer bounds count as inside.
+            let above = match &outer.lo {
+                Some((lo, _)) => java_compare(vm, cmp, k, lo)? != Ordering::Less,
+                None => true,
+            };
+            above
+                && match &outer.hi {
+                    Some((hi, _)) => java_compare(vm, cmp, hi, k)? != Ordering::Less,
+                    None => true,
+                }
+        };
+        if !fits {
+            return Err(format!(
+                "scalars: java.lang.IllegalArgumentException: {what} out of range"
+            ));
+        }
+    }
+    Ok(SubRange {
+        lo: range.lo.or_else(|| outer.lo.clone()),
+        hi: range.hi.or_else(|| outer.hi.clone()),
     })
 }
 
@@ -25487,10 +26188,7 @@ fn java_navigable_method(
                 None => (recv.clone(), None),
             };
             let range = match outer {
-                Some(o) => SubRange {
-                    lo: range.lo.or(o.lo),
-                    hi: range.hi.or(o.hi),
-                },
+                Some(o) => nested_sub_range(vm, java_comparator(&backing).as_ref(), &o, range)?,
                 None => range,
             };
             let view = java_subview(vm, &backing, range)?;

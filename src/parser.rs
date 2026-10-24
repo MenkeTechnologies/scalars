@@ -20,6 +20,17 @@ pub const NEW_ARRAY: &str = "$new_array";
 /// The desugar target of `new java.util.ArrayList[T](…)` and the other
 /// [`JAVA_UTIL_CLASSES`]: the class's simple name, then the arguments.
 pub const JAVA_NEW: &str = "$java_new";
+/// `Using`'s `preferentiallySuppress(primary, secondary)`: the one of the two
+/// exceptions that wins — `secondary` only when it ranks above `primary`
+/// (`VirtualMachineError` > `LinkageError` > `InterruptedException` > a
+/// non-fatal one > a `ControlThrowable`) — with the
+/// other added to its suppressed list.
+pub const USING_SUPPRESS: &str = "$using_suppress";
+/// A fresh `Using.Manager`: `use(r)`/`use.acquire(r)` register `r`.
+pub const USING_MANAGER: &str = "$using_manager";
+/// Close a `Using.Manager`: no more resources may be registered, and the
+/// answer is a `List` of those registered, the last first.
+pub const USING_RELEASE: &str = "$using_release";
 /// The desugar target of `TreeSet(…)(using ord)`: the collection, then the
 /// ordering it is held under.
 pub const WITH_ORDERING: &str = "$with_ordering";
@@ -4154,13 +4165,18 @@ impl Parser {
                         let binder = format!("_$using{}", self.usings);
                         let f = args.pop().expect("two arguments");
                         let res = args.pop().expect("two arguments");
-                        e = using_expr(res, f, binder, false, line);
+                        e = using_expr(res, f, binder, false, line)?;
+                        continue;
+                    }
+                    ("Manager", 1) => {
+                        self.usings += 1;
+                        let binder = format!("_$using{}", self.usings);
+                        let op = args.pop().expect("one argument");
+                        e = using_manager_expr(op, binder, line)?;
                         continue;
                     }
                     ("Manager", _) => {
-                        return Err(format!(
-                            "scalars: scala.util.Using.Manager is not modelled (line {line})"
-                        ))
+                        return Err(format!("scalars: Using.Manager(op) expected (line {line})"))
                     }
                     _ => {}
                 }
@@ -4265,7 +4281,7 @@ impl Parser {
             };
             self.usings += 1;
             let binder = format!("_$using{}", self.usings);
-            return Ok(using_expr(args.remove(0), f, binder, true, line));
+            return using_expr(args.remove(0), f, binder, true, line);
         }
         if let Some(ctor) = mutable_buffer_ctor(&name) {
             let elems = self.arg_list()?;
@@ -4455,8 +4471,27 @@ impl Parser {
                 parts,
                 exprs,
                 fmts,
+                custom,
             } => {
+                let line = self.line();
                 self.advance();
+                // `id"a${x}b"` is `StringContext("a", "b").id(x)`.
+                if let Some(id) = custom {
+                    let args = exprs
+                        .iter()
+                        .map(|e| parse_fragment(e, &self.enums))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr::Method {
+                        recv: Box::new(Expr::Call {
+                            name: "StringContext".to_string(),
+                            args: parts.into_iter().map(Expr::Str).collect(),
+                            line,
+                        }),
+                        name: id,
+                        args,
+                        line,
+                    });
+                }
                 self.build_interp(raw, is_f, &parts, &exprs, &fmts)
             }
             // `( e )` grouping, `( e: T )` ascription, the unit literal `()`, or a
@@ -6780,39 +6815,96 @@ fn ordered_literal(e: &Expr) -> bool {
     }
 }
 
-/// `scala.util.Using(res)(f)` (`wrap_try`) and `Using.resource(res)(f)`: the
-/// resource bound once, `f` applied to it, and `close()` run however `f` ends —
-/// `{ val r = res; try f(r) finally r.close() }`, inside `Try(…)` for the first
-/// form. A resource expression that throws is never closed, as in Scala.
-fn using_expr(res: Expr, f: Expr, binder: String, wrap_try: bool, line: u32) -> Expr {
-    let stmt = |kind: StmtKind| Stmt { line, kind };
-    let body = Expr::Block(vec![
-        stmt(StmtKind::Local {
-            is_val: true,
-            is_lazy: false,
-            ty: None,
-            name: binder.clone(),
-            init: Some(res),
-        }),
-        stmt(StmtKind::Expr(Expr::Try {
-            body: vec![stmt(StmtKind::Expr(Expr::Method {
-                recv: Box::new(f),
-                name: "apply".to_string(),
-                args: vec![Expr::Var(binder.clone())],
-                line,
-            }))],
-            catches: Vec::new(),
-            finalizer: Some(vec![stmt(StmtKind::Expr(Expr::Method {
-                recv: Box::new(Expr::Var(binder)),
-                name: "close".to_string(),
-                args: Vec::new(),
-                line,
-            }))]),
-        })),
-    ]);
-    if wrap_try {
+/// `scala.util.Using(res)(f)` (`wrap_try`) and `Using.resource(res)(f)`,
+/// written out as the library's `Using.resource` is: the resource bound once
+/// (a `null` one is `NullPointerException: null resource`), `f` applied to it,
+/// and `close()` run however `f` ends. When `f` threw, an exception from
+/// `close()` does not replace it but is SUPPRESSED by it (or suppresses it,
+/// by `Using`'s preference order — see [`USING_SUPPRESS`]); when `f` returned,
+/// one from `close()` is what the call throws. Inside `Try(…)` for the first
+/// form, where a resource expression that throws is a `Failure` with nothing
+/// to close.
+fn using_expr(res: Expr, f: Expr, b: String, wrap_try: bool, line: u32) -> Result<Expr, String> {
+    let mut stmts = vec![
+        binder_stmt(&format!("{b}_r"), res, line),
+        binder_stmt(&format!("{b}_f"), f, line),
+    ];
+    stmts.extend(snippet(
+        &format!(
+            "if ({b}_r == null) throw new NullPointerException(\"null resource\")
+             var {b}_t: Throwable = null
+             val {b}_v = try {b}_f({b}_r) catch {{ case {b}_e: Throwable => {b}_t = {b}_e; null }}
+             if ({b}_t == null) {{ {b}_r.close(); {b}_v }}
+             else {{
+               try {b}_r.close() catch {{ case {b}_o: Throwable => {b}_t = {USING_SUPPRESS}({b}_t, {b}_o) }}
+               throw {b}_t
+             }}"
+        ),
+        line,
+    )?);
+    let body = Expr::Block(stmts);
+    Ok(if wrap_try {
         try_factory(&body, line)
     } else {
         body
+    })
+}
+
+/// `scala.util.Using.Manager(op)`, written out as the library's
+/// `Manager.manage` is, inside `Try(…)`: `op` runs with a fresh manager (see
+/// [`USING_MANAGER`]) that `use(r)` registers resources with; then every
+/// resource is closed, the LAST registered first, each close running however
+/// the others ended. The first exception — `op`'s, or else the first close's —
+/// is what the `Failure` holds, the later ones suppressed into it in
+/// `Using`'s preference order.
+fn using_manager_expr(op: Expr, b: String, line: u32) -> Result<Expr, String> {
+    let mut stmts = vec![binder_stmt(&format!("{b}_op"), op, line)];
+    stmts.extend(snippet(
+        &format!(
+            "val {b}_m = {USING_MANAGER}()
+             var {b}_t: Throwable = null
+             val {b}_v = try {b}_op({b}_m) catch {{ case {b}_e: Throwable => {b}_t = {b}_e; null }}
+             var {b}_rs = {USING_RELEASE}({b}_m)
+             while ({b}_rs.nonEmpty) {{
+               val {b}_x = {b}_rs.head
+               {b}_rs = {b}_rs.tail
+               try {b}_x.close() catch {{
+                 case {b}_o: Throwable =>
+                   {b}_t = if ({b}_t == null) {b}_o else {USING_SUPPRESS}({b}_t, {b}_o)
+               }}
+             }}
+             if ({b}_t != null) throw {b}_t
+             {b}_v"
+        ),
+        line,
+    )?);
+    Ok(try_factory(&Expr::Block(stmts), line))
+}
+
+/// `val name = init`, as a statement.
+fn binder_stmt(name: &str, init: Expr, line: u32) -> Stmt {
+    Stmt {
+        line,
+        kind: StmtKind::Local {
+            is_val: true,
+            is_lazy: false,
+            ty: None,
+            name: name.to_string(),
+            init: Some(init),
+        },
     }
+}
+
+/// The statements of a desugar written as Scala source, every token placed on
+/// `line`. For library code reproduced as the library writes it; `src` must
+/// declare nothing but locals.
+fn snippet(src: &str, line: u32) -> Result<Vec<Stmt>, String> {
+    let mut toks = crate::lexer::lex(&format!("{src}\n}}"))?;
+    for t in &mut toks {
+        t.line = line;
+    }
+    let mut p = Parser::new(toks);
+    let stmts = p.block()?;
+    debug_assert!(p.funcs.is_empty() && p.classes.is_empty() && p.objects.is_empty());
+    Ok(stmts)
 }
