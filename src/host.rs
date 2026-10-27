@@ -9408,7 +9408,7 @@ fn is_own_member(recv: &Value, name: &str) -> bool {
 
 /// Whether `name` is a member of the class a STATIC type `ty` names, for the
 /// types whose everyday methods are mostly implicit enrichments (see
-/// [`is_own_member`]); `None` for any other type.
+/// `is_own_member`); `None` for any other type.
 pub fn own_member_of(ty: &str, name: &str) -> Option<bool> {
     /// `Any`'s members, which every receiver has.
     const ANY: &[&str] = &[
