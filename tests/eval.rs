@@ -6621,7 +6621,10 @@ fn an_option_reaches_collection_members_through_option2iterable() {
         r#"object T { def main(a: Array[String]): Unit = { val o = Some(5); val n: Option[Int] = None; println(o.sum); println(n.sum); println(o.mkString("<", ",", ">")); println(o.max); println(o.zipWithIndex); println(o ++ List(1)); println(o.toSet); println(o.minOption) } }"#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "5\n0\n<5>\n5\nList((5,0))\nList(5, 1)\nSet(5)\nSome(5)\n");
+    assert_eq!(
+        out,
+        "5\n0\n<5>\n5\nList((5,0))\nList(5, 1)\nSet(5)\nSome(5)\n"
+    );
 }
 
 #[test]
@@ -6665,7 +6668,10 @@ fn bulk_assignment_rebinds_an_immutable_var_and_mutates_a_buffer() {
         r#"object T { def main(a: Array[String]): Unit = { var xs = List(1); xs ++= List(2, 3); println(xs); var s = Set(1, 2); s ++= Set(5); s --= Set(1); println(s); var buf = scala.collection.mutable.ListBuffer(1); val alias = buf; buf ++= List(2); println(alias); var acc = List.empty[Int]; (1 to 3).foreach(i => acc ++= List(i)); println(acc); println("ab" ++ "cd"); println("ab" ++ List(1, 2)) } }"#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "List(1, 2, 3)\nSet(2, 5)\nListBuffer(1, 2)\nList(1, 2, 3)\nabcd\nVector(a, b, 1, 2)\n");
+    assert_eq!(
+        out,
+        "List(1, 2, 3)\nSet(2, 5)\nListBuffer(1, 2)\nList(1, 2, 3)\nabcd\nVector(a, b, 1, 2)\n"
+    );
 }
 
 #[test]

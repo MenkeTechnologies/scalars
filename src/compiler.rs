@@ -4569,7 +4569,13 @@ impl Compiler {
     /// is `()`. Which one applies is a property of the value the `var` holds,
     /// so the choice is made at run time by the same [`crate::host::IS_GROWABLE`]
     /// test `+=` takes.
-    fn var_bulk_assign(&mut self, var: &str, op_assign: &str, arg: &Expr, line: u32) -> Result<(), String> {
+    fn var_bulk_assign(
+        &mut self,
+        var: &str,
+        op_assign: &str,
+        arg: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
         let target = Expr::Var(var.to_string());
         self.expr(&target)?;
         self.b.emit(Op::Dup, 0);
@@ -12210,9 +12216,9 @@ impl<'a> BoxScan<'a> {
             }
             // `xs ++= ys` on a `var` may rebind it (see
             // [`Compiler::var_bulk_assign`]), so it is a write like `+=`.
-            Expr::Method { recv, name, args, .. }
-                if matches!(name.as_str(), "++=" | "--=") && matches!(&**recv, Expr::Var(_)) =>
-            {
+            Expr::Method {
+                recv, name, args, ..
+            } if matches!(name.as_str(), "++=" | "--=") && matches!(&**recv, Expr::Var(_)) => {
                 if let Expr::Var(n) = &**recv {
                     self.assigned.insert(n.clone());
                     if in_lambda {

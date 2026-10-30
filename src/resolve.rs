@@ -719,7 +719,9 @@ impl Resolver {
                 }
                 Ok(())
             }
-            Expr::Method { recv, name, args, .. } => {
+            Expr::Method {
+                recv, name, args, ..
+            } => {
                 self.walk_expr(recv)?;
                 for a in args.iter_mut() {
                     self.walk_expr(a)?;
