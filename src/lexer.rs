@@ -128,8 +128,9 @@ pub enum Tok {
     Assign,
     /// `~` — the unary bitwise complement.
     Tilde,
-    /// A symbolic compound assignment that is a method call, not arithmetic:
-    /// `++=` and `--=` on a growable collection.
+    /// A symbolic compound assignment other than the five arithmetic ones:
+    /// `++=` and `--=`, which are a growable collection's methods, and
+    /// `::=`, `:+=`, `|=`, `<<=`, …, which expand to `x = x op e`.
     OpAssign(String),
     PlusAssign,
     MinusAssign,
@@ -641,6 +642,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // The growable-collection bulk operators. Longest match first: `++=`
             // would otherwise lex as `++` then `=`.
             "++=" | "--=" => (Tok::OpAssign(three.to_string()), 3),
+            // The assignment operators of the remaining symbolic operators
+            // (SLS 6.12.4), longest match first so `>>>=` is not `>>>` `=`.
+            _ if four == ":::=" || four == ">>>=" => (Tok::OpAssign(four.to_string()), 4),
+            "::=" | ":+=" | "+:=" | "<<=" | ">>=" | "&~=" => (Tok::OpAssign(three.to_string()), 3),
+            _ if matches!(two, "|=" | "&=" | "^=") => (Tok::OpAssign(two.to_string()), 2),
             // `>>>` — the logical right shift, longest match before `>>`.
             ">>>" => (Tok::Op(three.to_string()), 3),
             // `#::` — `LazyList`'s cons. Matched at three characters, before

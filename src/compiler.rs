@@ -92,6 +92,11 @@ struct Compiler {
     /// rejects it. Reads never needed it: [`Compiler::resolve_place`] already
     /// falls back to `Place::Global`.
     global_binds: HashSet<String>,
+    /// The entry body's top-level bindings a lambda captures BY VALUE (see
+    /// [`entry_value_captures`]): immutable bindings introduced inside a
+    /// nested block, loop or `for` — fresh per evaluation in Scala, one
+    /// global here.
+    entry_value_captures: HashSet<String>,
     /// Every callable name that declares at least one BY-NAME parameter — user
     /// `def`s, class methods and object methods alike.
     ///
@@ -899,6 +904,7 @@ fn compile_inner(prog: &Program, debug: bool) -> Result<Chunk, String> {
             .collect(),
         scope: None,
         global_binds: HashSet::new(),
+        entry_value_captures: entry_value_captures(&prog.main),
         classes: class_meta,
         objects: obj_meta,
         companions,
@@ -2086,14 +2092,20 @@ impl Compiler {
     /// names that are globals/`def`s stay unbound and resolve at call time.
     fn lambda(&mut self, params: &[String], body: &Expr, partial: bool) -> Result<(), String> {
         // Upvalues: free names bound to an enclosing frame slot. At top level
-        // (`scope` is `None`) a lambda captures nothing — its free names are the
+        // (`scope` is `None`) a lambda's free names are mostly the
         // program-global bindings, read live when the closure runs.
+        // The exception is a binding the entry body re-declares on every pass
+        // of a loop (see [`entry_value_captures`]): Scala gives each pass its
+        // own `val`, so the closure keeps the value it saw, not the last one.
         let mut captures: Vec<String> = match self.scope.as_ref() {
             Some(scope) => free_vars(params, body)
                 .into_iter()
                 .filter(|n| scope.slots.contains_key(n))
                 .collect(),
-            None => Vec::new(),
+            None => free_vars(params, body)
+                .into_iter()
+                .filter(|n| self.entry_value_captures.contains(n) && !self.lazies.contains(n))
+                .collect(),
         };
         // A lambda inside a class method that reads a field or calls a sibling
         // method needs the enclosing `this` (slot 0) as an upvalue — as does a
@@ -4551,6 +4563,39 @@ impl Compiler {
         self.emit_place_store((r, &r_name), field, op, value, conv.as_ref(), line)
     }
 
+    /// `xs ++= ys` / `xs --= ys` on a `var`. A growable collection has the
+    /// member and mutates in place, answering itself; anything else has no
+    /// `++=` member, so SLS 6.12.4 expands it to `xs = xs ++ ys`, whose value
+    /// is `()`. Which one applies is a property of the value the `var` holds,
+    /// so the choice is made at run time by the same [`crate::host::IS_GROWABLE`]
+    /// test `+=` takes.
+    fn var_bulk_assign(&mut self, var: &str, op_assign: &str, arg: &Expr, line: u32) -> Result<(), String> {
+        let target = Expr::Var(var.to_string());
+        self.expr(&target)?;
+        self.b.emit(Op::Dup, 0);
+        self.b.emit(Op::CallBuiltin(crate::host::IS_GROWABLE, 1), 0);
+        let to_expand = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.expr(arg)?;
+        let mc = self.b.add_constant(Value::str(op_assign.to_string()));
+        self.b.emit(Op::LoadConst(mc), line);
+        self.b.emit(Op::CallBuiltin(crate::host::SMETHOD, 3), line);
+        let to_end = self.b.emit(Op::Jump(0), 0);
+        let expand = self.b.current_pos();
+        self.b.patch_jump(to_expand, expand);
+        self.b.emit(Op::Pop, 0);
+        let updated = Expr::Method {
+            recv: Box::new(target),
+            name: op_assign.trim_end_matches('=').to_string(),
+            args: vec![arg.clone()],
+            line,
+        };
+        self.name_assign(var, AssignOp::Assign, &updated, line)?;
+        self.emit_unit(line);
+        let end = self.b.current_pos();
+        self.b.patch_jump(to_end, end);
+        Ok(())
+    }
+
     /// The setter method `field_=` when some class declares one: an assignment
     /// `obj.field = v` is then the call `obj.field_=(v)`, as in Scala.
     fn user_setter(&self, field: &str) -> Option<String> {
@@ -5725,6 +5770,13 @@ impl Compiler {
     fn method(&mut self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
         if let Some(e) = self.sorted_view_rejection(recv, name, args.len(), line) {
             return Err(e);
+        }
+        if let (Expr::Var(v), "++=" | "--=", [arg]) = (recv, name, args) {
+            let bound = self.scope.as_ref().is_some_and(|s| s.slots.contains_key(v))
+                || self.global_binds.contains(v);
+            if bound && self.vals.get(v) != Some(&true) {
+                return self.var_bulk_assign(v, name, arg, line);
+            }
         }
         // `StringContext(…).f(args…)` — the `f` interpolator, which Scala
         // expands at compile time and so only on a literal `StringContext`.
@@ -12156,6 +12208,22 @@ impl<'a> BoxScan<'a> {
                 self.expr(target, in_lambda);
                 self.expr(value, in_lambda);
             }
+            // `xs ++= ys` on a `var` may rebind it (see
+            // [`Compiler::var_bulk_assign`]), so it is a write like `+=`.
+            Expr::Method { recv, name, args, .. }
+                if matches!(name.as_str(), "++=" | "--=") && matches!(&**recv, Expr::Var(_)) =>
+            {
+                if let Expr::Var(n) = &**recv {
+                    self.assigned.insert(n.clone());
+                    if in_lambda {
+                        self.assigned_in_lambda.insert(n.clone());
+                    }
+                }
+                self.expr(recv, in_lambda);
+                for a in args {
+                    self.expr(a, in_lambda);
+                }
+            }
             // A lambda's own parameters SHADOW the frame's bindings of the same
             // name: `(i: Int) => -i` reads its parameter, not a `var i` of the
             // enclosing frame, so its uses are not captures of that `var`.
@@ -12580,6 +12648,109 @@ fn fv_pattern(
         }
         _ => {}
     }
+}
+
+/// The entry-body names a top-level lambda must capture BY VALUE.
+///
+/// The entry body compiles flat: every binding in it, however deeply nested,
+/// is one program global, and a top-level lambda reads its free names live
+/// when it runs. That is right for the body's own fields, and wrong for a
+/// binding a block, loop or `for` introduces — Scala makes a fresh `val` per
+/// evaluation, so `for (i <- 1 to 3) fs ::= (() => i)` keeps `3, 2, 1` where a
+/// live read answers the loop variable's final value for every closure.
+///
+/// The names returned are those bound only immutably (a non-lazy `val`, a
+/// pattern `val`, a `for` generator or value definition, a `match`/`catch`
+/// pattern) and only below the body's own statement list. A name the body also
+/// binds at its top level, as a `var` or as a `lazy val`, keeps the live read:
+/// a field may be read before its initializer runs, and a `var` is shared.
+fn entry_value_captures(main: &[Stmt]) -> HashSet<String> {
+    #[derive(Default)]
+    struct Seen {
+        nested: HashSet<String>,
+        live: HashSet<String>,
+    }
+    fn note_pattern(p: &Pattern, seen: &mut Seen) {
+        pattern_binds(p, &mut seen.nested);
+    }
+    // Statement-level bindings only; every expression below is reached by the
+    // `expr_any` walk in the caller, which hands each nested block back here.
+    fn note_stmts(stmts: &[Stmt], nested: bool, seen: &mut Seen) {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Local {
+                    is_val,
+                    is_lazy,
+                    name,
+                    ..
+                } => {
+                    if nested && *is_val && !*is_lazy {
+                        seen.nested.insert(name.clone());
+                    } else {
+                        seen.live.insert(name.clone());
+                    }
+                }
+                StmtKind::Destructure { pat, .. } => {
+                    if nested {
+                        note_pattern(pat, seen);
+                    } else {
+                        pattern_binds(pat, &mut seen.live);
+                    }
+                }
+                StmtKind::If { then, els, .. } => {
+                    note_stmts(then, true, seen);
+                    note_stmts(els, true, seen);
+                }
+                StmtKind::While { body, .. } => note_stmts(body, true, seen),
+                _ => {}
+            }
+        }
+    }
+    let seen = std::cell::RefCell::new(Seen::default());
+    note_stmts(main, false, &mut seen.borrow_mut());
+    body_any(main, &|e| {
+        let mut seen = seen.borrow_mut();
+        match e {
+            Expr::Block(stmts) => note_stmts(stmts, true, &mut seen),
+            Expr::Match { arms, .. } => {
+                for a in arms {
+                    note_pattern(&a.pat, &mut seen);
+                    note_stmts(&a.body, true, &mut seen);
+                }
+            }
+            Expr::Try {
+                body,
+                catches,
+                finalizer,
+            } => {
+                note_stmts(body, true, &mut seen);
+                for a in catches {
+                    note_pattern(&a.pat, &mut seen);
+                    note_stmts(&a.body, true, &mut seen);
+                }
+                if let Some(f) = finalizer {
+                    note_stmts(f, true, &mut seen);
+                }
+            }
+            Expr::ForYield { enums, .. } | Expr::ForEach { enums, .. } => {
+                for en in enums {
+                    match en {
+                        ForEnum::Gen { name, .. } | ForEnum::Val { name, .. } => {
+                            seen.nested.insert(name.clone());
+                        }
+                        ForEnum::GenColl { pat, .. } | ForEnum::ValPat { pat, .. } => {
+                            note_pattern(pat, &mut seen)
+                        }
+                        ForEnum::Guard(_) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    });
+    let seen = seen.into_inner();
+    seen.nested.difference(&seen.live).cloned().collect()
 }
 
 /// Add the names a pattern binds to `bound` (recursing into constructor

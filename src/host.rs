@@ -6529,8 +6529,8 @@ fn obj_to_string(v: &Value) -> String {
                 if let Some((_, state)) = o.fields.iter().find(|(f, _)| &**f == THROWABLE_FIELD) {
                     if let Some(parts) = as_seq_or_tuple(state) {
                         return match parts.first() {
-                            Some(Value::Undef) | None => o.class.to_string(),
-                            Some(m) => format!("{}: {}", o.class, scala_str(m)),
+                            Some(Value::Undef) | None => jvm_qualified(&o.class),
+                            Some(m) => format!("{}: {}", jvm_qualified(&o.class), scala_str(m)),
                         };
                     }
                 }
@@ -7267,6 +7267,17 @@ fn obj_eq(a: &Value, b: &Value) -> bool {
                             .iter()
                             .zip(&ob.fields[..n])
                             .all(|((_, x), (_, y))| value_eq(x, y))
+                }
+                // An `Array` is a JVM array and an `Iterator` a cursor: neither
+                // overrides `equals`, so two of them are equal only when they
+                // are the same object (already answered above) —
+                // `Array(1) == Array(1)` is `false`, as is `Array(1).equals(List(1))`.
+                (HeapVal::Seq(ka, _), HeapVal::Seq(kb, _))
+                    if [ka, kb]
+                        .iter()
+                        .any(|k| matches!(k, SeqKind::Array | SeqKind::Iterator)) =>
+                {
+                    false
                 }
                 // A `Set` is UNORDERED, so `Set.equals` is "same size and every
                 // element of mine is in yours" — `Set(1, 2) == Set(2, 1)`. The
@@ -9592,6 +9603,23 @@ fn method_call_inner(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value
         return h.map(Value::int).unwrap_or_else(|e| fault(vm, e));
     }
 
+    // `IterableOnceOps.addString(b[, sep] | b, start, sep, end)`: `mkString`
+    // is defined as `addString(new StringBuilder, …).result()`, so the text
+    // appended is exactly what `mkString` answers for the remaining
+    // arguments, and the builder itself is the result.
+    if name == "addString"
+        && matches!(args.len(), 1 | 2 | 4)
+        && matches!(seq_kind(&args[0]), Some(SeqKind::StrBuf))
+    {
+        let builder = args[0].clone();
+        let text = method_call(vm, recv, "mkString".to_string(), args[1..].to_vec());
+        if unwinding() {
+            return Value::Undef;
+        }
+        method_call(vm, builder.clone(), "append".to_string(), vec![text]);
+        return builder;
+    }
+
     // A by-name argument runs only when the method needs it: the default of
     // a `getOrElse` whose receiver has a value is never evaluated. Every other
     // method receives it evaluated, as a by-value argument.
@@ -9689,11 +9717,18 @@ fn method_call_inner(vm: &mut VM, recv: Value, name: String, mut args: Vec<Value
     // unrecognized name falls through to the record dispatcher below, which
     // still answers `Some(x).value`, `hashCode`, `equals`, ….
     if let Some(inner) = as_option(&recv) {
-        if let Some(r) = option_method(vm, inner, &name, &args) {
+        if let Some(r) = option_method(vm, inner.clone(), &name, &args) {
             return match r {
                 Ok(v) => v,
                 Err(e) => fault(vm, e),
             };
+        }
+        // A collection member `Option` does not declare itself reaches it
+        // through `Predef.option2Iterable`, which is `xo.toList`: `Some(5).sum`
+        // is `List(5).sum` and `o ++ xs` a `List`.
+        if !OPTION_MEMBERS.contains(&name.as_str()) && ITERABLE_MEMBERS.contains(&name.as_str()) {
+            let list = new_list(inner.into_iter().collect());
+            return method_call(vm, list, name, args);
         }
     }
 
@@ -16357,12 +16392,26 @@ fn string_method(s: &str, name: &str, args: &[Value]) -> Result<Value, String> {
                 format!("{c}{s}")
             }));
         }
-        ("appendedAll" | "prependedAll", [Value::Str(t)]) => {
-            return Ok(Value::str(if name == "appendedAll" {
+        ("appendedAll" | "prependedAll" | "++" | "++:", [Value::Str(t)]) => {
+            return Ok(Value::str(if matches!(name, "appendedAll" | "++") {
                 format!("{s}{t}")
             } else {
                 format!("{t}{s}")
             }));
+        }
+        // `StringOps.++` with any other collection: a collection of `Char`s
+        // is the `IterableOnce[Char]` overload and answers a `String`; any
+        // other element type widens to the `IndexedSeq` overload.
+        ("appendedAll" | "++", [other]) => {
+            if let Some(items) = as_iterable_once(other) {
+                if items.iter().all(|x| as_char(x).is_some()) {
+                    let tail: String = items.iter().filter_map(as_char).collect();
+                    return Ok(Value::str(format!("{s}{tail}")));
+                }
+                let mut all: Vec<Value> = s.chars().map(make_char).collect();
+                all.extend(items);
+                return Ok(new_seq(SeqKind::Vector, all));
+            }
         }
         // `lift(i)` — the character at `i` as an `Option`, `None` out of range.
         ("lift", [i]) => {
@@ -18579,7 +18628,7 @@ fn obj_to_string_vm(vm: &mut VM, v: &Value) -> String {
             Some(Err(_)) => return obj_to_string(v),
             None => stored,
         };
-        let class = with_obj(v, |o| o.class.to_string()).unwrap_or_default();
+        let class = with_obj(v, |o| jvm_qualified(&o.class)).unwrap_or_default();
         return match msg {
             Value::Undef => class,
             m => format!("{class}: {}", scala_str(&m)),

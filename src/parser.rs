@@ -2273,6 +2273,22 @@ impl Parser {
     /// through a lambda) fails the guard and keeps unwinding. Because `Break`
     /// is a `RuntimeException`, an intervening `catch { case e: Exception }`
     /// catches it, and a `finally` on the way out runs — both as in Scala.
+    /// How many tokens of a qualified `scala.util.` / `util.` prefix stand
+    /// before a `boundary` identifier at the cursor — 4 for
+    /// `scala . util . boundary`, 2 for `util . boundary` — or `None` when the
+    /// cursor does not start such a path.
+    fn qualified_boundary_prefix(&self) -> Option<usize> {
+        let ident = |n: usize, w: &str| matches!(self.peek_at(n), Tok::Ident(s) if s == w);
+        let dot = |n: usize| matches!(self.peek_at(n), Tok::Dot);
+        if ident(0, "scala") && dot(1) && ident(2, "util") && dot(3) && ident(4, "boundary") {
+            return Some(4);
+        }
+        if ident(0, "util") && dot(1) && ident(2, "boundary") {
+            return Some(2);
+        }
+        None
+    }
+
     fn boundary_block(&mut self) -> Result<Expr, String> {
         self.advance(); // boundary
         self.advance(); // {
@@ -3211,6 +3227,9 @@ impl Parser {
                 self.advance(); // name
                 self.advance(); // op
                 let value = self.expression()?;
+                if let Some(sym) = expanding_op_assign(&op) {
+                    return op_assign_stmt(Expr::Var(name), sym, value, line);
+                }
                 return Ok(StmtKind::Expr(Expr::Method {
                     recv: Box::new(Expr::Var(name)),
                     name: op,
@@ -3709,6 +3728,10 @@ impl Parser {
             let line = self.line();
             self.advance();
             let value = self.expression()?;
+            if let Some(sym) = expanding_op_assign(&name) {
+                let kind = op_assign_stmt(e, sym, value, line)?;
+                return Ok(Expr::Block(vec![Stmt { line, kind }]));
+            }
             return Ok(Expr::Method {
                 recv: Box::new(e),
                 name,
@@ -4776,6 +4799,27 @@ impl Parser {
                 // still lets it through.
                 // `scala.util.boundary`: `boundary { … }` with `break(v)` (or
                 // `boundary.break(v)`) inside it. See [`Self::boundary_block`].
+                // The spelled-out path names the same object whatever is
+                // imported: `scala.util.boundary { … }` and
+                // `scala.util.boundary.break(v)` (or `util.…`, `scala._` being
+                // in scope). The prefix is consumed only when what follows it
+                // is one of the two shapes below.
+                if let Some(skip) = self.qualified_boundary_prefix() {
+                    let opens = matches!(self.peek_at(skip + 1), Tok::LBrace);
+                    let breaks = matches!(self.peek_at(skip + 1), Tok::Dot)
+                        && matches!(self.peek_at(skip + 2), Tok::Ident(w) if w == "break");
+                    if opens || breaks {
+                        for _ in 0..skip {
+                            self.advance();
+                        }
+                        if opens {
+                            return self.boundary_block();
+                        }
+                        self.advance(); // boundary
+                        self.advance(); // .
+                        return self.boundary_break();
+                    }
+                }
                 if name == "boundary" && self.boundary_imported() {
                     if matches!(next, Some(Tok::LBrace)) {
                         return self.boundary_block();
@@ -6322,6 +6366,52 @@ fn type_tok_text(t: &Tok) -> String {
 /// compiler's member lookup is what rejects a non-field.
 fn selection_target(e: &Expr) -> bool {
     matches!(e, Expr::Method { args, .. } if args.is_empty())
+}
+
+/// The operator `op=` stands for when it EXPANDS to `x = x op e` rather than
+/// calling a member: every [`Tok::OpAssign`] except `++=`/`--=`, which are
+/// a growable collection's own methods and lower as calls.
+fn expanding_op_assign(op_assign: &str) -> Option<&str> {
+    match op_assign {
+        "++=" | "--=" => None,
+        _ => op_assign.strip_suffix('='),
+    }
+}
+
+/// `target op= value` for an operator no standard receiver defines an `op=`
+/// member for, which SLS 6.12.4 reads as `target = target.op(value)` — the
+/// operator applied as a METHOD of the target even when it ends in `:`, so
+/// `xs ::= 0` is `xs = xs.::(0)`, i.e. `0 :: xs`, and `xs +:= 0` is `0 +: xs`.
+fn op_assign_stmt(target: Expr, sym: &str, value: Expr, line: u32) -> Result<StmtKind, String> {
+    let updated = if sym == "::" {
+        Expr::Binary {
+            op: BinOp::Cons,
+            lhs: Box::new(value),
+            rhs: Box::new(target.clone()),
+        }
+    } else {
+        Expr::Method {
+            recv: Box::new(target.clone()),
+            name: sym.to_string(),
+            args: vec![value],
+            line,
+        }
+    };
+    match target {
+        Expr::Var(name) => Ok(StmtKind::Assign {
+            name,
+            op: AssignOp::Assign,
+            value: updated,
+        }),
+        place if selection_target(&place) => Ok(StmtKind::PlaceAssign {
+            place,
+            op: AssignOp::Assign,
+            value: updated,
+        }),
+        _ => Err(format!(
+            "scalars: `{sym}=` needs a variable or field on the left (line {line})"
+        )),
+    }
 }
 
 fn assign_op(t: &Tok) -> Option<AssignOp> {

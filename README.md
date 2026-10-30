@@ -344,6 +344,11 @@ Implemented and checked against the reference `scala`:
   EXPRESSION, as in Scala — `println(buf += 1)` prints the buffer (the `op=`
   member answers its receiver), `println(n += 1)` prints `()` (the
   `n = n + 1` expansion is an assignment), and `(buf += 2) += 3` chains.
+  The other symbolic operators' assignment forms — `::=`, `:::=`, `:+=`,
+  `+:=`, `|=`, `&=`, `^=`, `&~=`, `<<=`, `>>=`, `>>>=` — expand to
+  `x = x.op(e)` on a `var` or a `var` field (so `xs ::= 0` prepends), and
+  `xs ++= ys` / `xs --= ys` on a `var` call the member when the value is a
+  growable collection and otherwise rebind it to `xs ++ ys`.
 - **User-defined methods** — helper `def f(a: T, b: U): R = body` alongside
   `main` (or in an `App` body) compile to fusevm's native `Op::Call` frames:
   parameters bind to per-call frame slots, so recursion and mutual recursion are
@@ -374,7 +379,8 @@ Implemented and checked against the reference `scala`:
   out of that frame.
 - **`boundary` / `break(v)`** — Scala 3's `scala.util.boundary`, with `break`
   imported (`import scala.util.boundary, boundary.break`) or written
-  `boundary.break(v)`. Lowered as the library implements it: `break(v)` throws
+  `boundary.break(v)`; the qualified `scala.util.boundary` / `util.boundary`
+  spellings need no import. Lowered as the library implements it: `break(v)` throws
   a `boundary.Break` carrying its block's label and `v`, and the lexically
   innermost `boundary` catches its own label and answers `v`. `Break` is a
   `RuntimeException`, so a `catch { case e: Exception }` between the two DOES
@@ -400,6 +406,8 @@ Implemented and checked against the reference `scala`:
   throws `ArithmeticException`, floating `/ 0.0` is `Infinity`); `if`/`else` in
   value position (`val r = if (c) a else b`, including block branches). Every
   operator is a method, so the dotted spelling works too (`n.+(1)`, `"a".*(3)`).
+  `String ++` concatenates another `String` or a collection of `Char`s and
+  widens to a `Vector` for any other element type.
 - **Exceptions** — `try { … } catch { case e: T [if guard] => … } finally { … }`
   and `throw e`, both value-producing expressions. Handler arms match the JVM
   throwable hierarchy (`case e: Exception` catches an
@@ -415,7 +423,8 @@ Implemented and checked against the reference `scala`:
   extending one (`class E(m: String) extends Exception(m)`, or a `case class`)
   IS a throwable: it keeps the message and cause it passed up, answers
   `getMessage`/`getCause`, is caught by every JDK supertype, and renders as
-  `Throwable.toString` does. A handler arm may also be an extractor pattern —
+  `Throwable.toString` does, under its JVM class name — `T$E: m` for a class
+  declared inside `object T`. A handler arm may also be an extractor pattern —
   `case NonFatal(e)`, `case Code(n)` — and an arm whose pattern or guard
   rejects the exception leaves it in flight for the next one.
 - **Ranges** — `a to b`, `a until b`, `… by s` as first-class values with
@@ -502,6 +511,9 @@ Implemented and checked against the reference `scala`:
   the declaring frame — and the closure may outlive that frame
   (`def mk() = { var i = 0; () => { i += 1; i } }`). Only the vars a closure
   actually writes are boxed, so every other local keeps its plain frame slot.
+  A loop in the entry body binds a fresh `val` per pass, as Scala does, so
+  `for (i <- 1 to 3) fs ::= (() => i)` keeps `3, 2, 1` rather than three
+  copies of the final value.
   Modeled as a host-heap closure re-entering the VM to run its body — no fusevm
   changes.
 - **Collections** — the immutable `List`/`Seq`/`Vector`/`Set`/`Map` family, plus
@@ -528,7 +540,8 @@ Implemented and checked against the reference `scala`:
   `lift`/`isDefinedAt`, the `Option`-valued `minOption`/`maxOption`/
   `minByOption`/`maxByOption`, `sizeCompare`/`lengthCompare`, `sizeIs`/`lengthIs`
   (the size stands in for `SizeCompareOps`), an instance's `empty`, `tapEach`,
-  `mkString`, the `to*` conversions, the set
+  `mkString` and `addString(b, …)` (which appends that text to the builder and
+  answers it), the `to*` conversions, the set
   algebra (`union`/`intersect`/`diff`/`subsetOf`, `+`/`-`/`++`/`:+`/`+:`; on a
   sequence or `String`, `diff`/`intersect` are multiset operations), `:::`
   and `++:`, and
@@ -543,7 +556,11 @@ Implemented and checked against the reference `scala`:
   `Vector.tabulate(n)(f)`, `List.iterate(start, n)(f)`, `List.range(a, b[, step])`,
   `List.concat(…)`,
   `List.from(xs)` and the `Range` companion (`Range(a, b[, step])`,
-  `Range.inclusive(…)`). `toString` is
+  `Range.inclusive(…)`). An `Option` reaches every collection member it does
+  not declare through `option2Iterable` (`Some(5).sum`, `opt ++ xs`). An
+  `Array` or `Iterator` does not override `equals`, so `==` between two of them
+  is identity (`Array(1) == Array(1)` is `false`; `sameElements` compares
+  elements). `toString` is
   byte-faithful, which for `Set`/`Map` means reproducing Scala's representation
   split: up to four entries the insertion-ordered `Set(…)`/`Map(…)`, beyond that
   a CHAMP `HashSet(…)`/`HashMap(…)` in trie order (the JVM hash codes, the

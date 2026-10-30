@@ -6579,3 +6579,102 @@ fn a_java_sorted_view_has_no_navigable_members() {
     assert!(ok, "{out}");
     assert_eq!(out, "[1, 2, 3]\n5\n");
 }
+
+#[test]
+fn a_user_throwable_in_an_object_renders_its_binary_class_name() {
+    // A throwable class declared inside `object T` is the JVM class `T$MyEx`, and `Throwable.toString` names it so, with or without a message.
+    // Expected output captured from Scala 3.10.0 (JVM 27, en_US).
+    let (out, ok) = run(
+        r#"object T { class MyEx(m: String) extends Exception(m); class Quiet extends RuntimeException; def main(a: Array[String]): Unit = { try throw new MyEx("boom") catch { case e: Exception => println(e) }; println(new Quiet); println(List(new MyEx("x"))) } }"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "T$MyEx: boom\nT$Quiet\nList(T$MyEx: x)\n");
+}
+
+#[test]
+fn a_qualified_boundary_is_the_boundary_whatever_is_imported() {
+    // `scala.util.boundary { … }` and `scala.util.boundary.break(v)` (or `util.…`) need no import.
+    // Expected output captured from Scala 3.10.0 (JVM 27, en_US).
+    let (out, ok) = run(
+        r#"object T { def main(a: Array[String]): Unit = { println(scala.util.boundary { for (i <- 1 to 10) if (i > 3) scala.util.boundary.break(i); 0 }); println(util.boundary { util.boundary.break(7); 5 }); println(scala.util.boundary { 5 }) } }"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n7\n5\n");
+}
+
+#[test]
+fn add_string_appends_the_mk_string_text_and_answers_the_builder() {
+    // `addString(b, …)` appends what `mkString(…)` answers to `b` and returns `b`, for a sequence, a map, an iterator and a range.
+    // Expected output captured from Scala 3.10.0 (JVM 27, en_US).
+    let (out, ok) = run(
+        r#"object T { def main(a: Array[String]): Unit = { val sb = new StringBuilder("x:"); println(List(1, 2, 3).addString(sb, "-")); println(sb.length); println(Map(1 -> "a", 2 -> "b").addString(new StringBuilder, "[", "; ", "]")); println(Iterator(7, 8).addString(new StringBuilder, "+")); println((1 to 4).addString(new StringBuilder, "", "", "!").reverse) } }"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "x:1-2-3\n7\n[1 -> a; 2 -> b]\n7+8\n!4321\n");
+}
+
+#[test]
+fn an_option_reaches_collection_members_through_option2iterable() {
+    // A collection member `Option` lacks is `option2Iterable`'s, i.e. the `List` of zero or one element.
+    // Expected output captured from Scala 3.10.0 (JVM 27, en_US).
+    let (out, ok) = run(
+        r#"object T { def main(a: Array[String]): Unit = { val o = Some(5); val n: Option[Int] = None; println(o.sum); println(n.sum); println(o.mkString("<", ",", ">")); println(o.max); println(o.zipWithIndex); println(o ++ List(1)); println(o.toSet); println(o.minOption) } }"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n0\n<5>\n5\nList((5,0))\nList(5, 1)\nSet(5)\nSome(5)\n");
+}
+
+#[test]
+fn arrays_and_iterators_compare_by_identity() {
+    // `Array` and `Iterator` do not override `equals`: `==` is identity, while `sameElements` and `toSeq` compare elements.
+    // Expected output captured from Scala 3.10.0 (JVM 27, en_US).
+    let (out, ok) = run(
+        r#"object T { def main(a: Array[String]): Unit = { val x = Array(1, 2); val y = x; println(x == y); println(x == Array(1, 2)); println(x.equals(Array(1, 2))); println(x sameElements Array(1, 2)); println(List(Array(1)).contains(Array(1))); println(Iterator(1) == Iterator(1)); println(x.toSeq == Seq(1, 2)) } }"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\nfalse\nfalse\ntrue\nfalse\nfalse\ntrue\n");
+}
+
+#[test]
+fn a_top_level_closure_keeps_a_loop_bindings_value() {
+    // Each pass of a loop in the entry body binds a fresh `val`; a closure keeps the value of its own pass, while a top-level `var` is still read live.
+    // Expected output captured from Scala 3.10.0 (JVM 27, en_US).
+    let (out, ok) = run(
+        r#"object T { def main(a: Array[String]): Unit = { var fs = List.empty[() => Int]; for (i <- 1 to 3) fs = (() => i) :: fs; println(fs.map(_())); val b = scala.collection.mutable.ListBuffer[() => Int](); var k = 0; while (k < 3) { k += 1; val j = k * 10; b += (() => j) }; println(b.map(_())); var c = 0; val f = () => c; c = 5; println(f()) } }"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "List(3, 2, 1)\nListBuffer(10, 20, 30)\n5\n");
+}
+
+#[test]
+fn symbolic_assignment_operators_expand_to_the_operator() {
+    // `x op= e` for `::`, `:+`, `+:`, `|`, `<<`, `>>>`, `&`, `&~` is `x = x.op(e)`, on a local and on a field.
+    // Expected output captured from Scala 3.10.0 (JVM 27, en_US).
+    let (out, ok) = run(
+        r#"object T { class Box { var items: List[Int] = Nil; var flags = 0 }; def main(a: Array[String]): Unit = { var xs = List(1); xs ::= 0; xs :+= 2; xs +:= -1; println(xs); var n = 6; n |= 1; n <<= 3; println(n); var m = -64; m >>>= 28; println(m); var s = Set(1, 2, 3); s &= Set(2, 3, 4); s &~= Set(2); println(s); val b = new Box; b.items ::= 5; b.flags |= 4; println(b.items); println(b.flags) } }"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "List(-1, 0, 1, 2)\n56\n15\nSet(3)\nList(5)\n4\n");
+}
+
+#[test]
+fn bulk_assignment_rebinds_an_immutable_var_and_mutates_a_buffer() {
+    // `xs ++= ys` on a `var` holding an immutable collection is `xs = xs ++ ys`; on a buffer it is the in-place member; `String ++` concatenates.
+    // Expected output captured from Scala 3.10.0 (JVM 27, en_US).
+    let (out, ok) = run(
+        r#"object T { def main(a: Array[String]): Unit = { var xs = List(1); xs ++= List(2, 3); println(xs); var s = Set(1, 2); s ++= Set(5); s --= Set(1); println(s); var buf = scala.collection.mutable.ListBuffer(1); val alias = buf; buf ++= List(2); println(alias); var acc = List.empty[Int]; (1 to 3).foreach(i => acc ++= List(i)); println(acc); println("ab" ++ "cd"); println("ab" ++ List(1, 2)) } }"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "List(1, 2, 3)\nSet(2, 5)\nListBuffer(1, 2)\nList(1, 2, 3)\nabcd\nVector(a, b, 1, 2)\n");
+}
+
+#[test]
+fn a_local_def_rebinding_a_captured_var_with_bulk_assignment_writes_it_back() {
+    // A local `def` doing `xs ++= ys` on an enclosing `var` rebinds that `var`, while a `val` buffer is appended in place.
+    // Expected output captured from Scala 3.10.0 (JVM 27, en_US).
+    let (out, ok) = run(
+        r#"object T { def outer() = { var xs = List(1); def add(): Unit = { xs ++= List(2) }; add(); add(); xs }; def keep() = { val b = scala.collection.mutable.ListBuffer(1); def add(): Unit = { b ++= List(2) }; add(); b }; def main(a: Array[String]): Unit = { println(outer()); println(keep()) } }"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "List(1, 2, 2)\nListBuffer(1, 2)\n");
+}

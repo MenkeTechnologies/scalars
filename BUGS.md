@@ -1236,6 +1236,11 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Not implemented (parse errors / unresolved today)
 
+- **An empty argument list applied to a parameterless member's result.**
+  `fs.head()` on a `List[() => Int]` is `fs.head.apply()` in Scala, because
+  `head` declares no parameter list; here the parser does not record whether a
+  selection was written with `()`, so `fs.head()` is the selection itself and
+  prints `<function0>`. `fs.head.apply()` and `(fs.head)()` work.
 - **`Enumeration` beyond `Value`.** `object Color extends Enumeration { val Red,
   Green = Value }`, `Value("n")`, `Value(id)`, `Value(id, "n")`, `values`,
   `withName`, `apply(id)`, `maxId`, `id`, `compare` and the orderings are
@@ -1789,6 +1794,14 @@ reported as parse/compile errors, never silently mis-run.
 
 ## Modeled with a documented simplification
 
+- **A `var` declared inside a loop of the entry body is one binding.** The
+  entry body compiles flat, so each of its bindings is one global. A `val`, a
+  pattern binder and a `for` variable bound below its top-level statement list
+  are captured BY VALUE by a lambda, which is indistinguishable from Scala's
+  fresh binding per pass. A `var` declared in a loop body is not: a closure
+  built in one pass and read after a later pass sees the later value, where
+  Scala gives each pass its own `var`. Inside a `def` every binding is a frame
+  slot and both are per pass.
 - **`inline if` / `inline x match` choose their branch at run time.** The
   reference reduces them at compile time, a type pattern against the
   scrutinee's STATIC type. They agree whenever the condition is a constant or

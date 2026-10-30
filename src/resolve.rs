@@ -719,10 +719,20 @@ impl Resolver {
                 }
                 Ok(())
             }
-            Expr::Method { recv, args, .. } => {
+            Expr::Method { recv, name, args, .. } => {
                 self.walk_expr(recv)?;
                 for a in args.iter_mut() {
                     self.walk_expr(a)?;
+                }
+                // `xs ++= ys` on a `var` may rebind it to `xs ++ ys` (see
+                // `Compiler::var_bulk_assign`), so a lifted `def` doing it
+                // writes the captured binding, exactly as `xs += y` does.
+                if let (Expr::Var(n), "++=" | "--=") = (&**recv, name.as_str()) {
+                    if !self.immutable.contains(n) {
+                        if let Some(&l) = self.lift_stack.last() {
+                            self.lifted[l].assigns.insert(n.clone());
+                        }
+                    }
                 }
                 Ok(())
             }
