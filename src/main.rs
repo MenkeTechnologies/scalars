@@ -72,9 +72,12 @@ fn main() -> ExitCode {
     let argv = cli.argv;
     let run = std::thread::Builder::new()
         .stack_size(RUN_STACK)
-        .spawn(move || scalars::run_str_with_args(&src, argv).map(|_| ()));
+        // The `sys.exit` status is per thread, so it is read on the program's.
+        .spawn(move || scalars::run_str_with_args(&src, argv).map(|_| scalars::host::exit_code()));
     match run.map(|h| h.join()) {
-        Ok(Ok(Ok(()))) => ExitCode::SUCCESS,
+        // `sys.exit(n)` reports `n` modulo 256, as a Unix process does.
+        Ok(Ok(Ok(Some(code)))) => ExitCode::from(code as u8),
+        Ok(Ok(Ok(None))) => ExitCode::SUCCESS,
         Ok(Ok(Err(e))) => fail(&e),
         Ok(Err(_)) => ExitCode::FAILURE,
         Err(e) => fail(&format!("cannot start the program thread: {e}")),

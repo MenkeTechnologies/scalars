@@ -3858,6 +3858,7 @@ impl Compiler {
                 ["mutable"] | ["collection", "mutable"] | ["scala", "collection", "mutable"] => {
                     MUTABLE_MEMBERS.contains(&name)
                 }
+                ["io", "StdIn"] | ["scala", "io", "StdIn"] => STDIN_MEMBERS.contains(&name),
                 // `import Color._` — a program's own object: its members, and
                 // the types declared inside it, are bare names.
                 [obj] => self
@@ -3873,6 +3874,94 @@ impl Compiler {
             full.push(name.to_string());
             Some(full)
         })
+    }
+
+    /// Whether `recv` names the standard-library object `bare`: in full
+    /// (`full`, e.g. `scala.Console`) or by its bare name when the program
+    /// declares nothing of that name.
+    fn is_library_object(&self, recv: &Expr, bare: &str, full: &[&str]) -> bool {
+        match recv {
+            Expr::Var(n) => n == bare && self.is_library_name(n) && !self.vals.contains_key(n),
+            _ => is_package_path(recv, full),
+        }
+    }
+
+    /// Whether `recv` is `scala.io.StdIn`: in full, as `io.StdIn`, or as a
+    /// bare `StdIn` an import brought into scope.
+    fn is_stdin(&self, recv: &Expr) -> bool {
+        let imported = self
+            .imports
+            .get("StdIn")
+            .is_some_and(|p| p.join(".") == "scala.io.StdIn")
+            || self.wildcards.iter().any(|w| w.join(".") == "scala.io");
+        is_package_path(recv, &["io", "StdIn"])
+            || (self.is_library_object(recv, "StdIn", &["scala", "io", "StdIn"])
+                && (imported || !matches!(recv, Expr::Var(_))))
+    }
+
+    /// Whether `recv` owns an `exit(status)`: `sys` or `System`.
+    fn is_exit_owner(&self, recv: &Expr) -> bool {
+        self.is_library_object(recv, "sys", &["scala", "sys"])
+            || self.is_library_object(recv, "System", &["java", "lang", "System"])
+    }
+
+    /// `Console.println(x)`, `System.out.print(x)`, `Console.out.printf(fmt, …)`
+    /// write to the same stream as Predef's `println`/`print`/`printf` (which
+    /// are defined as `Console`'s), so they lower to the same node. `None` for
+    /// any other call.
+    fn console_print(&self, recv: &Expr, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+        let console = |e: &Expr| self.is_library_object(e, "Console", &["scala", "Console"]);
+        let stream = console(recv)
+            || matches!(recv, Expr::Method { recv: owner, name: out, args: a, .. }
+                if out == "out"
+                    && a.is_empty()
+                    && (console(owner)
+                        || self.is_library_object(owner, "System", &["java", "lang", "System"])));
+        if !stream {
+            return None;
+        }
+        match (name, args) {
+            ("println", []) | ("println" | "print", [_]) => Some(Expr::Println {
+                newline: name == "println",
+                arg: args.first().cloned().map(Box::new),
+            }),
+            ("printf", [fmt, rest @ ..]) => Some(Expr::Println {
+                newline: false,
+                arg: Some(Box::new(Expr::Method {
+                    recv: Box::new(fmt.clone()),
+                    name: "format".to_string(),
+                    args: rest.to_vec(),
+                    line,
+                })),
+            }),
+            _ => None,
+        }
+    }
+
+    /// A `scala.io.StdIn` read (see [`crate::host::STDIN_READ`]).
+    /// `readLine(text, args…)` first prints `text.format(args…)`, as `StdIn`'s
+    /// prompting overload does.
+    fn stdin_read(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        if let [text, rest @ ..] = args {
+            if name != "readLine" {
+                return Err(format!(
+                    "scalars: too many arguments for method {name} in object StdIn (line {line})"
+                ));
+            }
+            let prompt = Expr::Method {
+                recv: Box::new(text.clone()),
+                name: "format".to_string(),
+                args: rest.to_vec(),
+                line,
+            };
+            self.println(false, Some(&prompt))?;
+            self.b.emit(Op::Pop, line);
+        }
+        let k = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(k), line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::STDIN_READ, 1), line);
+        Ok(())
     }
 
     /// Whether an instance of `cname` responds to `method` — declared by the
@@ -6182,6 +6271,17 @@ impl Compiler {
                 line,
             };
             return self.method(&member, "apply", args, line);
+        }
+        if let Some(e) = self.console_print(recv, name, args, line) {
+            return self.expr(&e);
+        }
+        if name == "exit" && args.len() == 1 && self.is_exit_owner(recv) {
+            self.expr(&args[0])?;
+            self.b.emit(Op::CallBuiltin(crate::host::SYS_EXIT, 1), line);
+            return Ok(());
+        }
+        if STDIN_MEMBERS.contains(&name) && self.is_stdin(recv) {
+            return self.stdin_read(name, args, line);
         }
         // `sys.error(msg)` is `throw new RuntimeException(msg)`.
         if args.len() == 1 && name == "error" && matches!(recv, Expr::Var(s) if s == "sys") {
@@ -10870,6 +10970,20 @@ fn combine_all(mut widths: impl Iterator<Item = NumTy>) -> NumTy {
 
 /// The collection literals whose elements are values (as opposed to `Map`'s
 /// key/value pairs, which have two widths and no single element type).
+/// The members of `scala.io.StdIn` that [`crate::host::STDIN_READ`] reads.
+/// What an import (`import scala.io.StdIn._`) of the object binds.
+const STDIN_MEMBERS: &[&str] = &[
+    "readLine",
+    "readInt",
+    "readLong",
+    "readShort",
+    "readByte",
+    "readDouble",
+    "readFloat",
+    "readBoolean",
+    "readChar",
+];
+
 /// The members `scala.math` provides, which is what a wildcard over it binds.
 /// Mirrors `host::math_member`'s own match, so the two cannot drift into a
 /// wildcard that binds a name the runtime then refuses.

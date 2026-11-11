@@ -13,6 +13,7 @@ pub mod cli;
 pub mod compiler;
 pub mod corpus;
 pub mod dap;
+pub mod embed;
 pub mod fdlibm;
 pub mod host;
 pub mod jlocale;
@@ -28,6 +29,7 @@ pub mod tiers;
 pub mod timsort;
 
 pub use banner::version_banner;
+pub use embed::run_program;
 use fusevm::{VMResult, Value, VM};
 
 /// Parse Scala `src` to an AST.
@@ -51,6 +53,7 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
     host::reset_heap(); // start each run with an empty object arena
     host::reset_types(); // and with an empty declared-type registry
     host::reset_exceptions(); // and with no exception left in flight
+    host::reset_exit_code(); // and with no `sys.exit` status from a prior run
     let _ = host::take_error(); // clear any stale FFI fault from a prior run
     let res = vm.run();
     // An FFI compile/dispatch fault halts the VM and parks its message; surface

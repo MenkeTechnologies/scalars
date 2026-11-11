@@ -58,6 +58,15 @@ JIT of its own; it is a pure frontend over the shared engine. Highlights:
   and `Unit` prints `()` — matching `scala`, not the VM's shell-flavoured
   default. `Unit` is its own value rather than an alias for the absent one, so
   `println(xs.foreach(f))` and `println(println("x"))` render `()`.
+- **Console I/O** — `Console.println`/`print`/`printf` and
+  `System.out.println`/`print`/`printf` write to the same stream as the Predef
+  forms. `scala.io.StdIn` (`import scala.io.StdIn`, `import scala.io.StdIn._`,
+  or spelled in full) reads stdin: `readLine()` answers `null` at end of input
+  and `readLine(text, args…)` prints its prompt first; `readInt`, `readLong`,
+  `readShort`, `readByte`, `readDouble`, `readFloat`, `readChar` and
+  `readBoolean` convert the line as `StdIn` does and throw
+  `java.io.EOFException` at end of input. `sys.exit(n)` / `System.exit(n)`
+  stops the program where it stands with exit status `n`.
 - **Scala `/` semantics** — a type-dispatching division builtin truncates when
   both operands are `Int` (`7 / 2 == 3`) and floats when either is a `Double`
   (`7 / 2.0 == 3.5`), because fusevm's native divide is always floating.
@@ -260,6 +269,28 @@ object Hello extends App {
   val who = "fusevm"
   println("Hello from scalars — Scala on " + who)
 }
+```
+
+### Embedding
+
+The `scalars` library crate runs a whole program from Rust:
+
+```rust
+pub fn run_program(src: &str, input: &str) -> Result<String, String>
+```
+
+`input` is the program's stdin (what `scala.io.StdIn` reads); the return value
+is everything it wrote through `println`/`print`/`printf`, `Console` and
+`System.out`, which never reaches the process stdout. Each call runs on its own
+interpreter thread with a fresh heap, so calls from several threads at once
+keep their output apart. A parse or compile error, an uncaught exception, a
+nonzero `sys.exit`, or an internal panic is `Err`; `sys.exit(0)` is `Ok` with
+the output so far.
+
+```rust
+let src = "import scala.io.StdIn\n\
+           object Main { def main(a: Array[String]): Unit = println(StdIn.readInt() * 2) }";
+assert_eq!(scalars::run_program(src, "21\n")?, "42\n");
 ```
 
 ---

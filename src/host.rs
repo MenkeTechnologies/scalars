@@ -588,6 +588,12 @@ pub const MAKE_NUMERIC: u16 = 838;
 /// to one `StringConcatFactory` call (an `s"…"` to one `StringContext.s`), so
 /// no operand is turned into text until every operand has been computed.
 pub const STR_CONCAT: u16 = 839;
+/// Builtin id for a `scala.io.StdIn` read: pops the member name (`readLine`,
+/// `readInt`, …) and answers what that member reads from the program's stdin.
+pub const STDIN_READ: u16 = 840;
+/// Builtin id for `sys.exit(n)` / `System.exit(n)`: pops the status, records it
+/// for [`exit_code`], and halts the run where it stands.
+pub const SYS_EXIT: u16 = 841;
 /// Builtin id for a `@main` method's REPEATED parameter (`rest: Int*`): pops
 /// the type name and the first index, and answers every argument from there on
 /// read as that type, in a `List` — Scala's
@@ -698,7 +704,10 @@ fn b_main_arg(vm: &mut VM, _argc: u8) -> Value {
             // `showError` writes to stdout and the exit status stays 0, so this
             // is a CLEAN halt rather than the `FFI_ERROR` path (which reports on
             // stderr and exits non-zero).
-            println!("Illegal command line{}: {cause}", arg_position(index));
+            write_stdout(&format!(
+                "Illegal command line{}: {cause}\n",
+                arg_position(index)
+            ));
             vm.request_halt();
             Value::Undef
         }
@@ -724,10 +733,10 @@ fn b_main_rest(vm: &mut VM, _argc: u8) -> Value {
             Ok(v) => items.push(v),
             Err(cause) => {
                 // A clean halt on stdout with exit 0, as in `b_main_arg`.
-                println!(
-                    "Illegal command line{}: {cause}",
+                write_stdout(&format!(
+                    "Illegal command line{}: {cause}\n",
                     arg_position(first + offset)
-                );
+                ));
                 vm.request_halt();
                 return Value::Undef;
             }
@@ -904,6 +913,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(MAKE_STRING_CONTEXT, b_make_string_context);
     vm.register_builtin(MAKE_NUMERIC, b_make_numeric);
     vm.register_builtin(STR_CONCAT, b_str_concat);
+    vm.register_builtin(STDIN_READ, b_stdin_read);
+    vm.register_builtin(SYS_EXIT, b_sys_exit);
     vm.register_builtin(SISTYPE, b_istype);
     vm.register_builtin(SMATCHERR, b_matcherr);
     vm.register_builtin(OBJ_NEW, b_obj_new);
@@ -18439,6 +18450,139 @@ fn b_mod(vm: &mut VM, _argc: u8) -> Value {
     }
 }
 
+thread_local! {
+    /// An embedded run's stdout buffer (see [`crate::embed`]). `None` (the CLI
+    /// case) writes to the process stdout.
+    static STDOUT_CAPTURE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// An embedded run's stdin: the whole text and the read offset. `None`
+    /// reads the process stdin.
+    static STDIN_TEXT: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
+    /// The status `sys.exit` / `System.exit` stopped the run with.
+    static EXIT_CODE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Route this thread's program stdout into a buffer and serve `input` as its
+/// stdin, until [`end_embedded_io`].
+pub fn begin_embedded_io(input: &str) {
+    STDOUT_CAPTURE.with(|c| *c.borrow_mut() = Some(String::new()));
+    STDIN_TEXT.with(|s| *s.borrow_mut() = Some((input.to_string(), 0)));
+}
+
+/// Restore the process stdin/stdout for this thread and return what the
+/// program printed since [`begin_embedded_io`].
+pub fn end_embedded_io() -> String {
+    STDIN_TEXT.with(|s| s.borrow_mut().take());
+    STDOUT_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// The status the last run's `sys.exit` / `System.exit` asked for, if it made
+/// one. Cleared at the start of every run.
+pub fn exit_code() -> Option<i32> {
+    EXIT_CODE.with(std::cell::Cell::get)
+}
+
+/// Forget the previous run's exit status.
+pub fn reset_exit_code() {
+    EXIT_CODE.with(|c| c.set(None));
+}
+
+/// The one stdout path for program output (`println`, `print`, `printf`, and
+/// their `Console` / `System.out` spellings): the embedded buffer when one is
+/// active, otherwise the process stdout.
+fn write_stdout(text: &str) {
+    use std::io::Write;
+    let captured = STDOUT_CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+        Some(buf) => {
+            buf.push_str(text);
+            true
+        }
+        None => false,
+    });
+    if !captured {
+        let _ = std::io::stdout().lock().write_all(text.as_bytes());
+    }
+}
+
+/// One line of program stdin without its `\n` / `\r\n` terminator, or `None`
+/// at end of input — what `Console.in.readLine()` answers.
+fn read_stdin_line() -> Option<String> {
+    let embedded = STDIN_TEXT.with(|s| {
+        s.borrow_mut().as_mut().map(|(text, pos)| {
+            if *pos >= text.len() {
+                return None;
+            }
+            let end = text[*pos..].find('\n').map_or(text.len(), |i| *pos + i);
+            let line = text[*pos..end].trim_end_matches('\r').to_string();
+            *pos = end + 1;
+            Some(line)
+        })
+    });
+    if let Some(line) = embedded {
+        return line;
+    }
+    use std::io::{BufRead, Write};
+    // A prompt printed with `print` has to be visible before the read blocks.
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(
+            line.trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string(),
+        ),
+    }
+}
+
+/// `STDIN_READ` builtin — see [`STDIN_READ`]. `readLine` answers `null` at end
+/// of input; every other member throws `EOFException` there, then converts
+/// the line exactly as `StdIn` does: through `StringOps` (`readInt` is
+/// `readLine().toInt`, so surrounding spaces are a `NumberFormatException`),
+/// `charAt(0)` for `readChar`, and `true`/`t`/`yes`/`y` in any case for
+/// `readBoolean`.
+fn b_stdin_read(vm: &mut VM, _argc: u8) -> Value {
+    let member = vm.pop().as_str_cow().into_owned();
+    if unwinding() {
+        return Value::Undef;
+    }
+    let line = read_stdin_line();
+    let result = match (member.as_str(), line) {
+        ("readLine", line) => Ok(line.map_or(Value::Undef, Value::str)),
+        (_, None) => {
+            Err("scalars: java.io.EOFException: Console has reached end of input".to_string())
+        }
+        ("readBoolean", Some(s)) => Ok(Value::Bool(matches!(
+            s.to_lowercase().as_str(),
+            "true" | "t" | "yes" | "y"
+        ))),
+        ("readChar", Some(s)) => string_method(&s, "charAt", &[Value::int(0)]),
+        ("readInt", Some(s)) => string_method(&s, "toInt", &[]),
+        ("readLong", Some(s)) => string_method(&s, "toLong", &[]),
+        ("readShort", Some(s)) => string_method(&s, "toShort", &[]),
+        ("readByte", Some(s)) => string_method(&s, "toByte", &[]),
+        ("readDouble", Some(s)) => string_method(&s, "toDouble", &[]),
+        ("readFloat", Some(s)) => string_method(&s, "toFloat", &[]),
+        (other, Some(_)) => Err(format!(
+            "scalars: value {other} is not a member of object scala.io.StdIn"
+        )),
+    };
+    result.unwrap_or_else(|e| fault(vm, e))
+}
+
+/// `SYS_EXIT` builtin — see [`SYS_EXIT`]. Nothing after the call runs, a
+/// `finally` included, as on the JVM.
+fn b_sys_exit(vm: &mut VM, _argc: u8) -> Value {
+    let code = vm.pop().to_int() as i32;
+    if unwinding() {
+        return Value::Undef;
+    }
+    EXIT_CODE.with(|c| c.set(Some(code)));
+    vm.request_halt();
+    Value::Undef
+}
+
 /// Predef `println` builtin: pop `argc` values (0 or 1), print them
 /// Scala-formatted followed by a newline, and return `Unit`/`null`.
 fn b_println(vm: &mut VM, argc: u8) -> Value {
@@ -18451,7 +18595,6 @@ fn b_print(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn print_args(vm: &mut VM, argc: u8, newline: bool) -> Value {
-    use std::io::Write;
     // Pop the args (pushed left-to-right, so the last is on top) and restore
     // source order.
     let mut vals = Vec::with_capacity(argc as usize);
@@ -18465,8 +18608,8 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool) -> Value {
     if unwinding() {
         return Value::Undef;
     }
-    // Rendered BEFORE the lock is taken: a user `toString` may itself `println`,
-    // and holding stdout across that would deadlock.
+    // Rendered BEFORE anything is written: a user `toString` may itself
+    // `println`, and its output comes first.
     let rendered: Vec<String> = vals.iter().map(|v| scala_str_vm(vm, v)).collect();
     // A user `toString` that raised leaves the exception in flight, and Scala
     // never reaches the `println` it was being rendered for. Re-checked here
@@ -18474,14 +18617,11 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool) -> Value {
     if unwinding() {
         return Value::Undef;
     }
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    for s in &rendered {
-        let _ = write!(lock, "{s}");
-    }
+    let mut text = rendered.concat();
     if newline {
-        let _ = writeln!(lock);
+        text.push('\n');
     }
+    write_stdout(&text);
     // `println`/`print` return `Unit`. In statement position a trailing `Pop`
     // discards this, but it is observable through a `Unit`-returning `def` whose
     // body is a `println` — `println(side())` prints `()`.
